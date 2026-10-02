@@ -3,3 +3,10 @@
 motor.melodiaseriffs.com.br {
     reverse_proxy engine:8080
 }
+
+# Painel/API do Evolution por HTTPS (criptografado). Assim NÃO precisa mais
+# acessar pela porta 8081 em HTTP (onde a chave viajava sem criptografia).
+# Requer DNS: A  evolution -> 179.236.233.223  (nuvem CINZA no Cloudflare).
+evolution.melodiaseriffs.com.br {
+    reverse_proxy evolution:8080
+}

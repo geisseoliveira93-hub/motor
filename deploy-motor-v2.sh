@@ -42,6 +42,25 @@ echo
 echo "==> 7) Sincronizando status dos números com o Evolution..."
 curl -s -X POST http://localhost:8080/numbers/sync -H "x-api-key: $KEY" >/dev/null && echo "   ok."
 
+echo "==> 8) Recarregando o Caddy (pega domínios novos do Caddyfile, ex: evolution.*)..."
+if docker compose --profile proxy ps caddy 2>/dev/null | grep -qiE "up|running"; then
+  docker compose --profile proxy up -d caddy >/dev/null 2>&1 || true
+  docker compose --profile proxy exec -T caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \
+    && echo "   Caddy recarregado (subdomínios novos serão certificados automaticamente)." \
+    || echo "   (Caddy nao recarregou via exec; se precisar: docker compose --profile proxy restart caddy)"
+else
+  echo "   Caddy nao esta ligado — rode enable-https.sh pra ligar o HTTPS."
+fi
+
+echo "==> 9) Agendando backup diario do banco (3h da manha), se ainda nao houver..."
+mkdir -p /opt/motor/backups
+if crontab -l 2>/dev/null | grep -q "backup-motor.sh"; then
+  echo "   backup diario ja estava agendado."
+else
+  ( crontab -l 2>/dev/null; echo "0 3 * * * cd /opt/motor && bash backup-motor.sh >> /opt/motor/backups/backup.log 2>&1" ) | crontab -
+  echo "   backup diario agendado."
+fi
+
 echo
 echo "==================== PRONTO ===================="
 echo "Números cadastrados no motor:"

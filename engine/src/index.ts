@@ -29,6 +29,9 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 // Tokens que validam os webhooks de pagamento (vêm na URL: ?token=...).
 const GURU_TOKEN = process.env.GURU_TOKEN || '';
 const LASTLINK_TOKEN = process.env.LASTLINK_TOKEN || '';
+// Segurança: liga/desliga a página de importação de leads (/importar e /import/leads).
+// Depois de terminar a migração, pôr IMPORTAR_ATIVO=false no .env pra desligar a porta de entrada.
+const IMPORTAR_ATIVO = (process.env.IMPORTAR_ATIVO || 'true') !== 'false';
 
 const PROJETOS = ['baixo', 'violao', 'teclado'] as const;
 type Projeto = (typeof PROJETOS)[number];
@@ -267,6 +270,15 @@ app.use((_req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  next();
+});
+
+// ---- Segurança: liga/desliga a porta de entrada da importação ----
+// Quando IMPORTAR_ATIVO=false, a página e o envio de importação respondem 403.
+app.use((req, res, next) => {
+  if (!IMPORTAR_ATIVO && (req.path === '/importar' || req.path === '/import/leads')) {
+    return res.status(403).json({ erro: 'importacao_desativada' });
+  }
   next();
 });
 

@@ -41,7 +41,10 @@ services:
     volumes:
       - evoinstances:/evolution/instances
     ports:
-      - "8081:8080"   # painel/api do Evolution (uso interno)
+      # SEGURANCA: antes ficava exposto na internet (qualquer um alcançava em HTTP).
+      # - "8081:8080"
+      # Agora só local (host): de fora, só pelo HTTPS evolution.melodiaseriffs.com.br (Caddy).
+      - "127.0.0.1:8081:8080"
 
   # ---- Nosso engine: projetos (baixo/violão/teclado), disparos, tags, CRM, webhooks de pagamento ----
   engine:
@@ -56,10 +59,14 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       GURU_TOKEN: ${GURU_TOKEN}
       LASTLINK_TOKEN: ${LASTLINK_TOKEN}
+      IMPORTAR_ATIVO: ${IMPORTAR_ATIVO:-true}
     volumes:
       - enginedata:/data
     ports:
-      - "8080:8080"   # API que o app Editor-Video e os webhooks de pagamento chamam
+      # SEGURANCA: antes ficava exposto na internet.
+      # - "8080:8080"
+      # Agora só local (host): o app e os webhooks usam o HTTPS motor.melodiaseriffs.com.br (Caddy).
+      - "127.0.0.1:8080:8080"
 
   # ---- (Opcional) proxy HTTPS com domínio + SSL automático ----
   # Só sobe quando você tiver um domínio apontado: docker compose --profile proxy up -d
