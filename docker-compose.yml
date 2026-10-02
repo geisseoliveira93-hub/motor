@@ -1,0 +1,87 @@
+# ============================================================
+# Motor de WhatsApp do Melodias e Riffs — stack pro VPS (24/7)
+# Sobe: Evolution API (WhatsApp não-oficial multi-número) + Postgres +
+# Redis + o nosso "engine" (a cola que o app e os webhooks falam).
+# ============================================================
+version: "3.8"
+
+services:
+  # ---- Banco do Evolution ----
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: evolution
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redisdata:/data
+
+  # ---- Evolution API: conecta os números por QR, envia, grupos, mídia ----
+  evolution:
+    image: atendai/evolution-api:v2.1.1
+    restart: always
+    depends_on: [postgres, redis]
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:${POSTGRES_PASSWORD}@postgres:5432/evolution
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379
+      # manda os eventos (mensagem recebida, status) pro nosso engine:
+      WEBHOOK_GLOBAL_ENABLED: "true"
+      WEBHOOK_GLOBAL_URL: http://engine:8080/webhook/evolution
+    volumes:
+      - evoinstances:/evolution/instances
+    ports:
+      - "8081:8080"   # painel/api do Evolution (uso interno)
+
+  # ---- Nosso engine: projetos (baixo/violão/teclado), disparos, tags, CRM, webhooks de pagamento ----
+  engine:
+    build: ./engine
+    restart: always
+    depends_on: [evolution]
+    environment:
+      PORT: "8080"
+      EVOLUTION_URL: http://evolution:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      ENGINE_API_KEY: ${ENGINE_API_KEY}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      GURU_TOKEN: ${GURU_TOKEN}
+      LASTLINK_TOKEN: ${LASTLINK_TOKEN}
+    volumes:
+      - enginedata:/data
+    ports:
+      - "8080:8080"   # API que o app Editor-Video e os webhooks de pagamento chamam
+
+  # ---- (Opcional) proxy HTTPS com domínio + SSL automático ----
+  # Só sobe quando você tiver um domínio apontado: docker compose --profile proxy up -d
+  caddy:
+    image: caddy:2-alpine
+    restart: always
+    profiles: ["proxy"]
+    depends_on: [engine]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${PUBLIC_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddydata:/data
+      - caddyconfig:/config
+
+volumes:
+  pgdata:
+  redisdata:
+  evoinstances:
+  enginedata:
+  caddydata:
+  caddyconfig:

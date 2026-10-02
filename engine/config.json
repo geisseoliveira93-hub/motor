@@ -1,0 +1,34 @@
+{
+  "_leia": "Config editável do motor. Mapeia produto->projeto e define as mensagens. Depois de editar, rode: curl -s -X POST http://localhost:8080/config/reload -H \"x-api-key: $(grep -oP '(?<=ENGINE_API_KEY=).*' /opt/motor/.env)\"  (não precisa rebuildar).",
+
+  "_como_mapear": "produtoProjeto: a CHAVE pode ser o ID do produto (UUID da LastLink/Guru) OU um pedaço do nome; o VALOR é baixo | violao | teclado. Se o nome do produto já tem 'baixo'/'violao'/'teclado', nem precisa cadastrar aqui (palavraChaveProjeto resolve). Use produtoProjeto só pros produtos cujo nome NÃO deixa claro o instrumento (ex: '200 cifras', '20 dedilhados').",
+  "produtoProjeto": {
+    "200 cifras": "teclado",
+    "20 dedilhados": "teclado",
+    "100 melhores cifras": "teclado",
+    "harpa crista": "teclado",
+    "pestana perfeita": "violao",
+    "violonista": "violao"
+  },
+
+  "palavraChaveProjeto": [
+    { "contem": "baixo", "projeto": "baixo" },
+    { "contem": "violao", "projeto": "violao" },
+    { "contem": "violão", "projeto": "violao" },
+    { "contem": "teclado", "projeto": "teclado" }
+  ],
+
+  "projetoPadrao": "teclado",
+
+  "_mensagens": "Use {nome} pra inserir o nome do comprador. TROQUE os (links) pelos links reais de acesso/download de cada instrumento.",
+  "entrega": {
+    "baixo": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do BAIXO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶",
+    "violao": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do VIOLÃO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶",
+    "teclado": "Olá {nome}! 🎹 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do TECLADO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶"
+  },
+  "recuperacao": {
+    "baixo": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de baixo mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎸",
+    "violao": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de violão mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎸",
+    "teclado": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de teclado mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎹"
+  }
+}

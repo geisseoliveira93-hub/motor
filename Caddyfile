@@ -1,0 +1,5 @@
+# Proxy HTTPS automático (SSL grátis) pro motor.
+# Troque o domínio se usar outro. O Caddy cuida do certificado sozinho.
+motor.melodiaseriffs.com.br {
+    reverse_proxy engine:8080
+}

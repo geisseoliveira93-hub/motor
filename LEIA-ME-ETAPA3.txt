@@ -1,0 +1,81 @@
+=====================================================================
+ MOTOR DO WHATSAPP — ETAPA 3 (ligar as funções)
+ O que o Kia já fez sozinho  +  o que falta fazer JUNTO com você
+=====================================================================
+
+JÁ FEITO (sozinho, enquanto você dava aula):
+---------------------------------------------------------------------
+1) Código NOVO do motor (v2) pronto e testado (compila limpo):
+   - Agora o motor sabe de qual PROJETO é cada número por um CADASTRO
+     (não mais pelo nome da instância). Assim o nome "Ezequias-pessoal"
+     pode ficar livre e ainda ser do projeto TECLADO.
+   - Endpoint novo pra registrar um número que já existe num projeto
+     (registra o seu número pessoal no Teclado SEM re-escanear QR).
+   - Webhooks de pagamento das DUAS plataformas: GURU e LASTLINK.
+     Entende "compra aprovada" -> manda ENTREGA; "abandono/recusado/
+     cancelado/expirado" -> manda RECUPERAÇÃO; "reembolso/chargeback"
+     -> só marca a tag (sem mensagem). Validação por token na URL,
+     anti-duplicado, e mapa produto->projeto.
+2) Configuração editável (engine/config.json): mapa produto->projeto
+   e as mensagens de entrega/recuperação JÁ escritas na sua voz
+   (só falta você colocar os LINKS de acesso reais de cada instrumento).
+3) Scripts de deploy prontos (deploy-motor-v2.sh e enable-https.sh).
+4) docker-compose já atualizado pra passar os tokens dos webhooks.
+
+ARQUIVOS DESTE PACOTE (ficam em F:\Claude\_VPS\motor-v2\):
+   engine/src/index.ts      <- o motor v2
+   engine/config.json       <- mapa + mensagens (edite os links!)
+   docker-compose.yml       <- atualizado (tokens dos webhooks)
+   deploy-motor-v2.sh       <- sobe o motor v2 no servidor
+   enable-https.sh          <- liga o HTTPS (depois do DNS)
+   Caddyfile                <- já aponta motor.melodiaseriffs.com.br
+
+=====================================================================
+ O QUE FALTA FAZER JUNTOS (depende de você) — em ordem
+=====================================================================
+
+PASSO A — DNS do subdomínio (Cloudflare)  [2 min]
+   Criar no Cloudflare um registro:
+     Tipo A | Nome: motor | Conteúdo: 179.236.233.223
+     Proxy: DESLIGADO (nuvem CINZA) — importante pro SSL funcionar.
+   (Se eu conseguir logar no seu Cloudflare pelo navegador, já deixo feito.)
+
+PASSO B — Colocar o motor v2 no servidor  [melhor via GitHub]
+   OPÇÃO 1 (recomendada): montar o GitHub do motor.
+     - Você loga no GitHub 1x; eu crio o repositório privado e subo o código.
+     - No servidor vira só "git pull" (comando curto, sem aquela dor de
+       colar texto longo no terminal).
+   OPÇÃO 2 (sem GitHub): você cola os arquivos no servidor manualmente
+     (eu te passo cada um; seu copiar/colar manual funciona certinho).
+
+PASSO C — Rodar o deploy  [1 comando]
+   No terminal do servidor, em /opt/motor:
+     bash deploy-motor-v2.sh
+   Isso: sobe o motor v2, carrega a config, e JÁ registra seu número
+   pessoal no projeto Teclado. No final ele imprime as URLs de webhook.
+
+PASSO D — Ligar o HTTPS  [1 comando, depois do DNS]
+     bash enable-https.sh
+   Resultado: https://motor.melodiaseriffs.com.br/health funcionando.
+
+PASSO E — Plugar os webhooks nas plataformas  [você cola as URLs]
+   Pegue as URLs que o deploy imprimiu e cole:
+     - na GURU (produtos da IA)
+     - na LASTLINK (low-tickets) — nos eventos de venda
+   (eu te mostro exatamente onde em cada painel).
+
+PASSO F — Preencher os LINKS de acesso  [você me diz]
+   Me passe os links de acesso/download de cada instrumento
+   (teclado/violão/baixo) pra eu colocar nas mensagens de entrega.
+   Se algum produto tiver nome que não deixa claro o instrumento,
+   me diz o ID/nome -> projeto certo.
+
+DEPOIS (quando a base estiver rodando):
+   - Integrar o app do PC (Editor-Video) com o motor da nuvem (sincronizar
+     números/contatos/tags/conversas dentro da aba Sellflux).
+   - SAC omnichannel com comentários de Instagram/Facebook + filtros por rede
+     (depende das APIs da Meta — liga com o projeto de App Review da Meta).
+   - Fechar os 3 cursos low-ticket (acesso por produto).
+   - Pra disparo em escala: número(s) DEDICADO(s) por projeto (o pessoal
+     tem risco de ban se o volume subir).
+=====================================================================
