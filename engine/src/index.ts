@@ -256,12 +256,15 @@ const preenche = (tpl: string, nome?: string) => String(tpl || '').replace(/\{no
 // ----------------------- API HTTP -----------------------
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+// aceita CSV cru no corpo (pra importação em massa de leads da SellFlux)
+app.use(express.text({ type: ['text/csv', 'application/csv', 'text/plain'], limit: '120mb' }));
 
 // Webhooks de pagamento NÃO exigem nossa chave (vêm de fora), mas são validados por token na URL.
 // Todo o resto exige x-api-key.
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
   if (req.path === '/health') return next();
+  if (req.path === '/importar' && req.method === 'GET') return next(); // só a PÁGINA; o envio ainda exige a chave
   if ((req.header('x-api-key') || '') !== ENGINE_API_KEY) return res.status(401).json({ erro: 'sem_autorizacao' });
   next();
 });
@@ -327,6 +330,56 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
 app.get('/config', (_req, res) => res.json(CONFIG));
 
+// Página simples de importação de leads (sem precisar de terminal).
+app.get('/importar', (_req, res) => {
+  res.type('html').send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Importar leads - Melodias e Riffs</title>
+<style>
+  :root{color-scheme:dark} *{box-sizing:border-box}
+  body{margin:0;font:16px/1.5 system-ui,Segoe UI,Arial;background:#0e1116;color:#e6e6e6;display:flex;justify-content:center;padding:28px 16px}
+  .card{width:100%;max-width:520px;background:#161b22;border:1px solid #2a313c;border-radius:14px;padding:24px}
+  h1{font-size:20px;margin:0 0 4px} p.sub{color:#9aa4b2;margin:0 0 20px;font-size:14px}
+  label{display:block;margin:14px 0 6px;font-weight:600}
+  input,select{width:100%;padding:11px 12px;border-radius:9px;border:1px solid #2a313c;background:#0e1116;color:#e6e6e6;font-size:15px}
+  button{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#1db954;color:#07210f;font-weight:700;font-size:16px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  #res{margin-top:18px;white-space:pre-wrap;font-size:14px;padding:12px;border-radius:9px;display:none}
+  .ok{background:#0f2e1b;border:1px solid #1db95455} .err{background:#2e1313;border:1px solid #b91d1d55}
+  small{color:#9aa4b2}
+</style></head><body><div class="card">
+<h1>Importar leads 🎸</h1>
+<p class="sub">Suba o arquivo .CSV exportado da SellFlux. Os contatos e tags entram no projeto escolhido.</p>
+<label>Chave do motor (ENGINE_API_KEY)</label>
+<input id="key" type="password" placeholder="cole sua chave aqui" autocomplete="off">
+<small>Fica no seu arquivo F:\\Claude\\_VPS\\chaves-motor.txt</small>
+<label>Projeto</label>
+<select id="proj"><option value="teclado">Teclado</option><option value="violao">Violão</option><option value="baixo">Baixo</option></select>
+<label>Arquivo CSV</label>
+<input id="file" type="file" accept=".csv,text/csv">
+<button id="go">Importar</button>
+<div id="res"></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+$('#go').onclick=async()=>{
+  const key=$('#key').value.trim(), proj=$('#proj').value, f=$('#file').files[0], res=$('#res');
+  res.style.display='block'; res.className='';
+  if(!key){res.className='err';res.textContent='Cole a chave do motor.';return;}
+  if(!f){res.className='err';res.textContent='Escolha um arquivo CSV.';return;}
+  $('#go').disabled=true; res.textContent='Importando... (pode levar um tempo pra arquivos grandes)';
+  try{
+    const csv=await f.text();
+    const r=await fetch('/import/leads?projeto='+encodeURIComponent(proj),{method:'POST',headers:{'x-api-key':key,'Content-Type':'text/csv'},body:csv});
+    const j=await r.json();
+    if(r.ok&&j.ok){res.className='ok';res.textContent='✅ Pronto!\\n\\nImportados: '+j.importados+'\\nSem telefone (pulados): '+j.sem_telefone+'\\nTags aplicadas: '+j.tags_aplicadas+'\\n\\nColunas detectadas: '+JSON.stringify(j.colunas_detectadas);}
+    else{res.className='err';res.textContent='Erro: '+(j.erro||r.status);}
+  }catch(e){res.className='err';res.textContent='Falha: '+e.message;}
+  $('#go').disabled=false;
+};
+</script></body></html>`);
+});
+
 // ---- Envio 1x1 ----
 app.post('/send', async (req, res) => {
   try {
@@ -367,6 +420,81 @@ app.post('/tags/apply', (req, res) => {
 app.get('/contacts', (req, res) => {
   const projeto = String(req.query.projeto || '');
   res.json(db.prepare(`SELECT * FROM contatos WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 500`).all(projeto));
+});
+app.get('/contacts/count', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const c = db.prepare(`SELECT COUNT(*) n FROM contatos WHERE projeto=?`).get(projeto) as any;
+  res.json({ projeto, total: c?.n ?? 0 });
+});
+
+// ---- Importação em massa de leads (CSV exportado da SellFlux) ----
+// POST /import/leads?projeto=teclado   corpo = CSV (Content-Type: text/csv)
+// Detecta as colunas pelo cabeçalho (nome/email/telefone/tags), aceita , ou ; como separador.
+function detectDelim(line: string): string {
+  const c = (line.match(/,/g) || []).length;
+  const s = (line.match(/;/g) || []).length;
+  const t = (line.match(/\t/g) || []).length;
+  if (t >= c && t >= s) return '\t';
+  return s > c ? ';' : ',';
+}
+function parseCSV(txt: string, delim: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [], cur = '', q = false;
+  for (let i = 0; i < txt.length; i++) {
+    const ch = txt[i];
+    if (q) {
+      if (ch === '"') { if (txt[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += ch;
+    } else {
+      if (ch === '"') q = true;
+      else if (ch === delim) { row.push(cur); cur = ''; }
+      else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+      else if (ch === '\r') { /* ignora */ }
+      else cur += ch;
+    }
+  }
+  if (cur.length || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+app.post('/import/leads', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    if (!ehProjeto(projeto)) return res.status(400).json({ erro: 'projeto_invalido' });
+    const csv = typeof req.body === 'string' ? req.body : '';
+    if (!csv.trim()) return res.status(400).json({ erro: 'csv_vazio' });
+    const nl = csv.indexOf('\n');
+    const delim = detectDelim(nl >= 0 ? csv.slice(0, nl) : csv);
+    const rows = parseCSV(csv, delim);
+    if (rows.length < 2) return res.status(400).json({ erro: 'sem_linhas' });
+    const header = rows[0].map((h) => h.trim().toLowerCase().replace(/^﻿/, ''));
+    const col = (names: string[]) => header.findIndex((h) => names.some((n) => h === n) ) ;
+    const colLike = (names: string[]) => header.findIndex((h) => names.some((n) => h.includes(n)));
+    const pick = (names: string[]) => { const e = col(names); return e >= 0 ? e : colLike(names); };
+    const iNome = pick(['nome', 'name', 'lead', 'cliente', 'contato', 'contact']);
+    const iEmail = pick(['email', 'e-mail', 'mail']);
+    const iTel = pick(['telefone', 'phone', 'celular', 'whatsapp', 'numero', 'número', 'fone', 'mobile', 'telephone']);
+    const iTags = pick(['tags', 'etiquetas', 'tag']);
+    let importados = 0, semTelefone = 0, tagsAplicadas = 0;
+    const tx = db.transaction(() => {
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r];
+        if (!row || row.length === 0 || (row.length === 1 && !row[0])) continue;
+        const tel = (iTel >= 0 ? String(row[iTel] || '') : '').replace(/\D/g, '');
+        if (!tel || tel.length < 10) { semTelefone++; continue; }
+        const nome = iNome >= 0 ? String(row[iNome] || '').trim() : '';
+        const email = iEmail >= 0 ? String(row[iEmail] || '').trim() : '';
+        const cid = upsertContato(projeto, tel, nome || undefined, email || undefined, 'sellflux-import');
+        importados++;
+        if (iTags >= 0 && row[iTags]) {
+          const tags = String(row[iTags]).split(/[;,|]/).map((t) => t.trim()).filter(Boolean);
+          for (const t of tags) { aplicarTag(projeto, cid, t); tagsAplicadas++; }
+        }
+      }
+    });
+    tx();
+    res.json({ ok: true, projeto, importados, sem_telefone: semTelefone, tags_aplicadas: tagsAplicadas,
+      colunas_detectadas: { nome: iNome, email: iEmail, telefone: iTel, tags: iTags }, cabecalho: header });
+  } catch (e: any) { res.status(500).json({ erro: String(e.message || e) }); }
 });
 
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----

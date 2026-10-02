@@ -1,0 +1,56 @@
+=====================================================================
+ PRÓXIMOS PASSOS — atualizar o motor + importar os leads da SellFlux
+ (feito pelo Ezequias, com o Kia guiando em cada um)
+=====================================================================
+
+NOVIDADES DESTA VERSÃO DO MOTOR:
+- Importação em massa de leads por CSV (POST /import/leads?projeto=...)
+- Contagem de contatos (GET /contacts/count?projeto=...)
+- Correção da imagem do Evolution (evoapicloud) no docker-compose.yml
+
+---------------------------------------------------------------------
+PASSO 1 — Atualizar o código no GitHub (re-upload)
+---------------------------------------------------------------------
+No navegador, repo: github.com/geisseoliveira93-hub/motor -> "Add file" ->
+"Upload files". Arraste o CONTEÚDO da pasta F:\Claude\_VPS\motor-v2
+(os arquivos + a pasta engine). O GitHub vai substituir os que mudaram
+(engine/src/index.ts e docker-compose.yml). Confirme (commit).
+[Arraste UMA vez só pra não duplicar.]
+
+---------------------------------------------------------------------
+PASSO 2 — Atualizar o motor no servidor (terminal da VPS)
+---------------------------------------------------------------------
+cd /opt/motor
+curl -sL https://github.com/geisseoliveira93-hub/motor/tarball/main -o new.tgz
+tar xzf new.tgz --strip-components=1
+bash deploy-motor-v2.sh
+(espera o "PRONTO")
+
+---------------------------------------------------------------------
+PASSO 3 — Exportar os leads da SellFlux (3 perfis)
+---------------------------------------------------------------------
+Na SellFlux, para CADA perfil (Teclado, Violão, Baixo):
+  Trocar o perfil no seletor -> Leads -> "Exportar leads" -> confirmar.
+  Baixar o CSV em Leads -> Importações/Exportações.
+Salve os 3 arquivos, por ex.: teclado.csv, violao.csv, baixo.csv
+
+---------------------------------------------------------------------
+PASSO 4 — Importar cada CSV (FÁCIL, por uma página web)
+---------------------------------------------------------------------
+Abra no navegador:  https://motor.melodiaseriffs.com.br/importar
+1) Cole a chave do motor (ENGINE_API_KEY, do arquivo
+   F:\Claude\_VPS\chaves-motor.txt)
+2) Escolha o projeto (Teclado / Violão / Baixo)
+3) Escolha o arquivo CSV daquele perfil
+4) Clique "Importar"
+A página mostra quantos entraram, quantos foram pulados (sem telefone)
+e quantas tags foram aplicadas. Repita para os 3 CSVs.
+
+---------------------------------------------------------------------
+AINDA FALTA (quando quiser):
+---------------------------------------------------------------------
+- E) Webhooks de pagamento (Guru/LastLink) -> entrega/recuperação automática
+- F) Links de acesso de cada produto -> nas mensagens de entrega
+- Conectar um número por projeto (Baixo e Violão ainda não têm número)
+- Fluxos/automações da SellFlux: documentar e reconstruir (recurso futuro)
+=====================================================================
