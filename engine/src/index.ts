@@ -261,11 +261,38 @@ app.use(express.text({ type: ['text/csv', 'application/csv', 'text/plain'], limi
 
 // Webhooks de pagamento NÃO exigem nossa chave (vêm de fora), mas são validados por token na URL.
 // Todo o resto exige x-api-key.
+// ---- Segurança: cabeçalhos básicos ----
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  next();
+});
+
+// ---- Segurança: anti-força-bruta na chave (rate limit simples, em memória) ----
+// Se um mesmo IP errar a chave muitas vezes em pouco tempo, bloqueia por uns minutos.
+const falhasAuth = new Map<string, { n: number; ate: number }>();
+function ipDoReq(req: express.Request): string {
+  return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'desconhecido';
+}
+
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
   if (req.path === '/health') return next();
   if (req.path === '/importar' && req.method === 'GET') return next(); // só a PÁGINA; o envio ainda exige a chave
-  if ((req.header('x-api-key') || '') !== ENGINE_API_KEY) return res.status(401).json({ erro: 'sem_autorizacao' });
+  const ip = ipDoReq(req);
+  const agora2 = Date.now();
+  const reg = falhasAuth.get(ip);
+  if (reg && reg.ate > agora2 && reg.n >= 20) {
+    return res.status(429).json({ erro: 'muitas_tentativas', tente_em_segundos: Math.ceil((reg.ate - agora2) / 1000) });
+  }
+  if ((req.header('x-api-key') || '') !== ENGINE_API_KEY) {
+    const r = (reg && reg.ate > agora2) ? reg : { n: 0, ate: agora2 + 300000 }; // janela de 5 min
+    r.n++; falhasAuth.set(ip, r);
+    return res.status(401).json({ erro: 'sem_autorizacao' });
+  }
+  if (reg) falhasAuth.delete(ip); // acertou a chave -> limpa o contador
   next();
 });
 
@@ -437,6 +464,19 @@ function detectDelim(line: string): string {
   if (t >= c && t >= s) return '\t';
   return s > c ? ';' : ',';
 }
+// Lê o campo de tags: aceita lista JSON ["a","b"] (formato da SellFlux) OU separado por ; , |
+function parseTags(raw: string): string[] {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+  if (s.startsWith('[')) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr.map((t) => String(t).trim()).filter(Boolean);
+    } catch { /* cai no fallback */ }
+    return s.replace(/[\[\]"]/g, '').split(/[;,|]/).map((t) => t.trim()).filter(Boolean);
+  }
+  return s.split(/[;,|]/).map((t) => t.trim()).filter(Boolean);
+}
 function parseCSV(txt: string, delim: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [], cur = '', q = false;
@@ -486,7 +526,7 @@ app.post('/import/leads', (req, res) => {
         const cid = upsertContato(projeto, tel, nome || undefined, email || undefined, 'sellflux-import');
         importados++;
         if (iTags >= 0 && row[iTags]) {
-          const tags = String(row[iTags]).split(/[;,|]/).map((t) => t.trim()).filter(Boolean);
+          const tags = parseTags(String(row[iTags]));
           for (const t of tags) { aplicarTag(projeto, cid, t); tagsAplicadas++; }
         }
       }
