@@ -29,6 +29,11 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 // Tokens que validam os webhooks de pagamento (vêm na URL: ?token=...).
 const GURU_TOKEN = process.env.GURU_TOKEN || '';
 const LASTLINK_TOKEN = process.env.LASTLINK_TOKEN || '';
+// (Opcional) Token do webhook da Cademí. As vendas hoje só passam por Guru/LastLink,
+// então a Cademí NÃO é necessária como gatilho de venda. Mas deixamos o endpoint pronto:
+// se um dia houver venda pelo checkout da própria Cademí, basta pôr CADEMI_TOKEN no .env
+// e criar o webhook na Cademí apontando pra /webhook/cademi?token=...
+const CADEMI_TOKEN = process.env.CADEMI_TOKEN || '';
 // Segurança: liga/desliga a página de importação de leads (/importar e /import/leads).
 // Depois de terminar a migração, pôr IMPORTAR_ATIVO=false no .env pra desligar a porta de entrada.
 const IMPORTAR_ATIVO = (process.env.IMPORTAR_ATIVO || 'true') !== 'false';
@@ -68,29 +73,68 @@ CREATE TABLE IF NOT EXISTS negocios (
 CREATE TABLE IF NOT EXISTS fila_envio (
   id TEXT PRIMARY KEY, projeto TEXT, para TEXT, is_grupo INTEGER DEFAULT 0,
   texto TEXT, status TEXT DEFAULT 'pendente', tentativas INTEGER DEFAULT 0,
-  agendado_para TEXT, criado_em TEXT
+  agendado_para TEXT, criado_em TEXT,
+  tipo TEXT DEFAULT 'texto', url TEXT, legenda TEXT
 );
 CREATE TABLE IF NOT EXISTS pagamentos_processados (
   provider TEXT, pedido TEXT, criado_em TEXT, PRIMARY KEY (provider, pedido)
 );
 `);
 
+// Migração suave: bancos ANTIGOS (já no ar) não têm as colunas novas da fila.
+// ALTER TABLE ... ADD COLUMN é seguro; se a coluna já existir, ignora o erro.
+for (const alter of [
+  `ALTER TABLE fila_envio ADD COLUMN tipo TEXT DEFAULT 'texto'`,
+  `ALTER TABLE fila_envio ADD COLUMN url TEXT`,
+  `ALTER TABLE fila_envio ADD COLUMN legenda TEXT`,
+]) {
+  try { db.exec(alter); } catch { /* coluna já existe */ }
+}
+
 const agora = () => new Date().toISOString();
+const emSegundos = (s: number) => new Date(Date.now() + Math.max(0, s) * 1000).toISOString();
 
 // ----------------------- Config editável (sem redeploy) -----------------------
 // Carrega /data/config.json se existir; senão usa o default abaixo.
 // O Ezequias/eu editamos esse arquivo pra mapear produto->projeto e as mensagens,
 // sem precisar rebuildar o container.
+// Um PASSO de um fluxo de mensagens (igual aos blocos da SellFlux):
+//  - tipo: texto | imagem | video | audio | documento
+//  - texto: o conteúdo (pro tipo texto) OU a legenda da mídia
+//  - url: endereço do material (imagem/vídeo/áudio/PDF) — pros low-tickets entregues por WhatsApp
+//  - delaySegundos: quanto esperar ANTES de mandar este passo (ritmo humano entre as mensagens)
+// {nome} é trocado pelo nome do comprador em texto e legenda.
+type FluxoPasso = {
+  tipo?: 'texto' | 'imagem' | 'video' | 'audio' | 'documento';
+  texto?: string;
+  legenda?: string;
+  url?: string;
+  delaySegundos?: number;
+};
+// Um fluxo por PRODUTO: casa pelo id OU por um pedaço do nome do produto, e entrega
+// o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
+type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[] };
+
 type Config = {
   // Mapa de produto (id OU nome, em minúsculas) -> projeto.
   produtoProjeto: Record<string, Projeto>;
+  // (Opcional) Mapa por ID EXATO do produto -> projeto. Mais confiável pros casos
+  // ambíguos (produtos de nome parecido entre instrumentos). Checado ANTES de tudo.
+  produtoProjetoId?: Record<string, Projeto>;
   // Palavra que aparece no produto -> projeto (fallback por "contém").
   palavraChaveProjeto: { contem: string; projeto: Projeto }[];
   // Projeto usado quando não dá pra identificar.
   projetoPadrao: Projeto;
-  // Mensagens por projeto. {nome} é substituído pelo nome do comprador.
+  // Mensagens por projeto (modo simples). {nome} é substituído pelo nome do comprador.
   entrega: Record<Projeto, string>;
   recuperacao: Record<Projeto, string>;
+  // (Opcional) FLUXOS por projeto — vários passos com mídia e delay. Quando existir
+  // um fluxo pro projeto, ele é usado NO LUGAR da mensagem simples de entrega/recuperação.
+  entregaFluxo?: Partial<Record<Projeto, FluxoPasso[]>>;
+  recuperacaoFluxo?: Partial<Record<Projeto, FluxoPasso[]>>;
+  // (Opcional) FLUXOS por PRODUTO (ex.: um low-ticket que entrega o ebook direto no WhatsApp).
+  // Tem prioridade sobre o fluxo do projeto. Casa pelo nome (padrão) ou por id (porId:true).
+  entregaFluxoProduto?: FluxoProduto[];
 };
 const CONFIG_DEFAULT: Config = {
   produtoProjeto: {},
@@ -123,18 +167,34 @@ function carregarConfig(): Config {
 }
 let CONFIG = carregarConfig();
 
-/** Descobre o projeto de um pagamento pelo produto (id, nome). */
+/** Descobre o projeto de um pagamento pelo produto (id, nome).
+ * Ordem (do mais confiável pro mais genérico):
+ *  1) ID EXATO do produto (produtoProjetoId) — resolve nomes ambíguos entre instrumentos.
+ *  2) PALAVRA-CHAVE no nome (baixo/violão/teclado) — cobre a grande maioria dos produtos.
+ *  3) Pedaço do NOME cadastrado (produtoProjeto) — pros nomes que NÃO têm o instrumento
+ *     (ex.: "pestana perfeita"->violao, "violonista"->violao).
+ *  4) Projeto padrão.
+ * Obs.: a palavra-chave vem ANTES do mapa por nome de propósito — assim um produto
+ * "...no Violão" nunca cai num atalho genérico antes de bater o instrumento do nome.
+ */
 function projetoDoProduto(idOuNome: string | undefined, nome?: string): Projeto {
+  const id = String(idOuNome || '').toLowerCase().trim();
   const alvo = `${idOuNome || ''} ${nome || ''}`.toLowerCase().trim();
-  // 1) match exato por id ou nome cadastrado
-  for (const chave of Object.keys(CONFIG.produtoProjeto)) {
-    if (alvo.includes(chave.toLowerCase())) return CONFIG.produtoProjeto[chave];
+  // 1) ID exato do produto
+  const porId = CONFIG.produtoProjetoId || {};
+  if (id && porId[id]) return porId[id];
+  for (const chave of Object.keys(porId)) {
+    if (id && id === chave.toLowerCase()) return porId[chave];
   }
   // 2) por palavra-chave (baixo/violao/teclado no nome)
   for (const { contem, projeto } of CONFIG.palavraChaveProjeto) {
     if (alvo.includes(contem.toLowerCase())) return projeto;
   }
-  // 3) padrão
+  // 3) pedaço do nome cadastrado (atalhos pros nomes sem instrumento)
+  for (const chave of Object.keys(CONFIG.produtoProjeto)) {
+    if (alvo.includes(chave.toLowerCase())) return CONFIG.produtoProjeto[chave];
+  }
+  // 4) padrão
   return CONFIG.projetoPadrao;
 }
 
@@ -225,15 +285,96 @@ function projetoDaInstancia(instancia: string): Projeto {
   return CONFIG.projetoPadrao;
 }
 
+/** Pega o 1º número conectado do projeto (base do rodízio, que entra depois). */
+function numeroConectado(projeto: Projeto): any {
+  return db.prepare(
+    `SELECT * FROM numeros WHERE projeto=? AND status='conectado' ORDER BY criado_em LIMIT 1`
+  ).get(projeto);
+}
+
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
 async function enviarTexto(projeto: Projeto, para: string, texto: string) {
-  const num = db.prepare(
-    `SELECT * FROM numeros WHERE projeto=? AND status='conectado' ORDER BY criado_em LIMIT 1`
-  ).get(projeto) as any;
+  const num = numeroConectado(projeto);
   if (!num) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
   return evo(`/message/sendText/${num.instancia}`, 'POST', {
     number: para, text: texto,
   });
+}
+
+/** Envia MÍDIA (imagem/vídeo/áudio/documento) por URL, por um número do projeto. */
+async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: string, legenda?: string) {
+  const num = numeroConectado(projeto);
+  if (!num) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
+  if (!url) throw new Error('midia_sem_url');
+  if (tipo === 'audio') {
+    return evo(`/message/sendWhatsAppAudio/${num.instancia}`, 'POST', { number: para, audio: url });
+  }
+  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const body: any = { number: para, mediatype, media: url };
+  if (legenda) body.caption = preenche(legenda);
+  if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
+  return evo(`/message/sendMedia/${num.instancia}`, 'POST', body);
+}
+
+/** Envia UM passo de fluxo (texto ou mídia), já com {nome} preenchido. */
+async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, nome?: string) {
+  const tipo = passo.tipo || 'texto';
+  if (tipo === 'texto') {
+    return enviarTexto(projeto, para, preenche(passo.texto || '', nome));
+  }
+  return enviarMidia(projeto, para, tipo, passo.url || '', preenche(passo.texto || passo.legenda || '', nome));
+}
+
+/** Enfileira um FLUXO (vários passos com delay) pra um contato. O worker manda no ritmo,
+ * respeitando o delay de cada passo (agendado_para). Preenche {nome} em texto/legenda. */
+function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string) {
+  const ins = db.prepare(
+    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+  );
+  let acumulado = 0;
+  const tx = db.transaction(() => {
+    for (const p of passos || []) {
+      acumulado += Math.max(0, Number(p.delaySegundos || 0));
+      const tipo = p.tipo || 'texto';
+      const texto = tipo === 'texto' ? preenche(p.texto || '', nome) : '';
+      const legenda = tipo === 'texto' ? '' : preenche(p.texto || p.legenda || '', nome);
+      ins.run(randomUUID(), projeto, para, 0, texto, tipo, p.url || null, legenda || null,
+        'pendente', emSegundos(acumulado), agora());
+    }
+  });
+  tx();
+  return (passos || []).length;
+}
+
+/** Acha o FLUXO de entrega de um produto: 1º por produto (id/nome), 2º por projeto. */
+function fluxoEntregaDoProduto(projeto: Projeto, produtoId?: string, produtoNome?: string): FluxoPasso[] | null {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  for (const fp of CONFIG.entregaFluxoProduto || []) {
+    const chave = String(fp.chave || '').toLowerCase();
+    if (!chave) continue;
+    const casa = fp.porId ? (id && id === chave) : alvo.includes(chave);
+    if (casa && Array.isArray(fp.fluxo) && fp.fluxo.length) return fp.fluxo;
+  }
+  const porProjeto = CONFIG.entregaFluxo?.[projeto];
+  if (Array.isArray(porProjeto) && porProjeto.length) return porProjeto;
+  return null;
+}
+
+/** Dispara a ENTREGA: usa o fluxo do produto/projeto se houver; senão a mensagem simples. */
+async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
+  const fluxo = fluxoEntregaDoProduto(projeto, produtoId, produtoNome);
+  if (fluxo) { enfileirarFluxo(projeto, telefone, fluxo, nome); return 'fluxo'; }
+  await enviarTexto(projeto, telefone, preenche(CONFIG.entrega[projeto], nome)).catch(() => {});
+  return 'mensagem';
+}
+/** Dispara a RECUPERAÇÃO: usa o fluxo do projeto se houver; senão a mensagem simples. */
+async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string): Promise<'fluxo' | 'mensagem'> {
+  const fluxo = CONFIG.recuperacaoFluxo?.[projeto];
+  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome); return 'fluxo'; }
+  await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome)).catch(() => {});
+  return 'mensagem';
 }
 
 // ----------------------- Helpers de CRM/tags -----------------------
@@ -653,10 +794,10 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       if (categoria === 'aprovado') {
         aplicarTag(projeto, cid, 'comprou');
-        await enviarTexto(projeto, p.telefone, preenche(CONFIG.entrega[projeto], p.nome)).catch(() => {});
+        await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
-        await enviarTexto(projeto, p.telefone, preenche(CONFIG.recuperacao[projeto], p.nome)).catch(() => {});
+        await dispararRecuperacao(projeto, p.telefone, p.nome).catch(() => {});
       } else if (categoria === 'reembolso') {
         aplicarTag(projeto, cid, 'reembolso'); // sem mensagem automática
       }
@@ -665,15 +806,78 @@ app.post('/webhook/payment/:provider', async (req, res) => {
   } catch (e: any) { res.status(200).json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// ---- Webhook da CADEMÍ (OPCIONAL) — entrega por "acesso liberado" (aluno criado / entrega adicionada) ----
+// URL: /webhook/cademi?token=XXXX
+// Hoje as vendas só passam por Guru/LastLink, então ISTO NÃO É NECESSÁRIO. Fica pronto pro caso
+// de venda pelo checkout da própria Cademí. Aceita os 2 formatos da Cademí:
+//   - LEGADO (query-params, igual o da SellFlux): ?nome=..&email=..&phone=..&produto=..&pedido=..
+//   - v3 (JSON no corpo): { event_type, usuario:{nome,email,celular}, produto:{nome,id}, id }
+// Só dispara entrega em eventos de ACESSO/CRIAÇÃO (ignora progresso/prova/certificado/etc).
+function normalizaCademi(req: express.Request): {
+  pedido: string; evento: string; telefone: string; nome?: string; email?: string; produtoId?: string; produtoNome?: string;
+} {
+  const q = req.query as any;
+  const b = (req.body && typeof req.body === 'object') ? req.body as any : {};
+  const u = b.usuario || b.user || b.aluno || {};
+  const prod = b.produto || b.product || {};
+  const nome = q.nome || q.name || u.nome || u.name;
+  const email = q.email || u.email;
+  const telefoneRaw = q.phone || q.telefone || q.celular || u.celular || u.telefone || u.phone || '';
+  const evento = String(q.evento || q.event || b.event_type || b.evento || 'acesso').toLowerCase();
+  return {
+    pedido: String(q.pedido || q.id || b.id || b.event_id || b.pedido || randomUUID()),
+    evento,
+    telefone: String(telefoneRaw).replace(/\D/g, ''),
+    nome, email,
+    produtoId: String(q.produto_id || prod.id || ''),
+    produtoNome: q.produto || q.product || prod.nome || prod.name,
+  };
+}
+app.all('/webhook/cademi', async (req, res) => {
+  try {
+    if (!CADEMI_TOKEN || String(req.query.token || '') !== CADEMI_TOKEN) {
+      return res.status(401).json({ erro: 'token_invalido' });
+    }
+    const c = normalizaCademi(req);
+    // Só nos interessa "acesso liberado / aluno criado / entrega adicionada".
+    // Primeiro IGNORA os eventos que não são de acesso (progresso/prova/certificado/termo/ponto),
+    // depois aceita os de acesso/criação. (Assim "usuario.progresso" não vira entrega.)
+    const ignorar = /progress|prova|certific|termo|ponto|assinad|exam|login|acesso_realizado/.test(c.evento);
+    const ehEntrega = !ignorar && /acesso|aluno|usuario|usuário|criad|entrega|matricul|member|enroll|created/.test(c.evento);
+    if (!ehEntrega) return res.json({ ok: true, ignorado: c.evento });
+    // dedupe
+    const ja = db.prepare(`SELECT 1 FROM pagamentos_processados WHERE provider=? AND pedido=?`).get('cademi', c.pedido);
+    if (ja) return res.json({ ok: true, dedupe: true });
+    db.prepare(`INSERT INTO pagamentos_processados(provider,pedido,criado_em) VALUES(?,?,?)`).run('cademi', c.pedido, agora());
+    const projeto = projetoDoProduto(c.produtoId, c.produtoNome);
+    if (c.telefone) {
+      const cid = upsertContato(projeto, c.telefone, c.nome, c.email, 'cademi');
+      aplicarTag(projeto, cid, 'comprou');
+      await dispararEntrega(projeto, c.telefone, c.nome, c.produtoId, c.produtoNome).catch(() => {});
+    }
+    res.json({ ok: true, projeto, evento: c.evento });
+  } catch (e: any) { res.status(200).json({ ok: false, erro: String(e.message || e) }); }
+});
+
 // ----------------------- Worker de disparo (ritmo humano / anti-ban) -----------------------
 let enviando = false;
 async function tickFila() {
   if (enviando) return; enviando = true;
   try {
-    const item = db.prepare(`SELECT * FROM fila_envio WHERE status='pendente' ORDER BY criado_em LIMIT 1`).get() as any;
+    // Pega o próximo pendente JÁ liberado (respeita o delay do passo via agendado_para).
+    const item = db.prepare(
+      `SELECT * FROM fila_envio
+         WHERE status='pendente' AND (agendado_para IS NULL OR agendado_para <= ?)
+         ORDER BY agendado_para IS NULL DESC, agendado_para, criado_em LIMIT 1`
+    ).get(agora()) as any;
     if (item) {
       try {
-        await enviarTexto(item.projeto, item.para, item.texto);
+        const tipo = item.tipo || 'texto';
+        if (tipo === 'texto') {
+          await enviarTexto(item.projeto, item.para, item.texto || '');
+        } else {
+          await enviarMidia(item.projeto, item.para, tipo, item.url || '', item.legenda || '');
+        }
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
       } catch {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'pendente' END WHERE id=?`).run(item.id);

@@ -59,6 +59,7 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       GURU_TOKEN: ${GURU_TOKEN}
       LASTLINK_TOKEN: ${LASTLINK_TOKEN}
+      CADEMI_TOKEN: ${CADEMI_TOKEN:-}
       IMPORTAR_ATIVO: ${IMPORTAR_ATIVO:-true}
     volumes:
       - enginedata:/data

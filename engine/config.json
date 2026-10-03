@@ -1,14 +1,23 @@
 {
-  "_leia": "Config editável do motor. Mapeia produto->projeto e define as mensagens. Depois de editar, rode: curl -s -X POST http://localhost:8080/config/reload -H \"x-api-key: $(grep -oP '(?<=ENGINE_API_KEY=).*' /opt/motor/.env)\"  (não precisa rebuildar).",
+  "_leia": "Config editável do motor. Mapeia produto->projeto e define as mensagens/fluxos. Depois de editar, rode: curl -s -X POST http://localhost:8080/config/reload -H \"x-api-key: $(grep -oP '(?<=ENGINE_API_KEY=).*' /opt/motor/.env)\"  (não precisa rebuildar).",
 
-  "_como_mapear": "produtoProjeto: a CHAVE pode ser o ID do produto (UUID da LastLink/Guru) OU um pedaço do nome; o VALOR é baixo | violao | teclado. Se o nome do produto já tem 'baixo'/'violao'/'teclado', nem precisa cadastrar aqui (palavraChaveProjeto resolve). Use produtoProjeto só pros produtos cujo nome NÃO deixa claro o instrumento (ex: '200 cifras', '20 dedilhados').",
+  "_como_mapear": "Ordem do roteamento: 1) produtoProjetoId (ID EXATO do produto) -> mais confiável pros ambíguos; 2) palavraChaveProjeto (tem 'baixo'/'violao'/'teclado' no NOME) -> cobre quase tudo; 3) produtoProjeto (pedaço do nome SEM instrumento, ex '20 dedilhados'); 4) projetoPadrao. Como a palavra-chave vem ANTES do mapa por nome, um produto '...no Violão' nunca cai errado.",
+
+  "produtoProjetoId": {
+    "_comentario": "Opcional. CHAVE = id EXATO do produto na Guru/LastLink; VALOR = baixo|violao|teclado. Use só pros produtos de nome ambíguo (mesmo nome em mais de um instrumento). Deixe vazio se não precisar."
+  },
+
   "produtoProjeto": {
-    "200 cifras": "teclado",
-    "20 dedilhados": "teclado",
-    "100 melhores cifras": "teclado",
-    "harpa crista": "teclado",
+    "violonista": "violao",
     "pestana perfeita": "violao",
-    "violonista": "violao"
+    "engenharia do fingerstyle": "violao",
+    "baixista": "baixo",
+    "harpa crista": "teclado",
+    "harpa cristã": "teclado",
+    "100 melhores cifras": "teclado",
+    "encadeamentos sem saltos": "teclado",
+    "20 dedilhados": "teclado",
+    "200 cifras": "teclado"
   },
 
   "palavraChaveProjeto": [
@@ -20,15 +29,42 @@
 
   "projetoPadrao": "teclado",
 
-  "_mensagens": "Use {nome} pra inserir o nome do comprador. TROQUE os (links) pelos links reais de acesso/download de cada instrumento.",
+  "_mensagens": "Modo simples: uma mensagem por projeto. {nome} = nome do comprador. O link é o login único da area de aluno da Cademi (serve pros 3 instrumentos; cada aluno cai na vitrine do que comprou).",
   "entrega": {
-    "baixo": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do BAIXO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶",
-    "violao": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do VIOLÃO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶",
-    "teclado": "Olá {nome}! 🎹 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso está liberado aqui: (coloque o link de acesso do TECLADO)\n\nQualquer dúvida, é só responder esta mensagem que eu te ajudo. Bons estudos e que Deus abençoe sua caminhada na música! 🎶"
+    "baixo": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso já está liberado na nossa área de aluno:\n👉 https://melodiaseriffs.cademi.com.br\n\nÉ só entrar com o e-mail que você usou na compra (a senha também chega no seu e-mail). Qualquer dúvida, é só responder aqui que eu te ajudo.\n\nBons estudos e que Deus abençoe sua caminhada na música! 🎶",
+    "violao": "Olá {nome}! 🎸 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso já está liberado na nossa área de aluno:\n👉 https://melodiaseriffs.cademi.com.br\n\nÉ só entrar com o e-mail que você usou na compra (a senha também chega no seu e-mail). Qualquer dúvida, é só responder aqui que eu te ajudo.\n\nBons estudos e que Deus abençoe sua caminhada na música! 🎶",
+    "teclado": "Olá {nome}! 🎹 Aqui é da Melodias e Riffs. Sua compra foi aprovada — seja muito bem-vindo(a)! 🙌\n\nSeu acesso já está liberado na nossa área de aluno:\n👉 https://melodiaseriffs.cademi.com.br\n\nÉ só entrar com o e-mail que você usou na compra (a senha também chega no seu e-mail). Qualquer dúvida, é só responder aqui que eu te ajudo.\n\nBons estudos e que Deus abençoe sua caminhada na música! 🎶"
   },
   "recuperacao": {
     "baixo": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de baixo mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎸",
     "violao": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de violão mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎸",
     "teclado": "Oi {nome}! 👋 Aqui é da Melodias e Riffs. Vi que você começou a compra do nosso material de teclado mas não finalizou. Deu algum problema no pagamento? Posso te ajudar a concluir agora mesmo — é só me chamar aqui. 🎹"
-  }
+  },
+
+  "_fluxos": "AVANCADO (opcional): em vez de 1 mensagem, voce pode definir um FLUXO de varios passos (texto/imagem/video/audio/documento) com delay entre eles — igual aos blocos da SellFlux. Quando existir fluxo, ele e usado NO LUGAR da mensagem simples. 'entregaFluxo'/'recuperacaoFluxo' = por projeto. 'entregaFluxoProduto' = por produto (ex.: low-ticket que manda o ebook direto no WhatsApp); tem prioridade. Depois a gente liga o construtor visual no app pra voce montar isso clicando.",
+
+  "entregaFluxo": {},
+  "recuperacaoFluxo": {},
+  "entregaFluxoProduto": [],
+
+  "_exemplo_entregaFluxoProduto": [
+    {
+      "chave": "200 cifras no teclado",
+      "porId": false,
+      "fluxo": [
+        { "tipo": "texto", "texto": "Olá {nome}! 🎹 Sua compra foi aprovada! Já vou te mandar aqui o seu material. 🙌", "delaySegundos": 0 },
+        { "tipo": "documento", "url": "https://LINK-DO-EBOOK-AQUI.pdf", "texto": "200 Cifras - Melodias e Riffs 🎹", "delaySegundos": 4 },
+        { "tipo": "texto", "texto": "As videoaulas de ritmos você assiste aqui na área de aluno: https://melodiaseriffs.cademi.com.br (entre com o e-mail da compra). Qualquer dúvida é só chamar! 🎶", "delaySegundos": 6 }
+      ]
+    },
+    {
+      "chave": "ID_EXATO_DO_PRODUTO_NA_GURU",
+      "porId": true,
+      "projeto": "teclado",
+      "fluxo": [
+        { "tipo": "texto", "texto": "Oi {nome}! Segue seu material 👇", "delaySegundos": 0 },
+        { "tipo": "imagem", "url": "https://LINK-DA-IMAGEM.jpg", "texto": "Bônus especial 🎁", "delaySegundos": 3 }
+      ]
+    }
+  ]
 }
