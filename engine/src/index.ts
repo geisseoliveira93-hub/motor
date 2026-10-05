@@ -222,6 +222,11 @@ for (const alter of [
   try { db.exec(alter); } catch { /* coluna já existe */ }
 }
 
+// Etapa 11: tabela de Empresas (cadastro B2B do projeto).
+db.exec(`CREATE TABLE IF NOT EXISTS empresas (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, cnpj TEXT, site TEXT, telefone TEXT, criado_em TEXT
+);`);
+
 const agora = () => new Date().toISOString();
 const emSegundos = (s: number) => new Date(Date.now() + Math.max(0, s) * 1000).toISOString();
 
@@ -1813,6 +1818,21 @@ app.get('/q/:id', (req, res) => {
     + 'function enviar(){document.getElementById("bar").style.width="100%";fetch(location.pathname.replace("/q/","/f/"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(R)}).then(function(){document.getElementById("steps").innerHTML="<h1>\\u2705 Enviado!</h1><p class=sub>Obrigado.</p>";if(redir)setTimeout(function(){location.href=redir;},1200);}).catch(function(){document.getElementById("steps").innerHTML="<h1>\\u2705 Enviado!</h1>";});}'
     + 'render();</script></body></html>');
 });
+
+// ======================= ETAPA 11: Empresas (cadastro B2B) =======================
+app.get('/empresas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, empresas: db.prepare(`SELECT * FROM empresas WHERE projeto=? ORDER BY nome ASC`).all(projeto) });
+});
+app.post('/empresa', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM empresas WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE empresas SET nome=?, cnpj=?, site=?, telefone=? WHERE id=?`).run(String(b.nome || ''), String(b.cnpj || ''), String(b.site || ''), String(b.telefone || ''), id);
+  else db.prepare(`INSERT INTO empresas(id,projeto,nome,cnpj,site,telefone,criado_em) VALUES(?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.cnpj || ''), String(b.site || ''), String(b.telefone || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/empresa/remover', (req, res) => { db.prepare(`DELETE FROM empresas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
 
 // ----------------------- Worker de disparo (ritmo humano / anti-ban) -----------------------
 let enviando = false;
