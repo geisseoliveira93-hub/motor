@@ -79,6 +79,116 @@ CREATE TABLE IF NOT EXISTS fila_envio (
 CREATE TABLE IF NOT EXISTS pagamentos_processados (
   provider TEXT, pedido TEXT, criado_em TEXT, PRIMARY KEY (provider, pedido)
 );
+CREATE TABLE IF NOT EXISTS eventos (
+  id TEXT PRIMARY KEY, projeto TEXT, titulo TEXT, inicio TEXT, fim TEXT,
+  contato_id TEXT, obs TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS respostas_rapidas (
+  id TEXT PRIMARY KEY, projeto TEXT, atalho TEXT, texto TEXT, criado_em TEXT
+);
+`);
+
+// Tabelas da V4 (usabilidade): listas, segmentos, campos customizados, pipelines,
+// motivos, tickets, tarefas, produtos, departamentos, roteiros, avaliacoes, equipe, transacoes.
+db.exec(`
+CREATE TABLE IF NOT EXISTS listas (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS contato_listas (
+  contato_id TEXT, lista_id TEXT, criado_em TEXT, PRIMARY KEY (contato_id, lista_id)
+);
+CREATE TABLE IF NOT EXISTS segmentos (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, filtro TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS campos_customizados (
+  id TEXT PRIMARY KEY, projeto TEXT, chave TEXT, rotulo TEXT, tipo TEXT DEFAULT 'texto', criado_em TEXT,
+  UNIQUE(projeto, chave)
+);
+CREATE TABLE IF NOT EXISTS contato_campos (
+  contato_id TEXT, campo_id TEXT, valor TEXT, PRIMARY KEY (contato_id, campo_id)
+);
+CREATE TABLE IF NOT EXISTS pipelines (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, tipo TEXT DEFAULT 'vendas', etapas TEXT, ordem INTEGER DEFAULT 0, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS motivos (
+  id TEXT PRIMARY KEY, projeto TEXT, tipo TEXT DEFAULT 'ganho', nome TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS tickets (
+  id TEXT PRIMARY KEY, projeto TEXT, contato_id TEXT, titulo TEXT, descricao TEXT,
+  status TEXT DEFAULT 'aberto', prioridade TEXT DEFAULT 'media', criado_em TEXT, atualizado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS tarefas (
+  id TEXT PRIMARY KEY, projeto TEXT, titulo TEXT, responsavel TEXT, prazo TEXT,
+  concluida INTEGER DEFAULT 0, contato_id TEXT, criado_em TEXT, atualizado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS produtos (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, preco REAL DEFAULT 0, descricao TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS departamentos (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS roteiros (
+  id TEXT PRIMARY KEY, projeto TEXT, titulo TEXT, texto TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS avaliacoes (
+  id TEXT PRIMARY KEY, projeto TEXT, contato_id TEXT, nota INTEGER DEFAULT 0, comentario TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS equipe (
+  id TEXT PRIMARY KEY, nome TEXT, email TEXT, papel TEXT DEFAULT 'operador', ativo INTEGER DEFAULT 1, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS transacoes (
+  id TEXT PRIMARY KEY, projeto TEXT, contato_id TEXT, produto TEXT, valor REAL DEFAULT 0,
+  status TEXT DEFAULT 'pago', provider TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS automacoes (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, ativo INTEGER DEFAULT 1,
+  gatilho TEXT, condicao TEXT, acoes TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS automacao_logs (
+  id TEXT PRIMARY KEY, automacao_id TEXT, projeto TEXT, contato_id TEXT, gatilho TEXT, detalhe TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id TEXT PRIMARY KEY, nome TEXT, token TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS paginas (
+  id TEXT PRIMARY KEY, projeto TEXT, slug TEXT UNIQUE, titulo TEXT, html TEXT,
+  publicada INTEGER DEFAULT 0, criado_em TEXT, atualizado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS formularios (
+  id TEXT PRIMARY KEY, projeto TEXT, titulo TEXT, campos TEXT, tag TEXT, redirecionar TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS formulario_respostas (
+  id TEXT PRIMARY KEY, formulario_id TEXT, projeto TEXT, contato_id TEXT, dados TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS pixels (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, plataforma TEXT, pixel_id TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS email_templates (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, assunto TEXT, html TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS email_dominios (
+  id TEXT PRIMARY KEY, projeto TEXT, dominio TEXT, smtp_host TEXT, smtp_porta INTEGER, smtp_usuario TEXT, remetente TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS email_fila (
+  id TEXT PRIMARY KEY, projeto TEXT, para TEXT, assunto TEXT, html TEXT, status TEXT DEFAULT 'pendente', criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS comentarios (
+  id TEXT PRIMARY KEY, projeto TEXT, rede TEXT, post_id TEXT, autor TEXT, texto TEXT,
+  respondido INTEGER DEFAULT 0, resposta TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS templates_whatsapp (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, idioma TEXT DEFAULT 'pt_BR', categoria TEXT DEFAULT 'UTILITY',
+  corpo TEXT, status TEXT DEFAULT 'rascunho', criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS webhooks_saida (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, url TEXT, evento TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS integracao_eventos (
+  id TEXT PRIMARY KEY, projeto TEXT, origem TEXT, tipo TEXT, dados TEXT, criado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS apps_externos (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, base_url TEXT, descricao TEXT, criado_em TEXT
+);
 `);
 
 // Migração suave: bancos ANTIGOS (já no ar) não têm as colunas novas da fila.
@@ -87,6 +197,27 @@ for (const alter of [
   `ALTER TABLE fila_envio ADD COLUMN tipo TEXT DEFAULT 'texto'`,
   `ALTER TABLE fila_envio ADD COLUMN url TEXT`,
   `ALTER TABLE fila_envio ADD COLUMN legenda TEXT`,
+]) {
+  try { db.exec(alter); } catch { /* coluna já existe */ }
+}
+
+// Migração suave: colunas novas em negocios (vários funis + motivo de ganho/perda).
+for (const alter of [
+  `ALTER TABLE negocios ADD COLUMN pipeline_id TEXT`,
+  `ALTER TABLE negocios ADD COLUMN motivo TEXT`,
+  `ALTER TABLE negocios ADD COLUMN motivo_tipo TEXT`,
+]) {
+  try { db.exec(alter); } catch { /* coluna já existe */ }
+}
+
+// Etapa 9: colunas novas p/ o construtor de Paginas (blocos) e o Quiz multi-passos.
+for (const alter of [
+  `ALTER TABLE paginas ADD COLUMN blocos TEXT`,
+  `ALTER TABLE paginas ADD COLUMN pasta TEXT`,
+  `ALTER TABLE paginas ADD COLUMN idioma TEXT DEFAULT 'pt'`,
+  `ALTER TABLE formularios ADD COLUMN passos TEXT`,
+  `ALTER TABLE formularios ADD COLUMN tema TEXT`,
+  `ALTER TABLE formularios ADD COLUMN acessos INTEGER DEFAULT 0`,
 ]) {
   try { db.exec(alter); } catch { /* coluna já existe */ }
 }
@@ -166,6 +297,15 @@ function carregarConfig(): Config {
   }
 }
 let CONFIG = carregarConfig();
+
+// ----------------------- Salvar config (construtor de fluxos do app) -----------------------
+// Grava o CONFIG atual em /data/config.json (volume do engine). Usado pelos endpoints /flows
+// pro app publicar os fluxos de entrega/recuperacao sem editar o arquivo na mao.
+function salvarConfig(): void {
+  fs.mkdirSync('/data', { recursive: true });
+  fs.writeFileSync('/data/config.json', JSON.stringify(CONFIG, null, 2), 'utf8');
+}
+
 
 /** Descobre o projeto de um pagamento pelo produto (id, nome).
  * Ordem (do mais confiável pro mais genérico):
@@ -434,6 +574,12 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
   if (req.path === '/health') return next();
   if (req.path === '/importar' && req.method === 'GET') return next(); // só a PÁGINA; o envio ainda exige a chave
+  // Rotas PÚBLICAS da V4: páginas (/p/:slug), formulários (/f/:id) e recebimento de eventos
+  // (/receive/:token, validado pelo token na URL). O resto continua exigindo a x-api-key.
+  if (req.path.startsWith('/p/')) return next();
+  if (req.path.startsWith('/f/')) return next();
+  if (req.path.startsWith('/receive/')) return next();
+  if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -509,6 +655,191 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 // Recarrega a config (produto->projeto, mensagens) sem reiniciar o serviço.
 app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
 app.get('/config', (_req, res) => res.json(CONFIG));
+
+// ======================= API SELLFLUX (CRM / Kanban / Agenda / Inbox / Respostas) =======================
+// Tudo protegido por x-api-key. Reusa tabelas existentes + eventos/respostas_rapidas.
+function tagsDoContato(contatoId: string): string[] {
+  return (db.prepare(`SELECT t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.contato_id=?`).all(contatoId) as any[]).map((r) => r.nome);
+}
+// ---- CRM: contatos (busca + filtro por tag + paginacao) ----
+app.get('/crm/contatos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const busca = String(req.query.busca || '').trim();
+  const tag = String(req.query.tag || '').trim();
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+  const cond: string[] = ['c.projeto=?']; const args: any[] = [projeto];
+  if (busca) { cond.push('(c.nome LIKE ? OR c.telefone LIKE ? OR c.email LIKE ?)'); args.push('%' + busca + '%', '%' + busca + '%', '%' + busca + '%'); }
+  let join = '';
+  if (tag) { join = 'JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id'; cond.push('t.nome=?'); args.push(tag); }
+  const sql = 'SELECT c.* FROM contatos c ' + join + ' WHERE ' + cond.join(' AND ') + ' ORDER BY c.atualizado_em DESC LIMIT ? OFFSET ?';
+  const rows = db.prepare(sql).all(...args, limit, offset) as any[];
+  rows.forEach((r) => (r.tags = tagsDoContato(r.id)));
+  res.json({ ok: true, contatos: rows });
+});
+app.get('/crm/contatos/count', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const busca = String(req.query.busca || '').trim();
+  const tag = String(req.query.tag || '').trim();
+  const cond: string[] = ['c.projeto=?']; const args: any[] = [projeto];
+  if (busca) { cond.push('(c.nome LIKE ? OR c.telefone LIKE ? OR c.email LIKE ?)'); args.push('%' + busca + '%', '%' + busca + '%', '%' + busca + '%'); }
+  let join = '';
+  if (tag) { join = 'JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id'; cond.push('t.nome=?'); args.push(tag); }
+  const r = db.prepare('SELECT COUNT(DISTINCT c.id) n FROM contatos c ' + join + ' WHERE ' + cond.join(' AND ')).get(...args) as any;
+  res.json({ ok: true, total: (r && r.n) || 0 });
+});
+app.get('/crm/contato/:id', (req, res) => {
+  const c = db.prepare(`SELECT * FROM contatos WHERE id=?`).get(req.params.id) as any;
+  if (!c) return res.status(404).json({ erro: 'nao_encontrado' });
+  c.tags = tagsDoContato(c.id);
+  c.mensagens = db.prepare(`SELECT * FROM mensagens WHERE contato_id=? ORDER BY criado_em DESC LIMIT 50`).all(c.id);
+  c.negocios = db.prepare(`SELECT * FROM negocios WHERE contato_id=? ORDER BY atualizado_em DESC`).all(c.id);
+  res.json({ ok: true, contato: c });
+});
+app.get('/crm/tags', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT t.nome, COUNT(ct.contato_id) n FROM tags t LEFT JOIN contato_tags ct ON ct.tag_id=t.id WHERE t.projeto=? GROUP BY t.id ORDER BY n DESC`).all(projeto);
+  res.json({ ok: true, tags: rows });
+});
+app.post('/crm/contato/tags', (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || ''); const contatoId = String(b.contatoId || '');
+  if (!contatoId) return res.status(400).json({ erro: 'contato_obrigatorio' });
+  (Array.isArray(b.add) ? b.add : []).forEach((nome: string) => aplicarTag(projeto, contatoId, String(nome)));
+  (Array.isArray(b.remove) ? b.remove : []).forEach((nome: string) => {
+    const t = db.prepare(`SELECT id FROM tags WHERE projeto=? AND nome=?`).get(projeto, String(nome)) as any;
+    if (t) db.prepare(`DELETE FROM contato_tags WHERE contato_id=? AND tag_id=?`).run(contatoId, t.id);
+  });
+  // Automacoes: gatilho "tag_adicionada" (condicao = nome exato da tag) pra cada tag adicionada.
+  const ctt = db.prepare(`SELECT telefone, nome FROM contatos WHERE id=?`).get(contatoId) as any;
+  (Array.isArray(b.add) ? b.add : []).forEach((nome: string) => rodarAutomacoes(projeto, 'tag_adicionada', { contatoId, tag: String(nome), telefone: ctt?.telefone, nome: ctt?.nome }).catch(() => {}));
+  res.json({ ok: true, tags: tagsDoContato(contatoId) });
+});
+// ---- Kanban / Negocios ----
+app.get('/crm/negocios', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT n.*, c.nome contato_nome, c.telefone contato_telefone FROM negocios n LEFT JOIN contatos c ON c.id=n.contato_id WHERE n.projeto=? ORDER BY n.atualizado_em DESC`).all(projeto);
+  res.json({ ok: true, negocios: rows });
+});
+app.post('/crm/negocio', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM negocios WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE negocios SET titulo=?, valor=?, etapa=?, contato_id=?, atualizado_em=? WHERE id=?`).run(String(b.titulo || ''), Number(b.valor || 0), String(b.etapa || 'novo'), b.contatoId || null, agora(), id);
+  else db.prepare(`INSERT INTO negocios(id,projeto,contato_id,titulo,valor,etapa,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), b.contatoId || null, String(b.titulo || ''), Number(b.valor || 0), String(b.etapa || 'novo'), agora(), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/negocio/etapa', (req, res) => {
+  const b = req.body || {};
+  db.prepare(`UPDATE negocios SET etapa=?, atualizado_em=? WHERE id=?`).run(String(b.etapa || 'novo'), agora(), String(b.id || ''));
+  res.json({ ok: true });
+});
+app.post('/crm/negocio/remover', (req, res) => { db.prepare(`DELETE FROM negocios WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// ---- Agenda / Eventos ----
+app.get('/agenda/eventos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, eventos: db.prepare(`SELECT * FROM eventos WHERE projeto=? ORDER BY inicio ASC`).all(projeto) });
+});
+app.post('/agenda/evento', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM eventos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE eventos SET titulo=?, inicio=?, fim=?, contato_id=?, obs=? WHERE id=?`).run(String(b.titulo || ''), String(b.inicio || ''), String(b.fim || ''), b.contatoId || null, String(b.obs || ''), id);
+  else db.prepare(`INSERT INTO eventos(id,projeto,titulo,inicio,fim,contato_id,obs,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.titulo || ''), String(b.inicio || ''), String(b.fim || ''), b.contatoId || null, String(b.obs || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/agenda/evento/remover', (req, res) => { db.prepare(`DELETE FROM eventos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// ---- Mensagens rapidas ----
+app.get('/crm/respostas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, respostas: db.prepare(`SELECT * FROM respostas_rapidas WHERE projeto=? ORDER BY atalho ASC`).all(projeto) });
+});
+app.post('/crm/resposta', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM respostas_rapidas WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE respostas_rapidas SET atalho=?, texto=? WHERE id=?`).run(String(b.atalho || ''), String(b.texto || ''), id);
+  else db.prepare(`INSERT INTO respostas_rapidas(id,projeto,atalho,texto,criado_em) VALUES(?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.atalho || ''), String(b.texto || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/resposta/remover', (req, res) => { db.prepare(`DELETE FROM respostas_rapidas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// ---- Inbox / Conversas ----
+app.get('/inbox/conversas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare('SELECT c.id contato_id, c.nome, c.telefone, m.texto ultima, m.direcao, MAX(m.criado_em) quando FROM mensagens m JOIN contatos c ON c.id=m.contato_id WHERE m.projeto=? GROUP BY c.id ORDER BY quando DESC LIMIT 100').all(projeto);
+  res.json({ ok: true, conversas: rows });
+});
+app.get('/inbox/mensagens', (req, res) => {
+  const contatoId = String(req.query.contatoId || '');
+  res.json({ ok: true, mensagens: db.prepare(`SELECT * FROM mensagens WHERE contato_id=? ORDER BY criado_em ASC LIMIT 300`).all(contatoId) });
+});
+// ---- Campanhas: resumo da fila ----
+app.get('/campaigns/resumo', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE projeto=? GROUP BY status`).all(projeto) });
+});
+
+// ----------------------- API de FLUXOS (construtor de fluxos do app) -----------------------
+// Protegidos por x-api-key (middleware acima). O processo principal do app chama estes
+// endpoints pra LISTAR/SALVAR/REMOVER os fluxos. O runner existente (dispararEntrega/
+// dispararRecuperacao/enfileirarFluxo + fluxoEntregaDoProduto) ja executa esses fluxos.
+function normalizaFluxo(f: any): FluxoPasso[] {
+  return (Array.isArray(f) ? f : []).map((p: any) => ({
+    tipo: p?.tipo || 'texto',
+    texto: p?.texto,
+    legenda: p?.legenda,
+    url: p?.url,
+    delaySegundos: Number(p?.delaySegundos || 0),
+  }));
+}
+
+// Lista todos os fluxos cadastrados (por produto e por projeto).
+app.get('/flows', (_req, res) => {
+  res.json({
+    ok: true,
+    entregaFluxoProduto: CONFIG.entregaFluxoProduto || [],
+    entregaFluxo: CONFIG.entregaFluxo || {},
+    recuperacaoFluxo: CONFIG.recuperacaoFluxo || {},
+  });
+});
+
+// Cria/atualiza um fluxo de ENTREGA por PRODUTO. body: { chave, porId?, projeto?, fluxo:[] }
+app.post('/flows/produto', (req, res) => {
+  const b = req.body || {};
+  const chave = String(b.chave || '').trim();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const item: FluxoProduto = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo) };
+  const lista = CONFIG.entregaFluxoProduto || [];
+  const i = lista.findIndex((f) => f.chave.toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
+  if (i >= 0) lista[i] = item; else lista.push(item);
+  CONFIG.entregaFluxoProduto = lista;
+  salvarConfig();
+  res.json({ ok: true, total: lista.length, item });
+});
+
+// Remove um fluxo de entrega por produto (pela chave).
+app.post('/flows/produto/remover', (req, res) => {
+  const chave = String((req.body || {}).chave || '').trim().toLowerCase();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const antes = (CONFIG.entregaFluxoProduto || []).length;
+  CONFIG.entregaFluxoProduto = (CONFIG.entregaFluxoProduto || []).filter((f) => f.chave.toLowerCase() !== chave);
+  salvarConfig();
+  res.json({ ok: true, removidos: antes - (CONFIG.entregaFluxoProduto || []).length });
+});
+
+// Salva um fluxo por PROJETO (entrega OU recuperacao). body: { projeto, tipo, fluxo:[] }
+app.post('/flows/projeto', (req, res) => {
+  const b = req.body || {};
+  const projeto = b.projeto as Projeto;
+  if (!PROJETOS.includes(projeto)) return res.status(400).json({ erro: 'projeto_invalido' });
+  const tipo = b.tipo === 'recuperacao' ? 'recuperacao' : 'entrega';
+  const fluxo = normalizaFluxo(b.fluxo);
+  if (tipo === 'entrega') CONFIG.entregaFluxo = { ...(CONFIG.entregaFluxo || {}), [projeto]: fluxo };
+  else CONFIG.recuperacaoFluxo = { ...(CONFIG.recuperacaoFluxo || {}), [projeto]: fluxo };
+  salvarConfig();
+  res.json({ ok: true, projeto, tipo, passos: fluxo.length });
+});
+
 
 // Página simples de importação de leads (sem precisar de terminal).
 app.get('/importar', (_req, res) => {
@@ -690,6 +1021,574 @@ app.post('/import/leads', (req, res) => {
   } catch (e: any) { res.status(500).json({ erro: String(e.message || e) }); }
 });
 
+// ======================= API SELLFLUX V4 (usabilidade) =======================
+// Modulos novos da versao nova da SellFlux que ainda nao tinhamos. Tudo protegido
+// por x-api-key (middleware acima). SO funcoes de USABILIDADE (sem a parte de IA deles).
+
+// ---- Listas de leads ----
+app.get('/crm/listas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT l.id, l.nome, l.criado_em, COUNT(cl.contato_id) n FROM listas l LEFT JOIN contato_listas cl ON cl.lista_id=l.id WHERE l.projeto=? GROUP BY l.id ORDER BY l.nome ASC`).all(projeto);
+  res.json({ ok: true, listas: rows });
+});
+app.post('/crm/lista', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM listas WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE listas SET nome=? WHERE id=?`).run(String(b.nome || ''), id);
+  else db.prepare(`INSERT INTO listas(id,projeto,nome,criado_em) VALUES(?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/lista/remover', (req, res) => {
+  const id = String((req.body || {}).id || '');
+  db.prepare(`DELETE FROM contato_listas WHERE lista_id=?`).run(id);
+  db.prepare(`DELETE FROM listas WHERE id=?`).run(id);
+  res.json({ ok: true });
+});
+app.post('/crm/lista/contatos', (req, res) => {
+  const b = req.body || {};
+  const listaId = String(b.listaId || '');
+  if (!listaId) return res.status(400).json({ erro: 'lista_obrigatoria' });
+  (Array.isArray(b.add) ? b.add : []).forEach((cid: string) => db.prepare(`INSERT OR IGNORE INTO contato_listas(contato_id,lista_id,criado_em) VALUES(?,?,?)`).run(String(cid), listaId, agora()));
+  (Array.isArray(b.remove) ? b.remove : []).forEach((cid: string) => db.prepare(`DELETE FROM contato_listas WHERE contato_id=? AND lista_id=?`).run(String(cid), listaId));
+  const n = db.prepare(`SELECT COUNT(*) n FROM contato_listas WHERE lista_id=?`).get(listaId) as any;
+  res.json({ ok: true, total: (n && n.n) || 0 });
+});
+app.get('/crm/lista/:id/contatos', (req, res) => {
+  const rows = db.prepare(`SELECT c.* FROM contatos c JOIN contato_listas cl ON cl.contato_id=c.id WHERE cl.lista_id=? ORDER BY c.nome ASC`).all(req.params.id);
+  res.json({ ok: true, contatos: rows });
+});
+
+// ---- Segmentos (filtros salvos) ----
+app.get('/crm/segmentos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = (db.prepare(`SELECT * FROM segmentos WHERE projeto=? ORDER BY nome ASC`).all(projeto) as any[]).map((s) => { try { s.filtro = JSON.parse(s.filtro || '{}'); } catch { s.filtro = {}; } return s; });
+  res.json({ ok: true, segmentos: rows });
+});
+app.post('/crm/segmento', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const filtro = JSON.stringify(b.filtro || {});
+  const existe = db.prepare(`SELECT id FROM segmentos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE segmentos SET nome=?, filtro=? WHERE id=?`).run(String(b.nome || ''), filtro, id);
+  else db.prepare(`INSERT INTO segmentos(id,projeto,nome,filtro,criado_em) VALUES(?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), filtro, agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/segmento/remover', (req, res) => { db.prepare(`DELETE FROM segmentos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Campos customizados ----
+app.get('/crm/campos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, campos: db.prepare(`SELECT * FROM campos_customizados WHERE projeto=? ORDER BY rotulo ASC`).all(projeto) });
+});
+app.post('/crm/campo', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM campos_customizados WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE campos_customizados SET chave=?, rotulo=?, tipo=? WHERE id=?`).run(String(b.chave || ''), String(b.rotulo || ''), String(b.tipo || 'texto'), id);
+  else db.prepare(`INSERT INTO campos_customizados(id,projeto,chave,rotulo,tipo,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.chave || ''), String(b.rotulo || ''), String(b.tipo || 'texto'), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/campo/remover', (req, res) => {
+  const id = String((req.body || {}).id || '');
+  db.prepare(`DELETE FROM contato_campos WHERE campo_id=?`).run(id);
+  db.prepare(`DELETE FROM campos_customizados WHERE id=?`).run(id);
+  res.json({ ok: true });
+});
+app.get('/crm/contato/:id/campos', (req, res) => {
+  const rows = db.prepare(`SELECT cc.id campo_id, cc.chave, cc.rotulo, cc.tipo, v.valor FROM campos_customizados cc LEFT JOIN contato_campos v ON v.campo_id=cc.id AND v.contato_id=? WHERE cc.projeto=(SELECT projeto FROM contatos WHERE id=?) ORDER BY cc.rotulo ASC`).all(req.params.id, req.params.id);
+  res.json({ ok: true, campos: rows });
+});
+app.post('/crm/contato/campos', (req, res) => {
+  const b = req.body || {};
+  const contatoId = String(b.contatoId || '');
+  const valores = (b.valores && typeof b.valores === 'object') ? b.valores : {};
+  for (const campoId of Object.keys(valores)) {
+    const valor = String(valores[campoId] ?? '');
+    const existe = db.prepare(`SELECT 1 FROM contato_campos WHERE contato_id=? AND campo_id=?`).get(contatoId, campoId);
+    if (existe) db.prepare(`UPDATE contato_campos SET valor=? WHERE contato_id=? AND campo_id=?`).run(valor, contatoId, campoId);
+    else db.prepare(`INSERT INTO contato_campos(contato_id,campo_id,valor) VALUES(?,?,?)`).run(contatoId, campoId, valor);
+  }
+  res.json({ ok: true });
+});
+
+// ---- Pipelines (varios funis) ----
+app.get('/crm/pipelines', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const tipo = String(req.query.tipo || '');
+  const cond: string[] = ['projeto=?']; const args: any[] = [projeto];
+  if (tipo) { cond.push('tipo=?'); args.push(tipo); }
+  const rows = (db.prepare('SELECT * FROM pipelines WHERE ' + cond.join(' AND ') + ' ORDER BY ordem ASC, nome ASC').all(...args) as any[]).map((p) => { try { p.etapas = JSON.parse(p.etapas || '[]'); } catch { p.etapas = []; } return p; });
+  res.json({ ok: true, pipelines: rows });
+});
+app.post('/crm/pipeline', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const etapas = JSON.stringify(Array.isArray(b.etapas) ? b.etapas : []);
+  const existe = db.prepare(`SELECT id FROM pipelines WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE pipelines SET nome=?, tipo=?, etapas=?, ordem=? WHERE id=?`).run(String(b.nome || ''), String(b.tipo || 'vendas'), etapas, Number(b.ordem || 0), id);
+  else db.prepare(`INSERT INTO pipelines(id,projeto,nome,tipo,etapas,ordem,criado_em) VALUES(?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.tipo || 'vendas'), etapas, Number(b.ordem || 0), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/pipeline/remover', (req, res) => { db.prepare(`DELETE FROM pipelines WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Motivos de ganho/perda + marcar motivo no negocio ----
+app.get('/crm/motivos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const tipo = String(req.query.tipo || '');
+  const cond: string[] = ['projeto=?']; const args: any[] = [projeto];
+  if (tipo) { cond.push('tipo=?'); args.push(tipo); }
+  res.json({ ok: true, motivos: db.prepare('SELECT * FROM motivos WHERE ' + cond.join(' AND ') + ' ORDER BY nome ASC').all(...args) });
+});
+app.post('/crm/motivo', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM motivos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE motivos SET tipo=?, nome=? WHERE id=?`).run(String(b.tipo || 'ganho'), String(b.nome || ''), id);
+  else db.prepare(`INSERT INTO motivos(id,projeto,tipo,nome,criado_em) VALUES(?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.tipo || 'ganho'), String(b.nome || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/crm/motivo/remover', (req, res) => { db.prepare(`DELETE FROM motivos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.post('/crm/negocio/pipeline', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE negocios SET pipeline_id=?, atualizado_em=? WHERE id=?`).run(String(b.pipelineId || ''), agora(), String(b.id || '')); res.json({ ok: true }); });
+app.post('/crm/negocio/motivo', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE negocios SET motivo=?, motivo_tipo=?, atualizado_em=? WHERE id=?`).run(String(b.motivo || ''), String(b.motivoTipo || ''), agora(), String(b.id || '')); res.json({ ok: true }); });
+
+// ---- Tickets (suporte) ----
+app.get('/tickets', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const status = String(req.query.status || '');
+  const cond: string[] = ['t.projeto=?']; const args: any[] = [projeto];
+  if (status) { cond.push('t.status=?'); args.push(status); }
+  const rows = db.prepare('SELECT t.*, c.nome contato_nome, c.telefone contato_telefone FROM tickets t LEFT JOIN contatos c ON c.id=t.contato_id WHERE ' + cond.join(' AND ') + ' ORDER BY t.atualizado_em DESC').all(...args);
+  res.json({ ok: true, tickets: rows });
+});
+app.post('/ticket', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM tickets WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE tickets SET titulo=?, descricao=?, status=?, prioridade=?, contato_id=?, atualizado_em=? WHERE id=?`).run(String(b.titulo || ''), String(b.descricao || ''), String(b.status || 'aberto'), String(b.prioridade || 'media'), b.contatoId || null, agora(), id);
+  else db.prepare(`INSERT INTO tickets(id,projeto,contato_id,titulo,descricao,status,prioridade,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), b.contatoId || null, String(b.titulo || ''), String(b.descricao || ''), String(b.status || 'aberto'), String(b.prioridade || 'media'), agora(), agora());
+  res.json({ ok: true, id });
+});
+app.post('/ticket/status', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE tickets SET status=?, atualizado_em=? WHERE id=?`).run(String(b.status || 'aberto'), agora(), String(b.id || '')); res.json({ ok: true }); });
+app.post('/ticket/remover', (req, res) => { db.prepare(`DELETE FROM tickets WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Tarefas (to-do) ----
+app.get('/tarefas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const cond: string[] = ['projeto=?']; const args: any[] = [projeto];
+  if (req.query.responsavel) { cond.push('responsavel=?'); args.push(String(req.query.responsavel)); }
+  if (req.query.concluida !== undefined) { cond.push('concluida=?'); args.push(Number(req.query.concluida)); }
+  res.json({ ok: true, tarefas: db.prepare('SELECT * FROM tarefas WHERE ' + cond.join(' AND ') + ' ORDER BY concluida ASC, prazo ASC').all(...args) });
+});
+app.post('/tarefa', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM tarefas WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE tarefas SET titulo=?, responsavel=?, prazo=?, contato_id=?, atualizado_em=? WHERE id=?`).run(String(b.titulo || ''), String(b.responsavel || ''), String(b.prazo || ''), b.contatoId || null, agora(), id);
+  else db.prepare(`INSERT INTO tarefas(id,projeto,titulo,responsavel,prazo,concluida,contato_id,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.titulo || ''), String(b.responsavel || ''), String(b.prazo || ''), 0, b.contatoId || null, agora(), agora());
+  res.json({ ok: true, id });
+});
+app.post('/tarefa/concluir', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE tarefas SET concluida=?, atualizado_em=? WHERE id=?`).run(b.concluida ? 1 : 0, agora(), String(b.id || '')); res.json({ ok: true }); });
+app.post('/tarefa/remover', (req, res) => { db.prepare(`DELETE FROM tarefas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Produtos ----
+app.get('/produtos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, produtos: db.prepare(`SELECT * FROM produtos WHERE projeto=? ORDER BY nome ASC`).all(projeto) });
+});
+app.post('/produto', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM produtos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE produtos SET nome=?, preco=?, descricao=? WHERE id=?`).run(String(b.nome || ''), Number(b.preco || 0), String(b.descricao || ''), id);
+  else db.prepare(`INSERT INTO produtos(id,projeto,nome,preco,descricao,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), Number(b.preco || 0), String(b.descricao || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/produto/remover', (req, res) => { db.prepare(`DELETE FROM produtos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Departamentos ----
+app.get('/departamentos', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, departamentos: db.prepare(`SELECT * FROM departamentos WHERE projeto=? ORDER BY nome ASC`).all(projeto) });
+});
+app.post('/departamento', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM departamentos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE departamentos SET nome=? WHERE id=?`).run(String(b.nome || ''), id);
+  else db.prepare(`INSERT INTO departamentos(id,projeto,nome,criado_em) VALUES(?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/departamento/remover', (req, res) => { db.prepare(`DELETE FROM departamentos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Roteiros de atendimento ----
+app.get('/roteiros', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, roteiros: db.prepare(`SELECT * FROM roteiros WHERE projeto=? ORDER BY titulo ASC`).all(projeto) });
+});
+app.post('/roteiro', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM roteiros WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE roteiros SET titulo=?, texto=? WHERE id=?`).run(String(b.titulo || ''), String(b.texto || ''), id);
+  else db.prepare(`INSERT INTO roteiros(id,projeto,titulo,texto,criado_em) VALUES(?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.titulo || ''), String(b.texto || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/roteiro/remover', (req, res) => { db.prepare(`DELETE FROM roteiros WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Avaliacoes (NPS / satisfacao) ----
+app.get('/avaliacoes', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT a.*, c.nome contato_nome FROM avaliacoes a LEFT JOIN contatos c ON c.id=a.contato_id WHERE a.projeto=? ORDER BY a.criado_em DESC LIMIT 500`).all(projeto);
+  const m = db.prepare(`SELECT AVG(nota) media, COUNT(*) n FROM avaliacoes WHERE projeto=?`).get(projeto) as any;
+  res.json({ ok: true, avaliacoes: rows, media: (m && m.media) || 0, total: (m && m.n) || 0 });
+});
+app.post('/avaliacao', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  db.prepare(`INSERT INTO avaliacoes(id,projeto,contato_id,nota,comentario,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), b.contatoId || null, Number(b.nota || 0), String(b.comentario || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/avaliacao/remover', (req, res) => { db.prepare(`DELETE FROM avaliacoes WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Equipe (usuarios/permissoes) ----
+app.get('/equipe', (_req, res) => { res.json({ ok: true, equipe: db.prepare(`SELECT * FROM equipe ORDER BY nome ASC`).all() }); });
+app.post('/equipe/membro', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM equipe WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE equipe SET nome=?, email=?, papel=?, ativo=? WHERE id=?`).run(String(b.nome || ''), String(b.email || ''), String(b.papel || 'operador'), b.ativo === false ? 0 : 1, id);
+  else db.prepare(`INSERT INTO equipe(id,nome,email,papel,ativo,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.nome || ''), String(b.email || ''), String(b.papel || 'operador'), b.ativo === false ? 0 : 1, agora());
+  res.json({ ok: true, id });
+});
+app.post('/equipe/membro/remover', (req, res) => { db.prepare(`DELETE FROM equipe WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Transacoes ----
+app.get('/transacoes', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT tr.*, c.nome contato_nome FROM transacoes tr LEFT JOIN contatos c ON c.id=tr.contato_id WHERE tr.projeto=? ORDER BY tr.criado_em DESC LIMIT 500`).all(projeto);
+  const m = db.prepare(`SELECT SUM(valor) total, COUNT(*) n FROM transacoes WHERE projeto=? AND status='pago'`).get(projeto) as any;
+  res.json({ ok: true, transacoes: rows, total_pago: (m && m.total) || 0, qtd_pago: (m && m.n) || 0 });
+});
+app.post('/transacao', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM transacoes WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE transacoes SET produto=?, valor=?, status=?, provider=?, contato_id=? WHERE id=?`).run(String(b.produto || ''), Number(b.valor || 0), String(b.status || 'pago'), String(b.provider || ''), b.contatoId || null, id);
+  else db.prepare(`INSERT INTO transacoes(id,projeto,contato_id,produto,valor,status,provider,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), b.contatoId || null, String(b.produto || ''), Number(b.valor || 0), String(b.status || 'pago'), String(b.provider || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/transacao/remover', (req, res) => { db.prepare(`DELETE FROM transacoes WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- Relatorios / Dashboards (numeros reais dos dados do motor) ----
+app.get('/relatorios/resumo', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const contatos = (db.prepare(`SELECT COUNT(*) n FROM contatos WHERE projeto=?`).get(projeto) as any)?.n || 0;
+  const negociosPorEtapa = db.prepare(`SELECT etapa, COUNT(*) n, SUM(valor) valor FROM negocios WHERE projeto=? GROUP BY etapa`).all(projeto);
+  const valorPipeline = (db.prepare(`SELECT SUM(valor) v FROM negocios WHERE projeto=?`).get(projeto) as any)?.v || 0;
+  const filaCampanhas = db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE projeto=? GROUP BY status`).all(projeto);
+  const ticketsAbertos = (db.prepare(`SELECT COUNT(*) n FROM tickets WHERE projeto=? AND status!='fechado'`).get(projeto) as any)?.n || 0;
+  const tarefasPendentes = (db.prepare(`SELECT COUNT(*) n FROM tarefas WHERE projeto=? AND concluida=0`).get(projeto) as any)?.n || 0;
+  const avaliacao = db.prepare(`SELECT AVG(nota) media, COUNT(*) n FROM avaliacoes WHERE projeto=?`).get(projeto) as any;
+  const transacoes = db.prepare(`SELECT SUM(valor) total, COUNT(*) n FROM transacoes WHERE projeto=? AND status='pago'`).get(projeto) as any;
+  res.json({ ok: true, resumo: {
+    contatos, negociosPorEtapa, valorPipeline, filaCampanhas, ticketsAbertos, tarefasPendentes,
+    avaliacaoMedia: (avaliacao && avaliacao.media) || 0, avaliacaoQtd: (avaliacao && avaliacao.n) || 0,
+    transacoesTotal: (transacoes && transacoes.total) || 0, transacoesQtd: (transacoes && transacoes.n) || 0,
+  } });
+});
+app.get('/relatorios/leads', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, porDia: db.prepare(`SELECT substr(criado_em,1,10) dia, COUNT(*) n FROM contatos WHERE projeto=? GROUP BY dia ORDER BY dia DESC LIMIT 60`).all(projeto) });
+});
+app.get('/relatorios/funil', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, etapas: db.prepare(`SELECT etapa, COUNT(*) n, SUM(valor) valor FROM negocios WHERE projeto=? GROUP BY etapa ORDER BY n DESC`).all(projeto) });
+});
+app.get('/relatorios/tags', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, tags: db.prepare(`SELECT t.nome, COUNT(ct.contato_id) n FROM tags t LEFT JOIN contato_tags ct ON ct.tag_id=t.id WHERE t.projeto=? GROUP BY t.id ORDER BY n DESC`).all(projeto) });
+});
+
+// ======================= AUTOMACOES (gatilho -> acoes), 24/7 no motor =======================
+// Regra simples e poderosa: quando um GATILHO acontece (mensagem recebida com palavra,
+// tag adicionada, pagamento aprovado/perdido), roda uma lista de ACOES (aplicar tag, enviar
+// texto, mover etapa do negocio, criar tarefa, abrir ticket, enfileirar fluxo do projeto).
+// Nao depende de nada externo: usa os proprios numeros/fluxos ja configurados.
+async function rodarAutomacoes(projeto: string, gatilho: string, ctx: any) {
+  const autos = db.prepare(`SELECT * FROM automacoes WHERE projeto=? AND gatilho=? AND ativo=1`).all(projeto, gatilho) as any[];
+  for (const a of autos) {
+    try {
+      const cond = String(a.condicao || '').trim().toLowerCase();
+      if (cond) {
+        if (gatilho === 'mensagem_recebida') { if (!String(ctx.texto || '').toLowerCase().includes(cond)) continue; }
+        else if (gatilho === 'tag_adicionada') { if (String(ctx.tag || '').toLowerCase() !== cond) continue; }
+      }
+      let acoes: any[] = [];
+      try { acoes = JSON.parse(a.acoes || '[]'); } catch { acoes = []; }
+      for (const ac of acoes) {
+        const tipo = String(ac?.tipo || '');
+        if (tipo === 'aplicar_tag' && ctx.contatoId && ac.tag) {
+          aplicarTag(projeto, ctx.contatoId, String(ac.tag));
+        } else if (tipo === 'enviar_texto' && ctx.telefone && ac.texto) {
+          await enviarTexto(projeto as Projeto, ctx.telefone, preenche(String(ac.texto), ctx.nome)).catch(() => {});
+        } else if (tipo === 'enviar_texto_delay' && ctx.telefone && ac.texto) {
+          // Etapa 9: envio com ATRASO — enfileira respeitando o ritmo/anti-ban do worker (agendado_para).
+          const seg = Math.max(0, Number(ac.delaySegundos || 0));
+          db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(randomUUID(), projeto, ctx.telefone, 0, preenche(String(ac.texto), ctx.nome), 'texto', null, null, 'pendente', emSegundos(seg), agora());
+        } else if (tipo === 'mover_etapa' && ctx.contatoId && ac.etapa) {
+          db.prepare(`UPDATE negocios SET etapa=?, atualizado_em=? WHERE contato_id=? AND projeto=?`).run(String(ac.etapa), agora(), ctx.contatoId, projeto);
+        } else if (tipo === 'criar_tarefa' && ac.titulo) {
+          db.prepare(`INSERT INTO tarefas(id,projeto,titulo,responsavel,prazo,concluida,contato_id,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projeto, String(ac.titulo), String(ac.responsavel || ''), '', 0, ctx.contatoId || null, agora(), agora());
+        } else if (tipo === 'abrir_ticket' && ac.titulo) {
+          db.prepare(`INSERT INTO tickets(id,projeto,contato_id,titulo,descricao,status,prioridade,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projeto, ctx.contatoId || null, String(ac.titulo), String(ac.descricao || ''), 'aberto', String(ac.prioridade || 'media'), agora(), agora());
+        } else if (tipo === 'enfileirar_fluxo' && ctx.telefone) {
+          const f = (ac.tipoFluxo === 'recuperacao' ? CONFIG.recuperacaoFluxo : CONFIG.entregaFluxo)?.[projeto as Projeto];
+          if (Array.isArray(f) && f.length) enfileirarFluxo(projeto as Projeto, ctx.telefone, f, ctx.nome);
+        }
+      }
+      db.prepare(`INSERT INTO automacao_logs(id,automacao_id,projeto,contato_id,gatilho,detalhe,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), a.id, projeto, ctx.contatoId || null, gatilho, 'ok: ' + acoes.length + ' acao(oes)', agora());
+    } catch (e: any) {
+      try { db.prepare(`INSERT INTO automacao_logs(id,automacao_id,projeto,contato_id,gatilho,detalhe,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), a.id, projeto, ctx.contatoId || null, gatilho, 'erro: ' + String(e?.message || e), agora()); } catch { /* log best-effort */ }
+    }
+  }
+}
+app.get('/automacoes', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = (db.prepare(`SELECT * FROM automacoes WHERE projeto=? ORDER BY criado_em DESC`).all(projeto) as any[]).map((a) => { try { a.acoes = JSON.parse(a.acoes || '[]'); } catch { a.acoes = []; } return a; });
+  res.json({ ok: true, automacoes: rows });
+});
+app.post('/automacao', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const acoes = JSON.stringify(Array.isArray(b.acoes) ? b.acoes : []);
+  const existe = db.prepare(`SELECT id FROM automacoes WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE automacoes SET nome=?, ativo=?, gatilho=?, condicao=?, acoes=? WHERE id=?`).run(String(b.nome || ''), b.ativo === false ? 0 : 1, String(b.gatilho || ''), String(b.condicao || ''), acoes, id);
+  else db.prepare(`INSERT INTO automacoes(id,projeto,nome,ativo,gatilho,condicao,acoes,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), b.ativo === false ? 0 : 1, String(b.gatilho || ''), String(b.condicao || ''), acoes, agora());
+  res.json({ ok: true, id });
+});
+app.post('/automacao/ativar', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE automacoes SET ativo=? WHERE id=?`).run(b.ativo ? 1 : 0, String(b.id || '')); res.json({ ok: true }); });
+app.post('/automacao/remover', (req, res) => { db.prepare(`DELETE FROM automacoes WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/automacoes/logs', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, logs: db.prepare(`SELECT l.*, a.nome automacao_nome FROM automacao_logs l LEFT JOIN automacoes a ON a.id=l.automacao_id WHERE l.projeto=? ORDER BY l.criado_em DESC LIMIT 200`).all(projeto) });
+});
+app.post('/automacao/testar', async (req, res) => { const b = req.body || {}; await rodarAutomacoes(String(b.projeto || ''), String(b.gatilho || 'mensagem_recebida'), b.ctx || {}); res.json({ ok: true }); });
+
+// ---- Tokens de API (registro das chaves que sistemas externos usam pra chamar o motor) ----
+app.get('/api-tokens', (_req, res) => { res.json({ ok: true, tokens: db.prepare(`SELECT id,nome,token,criado_em FROM api_tokens ORDER BY criado_em DESC`).all() }); });
+app.post('/api-token', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const token = String(b.token || ('mr_' + randomUUID().replace(/-/g, '')));
+  db.prepare(`INSERT INTO api_tokens(id,nome,token,criado_em) VALUES(?,?,?,?)`).run(id, String(b.nome || ''), token, agora());
+  res.json({ ok: true, id, token });
+});
+app.post('/api-token/remover', (req, res) => { db.prepare(`DELETE FROM api_tokens WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ======================= MODULOS QUE DEPENDEM DE CONEXAO (codigo pronto) =======================
+// Paginas, Formularios/Quiz, Pixels, E-mail (templates/dominios/fila), Comentarios IG/FB,
+// Templates WhatsApp oficial, Integracoes (webhooks de saida, API Receive, Apps).
+// O que roda SO no motor ja funciona (paginas /p/:slug e formularios /f/:id sao servidos aqui).
+// O que precisa de credencial externa (SMTP, Meta, WhatsApp oficial) fica ENFILEIRADO/registrado
+// e e enviado de verdade quando a conexao for ligada no fim.
+
+function esc(s: any): string {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as any)[c]);
+}
+
+// ---- PAGINAS (landing pages servidas pelo proprio motor) ----
+app.get('/paginas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, paginas: db.prepare(`SELECT id,projeto,slug,titulo,publicada,criado_em,atualizado_em FROM paginas WHERE projeto=? ORDER BY atualizado_em DESC`).all(projeto) });
+});
+app.get('/pagina/:id', (req, res) => {
+  const p = db.prepare(`SELECT * FROM paginas WHERE id=?`).get(req.params.id);
+  if (!p) return res.status(404).json({ erro: 'nao_encontrada' });
+  res.json({ ok: true, pagina: p });
+});
+app.post('/pagina', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const slug = String(b.slug || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '') || id.slice(0, 8);
+  const existe = db.prepare(`SELECT id FROM paginas WHERE id=?`).get(id);
+  try {
+    if (existe) db.prepare(`UPDATE paginas SET slug=?, titulo=?, html=?, publicada=?, atualizado_em=? WHERE id=?`).run(slug, String(b.titulo || ''), String(b.html || ''), b.publicada ? 1 : 0, agora(), id);
+    else db.prepare(`INSERT INTO paginas(id,projeto,slug,titulo,html,publicada,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), slug, String(b.titulo || ''), String(b.html || ''), b.publicada ? 1 : 0, agora(), agora());
+  } catch (e: any) { return res.status(400).json({ erro: 'slug_duplicado_ou_invalido', detalhe: String(e?.message || e) }); }
+  res.json({ ok: true, id, slug, url: (PUBLIC_BASE_URL || '') + '/p/' + slug });
+});
+app.post('/pagina/remover', (req, res) => { db.prepare(`DELETE FROM paginas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// publico: serve a pagina publicada
+app.get('/p/:slug', (req, res) => {
+  const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
+  if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
+  res.type('html').send(String(p.html || ''));
+});
+
+// ---- FORMULARIOS / QUIZ (servidos pelo motor; resposta salva + cria contato + tag) ----
+app.get('/formularios', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = (db.prepare(`SELECT * FROM formularios WHERE projeto=? ORDER BY criado_em DESC`).all(projeto) as any[]).map((f) => { try { f.campos = JSON.parse(f.campos || '[]'); } catch { f.campos = []; } return f; });
+  res.json({ ok: true, formularios: rows });
+});
+app.post('/formulario', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || randomUUID());
+  const campos = JSON.stringify(Array.isArray(b.campos) ? b.campos : []);
+  const existe = db.prepare(`SELECT id FROM formularios WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE formularios SET titulo=?, campos=?, tag=?, redirecionar=? WHERE id=?`).run(String(b.titulo || ''), campos, String(b.tag || ''), String(b.redirecionar || ''), id);
+  else db.prepare(`INSERT INTO formularios(id,projeto,titulo,campos,tag,redirecionar,criado_em) VALUES(?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.titulo || ''), campos, String(b.tag || ''), String(b.redirecionar || ''), agora());
+  res.json({ ok: true, id, url: (PUBLIC_BASE_URL || '') + '/f/' + id });
+});
+app.post('/formulario/remover', (req, res) => { db.prepare(`DELETE FROM formularios WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/formularios/:id/respostas', (req, res) => {
+  const rows = (db.prepare(`SELECT * FROM formulario_respostas WHERE formulario_id=? ORDER BY criado_em DESC LIMIT 500`).all(req.params.id) as any[]).map((r) => { try { r.dados = JSON.parse(r.dados || '{}'); } catch { r.dados = {}; } return r; });
+  res.json({ ok: true, respostas: rows });
+});
+// publico: renderiza o formulario
+app.get('/f/:id', (req, res) => {
+  const f = db.prepare(`SELECT * FROM formularios WHERE id=?`).get(req.params.id) as any;
+  if (!f) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Formulario nao encontrado</h1>');
+  let campos: any[] = [];
+  try { campos = JSON.parse(f.campos || '[]'); } catch { campos = []; }
+  const inputs = campos.map((c: any) => {
+    const req2 = c.obrigatorio ? 'required' : '';
+    const nome = esc(c.chave || c.rotulo);
+    if (c.tipo === 'textarea') return '<label>' + esc(c.rotulo) + '</label><textarea name="' + nome + '" ' + req2 + '></textarea>';
+    const tipo = c.tipo === 'email' ? 'email' : c.tipo === 'telefone' ? 'tel' : c.tipo === 'numero' ? 'number' : 'text';
+    return '<label>' + esc(c.rotulo) + '</label><input type="' + tipo + '" name="' + nome + '" ' + req2 + '>';
+  }).join('');
+  res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(f.titulo) + '</title>'
+    + '<style>body{margin:0;font:16px/1.5 system-ui,Segoe UI,Arial;background:#0e1116;color:#e6e6e6;display:flex;justify-content:center;padding:28px 16px}.card{width:100%;max-width:520px;background:#161b22;border:1px solid #2a313c;border-radius:14px;padding:24px}h1{font-size:22px;margin:0 0 16px}label{display:block;margin:12px 0 5px;font-weight:600}input,textarea{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:9px;border:1px solid #2a313c;background:#0e1116;color:#e6e6e6;font-size:15px}button{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#1db954;color:#07210f;font-weight:700;font-size:16px;cursor:pointer}#ok{display:none;margin-top:16px;padding:12px;border-radius:9px;background:#0f2e1b;border:1px solid #1db95455}</style></head><body><div class="card">'
+    + '<h1>' + esc(f.titulo) + '</h1><form id="frm">' + inputs + '<button type="submit">Enviar</button></form><div id="ok">✅ Enviado! Obrigado.</div></div>'
+    + '<script>document.getElementById("frm").onsubmit=async(e)=>{e.preventDefault();const d={};new FormData(e.target).forEach((v,k)=>d[k]=v);const r=await fetch(location.pathname,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});if(r.ok){e.target.style.display="none";document.getElementById("ok").style.display="block";' + (f.redirecionar ? 'setTimeout(()=>location.href=' + JSON.stringify(String(f.redirecionar)) + ',1200);' : '') + '}};</script></body></html>');
+});
+// publico: recebe a resposta
+app.post('/f/:id', (req, res) => {
+  const f = db.prepare(`SELECT * FROM formularios WHERE id=?`).get(req.params.id) as any;
+  if (!f) return res.status(404).json({ erro: 'nao_encontrado' });
+  const dados = (req.body && typeof req.body === 'object') ? req.body : {};
+  let contatoId: string | null = null;
+  const tel = String(dados.telefone || dados.phone || dados.celular || dados.whatsapp || '').replace(/\D/g, '');
+  const nome = dados.nome || dados.name;
+  const email = dados.email;
+  if (tel && tel.length >= 10) {
+    contatoId = upsertContato(f.projeto, tel, nome, email, 'formulario');
+    if (f.tag) aplicarTag(f.projeto, contatoId, String(f.tag));
+    if (contatoId) rodarAutomacoes(f.projeto, 'tag_adicionada', { contatoId, tag: String(f.tag || ''), telefone: tel, nome }).catch(() => {});
+  }
+  db.prepare(`INSERT INTO formulario_respostas(id,formulario_id,projeto,contato_id,dados,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), f.id, f.projeto, contatoId, JSON.stringify(dados), agora());
+  res.json({ ok: true });
+});
+
+// ---- PIXELS (registro de config pra injetar nas paginas/rastreamento) ----
+app.get('/pixels', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, pixels: db.prepare(`SELECT * FROM pixels WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
+app.post('/pixel', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM pixels WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE pixels SET nome=?, plataforma=?, pixel_id=? WHERE id=?`).run(String(b.nome || ''), String(b.plataforma || 'meta'), String(b.pixel_id || ''), id);
+  else db.prepare(`INSERT INTO pixels(id,projeto,nome,plataforma,pixel_id,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.plataforma || 'meta'), String(b.pixel_id || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/pixel/remover', (req, res) => { db.prepare(`DELETE FROM pixels WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- E-MAIL: templates, dominios (SMTP) e fila (envio real liga no fim) ----
+app.get('/email/templates', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, templates: db.prepare(`SELECT * FROM email_templates WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
+app.post('/email/template', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM email_templates WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE email_templates SET nome=?, assunto=?, html=? WHERE id=?`).run(String(b.nome || ''), String(b.assunto || ''), String(b.html || ''), id);
+  else db.prepare(`INSERT INTO email_templates(id,projeto,nome,assunto,html,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.assunto || ''), String(b.html || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/email/template/remover', (req, res) => { db.prepare(`DELETE FROM email_templates WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/email/dominios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, dominios: db.prepare(`SELECT * FROM email_dominios WHERE projeto=? ORDER BY dominio ASC`).all(projeto) }); });
+app.post('/email/dominio', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM email_dominios WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE email_dominios SET dominio=?, smtp_host=?, smtp_porta=?, smtp_usuario=?, remetente=? WHERE id=?`).run(String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), id);
+  else db.prepare(`INSERT INTO email_dominios(id,projeto,dominio,smtp_host,smtp_porta,smtp_usuario,remetente,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/email/dominio/remover', (req, res) => { db.prepare(`DELETE FROM email_dominios WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/email/fila', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, fila: db.prepare(`SELECT * FROM email_fila WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
+app.post('/email/enviar', (req, res) => {
+  const b = req.body || {};
+  let assunto = String(b.assunto || ''); let html = String(b.html || '');
+  if (b.templateId) { const t = db.prepare(`SELECT * FROM email_templates WHERE id=?`).get(String(b.templateId)) as any; if (t) { assunto = assunto || t.assunto; html = html || t.html; } }
+  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), String(b.projeto || ''), String(b.para || ''), assunto, html, 'pendente', agora());
+  res.json({ ok: true, enfileirado: true, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
+});
+
+// ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
+app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
+app.post('/comentario', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  db.prepare(`INSERT INTO comentarios(id,projeto,rede,post_id,autor,texto,respondido,resposta,criado_em) VALUES(?,?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.rede || 'instagram'), String(b.post_id || ''), String(b.autor || ''), String(b.texto || ''), 0, '', agora());
+  res.json({ ok: true, id });
+});
+app.post('/comentario/responder', (req, res) => { const b = req.body || {}; db.prepare(`UPDATE comentarios SET respondido=1, resposta=? WHERE id=?`).run(String(b.resposta || ''), String(b.id || '')); res.json({ ok: true, obs: 'Resposta salva. A publicacao no IG/FB ocorre quando a API da Meta estiver ligada.' }); });
+app.post('/comentario/remover', (req, res) => { db.prepare(`DELETE FROM comentarios WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- TEMPLATES WHATSAPP OFICIAL (registro; submissao a Meta liga no fim) ----
+app.get('/wpp/templates', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, templates: db.prepare(`SELECT * FROM templates_whatsapp WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
+app.post('/wpp/template', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM templates_whatsapp WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE templates_whatsapp SET nome=?, idioma=?, categoria=?, corpo=?, status=? WHERE id=?`).run(String(b.nome || ''), String(b.idioma || 'pt_BR'), String(b.categoria || 'UTILITY'), String(b.corpo || ''), String(b.status || 'rascunho'), id);
+  else db.prepare(`INSERT INTO templates_whatsapp(id,projeto,nome,idioma,categoria,corpo,status,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.idioma || 'pt_BR'), String(b.categoria || 'UTILITY'), String(b.corpo || ''), String(b.status || 'rascunho'), agora());
+  res.json({ ok: true, id });
+});
+app.post('/wpp/template/remover', (req, res) => { db.prepare(`DELETE FROM templates_whatsapp WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+
+// ---- INTEGRACOES: webhooks de saida, API Receive, Apps ----
+async function dispararWebhooksSaida(projeto: string, evento: string, payload: any) {
+  const hs = db.prepare(`SELECT * FROM webhooks_saida WHERE projeto=? AND evento=? AND ativo=1`).all(projeto, evento) as any[];
+  for (const h of hs) {
+    try { await fetch(String(h.url), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ evento, projeto, payload }) }); } catch { /* best-effort */ }
+  }
+}
+app.get('/webhooks', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, webhooks: db.prepare(`SELECT * FROM webhooks_saida WHERE projeto=? ORDER BY criado_em DESC`).all(projeto) }); });
+app.post('/webhook-saida', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM webhooks_saida WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE webhooks_saida SET nome=?, url=?, evento=?, ativo=? WHERE id=?`).run(String(b.nome || ''), String(b.url || ''), String(b.evento || ''), b.ativo === false ? 0 : 1, id);
+  else db.prepare(`INSERT INTO webhooks_saida(id,projeto,nome,url,evento,ativo,criado_em) VALUES(?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.url || ''), String(b.evento || ''), b.ativo === false ? 0 : 1, agora());
+  res.json({ ok: true, id });
+});
+app.post('/webhook-saida/remover', (req, res) => { db.prepare(`DELETE FROM webhooks_saida WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/integracao/eventos', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, eventos: db.prepare(`SELECT * FROM integracao_eventos WHERE projeto=? ORDER BY criado_em DESC LIMIT 200`).all(projeto) }); });
+app.get('/apps', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, apps: db.prepare(`SELECT * FROM apps_externos WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
+app.post('/app', (req, res) => {
+  const b = req.body || {}; const id = String(b.id || randomUUID());
+  const existe = db.prepare(`SELECT id FROM apps_externos WHERE id=?`).get(id);
+  if (existe) db.prepare(`UPDATE apps_externos SET nome=?, base_url=?, descricao=? WHERE id=?`).run(String(b.nome || ''), String(b.base_url || ''), String(b.descricao || ''), id);
+  else db.prepare(`INSERT INTO apps_externos(id,projeto,nome,base_url,descricao,criado_em) VALUES(?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.nome || ''), String(b.base_url || ''), String(b.descricao || ''), agora());
+  res.json({ ok: true, id });
+});
+app.post('/app/remover', (req, res) => { db.prepare(`DELETE FROM apps_externos WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// publico: API Receive — recebe eventos externos validados por token na URL (gere o token em "Tokens API")
+app.all('/receive/:token', (req, res) => {
+  const token = String(req.params.token || '');
+  const t = db.prepare(`SELECT id FROM api_tokens WHERE token=?`).get(token) as any;
+  if (!t) return res.status(401).json({ erro: 'token_invalido' });
+  const q = req.query as any;
+  const b = (req.body && typeof req.body === 'object') ? req.body : {};
+  const projeto = String(b.projeto || q.projeto || CONFIG.projetoPadrao);
+  const tipo = String(b.tipo || b.evento || q.tipo || 'evento');
+  db.prepare(`INSERT INTO integracao_eventos(id,projeto,origem,tipo,dados,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, 'api-receive', tipo, JSON.stringify({ query: q, body: b }), agora());
+  // se vier telefone, cria/atualiza contato e dispara automacao de evento recebido via tag opcional
+  const tel = String(b.telefone || b.phone || q.telefone || '').replace(/\D/g, '');
+  if (tel && tel.length >= 10) {
+    const cid = upsertContato(projeto, tel, b.nome || q.nome, b.email || q.email, 'api-receive');
+    if (b.tag || q.tag) { aplicarTag(projeto, cid, String(b.tag || q.tag)); rodarAutomacoes(projeto, 'tag_adicionada', { contatoId: cid, tag: String(b.tag || q.tag), telefone: tel, nome: b.nome || q.nome }).catch(() => {}); }
+  }
+  dispararWebhooksSaida(projeto, 'evento_recebido', { tipo, query: q, body: b }).catch(() => {});
+  res.json({ ok: true, recebido: true });
+});
+
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----
 app.post('/webhook/evolution', (req, res) => {
   try {
@@ -703,7 +1602,8 @@ app.post('/webhook/evolution', (req, res) => {
         const cid = upsertContato(projeto, telefone, data.pushName);
         db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`)
           .run(randomUUID(), projeto, cid, 'entrada', texto, agora());
-        // TODO: aqui entra o roteamento pro agente IA / auto-resposta / flow builder
+        // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
+        rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -795,9 +1695,11 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       if (categoria === 'aprovado') {
         aplicarTag(projeto, cid, 'comprou');
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
         await dispararRecuperacao(projeto, p.telefone, p.nome).catch(() => {});
+        await rodarAutomacoes(projeto, 'pagamento_perdido', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'reembolso') {
         aplicarTag(projeto, cid, 'reembolso'); // sem mensagem automática
       }
@@ -857,6 +1759,59 @@ app.all('/webhook/cademi', async (req, res) => {
     }
     res.json({ ok: true, projeto, evento: c.evento });
   } catch (e: any) { res.status(200).json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ======================= ETAPA 9: construtor de Paginas (blocos) + Quiz multi-passos =======================
+// Paginas: lista completa (com pasta/idioma) e gravacao dos blocos do construtor visual.
+// A pagina publica continua servida em /p/:slug (HTML gerado no app a partir dos blocos).
+app.get('/paginas/full', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, paginas: db.prepare(`SELECT id,projeto,slug,titulo,pasta,idioma,publicada,criado_em,atualizado_em FROM paginas WHERE projeto=? ORDER BY atualizado_em DESC`).all(projeto) });
+});
+app.post('/pagina/blocos', (req, res) => {
+  const b = req.body || {};
+  db.prepare(`UPDATE paginas SET blocos=?, pasta=?, idioma=?, atualizado_em=? WHERE id=?`).run(String(b.blocos || '[]'), String(b.pasta || ''), String(b.idioma || 'pt'), agora(), String(b.id || ''));
+  res.json({ ok: true });
+});
+
+// Quiz: grava os passos + tema do construtor multi-passos (o formulario base ja existe via /formulario).
+app.post('/formulario/passos', (req, res) => {
+  const b = req.body || {};
+  db.prepare(`UPDATE formularios SET passos=?, tema=? WHERE id=?`).run(String(b.passos || '[]'), String(b.tema || '{}'), String(b.id || ''));
+  res.json({ ok: true, url: (PUBLIC_BASE_URL || '') + '/q/' + String(b.id || '') });
+});
+
+// publico: renderiza o QUIZ multi-passos (uma tela por passo). Envia pro /f/:id (cria contato + tag + resposta).
+app.get('/q/:id', (req, res) => {
+  const f = db.prepare(`SELECT * FROM formularios WHERE id=?`).get(req.params.id) as any;
+  if (!f) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Quiz nao encontrado</h1>');
+  try { db.prepare(`UPDATE formularios SET acessos=COALESCE(acessos,0)+1 WHERE id=?`).run(f.id); } catch { /* ok */ }
+  let passos: any[] = []; try { passos = JSON.parse(f.passos || '[]'); } catch { passos = []; }
+  let tema: any = {}; try { tema = JSON.parse(f.tema || '{}'); } catch { tema = {}; }
+  const fundo = esc(tema.fundo || '#0e1116'), cor = esc(tema.texto || '#e6e6e6'), botao = esc(tema.botao || '#1db954');
+  const passosJson = JSON.stringify(passos).replace(/</g, '\\u003c');
+  const redir = f.redirecionar ? JSON.stringify(String(f.redirecionar)) : 'null';
+  res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(f.titulo) + '</title>'
+    + '<style>*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial;background:' + fundo + ';color:' + cor + ';min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}'
+    + '.card{width:100%;max-width:560px}h1{font-size:26px;margin:0 0 10px}p.sub{opacity:.8;margin:0 0 18px}'
+    + 'input,textarea{width:100%;padding:13px;border-radius:10px;border:1px solid #ffffff22;background:#ffffff0d;color:inherit;font-size:16px;margin-bottom:10px}'
+    + 'button,.opt{cursor:pointer;border:0;border-radius:10px;font-size:16px}.btn{background:' + botao + ';color:#07210f;font-weight:700;padding:14px 22px;width:100%}'
+    + '.opt{display:block;width:100%;text-align:left;background:#ffffff14;color:inherit;border:1px solid #ffffff22;padding:13px;margin-bottom:8px}'
+    + '.bar{height:5px;background:#ffffff1a;border-radius:4px;margin-bottom:18px;overflow:hidden}.bar>i{display:block;height:100%;background:' + botao + ';width:0;transition:.3s}</style></head>'
+    + '<body><div class="card"><div class="bar"><i id="bar"></i></div><div id="steps"></div></div>'
+    + '<script>var PS=' + passosJson + ',R={},i=0,redir=' + redir + ';'
+    + 'function render(){var s=PS[i];if(!s)return;var h=s.subtitulo?("<h1>"+(s.titulo||"")+"</h1><p class=sub>"+(s.subtitulo||"")+"</p>"):("<h1>"+(s.titulo||"")+"</h1>");'
+    + 'if(s.tipo==="multipla"){(s.opcoes||[]).forEach(function(o){h+="<button class=opt data-v=\\""+String(o).replace(/"/g,"&quot;")+"\\">"+o+"</button>";});}'
+    + 'else if(s.tipo==="texto"){h+="<textarea id=inp rows=3></textarea>";}'
+    + 'else if(s.tipo==="nome"||s.tipo==="telefone"||s.tipo==="email"){h+="<input id=inp type=\\""+(s.tipo==="email"?"email":s.tipo==="telefone"?"tel":"text")+"\\">";}'
+    + 'if(s.tipo!=="multipla"){h+="<button class=btn id=nx>"+(i===PS.length-1?"Enviar":"Continuar")+"</button>";}'
+    + 'var d=document.getElementById("steps");d.innerHTML="<div>"+h+"</div>";'
+    + 'document.getElementById("bar").style.width=(i/((PS.length-1)||1)*100)+"%";'
+    + 'var opts=d.querySelectorAll(".opt");opts.forEach(function(b){b.onclick=function(){R[s.chave||"opcao"]=b.getAttribute("data-v");next();};});'
+    + 'var nx=document.getElementById("nx");if(nx)nx.onclick=function(){var inp=document.getElementById("inp");if(inp){if(s.obrigatorio&&!inp.value){inp.focus();return;}if(s.chave)R[s.chave]=inp.value;}next();};}'
+    + 'function next(){if(i>=PS.length-1){enviar();return;}i++;render();}'
+    + 'function enviar(){document.getElementById("bar").style.width="100%";fetch(location.pathname.replace("/q/","/f/"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(R)}).then(function(){document.getElementById("steps").innerHTML="<h1>\\u2705 Enviado!</h1><p class=sub>Obrigado.</p>";if(redir)setTimeout(function(){location.href=redir;},1200);}).catch(function(){document.getElementById("steps").innerHTML="<h1>\\u2705 Enviado!</h1>";});}'
+    + 'render();</script></body></html>');
 });
 
 // ----------------------- Worker de disparo (ritmo humano / anti-ban) -----------------------
