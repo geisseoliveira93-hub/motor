@@ -2204,4 +2204,147 @@ app.post('/agente/testar', async (req, res) => {
   res.json(r);
 });
 
+
+// ============================================================================
+// ETAPA 15 — Central de Atendimento (API unificada de atendimento).
+// Aditivo. NAO altera o gatilho do webhook/evolution nem liga canal sozinho.
+// O cut-over (ligar a IA de verdade) continua por projeto na aba "Agentes IA".
+// ============================================================================
+db.exec(`
+CREATE TABLE IF NOT EXISTS atendimentos (
+  contato_id TEXT PRIMARY KEY,
+  projeto TEXT,
+  canal TEXT DEFAULT 'wa',
+  status TEXT DEFAULT 'fila',
+  responsavel TEXT,
+  instancia TEXT,
+  atualizado_em TEXT
+);
+`);
+try { db.exec(`ALTER TABLE contatos ADD COLUMN canal TEXT DEFAULT 'wa'`); } catch { /* coluna ja existe */ }
+try { db.exec(`ALTER TABLE mensagens ADD COLUMN canal TEXT DEFAULT 'wa'`); } catch { /* coluna ja existe */ }
+
+function hhmmCA(iso: string): string {
+  try {
+    const d = new Date(iso); const hoje = new Date();
+    if (d.toDateString() !== hoje.toDateString()) return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  } catch { return ''; }
+}
+function statusAtendimentoCA(contatoId: string): { status: string; responsavel?: string; instancia?: string } {
+  const at = db.prepare(`SELECT status, responsavel, instancia FROM atendimentos WHERE contato_id=?`).get(contatoId) as any;
+  const ac = db.prepare(`SELECT status FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(contatoId) as any;
+  if (ac && ac.status === 'ativo') return { status: 'ia', responsavel: at?.responsavel, instancia: at?.instancia };
+  if (at) return { status: at.status, responsavel: at.responsavel, instancia: at.instancia };
+  return { status: 'fila' };
+}
+function setAtendimentoCA(contatoId: string, campos: any): void {
+  const existe = db.prepare(`SELECT contato_id FROM atendimentos WHERE contato_id=?`).get(contatoId);
+  if (existe) {
+    const chaves = Object.keys(campos);
+    const sets = chaves.map((k) => `${k}=?`).join(',');
+    const vals = chaves.map((k) => campos[k]);
+    db.prepare(`UPDATE atendimentos SET ${sets}, atualizado_em=? WHERE contato_id=?`).run(...vals, agora(), contatoId);
+  } else {
+    const c = db.prepare(`SELECT projeto, COALESCE(canal,'wa') canal FROM contatos WHERE id=?`).get(contatoId) as any;
+    db.prepare(`INSERT INTO atendimentos(contato_id,projeto,canal,status,responsavel,instancia,atualizado_em) VALUES(?,?,?,?,?,?,?)`)
+      .run(contatoId, c?.projeto || '', c?.canal || 'wa', campos.status || 'fila', campos.responsavel || null, campos.instancia || null, agora());
+  }
+}
+function idsDoBodyCA(b: any): string[] {
+  const raw = b?.contatos != null ? b.contatos : (b?.contatoId != null ? b.contatoId : []);
+  return (Array.isArray(raw) ? raw : [raw]).map((x: any) => String(x || '')).filter((x: string) => x);
+}
+
+app.get('/atendimento/conversas', (req, res) => {
+  try {
+    const canal = String(req.query.canal || 'wa');
+    const social = canal.indexOf('ig') >= 0;   // ig / ia-ig => Instagram + Facebook
+    const querIA = canal.indexOf('ia') === 0;  // abas que comecam com "ia"
+    const rows = db.prepare(`
+      SELECT c.id contato_id, c.nome, c.telefone, c.projeto, COALESCE(c.canal,'wa') net,
+             m.texto ultima, MAX(m.criado_em) quando
+      FROM mensagens m JOIN contatos c ON c.id=m.contato_id
+      GROUP BY c.id ORDER BY quando DESC LIMIT 400
+    `).all() as any[];
+    const out: any[] = [];
+    for (const r of rows) {
+      const net = r.net || 'wa';
+      const ehSocial = net === 'ig' || net === 'fb';
+      if (social !== ehSocial) continue;
+      const st = statusAtendimentoCA(r.contato_id);
+      if (st.status === 'finalizado') continue;
+      const ehIA = st.status === 'ia';
+      if (querIA !== ehIA) continue;
+      out.push({
+        contato_id: r.contato_id, nome: r.nome || r.telefone, inst: r.projeto || '', net,
+        tipo: 'dm', status: st.status, dev: 0, ultima: r.ultima || '',
+        hora: hhmmCA(r.quando), ph: r.telefone || '', live: ehIA,
+      });
+    }
+    res.json({ ok: true, conversas: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.get('/atendimento/mensagens', (req, res) => {
+  const contatoId = String(req.query.contatoId || '');
+  const ms = db.prepare(`SELECT id, direcao, texto, criado_em FROM mensagens WHERE contato_id=? ORDER BY criado_em ASC LIMIT 400`).all(contatoId) as any[];
+  res.json({ ok: true, mensagens: ms.map((m) => ({ id: m.id, direcao: m.direcao, texto: m.texto, hora: hhmmCA(m.criado_em) })) });
+});
+
+app.post('/atendimento/assumir', (req, res) => {
+  const b = req.body || {};
+  const contatoId = String(b.contatoId || '');
+  if (!contatoId) return res.json({ ok: false, erro: 'contatoId' });
+  setAtendimentoCA(contatoId, { status: 'meu', responsavel: String(b.responsavel || 'humano') });
+  db.prepare(`UPDATE agente_conversas SET status='humano', atualizado_em=? WHERE contato_id=?`).run(agora(), contatoId);
+  res.json({ ok: true });
+});
+
+app.post('/atendimento/devolver', (req, res) => {
+  const contatoId = String((req.body || {}).contatoId || '');
+  if (!contatoId) return res.json({ ok: false, erro: 'contatoId' });
+  setAtendimentoCA(contatoId, { status: 'ia', responsavel: null });
+  db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE contato_id=?`).run(agora(), contatoId);
+  res.json({ ok: true });
+});
+
+app.post('/atendimento/finalizar', (req, res) => {
+  const ids = idsDoBodyCA(req.body || {});
+  for (const id of ids) setAtendimentoCA(id, { status: 'finalizado', responsavel: null });
+  res.json({ ok: true, n: ids.length });
+});
+
+app.post('/atendimento/ativar-ia', (req, res) => {
+  const ids = idsDoBodyCA(req.body || {});
+  for (const id of ids) {
+    setAtendimentoCA(id, { status: 'ia', responsavel: null });
+    const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(id) as any;
+    if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id);
+  }
+  res.json({ ok: true, n: ids.length });
+});
+
+app.post('/atendimento/transferir', (req, res) => {
+  const b = req.body || {};
+  const ids = idsDoBodyCA(b);
+  const paraIA = !!b.agenteIA;
+  for (const id of ids) {
+    if (paraIA) {
+      setAtendimentoCA(id, { status: 'ia', responsavel: null });
+      const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(id) as any;
+      if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id);
+    } else {
+      setAtendimentoCA(id, { status: 'meu', responsavel: String(b.destino || b.atendente || b.departamento || 'humano') });
+      db.prepare(`UPDATE agente_conversas SET status='humano', atualizado_em=? WHERE contato_id=?`).run(agora(), id);
+    }
+  }
+  res.json({ ok: true, n: ids.length });
+});
+
+app.get('/atendimento/numeros', (_req, res) => {
+  res.json({ ok: true, numeros: db.prepare(`SELECT id, projeto, telefone, instancia, tipo, status FROM numeros ORDER BY projeto, telefone`).all() });
+});
+
+
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
