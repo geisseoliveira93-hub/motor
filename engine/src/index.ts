@@ -1609,6 +1609,7 @@ app.post('/webhook/evolution', (req, res) => {
           .run(randomUUID(), projeto, cid, 'entrada', texto, agora());
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
+        try { if (((CONFIG as any).agentesHabilitados || {})[projeto]) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid).catch(() => {}); } catch { /* agente IA best-effort, etapa14 */ }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -1862,5 +1863,345 @@ async function tickFila() {
 }
 // 1 envio a cada 8–15s (ritmo humano). Ajustar por número/aquecimento depois.
 setInterval(tickFila, 8000 + Math.floor(Math.random() * 7000));
+
+
+// ============================================================================
+// ETAPA 14 (06/10) — MODULO DE AGENTES IA (SDR) NO MOTOR  [add-only]
+// ----------------------------------------------------------------------------
+// Objetivo: qualificar leads por LLM DENTRO do nosso motor, pra substituir os
+// "Agentes IA" da SellFlux (baixo/teclado/violao). Usa o que ja existe:
+// enviarTexto (Evolution), eventos (agenda), negocios (CRM), aplicarTag (tags),
+// upsertContato. So ACRESCENTA tabelas, funcoes e endpoints.
+//
+// SEGURANCA / CUT-OVER: o agente SO roda quando CONFIG.agentesHabilitados[projeto]
+// === true. Padrao = DESLIGADO em todos. Entao subir este codigo pro ar NAO muda
+// nada no comportamento atual (a SellFlux continua cuidando do WhatsApp) ate o
+// Ezequias habilitar projeto por projeto. Sem a chave do LLM (env LLM_API_KEY) o
+// agente tambem nao responde (fica em modo seguro).
+//
+// LIGAR DEPOIS (com o Ezequias): 1) por a env LLM_API_KEY (e, se quiser,
+// LLM_BASE_URL / LLM_MODEL) no .env do VPS; 2) carregar o prompt de cada
+// instrumento (POST /agente ou copiar engine/prompts-seed/<proj>.txt ->
+// /data/prompts/<proj>.txt); 3) POST /agentes/habilitar {projeto,on:true}.
+// ============================================================================
+
+const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://api.openai.com/v1';
+const LLM_API_KEY = process.env.LLM_API_KEY || '';
+const LLM_MODEL_PADRAO = process.env.LLM_MODEL || 'gpt-4o-mini';
+const AGENTE_MAX_TOOL_LOOPS = Number(process.env.AGENTE_MAX_TOOL_LOOPS || 6);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS agentes_ia (
+  id TEXT PRIMARY KEY,
+  projeto TEXT,
+  nome TEXT,
+  prompt TEXT,
+  modelo TEXT,
+  temperatura REAL DEFAULT 0.7,
+  ativo INTEGER DEFAULT 0,
+  tools_on INTEGER DEFAULT 1,
+  config TEXT,
+  criado_em TEXT,
+  atualizado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS agente_conversas (
+  id TEXT PRIMARY KEY,
+  agente_id TEXT,
+  projeto TEXT,
+  telefone TEXT,
+  contato_id TEXT,
+  status TEXT DEFAULT 'ativo',
+  estado TEXT,
+  historico TEXT,
+  criado_em TEXT,
+  atualizado_em TEXT
+);
+CREATE TABLE IF NOT EXISTS agente_logs (
+  id TEXT PRIMARY KEY,
+  agente_id TEXT,
+  telefone TEXT,
+  papel TEXT,
+  conteudo TEXT,
+  criado_em TEXT
+);
+`);
+
+// Metadados por instrumento (grade real, link do grupo gratis, sala, corte de idade).
+// dia da semana: 0=Dom 1=Seg 2=Ter 3=Qua 4=Qui 5=Sex 6=Sab.
+// Baixo Qua/Sex; Teclado Seg/Qui; Violao Seg/Qui. (fonte: calibracao dos agentes)
+const AGENTE_SEED: any = {
+  baixo: {
+    nome: 'SDR Baixo',
+    grade: { dias: [3, 5], horas: ['11:00', '15:00', '21:00'], duracaoMin: 60, antecedenciaH: 2 },
+    grupo: 'https://chat.whatsapp.com/FWl2ym2wow0JqVr4u9k3Hm',
+    sala: 'https://meet.google.com/rpw-wdwu-cby',
+    corteIdade: 24,
+  },
+  teclado: {
+    nome: 'SDR Teclado',
+    grade: { dias: [1, 4], horas: ['11:00', '15:00', '20:00'], duracaoMin: 60, antecedenciaH: 2 },
+    grupo: 'https://chat.whatsapp.com/C1VYxajhCJiCt1EFVuWjmY',
+    sala: '',
+    corteIdade: 24,
+  },
+  violao: {
+    nome: 'SDR Violao',
+    grade: { dias: [1, 4], horas: ['14:00', '19:00'], duracaoMin: 60, antecedenciaH: 3 },
+    grupo: '',
+    sala: '',
+    corteIdade: 24,
+  },
+};
+
+// Garante CONFIG.agentesHabilitados (padrao: tudo desligado) sem apagar config existente.
+if (!(CONFIG as any).agentesHabilitados) {
+  (CONFIG as any).agentesHabilitados = { baixo: false, violao: false, teclado: false };
+}
+
+// Semeia 1 agente por projeto (so se ainda nao existir). Prompt vem vazio; e carregado
+// depois via /agente, ou de /data/prompts/<projeto>.txt se o arquivo existir.
+function _seedAgentes(): void {
+  for (const projeto of PROJETOS) {
+    const ja = db.prepare(`SELECT id FROM agentes_ia WHERE projeto=?`).get(projeto) as any;
+    if (ja) continue;
+    const seed = AGENTE_SEED[projeto] || {};
+    let prompt = '';
+    try {
+      const p = `/data/prompts/${projeto}.txt`;
+      if (fs.existsSync(p)) prompt = fs.readFileSync(p, 'utf8');
+    } catch { /* sem arquivo, segue vazio */ }
+    db.prepare(
+      `INSERT INTO agentes_ia(id,projeto,nome,prompt,modelo,temperatura,ativo,tools_on,config,criado_em,atualizado_em)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      randomUUID(), projeto, String(seed.nome || ('SDR ' + projeto)), prompt,
+      'gpt-5.4-mini', 0.7, 0, 1, JSON.stringify(seed), agora(), agora()
+    );
+  }
+}
+try { _seedAgentes(); } catch (e) { console.log('[agentes] seed falhou:', e); }
+
+function agenteDoProjeto(projeto: string): any {
+  return db.prepare(`SELECT * FROM agentes_ia WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 1`).get(projeto) as any;
+}
+
+// --------- Agenda: calcula horarios livres a partir da grade + eventos ---------
+// Observacao: container roda em UTC; o Brasil (BRT) e UTC-3. A matematica abaixo e
+// aproximada e deve ser conferida no 1o teste real (horario de verao nao se aplica no BR atual).
+const _DIAS_PT = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
+function _slotsLivres(projeto: string, periodo: string, limite = 10): any[] {
+  const seed = AGENTE_SEED[projeto];
+  if (!seed || !seed.grade) return [];
+  const grade = seed.grade;
+  const noPeriodo = (h: string): boolean => {
+    const hh = Number(String(h).split(':')[0]);
+    if (periodo === 'manha') return hh < 12;
+    if (periodo === 'tarde') return hh >= 12 && hh < 18;
+    if (periodo === 'noite') return hh >= 18;
+    return true;
+  };
+  const agoraMs = Date.now();
+  const minMs = agoraMs + (grade.antecedenciaH || 2) * 3600 * 1000;
+  const ocupados = new Set(
+    (db.prepare(`SELECT inicio FROM eventos WHERE projeto=?`).all(projeto) as any[]).map((e) => String(e.inicio))
+  );
+  const out: any[] = [];
+  for (let d = 0; d < 21 && out.length < limite; d++) {
+    const brt = new Date(agoraMs + d * 86400000 - 3 * 3600000);
+    const dow = brt.getUTCDay();
+    if (!grade.dias.includes(dow)) continue;
+    for (const h of grade.horas) {
+      if (!noPeriodo(h)) continue;
+      const parts = String(h).split(':');
+      const hh = Number(parts[0]);
+      const mm = Number(parts[1] || 0);
+      const inicioUtcMs = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), hh + 3, mm);
+      if (inicioUtcMs < minMs) continue;
+      const iso = new Date(inicioUtcMs).toISOString();
+      if (ocupados.has(iso)) continue;
+      out.push({ iso, label: _DIAS_PT[dow] + ' ' + String(brt.getUTCDate()).padStart(2, '0') + '/' + String(brt.getUTCMonth() + 1).padStart(2, '0') + ' as ' + h });
+      if (out.length >= limite) break;
+    }
+  }
+  return out;
+}
+
+// --------- Ferramentas (function-calling) que o agente pode chamar ---------
+function _toolsDef(): any[] {
+  return [
+    { type: 'function', function: { name: 'listar_horarios_livres', description: 'Lista horarios livres reais da agenda do professor no periodo pedido. Use SEMPRE antes de oferecer horario; nunca invente horario.', parameters: { type: 'object', properties: { periodo: { type: 'string', enum: ['manha', 'tarde', 'noite'] } }, required: ['periodo'] } } },
+    { type: 'function', function: { name: 'salvar_whatsapp', description: 'Grava o numero de WhatsApp da pessoa no cadastro (so digitos, comecando com 55 e DDD).', parameters: { type: 'object', properties: { telefone: { type: 'string' } }, required: ['telefone'] } } },
+    { type: 'function', function: { name: 'marcar_agendamento', description: 'Cria o compromisso na agenda. Use o iso exato de um horario que a ferramenta de horarios retornou como livre.', parameters: { type: 'object', properties: { inicio_iso: { type: 'string' }, nome: { type: 'string' }, observacao: { type: 'string' } }, required: ['inicio_iso', 'nome'] } } },
+    { type: 'function', function: { name: 'registrar_card_crm', description: 'Cria/atualiza o card do lead no CRM com um resumo da qualificacao (horario, instrumento, igreja/gosto, dor, o que perguntou).', parameters: { type: 'object', properties: { resumo: { type: 'string' } }, required: ['resumo'] } } },
+    { type: 'function', function: { name: 'adicionar_tag', description: 'Marca o lead com uma tag (ex: sdr-instagram).', parameters: { type: 'object', properties: { tag: { type: 'string' } }, required: ['tag'] } } },
+    { type: 'function', function: { name: 'transferir_fila', description: 'Transfere a conversa pra fila humana (o professor assume). O agente para de responder esse lead depois disso.', parameters: { type: 'object', properties: { motivo: { type: 'string' } }, required: ['motivo'] } } },
+  ];
+}
+
+async function _execTool(projeto: string, conversa: any, nomeFerr: string, args: any): Promise<any> {
+  const seed = AGENTE_SEED[projeto] || {};
+  try {
+    if (nomeFerr === 'listar_horarios_livres') {
+      const slots = _slotsLivres(projeto, String(args.periodo || ''), 10);
+      return { ok: true, horarios: slots, sala: seed.sala || '' };
+    }
+    if (nomeFerr === 'salvar_whatsapp') {
+      const tel = String(args.telefone || '').replace(/\D/g, '');
+      if (conversa.contato_id && tel) db.prepare(`UPDATE contatos SET telefone=? WHERE id=?`).run(tel, conversa.contato_id);
+      return { ok: true, telefone: tel };
+    }
+    if (nomeFerr === 'marcar_agendamento') {
+      const inicio = String(args.inicio_iso || '');
+      const durMin = (seed.grade && seed.grade.duracaoMin) || 60;
+      const fim = inicio ? new Date(new Date(inicio).getTime() + durMin * 60000).toISOString() : '';
+      const id = randomUUID();
+      db.prepare(`INSERT INTO eventos(id,projeto,titulo,inicio,fim,contato_id,obs,criado_em) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(id, projeto, 'Sessao ' + projeto + ' - ' + String(args.nome || conversa.telefone), inicio, fim, conversa.contato_id || null, String(args.observacao || ''), agora());
+      return { ok: true, id, inicio, fim, sala: seed.sala || '' };
+    }
+    if (nomeFerr === 'registrar_card_crm') {
+      const id = randomUUID();
+      db.prepare(`INSERT INTO negocios(id,projeto,contato_id,titulo,valor,etapa,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(id, projeto, conversa.contato_id || null, 'Lead SDR - ' + String(conversa.telefone || ''), 0, 'novo', agora(), agora());
+      try { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, conversa.contato_id || null, 'nota', 'CRM: ' + String(args.resumo || ''), agora()); } catch { /* nota best-effort */ }
+      return { ok: true, id };
+    }
+    if (nomeFerr === 'adicionar_tag') {
+      if (conversa.contato_id) aplicarTag(projeto, conversa.contato_id, String(args.tag || ''));
+      return { ok: true };
+    }
+    if (nomeFerr === 'transferir_fila') {
+      db.prepare(`UPDATE agente_conversas SET status='humano', atualizado_em=? WHERE id=?`).run(agora(), conversa.id);
+      if (conversa.contato_id) { try { aplicarTag(projeto, conversa.contato_id, 'fila-humana'); } catch { /* best-effort */ } }
+      return { ok: true, transferido: true };
+    }
+  } catch (e: any) {
+    return { ok: false, erro: String(e && e.message || e) };
+  }
+  return { ok: false, erro: 'ferramenta desconhecida' };
+}
+
+// --------- Chamada ao LLM (API compativel com OpenAI chat/completions) ---------
+async function _chamarLLM(messages: any[], modelo: string, temperatura: number, tools: any[]): Promise<any> {
+  if (!LLM_API_KEY) return { content: '', _semChave: true };
+  const body: any = { model: modelo || LLM_MODEL_PADRAO, messages, temperature: (temperatura == null ? 0.7 : temperatura) };
+  if (tools && tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
+  const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+  const txt = await res.text();
+  let data: any = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch { data = txt; }
+  if (!res.ok) throw new Error(`LLM ${res.status}: ${txt}`);
+  return (data && data.choices && data.choices[0] && data.choices[0].message) || { content: '' };
+}
+
+// --------- Runtime do agente: processa UMA mensagem recebida ---------
+// opts.teste=true: nao envia pelo WhatsApp, devolve as respostas num array (pro Chat de teste).
+async function processarMensagemAgente(projeto: string, telefone: string, texto: string, nome?: string, contatoId?: string, opts?: any): Promise<any> {
+  const teste = !!(opts && opts.teste);
+  const agente = agenteDoProjeto(projeto);
+  if (!agente || !agente.ativo || !String(agente.prompt || '').trim()) {
+    return { ok: false, motivo: 'sem agente ativo/ prompt' };
+  }
+  let conversa = db.prepare(`SELECT * FROM agente_conversas WHERE agente_id=? AND telefone=?`).get(agente.id, telefone) as any;
+  if (!conversa) {
+    const id = randomUUID();
+    db.prepare(`INSERT INTO agente_conversas(id,agente_id,projeto,telefone,contato_id,status,estado,historico,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, agente.id, projeto, telefone, contatoId || null, 'ativo', '{}', '[]', agora(), agora());
+    conversa = db.prepare(`SELECT * FROM agente_conversas WHERE id=?`).get(id) as any;
+  }
+  if (conversa.status !== 'ativo') return { ok: false, motivo: 'conversa nao-ativa (' + conversa.status + ')' };
+
+  let historico: any[] = [];
+  try { historico = JSON.parse(conversa.historico || '[]'); } catch { historico = []; }
+  historico.push({ role: 'user', content: texto });
+
+  const tools = agente.tools_on ? _toolsDef() : [];
+  const respostasEnviadas: string[] = [];
+  try {
+    for (let loop = 0; loop < AGENTE_MAX_TOOL_LOOPS; loop++) {
+      const messages = [{ role: 'system', content: String(agente.prompt || '') }].concat(historico);
+      const msg = await _chamarLLM(messages, agente.modelo, agente.temperatura, tools);
+      if (msg._semChave) { return { ok: false, motivo: 'LLM sem chave (LLM_API_KEY)' }; }
+
+      if (msg.tool_calls && msg.tool_calls.length) {
+        historico.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
+        for (const tc of msg.tool_calls) {
+          let args: any = {};
+          try { args = JSON.parse(tc.function.arguments || '{}'); } catch { args = {}; }
+          const resultado = await _execTool(projeto, conversa, tc.function.name, args);
+          historico.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(resultado) });
+          // se transferiu, recarrega status
+          if (tc.function.name === 'transferir_fila') conversa = db.prepare(`SELECT * FROM agente_conversas WHERE id=?`).get(conversa.id) as any;
+        }
+        continue; // volta pro LLM com os resultados das ferramentas
+      }
+
+      const conteudo = String(msg.content || '').trim();
+      if (conteudo) {
+        historico.push({ role: 'assistant', content: conteudo });
+        respostasEnviadas.push(conteudo);
+        if (!teste) { try { await enviarTexto(projeto as any, telefone, conteudo); } catch (e) { console.log('[agente] enviarTexto falhou', e); } }
+      }
+      break; // sem tool_calls => fim do turno
+    }
+  } catch (e: any) {
+    console.log('[agente] erro no loop:', e && e.message || e);
+  }
+
+  db.prepare(`UPDATE agente_conversas SET historico=?, contato_id=COALESCE(contato_id,?), atualizado_em=? WHERE id=?`)
+    .run(JSON.stringify(historico).slice(0, 200000), contatoId || null, agora(), conversa.id);
+  try { db.prepare(`INSERT INTO agente_logs(id,agente_id,telefone,papel,conteudo,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), agente.id, telefone, 'turno', (respostasEnviadas.join(' | ')).slice(0, 2000), agora()); } catch { /* log best-effort */ }
+  return { ok: true, respostas: respostasEnviadas, status: (db.prepare(`SELECT status FROM agente_conversas WHERE id=?`).get(conversa.id) as any)?.status };
+}
+
+// --------- Endpoints (todos atras do x-api-key, igual os outros) ---------
+app.get('/agentes', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = projeto
+    ? db.prepare(`SELECT * FROM agentes_ia WHERE projeto=? ORDER BY atualizado_em DESC`).all(projeto)
+    : db.prepare(`SELECT * FROM agentes_ia ORDER BY projeto ASC`).all();
+  res.json({ ok: true, agentes: rows, habilitados: (CONFIG as any).agentesHabilitados || {} });
+});
+app.post('/agente', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || '');
+  if (id) {
+    const ex = db.prepare(`SELECT id FROM agentes_ia WHERE id=?`).get(id);
+    if (ex) {
+      db.prepare(`UPDATE agentes_ia SET nome=?, prompt=?, modelo=?, temperatura=?, ativo=?, tools_on=?, config=?, atualizado_em=? WHERE id=?`)
+        .run(String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-5.4-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), id);
+      return res.json({ ok: true, id });
+    }
+  }
+  const novo = id || randomUUID();
+  db.prepare(`INSERT INTO agentes_ia(id,projeto,nome,prompt,modelo,temperatura,ativo,tools_on,config,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(novo, String(b.projeto || ''), String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-5.4-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), agora());
+  res.json({ ok: true, id: novo });
+});
+app.post('/agente/remover', (req, res) => { db.prepare(`DELETE FROM agentes_ia WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/agente/conversas', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  res.json({ ok: true, conversas: db.prepare(`SELECT id,projeto,telefone,status,atualizado_em FROM agente_conversas WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 200`).all(projeto) });
+});
+app.post('/agente/conversa/reativar', (req, res) => { db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.post('/agentes/habilitar', (req, res) => {
+  const b = req.body || {};
+  if (!(CONFIG as any).agentesHabilitados) (CONFIG as any).agentesHabilitados = {};
+  (CONFIG as any).agentesHabilitados[String(b.projeto || '')] = !!b.on;
+  try { salvarConfig(); } catch { /* best-effort */ }
+  res.json({ ok: true, habilitados: (CONFIG as any).agentesHabilitados });
+});
+// Chat de teste: roda o agente sem enviar pelo WhatsApp. telefone 'teste-<proj>' por padrao.
+app.post('/agente/testar', async (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '');
+  const telefone = String(b.telefone || ('teste-' + projeto));
+  const r = await processarMensagemAgente(projeto, telefone, String(b.texto || ''), 'Teste', undefined, { teste: true });
+  res.json(r);
+});
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
