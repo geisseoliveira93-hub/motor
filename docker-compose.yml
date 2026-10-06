@@ -61,6 +61,10 @@ services:
       LASTLINK_TOKEN: ${LASTLINK_TOKEN}
       CADEMI_TOKEN: ${CADEMI_TOKEN:-}
       IMPORTAR_ATIVO: ${IMPORTAR_ATIVO:-true}
+      # ---- Agentes IA (Etapa 14): chave e modelo do LLM (vêm do .env) ----
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
     volumes:
       - enginedata:/data
     ports:
