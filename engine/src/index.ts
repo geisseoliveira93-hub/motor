@@ -1605,8 +1605,8 @@ app.post('/webhook/evolution', (req, res) => {
       const texto = data.message?.conversation || data.message?.extendedTextMessage?.text || '';
       if (telefone && !data.key?.fromMe) {
         const cid = upsertContato(projeto, telefone, data.pushName);
-        db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`)
-          .run(randomUUID(), projeto, cid, 'entrada', texto, agora());
+        try { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,instancia,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, String(ev.instance||''), agora()); }
+        catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
         try { if (((CONFIG as any).agentesHabilitados || {})[projeto]) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid).catch(() => {}); } catch { /* agente IA best-effort, etapa14 */ }
@@ -1631,7 +1631,7 @@ app.post('/webhook/evolution', (req, res) => {
  *       Status: approved, waiting_payment, billet_printed, abandoned, pending, refused, canceled, refunded, chargeback, trial
  */
 function normalizaPagamento(provider: string, b: any): {
-  pedido: string; status: string; telefone: string; nome?: string; email?: string; produtoId?: string; produtoNome?: string;
+  pedido: string; status: string; telefone: string; nome?: string; email?: string; produtoId?: string; produtoNome?: string; valor?: number;
 } {
   if (provider === 'lastlink') {
     const d = b?.Data || b?.data || b;
@@ -1645,6 +1645,7 @@ function normalizaPagamento(provider: string, b: any): {
       email: buyer?.Email || buyer?.email,
       produtoId: String(prod?.Id || prod?.id || ''),
       produtoNome: prod?.Name || prod?.name,
+      valor: Number(prod?.Price || prod?.price || d?.Purchase?.Price || d?.Purchase?.Value || d?.Purchase?.Amount || d?.Offer?.Price || b?.Value || 0),
     };
   }
   // Guru
@@ -1658,6 +1659,7 @@ function normalizaPagamento(provider: string, b: any): {
     email: contato?.email || b?.email,
     produtoId: String(prod?.id || prod?.marketplace_id || b?.product_id || ''),
     produtoNome: prod?.name || b?.product_name,
+    valor: Number(b?.payment?.total || b?.total_value || b?.value || b?.amount || prod?.total_value || prod?.unit_value || b?.payment?.marketplace_value || 0),
   };
 }
 
@@ -1688,6 +1690,16 @@ app.post('/webhook/payment/:provider', async (req, res) => {
     }
     const b = req.body || {};
     const p = normalizaPagamento(provider, b);
+    // Faturamento: registra/atualiza a venda (upsert por pedido) — NAO depende do dedupe de entrega.
+    try {
+      const _projT = projetoDoProduto(p.produtoId, p.produtoNome);
+      const _catT = classificaPagamento(provider, p.status);
+      const _stF = statusFaturamento(p.status, _catT);
+      const _cidT = p.telefone ? upsertContato(_projT, p.telefone, p.nome, p.email, `pagamento:${provider}`) : null;
+      const _exT = db.prepare(`SELECT id FROM transacoes WHERE id=?`).get(p.pedido);
+      if (_exT) db.prepare(`UPDATE transacoes SET valor=?, status=?, provider=?, produto=?, contato_id=COALESCE(contato_id,?) WHERE id=?`).run(Number(p.valor || 0), _stF, provider, p.produtoNome || '', _cidT, p.pedido);
+      else db.prepare(`INSERT INTO transacoes(id,projeto,contato_id,produto,valor,status,provider,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(p.pedido, _projT, _cidT, p.produtoNome || '', Number(p.valor || 0), _stF, provider, agora());
+    } catch { /* faturamento best-effort */ }
 
     // dedupe por pedido
     const ja = db.prepare(`SELECT 1 FROM pagamentos_processados WHERE provider=? AND pedido=?`).get(provider, p.pedido);
@@ -2223,6 +2235,7 @@ CREATE TABLE IF NOT EXISTS atendimentos (
 `);
 try { db.exec(`ALTER TABLE contatos ADD COLUMN canal TEXT DEFAULT 'wa'`); } catch { /* coluna ja existe */ }
 try { db.exec(`ALTER TABLE mensagens ADD COLUMN canal TEXT DEFAULT 'wa'`); } catch { /* coluna ja existe */ }
+try { db.exec(`ALTER TABLE mensagens ADD COLUMN instancia TEXT`); } catch { /* ja existe */ }
 
 function hhmmCA(iso: string): string {
   try {
@@ -2263,11 +2276,13 @@ app.get('/atendimento/conversas', (req, res) => {
     const querIA = canal.indexOf('ia') === 0;  // abas que comecam com "ia"
     const rows = db.prepare(`
       SELECT c.id contato_id, c.nome, c.telefone, c.projeto, COALESCE(c.canal,'wa') net,
-             m.texto ultima, MAX(m.criado_em) quando
+             m.texto ultima, m.instancia inst_msg, MAX(m.criado_em) quando
       FROM mensagens m JOIN contatos c ON c.id=m.contato_id
       GROUP BY c.id ORDER BY quando DESC LIMIT 400
     `).all() as any[];
     const out: any[] = [];
+    const _numByInst: any = {}; const _numByProj: any = {};
+    for (const nn of (db.prepare(`SELECT instancia, projeto, telefone, tipo FROM numeros ORDER BY criado_em`).all() as any[])) { if (nn.instancia) _numByInst[nn.instancia] = nn; if (nn.projeto && !_numByProj[nn.projeto]) _numByProj[nn.projeto] = nn; }
     for (const r of rows) {
       const net = r.net || 'wa';
       const ehSocial = net === 'ig' || net === 'fb';
@@ -2276,10 +2291,16 @@ app.get('/atendimento/conversas', (req, res) => {
       if (st.status === 'finalizado') continue;
       const ehIA = st.status === 'ia';
       if (querIA !== ehIA) continue;
+      const _nn = _numByInst[r.inst_msg] || _numByProj[r.projeto] || null;
+      const _tel = _nn ? _nn.telefone : '';
+      const _of = !!(_nn && /oficial/i.test(String(_nn.tipo || '')) && !/nao/i.test(String(_nn.tipo || '')));
       out.push({
         contato_id: r.contato_id, nome: r.nome || r.telefone, inst: r.projeto || '', net,
         tipo: 'dm', status: st.status, dev: 0, ultima: r.ultima || '',
         hora: hhmmCA(r.quando), ph: r.telefone || '', live: ehIA,
+        numero: _tel, num4: String(_tel).replace(/\D/g,'').slice(-4),
+        oficial: _of,
+        instancia: r.inst_msg || '',
       });
     }
     res.json({ ok: true, conversas: out });
@@ -2496,6 +2517,48 @@ async function tickCampanha() {
   } finally { _campEnviando = false; }
 }
 setInterval(tickCampanha, 1000);
+
+
+
+// ---- Faturamento (Dashboard estilo SellFlux) ----
+function statusFaturamento(statusRaw: string, categoria: string): string {
+  const s = String(statusRaw || '').toLowerCase();
+  if (categoria === 'reembolso') return 'estorno';
+  if (categoria === 'aprovado') return 'liquidada';
+  if (/waiting|pending|billet|boleto|aguard|pix.*(pend|gerad)|request_confirmed/.test(s)) return 'aguardando';
+  if (categoria === 'perdido') return 'perdido';
+  return 'outro';
+}
+function _rangeFat(periodo: string): { de: string; ate: string } {
+  const now = new Date(); const ate = new Date(now);
+  const de = new Date(now); de.setHours(0, 0, 0, 0);
+  const p = String(periodo || '30d');
+  if (p === 'hoje') { /* de=hoje 00:00 */ }
+  else if (p === 'ontem') { de.setDate(de.getDate() - 1); ate.setDate(ate.getDate() - 1); ate.setHours(23, 59, 59, 999); }
+  else if (p === '3d') de.setDate(de.getDate() - 2);
+  else if (p === '7d') de.setDate(de.getDate() - 6);
+  else if (p === '30d') de.setDate(de.getDate() - 29);
+  else if (p === '90d') de.setDate(de.getDate() - 89);
+  else if (p === 'mes') de.setDate(1);
+  else if (p === 'mespassado') { de.setDate(1); de.setMonth(de.getMonth() - 1); const fim = new Date(de.getFullYear(), de.getMonth() + 1, 0, 23, 59, 59, 999); return { de: de.toISOString(), ate: fim.toISOString() }; }
+  else if (p === 'vitalicio') { de.setFullYear(2000); }
+  else de.setDate(de.getDate() - 29);
+  return { de: de.toISOString(), ate: ate.toISOString() };
+}
+app.get('/relatorios/faturamento', (req, res) => {
+  try {
+    const { de, ate } = _rangeFat(String(req.query.periodo || '30d'));
+    const projeto = String(req.query.projeto || '');
+    const where = `criado_em >= ? AND criado_em <= ?` + (projeto ? ` AND projeto=?` : '');
+    const args: any[] = projeto ? [de, ate, projeto] : [de, ate];
+    const rows = db.prepare(`SELECT substr(criado_em,1,10) dia, status, SUM(valor) v, COUNT(*) n FROM transacoes WHERE ${where} GROUP BY dia, status ORDER BY dia`).all(...args) as any[];
+    const totaisRows = db.prepare(`SELECT status, SUM(valor) v, COUNT(*) n FROM transacoes WHERE ${where} GROUP BY status`).all(...args) as any[];
+    const totais: any = { liquidada: 0, aguardando: 0, estorno: 0, perdido: 0, outro: 0 };
+    for (const t of totaisRows) totais[t.status] = t.v || 0;
+    const leadsAtivos = (db.prepare(`SELECT COUNT(*) n FROM contatos` + (projeto ? ` WHERE projeto=?` : ``)).get(...(projeto ? [projeto] : [])) as any)?.n || 0;
+    res.json({ ok: true, de, ate, dias: rows, totais, leadsAtivos });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
 
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
