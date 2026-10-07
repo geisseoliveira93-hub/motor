@@ -2347,4 +2347,155 @@ app.get('/atendimento/numeros', (_req, res) => {
 });
 
 
+
+// ============================================================================
+// ETAPA 15b — Grupos + Disparo em massa (blocos/mídia/velocidade/agendamento/
+// sequência) + Tags (listar/criar). ADITIVO. Namespace /disparo/*.
+// Reaproveita evo/enviarTexto/enviarMidia/aplicarTag/fila_envio. O disparo usa
+// status 'camp_pend' na fila + ticker próprio (NÃO mexe no tickFila existente).
+// ============================================================================
+db.exec(`
+CREATE TABLE IF NOT EXISTS grupos_wpp (
+  id TEXT PRIMARY KEY,
+  projeto TEXT,
+  instancia TEXT,
+  nome TEXT,
+  tamanho INTEGER DEFAULT 0,
+  inst_manual TEXT,
+  atualizado_em TEXT
+);
+`);
+
+app.post('/disparo/grupos/sincronizar', async (req, res) => {
+  try {
+    const projetoFiltro = String((req.body || {}).projeto || '');
+    const nums = db.prepare(`SELECT instancia, projeto FROM numeros${projetoFiltro ? ' WHERE projeto=?' : ''}`).all(...(projetoFiltro ? [projetoFiltro] : [])) as any[];
+    let total = 0; const erros: string[] = [];
+    for (const n of nums) {
+      if (!n.instancia) continue;
+      try {
+        const r: any = await evo(`/group/fetchAllGroups/${n.instancia}?getParticipants=false`, 'GET');
+        const arr: any[] = Array.isArray(r) ? r : (r?.groups || r?.data || []);
+        const up = db.prepare(`INSERT INTO grupos_wpp(id,projeto,instancia,nome,tamanho,atualizado_em) VALUES(?,?,?,?,?,?)
+          ON CONFLICT(id) DO UPDATE SET nome=excluded.nome, tamanho=excluded.tamanho, instancia=excluded.instancia, projeto=excluded.projeto, atualizado_em=excluded.atualizado_em`);
+        const tx = db.transaction(() => {
+          for (const g of arr) {
+            const jid = g.id || g.jid || g.remoteJid; if (!jid) continue;
+            up.run(String(jid), n.projeto, n.instancia, g.subject || g.name || String(jid), Number(g.size || (g.participants ? g.participants.length : 0) || 0), agora());
+            total++;
+          }
+        });
+        tx();
+      } catch (e: any) { erros.push(`${n.instancia}: ${String(e.message || e)}`); }
+    }
+    res.json({ ok: true, total, erros });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.get('/disparo/grupos', (_req, res) => {
+  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho FROM grupos_wpp ORDER BY projeto, nome`).all();
+  res.json({ ok: true, grupos: rows });
+});
+
+app.post('/disparo/grupo/instrumento', (req, res) => {
+  const b = req.body || {};
+  db.prepare(`UPDATE grupos_wpp SET inst_manual=? WHERE id=?`).run(String(b.inst || ''), String(b.id || ''));
+  res.json({ ok: true });
+});
+
+app.get('/disparo/tags', (req, res) => {
+  const projeto = String(req.query.projeto || '');
+  const rows = db.prepare(`SELECT t.nome, t.projeto, COUNT(ct.contato_id) n FROM tags t LEFT JOIN contato_tags ct ON ct.tag_id=t.id ${projeto ? 'WHERE t.projeto=?' : ''} GROUP BY t.id ORDER BY n DESC LIMIT 500`).all(...(projeto ? [projeto] : [])) as any[];
+  res.json({ ok: true, tags: rows.map((r) => ({ nome: r.nome, inst: r.projeto, n: r.n })) });
+});
+
+app.post('/disparo/tag/criar', (req, res) => {
+  const b = req.body || {}; const nome = String(b.nome || '').trim(); const projeto = String(b.projeto || '');
+  if (!nome || !projeto) return res.json({ ok: false, erro: 'nome/projeto' });
+  const ex = db.prepare(`SELECT id FROM tags WHERE projeto=? AND nome=?`).get(projeto, nome);
+  if (!ex) db.prepare(`INSERT INTO tags(id,projeto,nome) VALUES(?,?,?)`).run(randomUUID(), projeto, nome);
+  res.json({ ok: true, nome, projeto });
+});
+
+function _alvosDisparo(p: any): { projeto: string; para: string; grupo: boolean }[] {
+  const out: { projeto: string; para: string; grupo: boolean }[] = [];
+  const padrao = (CONFIG as any).projetoPadrao || 'teclado';
+  if (p.alvoTipo === 'grupos') {
+    for (const jid of (p.grupos || [])) {
+      const g = db.prepare(`SELECT projeto FROM grupos_wpp WHERE id=?`).get(jid) as any;
+      out.push({ projeto: g?.projeto || p.projeto || padrao, para: String(jid), grupo: true });
+    }
+  } else {
+    const inc = (p.incluirTags || []); const exc = (p.excluirTags || []);
+    if (!inc.length) return out;
+    const ph = (a: any[]) => a.map(() => '?').join(',');
+    let sql = `SELECT DISTINCT c.id, c.telefone, c.projeto FROM contatos c
+      JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id
+      WHERE t.nome IN (${ph(inc)})`;
+    const args: any[] = [...inc];
+    if (exc.length) { sql += ` AND c.id NOT IN (SELECT ct2.contato_id FROM contato_tags ct2 JOIN tags t2 ON t2.id=ct2.tag_id WHERE t2.nome IN (${ph(exc)}))`; args.push(...exc); }
+    if (p.projeto) { sql += ` AND c.projeto=?`; args.push(p.projeto); }
+    const rows = db.prepare(sql).all(...args) as any[];
+    for (const r of rows) if (r.telefone) out.push({ projeto: r.projeto || p.projeto || padrao, para: String(r.telefone), grupo: false });
+  }
+  return out;
+}
+
+function _enfileiraDisparo(p: any): number {
+  const alvos = _alvosDisparo(p);
+  const blocos = (p.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+  if (!alvos.length || !blocos.length) return 0;
+  const intervalo = Math.max(1, Number(p.intervaloSegundos || 12));
+  const base = p.agendamento ? new Date(p.agendamento).getTime() : Date.now();
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
+  let n = 0;
+  const tx = db.transaction(() => {
+    alvos.forEach((a, i) => {
+      blocos.forEach((b: any, j: number) => {
+        const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
+        const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
+        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora());
+        n++;
+      });
+    });
+  });
+  tx();
+  return n;
+}
+
+app.post('/disparo/enviar', (req, res) => {
+  try { const n = _enfileiraDisparo(req.body || {}); res.json({ ok: true, enfileirados: n }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.post('/disparo/sequencia', (req, res) => {
+  try { let n = 0; for (const passo of (((req.body || {}).sequencia) || [])) n += _enfileiraDisparo(passo); res.json({ ok: true, enfileirados: n }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// resumo do disparo (pendentes/enviados/falhou)
+app.get('/disparo/resumo', (_req, res) => {
+  res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE status IN ('camp_pend','enviado','falhou') GROUP BY status`).all() });
+});
+
+// ticker próprio do disparo (1s; respeita o agendado_para → intervalo/agenda; NÃO toca no tickFila)
+let _campEnviando = false;
+async function tickCampanha() {
+  if (_campEnviando) return; _campEnviando = true;
+  try {
+    const item = db.prepare(`SELECT * FROM fila_envio WHERE status='camp_pend' AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em LIMIT 1`).get(agora()) as any;
+    if (item) {
+      try {
+        if ((item.tipo || 'texto') === 'texto') await enviarTexto(item.projeto, item.para, item.texto || '');
+        else await enviarMidia(item.projeto, item.para, item.tipo, item.url || '', item.legenda || '');
+        db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+      } catch {
+        db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'camp_pend' END WHERE id=?`).run(item.id);
+      }
+    }
+  } finally { _campEnviando = false; }
+}
+setInterval(tickCampanha, 1000);
+
+
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
