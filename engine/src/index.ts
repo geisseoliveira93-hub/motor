@@ -18,7 +18,7 @@
  */
 import express from 'express';
 import Database from 'better-sqlite3';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 
 const PORT = Number(process.env.PORT || 8080);
@@ -2559,6 +2559,783 @@ app.get('/relatorios/faturamento', (req, res) => {
     res.json({ ok: true, de, ate, dias: rows, totais, leadsAtivos });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+
+
+
+// ============================================================================
+// ETAPA 16 — Publicação na nuvem (espelhamento + migração do PC) — ADITIVO
+// Espelha no motor o sistema de postagem/calendário/limpeza do app do PC, +
+// as automações do PC2 (boas-vindas a novos seguidores, prospecção/directs) +
+// a ponte "reunião qualificada -> Google Agenda" (que NÃO existia no PC).
+// Nada aqui posta de verdade ainda: uploaders/sessões/tokens entram amanhã.
+// Tudo gated por flags; schema em try/catch pra nunca quebrar o engine no boot.
+// Namespaces: /pub/*  /sdr/*  /agenda/*
+// ============================================================================
+try {
+  db.exec(`
+  CREATE TABLE IF NOT EXISTS canais_publicacao (
+    id TEXT PRIMARY KEY, nome TEXT, projeto TEXT, instrumento TEXT, cor TEXT,
+    ativo INTEGER DEFAULT 1, plataformas_json TEXT DEFAULT '[]',
+    ig_business_id TEXT, fb_page_id TEXT, yt_channel_id TEXT, tiktok_open_id TEXT,
+    threads_user_id TEXT, pinterest_board_id TEXT,
+    descricao_template TEXT, descricao_social_template TEXT, hashtags_padrao_json TEXT,
+    usar_horario_otimo INTEGER DEFAULT 0, mover_publicados INTEGER DEFAULT 1,
+    criado_em TEXT, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS horarios_preferidos (
+    id TEXT PRIMARY KEY, canal_id TEXT, dia_semana INTEGER, horario TEXT,
+    ativo INTEGER DEFAULT 1, formato TEXT, trilha TEXT
+  );
+  CREATE TABLE IF NOT EXISTS fila_publicacao (
+    id TEXT PRIMARY KEY, canal_id TEXT, projeto TEXT,
+    onedrive_ref TEXT, onedrive_item_id TEXT, arquivo_nome TEXT, thumb_ref TEXT,
+    formato TEXT, plataformas_json TEXT DEFAULT '[]',
+    titulo TEXT, descricao TEXT, descricao_social TEXT,
+    data_agendada TEXT, status TEXT DEFAULT 'agendado',
+    resultado_por_plataforma_json TEXT, erro TEXT,
+    movido_para_publicados INTEGER DEFAULT 0, data_movido TEXT,
+    arquivo_apagado INTEGER DEFAULT 0, data_arquivo_apagado TEXT,
+    video_ids_externos_json TEXT, stats_json TEXT,
+    tentativas_consecutivas INTEGER DEFAULT 0, prioridade INTEGER DEFAULT 0,
+    aguardando_instrumento INTEGER DEFAULT 0, trial_reels INTEGER DEFAULT 0,
+    criado_em TEXT, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS conexoes_sociais (
+    id TEXT PRIMARY KEY, canal_id TEXT, plataforma TEXT, metodo TEXT,
+    status TEXT DEFAULT 'desconhecido', detalhe TEXT,
+    ultimo_sucesso TEXT, ultimo_check TEXT, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS oauth_tokens_pub (
+    canal_id TEXT, plataforma TEXT, access_token_enc TEXT, refresh_token_enc TEXT,
+    expires_at TEXT, scope TEXT, conta TEXT, atualizado_em TEXT,
+    PRIMARY KEY (canal_id, plataforma)
+  );
+  CREATE TABLE IF NOT EXISTS playwright_sessoes (
+    canal_id TEXT, plataforma TEXT, storage_state_enc TEXT, user_agent TEXT,
+    handle_logado TEXT, logado_em TEXT, ultima_validacao TEXT,
+    sessao_valida INTEGER DEFAULT 0, motivo_ultima_falha TEXT,
+    PRIMARY KEY (canal_id, plataforma)
+  );
+  CREATE TABLE IF NOT EXISTS pub_kv (chave TEXT PRIMARY KEY, valor TEXT, atualizado_em TEXT);
+  -- Boas-vindas a novos seguidores + prospecção (espelho do PC2)
+  CREATE TABLE IF NOT EXISTS bv_config (
+    canal_id TEXT PRIMARY KEY, plataforma TEXT DEFAULT 'instagram',
+    daily_limit INTEGER DEFAULT 15, limit_jitter INTEGER DEFAULT 3,
+    batch_size INTEGER DEFAULT 5, batch_pause_min INTEGER DEFAULT 30,
+    janela_hora_inicio INTEGER DEFAULT 8, janela_hora_fim INTEGER DEFAULT 21,
+    warmup_enabled INTEGER DEFAULT 1, warmup_start_limit INTEGER DEFAULT 5, warmup_step_per_day INTEGER DEFAULT 2,
+    day_off_weekday INTEGER, first_use_date TEXT, stop_words TEXT DEFAULT 'parar,stop,sair,cancelar',
+    mensagens_json TEXT, dry_run INTEGER DEFAULT 1, paused_by_user INTEGER DEFAULT 0, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS bv_fila (
+    id TEXT PRIMARY KEY, canal_id TEXT, plataforma TEXT, username TEXT, display_name TEXT,
+    tipo TEXT DEFAULT 'welcome', seq_index INTEGER DEFAULT 0, texto_pronto TEXT,
+    not_before TEXT, status TEXT DEFAULT 'pendente', attempts INTEGER DEFAULT 0,
+    motivo_falha TEXT, enviado_em TEXT, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS bv_enviados (
+    id TEXT PRIMARY KEY, canal_id TEXT, plataforma TEXT, username TEXT, tipo TEXT,
+    seq_index INTEGER DEFAULT 0, texto TEXT, sent_at TEXT, respondeu_em TEXT, followup_enviado INTEGER DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS bv_seguidores (
+    canal_id TEXT, plataforma TEXT, username TEXT, display_name TEXT, visto_em TEXT,
+    PRIMARY KEY (canal_id, plataforma, username)
+  );
+  CREATE TABLE IF NOT EXISTS bv_blocklist (
+    canal_id TEXT, plataforma TEXT, username TEXT, reason TEXT, criado_em TEXT,
+    PRIMARY KEY (canal_id, plataforma, username)
+  );
+  -- Ponte reunião -> Google Agenda (NOVO: não existia no PC)
+  CREATE TABLE IF NOT EXISTS reunioes_sdr (
+    id TEXT PRIMARY KEY, projeto TEXT, lead_nome TEXT, lead_telefone TEXT, lead_email TEXT,
+    origem TEXT, titulo TEXT, inicio TEXT, fim TEXT, observacao TEXT,
+    status TEXT DEFAULT 'agendada', google_event_id TEXT, criado_em TEXT, atualizado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS gcal_event_map (
+    tipo TEXT, ref_id TEXT, google_event_id TEXT, atualizado_em TEXT, PRIMARY KEY (tipo, ref_id)
+  );
+  CREATE INDEX IF NOT EXISTS ix_fila_pub_status ON fila_publicacao(status, data_agendada);
+  CREATE INDEX IF NOT EXISTS ix_fila_pub_canal ON fila_publicacao(canal_id, data_agendada);
+  CREATE INDEX IF NOT EXISTS ix_bv_fila_status ON bv_fila(status, not_before);
+  `);
+} catch (e) { console.error('[etapa16] schema erro (ignorado p/ não derrubar o engine):', e); }
+
+// ---- flags de operação (só ATIVA de verdade quando a gente ligar amanhã) ----
+function pubFlag(chave: string, padrao = '0'): string {
+  try { const r = db.prepare(`SELECT valor FROM pub_kv WHERE chave=?`).get(chave) as any; return r ? String(r.valor) : padrao; }
+  catch { return padrao; }
+}
+function setPubFlag(chave: string, valor: string) {
+  db.prepare(`INSERT INTO pub_kv(chave,valor,atualizado_em) VALUES(?,?,?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em`).run(chave, valor, agora());
+}
+
+// ---- cripto AES-256-GCM p/ tokens/sessões (substitui o safeStorage do Electron) ----
+function _chaveMestra(): Buffer {
+  const base = process.env.MOTOR_SECRET_KEY || (CONFIG as any).apiKey || 'motor-chave-provisoria-trocar';
+  return createHash('sha256').update(String(base)).digest();
+}
+function cifra(texto: string): string {
+  try {
+    const iv = randomBytes(12); const c = createCipheriv('aes-256-gcm', _chaveMestra(), iv);
+    const enc = Buffer.concat([c.update(String(texto), 'utf8'), c.final()]); const tag = c.getAuthTag();
+    return 'v1:' + Buffer.concat([iv, tag, enc]).toString('base64');
+  } catch { return ''; }
+}
+function decifra(blob: string): string {
+  try {
+    if (!blob || !blob.startsWith('v1:')) return '';
+    const raw = Buffer.from(blob.slice(3), 'base64');
+    const iv = raw.subarray(0, 12), tag = raw.subarray(12, 28), enc = raw.subarray(28);
+    const d = createDecipheriv('aes-256-gcm', _chaveMestra(), iv); d.setAuthTag(tag);
+    return Buffer.concat([d.update(enc), d.final()]).toString('utf8');
+  } catch { return ''; }
+}
+
+// ---- saúde de conexão: deriva status por rede/canal (tokens + sessões + último sucesso) ----
+function _statusConexao(canalId: string, plataforma: string): any {
+  const tok = db.prepare(`SELECT expires_at, atualizado_em FROM oauth_tokens_pub WHERE canal_id=? AND plataforma=?`).get(canalId, plataforma) as any;
+  const ses = db.prepare(`SELECT sessao_valida, motivo_ultima_falha, ultima_validacao FROM playwright_sessoes WHERE canal_id=? AND plataforma=?`).get(canalId, plataforma) as any;
+  const conx = db.prepare(`SELECT status, detalhe, ultimo_sucesso FROM conexoes_sociais WHERE canal_id=? AND plataforma=?`).get(canalId, plataforma) as any;
+  let status = 'nao_configurado'; let detalhe = '';
+  if (tok && tok.access_token_enc !== '') { status = 'conectado'; detalhe = 'API'; }
+  if (ses) { if (ses.sessao_valida) { status = 'conectado'; detalhe = (detalhe ? detalhe + '+' : '') + 'sessão'; } else if (ses.motivo_ultima_falha) { status = 'desconectado'; detalhe = String(ses.motivo_ultima_falha); } }
+  if (conx && conx.status && conx.status !== 'desconhecido') { status = conx.status; if (conx.detalhe) detalhe = String(conx.detalhe); }
+  return { canal_id: canalId, plataforma, status, detalhe, ultimo_sucesso: conx?.ultimo_sucesso || null };
+}
+
+// ======================= ENDPOINTS: CANAIS / HORÁRIOS =======================
+app.get('/pub/canais', (_req, res) => {
+  try { res.json({ ok: true, canais: db.prepare(`SELECT * FROM canais_publicacao ORDER BY projeto, nome`).all() }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/canais', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    const ex = db.prepare(`SELECT id FROM canais_publicacao WHERE id=?`).get(id);
+    if (ex) {
+      db.prepare(`UPDATE canais_publicacao SET nome=?, projeto=?, instrumento=?, cor=?, ativo=?, plataformas_json=?, ig_business_id=?, fb_page_id=?, yt_channel_id=?, tiktok_open_id=?, threads_user_id=?, pinterest_board_id=?, descricao_template=?, descricao_social_template=?, hashtags_padrao_json=?, usar_horario_otimo=?, mover_publicados=?, atualizado_em=? WHERE id=?`)
+        .run(b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), id);
+    } else {
+      db.prepare(`INSERT INTO canais_publicacao(id,nome,projeto,instrumento,cor,ativo,plataformas_json,ig_business_id,fb_page_id,yt_channel_id,tiktok_open_id,threads_user_id,pinterest_board_id,descricao_template,descricao_social_template,hashtags_padrao_json,usar_horario_otimo,mover_publicados,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), agora());
+    }
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/horarios', (req, res) => {
+  try { res.json({ ok: true, horarios: db.prepare(`SELECT * FROM horarios_preferidos WHERE canal_id=? ORDER BY dia_semana, horario`).all(String(req.query.canal || '')) }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/horarios', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    if (b.remover) { db.prepare(`DELETE FROM horarios_preferidos WHERE id=?`).run(id); return res.json({ ok: true, removido: id }); }
+    db.prepare(`INSERT INTO horarios_preferidos(id,canal_id,dia_semana,horario,ativo,formato,trilha) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET dia_semana=excluded.dia_semana, horario=excluded.horario, ativo=excluded.ativo, formato=excluded.formato, trilha=excluded.trilha`)
+      .run(id, String(b.canal_id || ''), Number(b.dia_semana || 0), String(b.horario || '10:00'), b.ativo != null ? (b.ativo ? 1 : 0) : 1, b.formato || null, b.trilha || null);
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ======================= ENDPOINTS: FILA / CALENDÁRIO =======================
+app.get('/pub/fila', (req, res) => {
+  try {
+    const q = req.query as any; const w: string[] = []; const a: any[] = [];
+    if (q.canal) { w.push('canal_id=?'); a.push(String(q.canal)); }
+    if (q.status) { w.push('status=?'); a.push(String(q.status)); }
+    if (q.de) { w.push('data_agendada>=?'); a.push(String(q.de)); }
+    if (q.ate) { w.push('data_agendada<=?'); a.push(String(q.ate)); }
+    const sql = `SELECT * FROM fila_publicacao ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY data_agendada ASC LIMIT ${Math.min(2000, Number(q.limite || 1000))}`;
+    res.json({ ok: true, itens: db.prepare(sql).all(...a) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/calendario', (req, res) => {
+  try {
+    const q = req.query as any;
+    const de = String(q.de || new Date(Date.now()).toISOString().slice(0, 10));
+    const ate = String(q.ate || new Date(Date.now() + 30 * 864e5).toISOString().slice(0, 10));
+    const w: string[] = ['date(data_agendada)>=date(?)', 'date(data_agendada)<=date(?)']; const a: any[] = [de, ate];
+    if (q.canal) { w.push('canal_id=?'); a.push(String(q.canal)); }
+    const itens = db.prepare(`SELECT id,canal_id,titulo,formato,plataformas_json,data_agendada,status FROM fila_publicacao WHERE ${w.join(' AND ')} ORDER BY data_agendada ASC`).all(...a) as any[];
+    const porDia: any = {};
+    for (const it of itens) { const d = String(it.data_agendada || '').slice(0, 10); (porDia[d] = porDia[d] || []).push(it); }
+    res.json({ ok: true, de, ate, itens, porDia });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/resumo', (_req, res) => {
+  try {
+    const hoje = new Date().toISOString().slice(0, 10);
+    const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_publicacao GROUP BY status`).all();
+    const agendadosHoje = (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE date(data_agendada)=date(?) AND status='agendado'`).get(hoje) as any)?.n || 0;
+    const prox7 = (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE date(data_agendada)>=date(?) AND date(data_agendada)<=date(?,'+7 day') AND status='agendado'`).get(hoje, hoje) as any)?.n || 0;
+    const publicadosHoje = (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE date(atualizado_em)=date(?) AND status='publicado'`).get(hoje) as any)?.n || 0;
+    const porCanal = db.prepare(`SELECT c.nome, c.id canal_id, COUNT(f.id) n FROM canais_publicacao c LEFT JOIN fila_publicacao f ON f.canal_id=c.id AND f.status='agendado' GROUP BY c.id ORDER BY n DESC`).all();
+    res.json({ ok: true, porStatus, agendadosHoje, prox7, publicadosHoje, porCanal });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/historico', (req, res) => {
+  try {
+    const dias = Math.min(365, Number((req.query as any).dias || 30));
+    const w: string[] = [`status='publicado'`, `date(atualizado_em)>=date('now','-${dias} day')`]; const a: any[] = [];
+    if ((req.query as any).canal) { w.push('canal_id=?'); a.push(String((req.query as any).canal)); }
+    res.json({ ok: true, itens: db.prepare(`SELECT * FROM fila_publicacao WHERE ${w.join(' AND ')} ORDER BY atualizado_em DESC LIMIT 500`).all(...a) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/agendar', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    // anti-duplicata: mesmo canal + mesmo onedrive_ref não finalizado
+    if (b.onedrive_ref) {
+      const dup = db.prepare(`SELECT id FROM fila_publicacao WHERE canal_id=? AND onedrive_ref=? AND status NOT IN ('cancelado','publicado')`).get(String(b.canal_id || ''), String(b.onedrive_ref)) as any;
+      if (dup) return res.json({ ok: true, id: dup.id, jaExistia: true });
+    }
+    db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,onedrive_item_id,arquivo_nome,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,prioridade,trial_reels,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, String(b.canal_id || ''), String(b.projeto || ''), b.onedrive_ref || null, b.onedrive_item_id || null, b.arquivo_nome || null, b.thumb_ref || null, String(b.formato || 'vertical'), JSON.stringify(b.plataformas || []), b.titulo || null, b.descricao || null, b.descricao_social || null, String(b.data_agendada || agora()), 'agendado', Number(b.prioridade || 0), b.trial_reels ? 1 : 0, agora(), agora());
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/cancelar', (req, res) => {
+  try { db.prepare(`UPDATE fila_publicacao SET status='cancelado', atualizado_em=? WHERE id=?`).run(agora(), String((req.body || {}).id || '')); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/reagendar', (req, res) => {
+  try { const b = req.body || {}; db.prepare(`UPDATE fila_publicacao SET data_agendada=?, status='agendado', atualizado_em=? WHERE id=?`).run(String(b.data_agendada || agora()), agora(), String(b.id || '')); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
+app.get('/pub/conexoes', (_req, res) => {
+  try {
+    const canais = db.prepare(`SELECT id, nome, projeto, plataformas_json FROM canais_publicacao WHERE ativo=1`).all() as any[];
+    const out: any[] = [];
+    for (const c of canais) {
+      let plats: string[] = []; try { plats = JSON.parse(c.plataformas_json || '[]'); } catch {}
+      for (const p of plats) out.push({ canal_nome: c.nome, projeto: c.projeto, ..._statusConexao(c.id, p) });
+    }
+    const resumo = { conectado: out.filter((x) => x.status === 'conectado').length, desconectado: out.filter((x) => x.status === 'desconectado').length, nao_configurado: out.filter((x) => x.status === 'nao_configurado').length, total: out.length };
+    res.json({ ok: true, conexoes: out, resumo });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/conexao/status', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.canal_id || '') + ':' + String(b.plataforma || '');
+    db.prepare(`INSERT INTO conexoes_sociais(id,canal_id,plataforma,metodo,status,detalhe,ultimo_sucesso,ultimo_check,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, detalhe=excluded.detalhe, ultimo_check=excluded.ultimo_check, atualizado_em=excluded.atualizado_em`)
+      .run(id, String(b.canal_id || ''), String(b.plataforma || ''), b.metodo || null, String(b.status || 'desconhecido'), b.detalhe || null, b.ultimo_sucesso || null, agora(), agora());
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ======================= ENDPOINTS: SDR / BOAS-VINDAS (espelho) =======================
+app.get('/sdr/resumo', (_req, res) => {
+  try {
+    const hoje = new Date().toISOString().slice(0, 10);
+    const enviadosHoje = (db.prepare(`SELECT COUNT(*) n FROM bv_enviados WHERE date(sent_at)=date(?)`).get(hoje) as any)?.n || 0;
+    const naFila = (db.prepare(`SELECT COUNT(*) n FROM bv_fila WHERE status='pendente'`).get() as any)?.n || 0;
+    const seguidoresConhecidos = (db.prepare(`SELECT COUNT(*) n FROM bv_seguidores`).get() as any)?.n || 0;
+    const porTipo = db.prepare(`SELECT tipo, COUNT(*) n FROM bv_fila WHERE status='pendente' GROUP BY tipo`).all();
+    res.json({ ok: true, enviadosHoje, naFila, seguidoresConhecidos, porTipo, ativo: pubFlag('sdr_ativo') === '1' });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/sdr/fila', (req, res) => {
+  try { res.json({ ok: true, itens: db.prepare(`SELECT * FROM bv_fila WHERE status=? ORDER BY not_before ASC LIMIT 500`).all(String((req.query as any).status || 'pendente')) }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ======================= ENDPOINTS: AGENDA / REUNIÃO (ponte NOVA) =======================
+// A SellFlux (ou o agente) chama isto quando qualifica e marca a reunião de diagnóstico.
+// Grava a reunião e, quando o Google estiver conectado, cria o evento na agenda do dono.
+app.post('/agenda/reuniao', async (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    const inicio = String(b.inicio || ''); if (!inicio) return res.json({ ok: false, erro: 'inicio_obrigatorio' });
+    const fim = String(b.fim || new Date(new Date(inicio).getTime() + 45 * 60000).toISOString());
+    const titulo = String(b.titulo || ('Diagnóstico — ' + (b.lead_nome || 'Lead')));
+    db.prepare(`INSERT INTO reunioes_sdr(id,projeto,lead_nome,lead_telefone,lead_email,origem,titulo,inicio,fim,observacao,status,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET inicio=excluded.inicio, fim=excluded.fim, titulo=excluded.titulo, atualizado_em=excluded.atualizado_em`)
+      .run(id, String(b.projeto || ''), b.lead_nome || null, b.lead_telefone || null, b.lead_email || null, b.origem || null, titulo, inicio, fim, b.observacao || null, 'agendada', agora(), agora());
+    let googleEventId: string | null = null; let avisoGoogle = '';
+    if (pubFlag('gcal_ativo') === '1') {
+      try { googleEventId = await _gcalCriarEvento({ tipo: 'reuniao', refId: id, titulo, inicio, fim, descricao: (b.observacao || '') + '\nLead: ' + (b.lead_nome || '') + ' ' + (b.lead_telefone || ''), convidadoEmail: b.lead_email || '' }); }
+      catch (e: any) { avisoGoogle = 'google_falhou: ' + String(e.message || e); }
+      if (googleEventId) db.prepare(`UPDATE reunioes_sdr SET google_event_id=? WHERE id=?`).run(googleEventId, id);
+    } else { avisoGoogle = 'google_nao_conectado'; }
+    res.json({ ok: true, id, googleEventId, avisoGoogle });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/agenda/reunioes', (req, res) => {
+  try {
+    const dias = Math.min(180, Number((req.query as any).dias || 30));
+    res.json({ ok: true, reunioes: db.prepare(`SELECT * FROM reunioes_sdr WHERE date(inicio)>=date('now','-2 day') AND date(inicio)<=date('now','+${dias} day') ORDER BY inicio ASC`).all() });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ---- Google Calendar: refresh token + criar evento (gated por gcal_ativo) ----
+async function _gcalAccessToken(): Promise<string> {
+  const refreshEnc = pubFlag('gcal_refresh_enc', ''); const cid = pubFlag('gcal_client_id', ''); const csec = decifra(pubFlag('gcal_client_secret_enc', ''));
+  const refresh = decifra(refreshEnc);
+  if (!refresh || !cid) throw new Error('gcal_sem_credencial');
+  const body = new URLSearchParams({ client_id: cid, client_secret: csec, refresh_token: refresh, grant_type: 'refresh_token' });
+  const r: any = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const j: any = await r.json(); if (!j.access_token) throw new Error('gcal_token_falhou');
+  return j.access_token;
+}
+async function _gcalCriarEvento(ev: { tipo: string; refId: string; titulo: string; inicio: string; fim: string; descricao?: string; convidadoEmail?: string }): Promise<string> {
+  const at = await _gcalAccessToken();
+  const corpo: any = { summary: ev.titulo, description: ev.descricao || '', start: { dateTime: ev.inicio, timeZone: 'America/Sao_Paulo' }, end: { dateTime: ev.fim, timeZone: 'America/Sao_Paulo' }, extendedProperties: { private: { motor: '1', tipo: ev.tipo, refId: ev.refId } } };
+  if (ev.convidadoEmail) corpo.attendees = [{ email: ev.convidadoEmail }];
+  const existe = db.prepare(`SELECT google_event_id FROM gcal_event_map WHERE tipo=? AND ref_id=?`).get(ev.tipo, ev.refId) as any;
+  const cal = pubFlag('gcal_calendar_id', 'primary');
+  const url = existe?.google_event_id ? `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal)}/events/${existe.google_event_id}` : `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal)}/events`;
+  const r: any = await fetch(url, { method: existe?.google_event_id ? 'PUT' : 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' }, body: JSON.stringify(corpo) });
+  const j: any = await r.json(); if (!j.id) throw new Error('gcal_evento_falhou: ' + JSON.stringify(j).slice(0, 200));
+  db.prepare(`INSERT INTO gcal_event_map(tipo,ref_id,google_event_id,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(tipo,ref_id) DO UPDATE SET google_event_id=excluded.google_event_id, atualizado_em=excluded.atualizado_em`).run(ev.tipo, ev.refId, j.id, agora());
+  return j.id;
+}
+
+// ======================= OneDrive: token + limpeza de postados =======================
+async function _onedriveToken(): Promise<string> {
+  const refresh = decifra(pubFlag('onedrive_refresh_enc', '')); const cid = pubFlag('onedrive_client_id', ''); const csec = decifra(pubFlag('onedrive_client_secret_enc', ''));
+  if (!refresh || !cid) throw new Error('onedrive_sem_credencial');
+  const body = new URLSearchParams({ client_id: cid, client_secret: csec, refresh_token: refresh, grant_type: 'refresh_token', scope: 'offline_access Files.ReadWrite' });
+  const r: any = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const j: any = await r.json(); if (!j.access_token) throw new Error('onedrive_token_falhou'); return j.access_token;
+}
+async function _onedriveApagar(itemId: string): Promise<boolean> {
+  const at = await _onedriveToken();
+  const r: any = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(itemId)}`, { method: 'DELETE', headers: { Authorization: 'Bearer ' + at } });
+  return r.status === 204 || r.status === 404;
+}
+// Worker de limpeza: apaga do OneDrive os vídeos JÁ POSTADOS (regra do PC, adaptada):
+// só apaga quando status='publicado' E tem onedrive_item_id E passou o período de carência.
+// Mantém a linha no banco (histórico). Inerte até onedrive_ativo=1 e limpeza_ativa=1.
+let _limpezaRodando = false;
+async function tickLimpezaOneDrive() {
+  if (_limpezaRodando) return; if (pubFlag('onedrive_ativo') !== '1' || pubFlag('limpeza_ativa') !== '1') return;
+  _limpezaRodando = true;
+  try {
+    const graceDias = Number(pubFlag('limpeza_grace_dias', '3'));
+    const alvos = db.prepare(`SELECT id, onedrive_item_id FROM fila_publicacao WHERE status='publicado' AND arquivo_apagado=0 AND onedrive_item_id IS NOT NULL AND date(atualizado_em)<=date('now','-${graceDias} day') LIMIT 20`).all() as any[];
+    for (const it of alvos) {
+      try { const ok = await _onedriveApagar(String(it.onedrive_item_id)); if (ok) db.prepare(`UPDATE fila_publicacao SET arquivo_apagado=1, data_arquivo_apagado=? WHERE id=?`).run(agora(), it.id); }
+      catch (e) { /* tenta na próxima rodada */ }
+    }
+  } finally { _limpezaRodando = false; }
+}
+setInterval(() => { tickLimpezaOneDrive().catch(() => {}); }, 60 * 60 * 1000); // 1x/hora
+
+app.get('/pub/onedrive/status', (_req, res) => {
+  try {
+    res.json({ ok: true, conectado: pubFlag('onedrive_ativo') === '1', limpeza_ativa: pubFlag('limpeza_ativa') === '1', grace_dias: Number(pubFlag('limpeza_grace_dias', '3')),
+      aAapagar: (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE status='publicado' AND arquivo_apagado=0 AND onedrive_item_id IS NOT NULL`).get() as any)?.n || 0,
+      jaApagados: (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE arquivo_apagado=1`).get() as any)?.n || 0 });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/pub/flags', (req, res) => {
+  try { const b = req.body || {}; for (const k of Object.keys(b)) if (/^[a-z0-9_]+$/.test(k)) setPubFlag(k, String(b[k])); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/flags', (_req, res) => {
+  try { res.json({ ok: true, flags: db.prepare(`SELECT chave, valor FROM pub_kv`).all() }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+console.log('[etapa16] módulo de publicação na nuvem carregado (inerte até configurar tokens/sessões)');
+
+
+
+// ============================================================================
+// ETAPA 17 — Construtor de fluxo visual (campanhas + pastas) — ADITIVO
+// Guarda os fluxos montados no canvas (estilo SellFlux) do app: campanhas de
+// "venda em grupos" e individuais. Só armazenamento + listagem aqui; a EXECUÇÃO
+// real (interpretar nós -> enfileirar disparos) entra na próxima etapa.
+// Namespace: /fluxo/*
+// ============================================================================
+try {
+  db.exec(`
+  CREATE TABLE IF NOT EXISTS fluxo_pastas (
+    id TEXT PRIMARY KEY, nome TEXT, tipo TEXT, criado_em TEXT
+  );
+  CREATE TABLE IF NOT EXISTS fluxo_campanhas (
+    id TEXT PRIMARY KEY, nome TEXT, pasta_id TEXT, tipo TEXT DEFAULT 'grupos',
+    ativo INTEGER DEFAULT 0, fluxo_json TEXT, qtd_nos INTEGER DEFAULT 0,
+    criado_em TEXT, atualizado_em TEXT
+  );
+  CREATE INDEX IF NOT EXISTS ix_fluxo_camp_tipo ON fluxo_campanhas(tipo, atualizado_em);
+  `);
+} catch (e) { console.error('[etapa17] schema erro (ignorado):', e); }
+
+function _contaNos(fluxoJson: string): number {
+  try { const o = JSON.parse(fluxoJson || '{}'); return Array.isArray(o.nodes) ? o.nodes.length : 0; } catch { return 0; }
+}
+
+app.get('/fluxo/campanhas', (req, res) => {
+  try {
+    const tipo = String((req.query as any).tipo || '');
+    const wc = tipo ? ` WHERE tipo=?` : ``;
+    const campanhas = db.prepare(`SELECT id, nome, pasta_id, ativo, qtd_nos, atualizado_em FROM fluxo_campanhas${wc} ORDER BY atualizado_em DESC`).all(...(tipo ? [tipo] : [])) as any[];
+    const pastas = db.prepare(`SELECT id, nome FROM fluxo_pastas${tipo ? ' WHERE tipo=?' : ''} ORDER BY nome`).all(...(tipo ? [tipo] : [])) as any[];
+    res.json({ ok: true, campanhas, pastas });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.get('/fluxo/campanha/:id', (req, res) => {
+  try {
+    const row = db.prepare(`SELECT id, nome, pasta_id, tipo, ativo, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.json({ ok: false, erro: 'nao_encontrada' });
+    res.json({ ok: true, campanha: row });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.post('/fluxo/campanha', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    const fluxoJson = typeof b.fluxo_json === 'string' ? b.fluxo_json : JSON.stringify(b.fluxo_json || { nodes: [], edges: [] });
+    const qtd = _contaNos(fluxoJson);
+    const ex = db.prepare(`SELECT id FROM fluxo_campanhas WHERE id=?`).get(id);
+    if (ex) {
+      db.prepare(`UPDATE fluxo_campanhas SET nome=?, pasta_id=?, tipo=?, ativo=?, fluxo_json=?, qtd_nos=?, atualizado_em=? WHERE id=?`)
+        .run(String(b.nome || 'Sem nome'), b.pasta_id || null, String(b.tipo || 'grupos'), b.ativo ? 1 : 0, fluxoJson, qtd, agora(), id);
+    } else {
+      db.prepare(`INSERT INTO fluxo_campanhas(id,nome,pasta_id,tipo,ativo,fluxo_json,qtd_nos,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`)
+        .run(id, String(b.nome || 'Sem nome'), b.pasta_id || null, String(b.tipo || 'grupos'), b.ativo ? 1 : 0, fluxoJson, qtd, agora(), agora());
+    }
+    // ao salvar ATIVADA, já compila/agenda os disparos (Etapa 18); desativada, cancela os pendentes
+    try {
+      db.prepare(`DELETE FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).run(id);
+      if ((b.ativo ? 1 : 0) === 1) { const _c = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any; if (_c) _compilarFluxo(_c, false); }
+    } catch (_e) { /* compilacao nunca derruba o salvar */ }
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.post('/fluxo/campanha/excluir', (req, res) => {
+  try { db.prepare(`DELETE FROM fluxo_campanhas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.post('/fluxo/pasta', (req, res) => {
+  try {
+    const b = req.body || {}; const nome = String(b.nome || '').trim(); if (!nome) return res.json({ ok: false, erro: 'nome' });
+    const id = String(b.id || randomUUID());
+    db.prepare(`INSERT INTO fluxo_pastas(id,nome,tipo,criado_em) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET nome=excluded.nome`).run(id, nome, String(b.tipo || 'grupos'), agora());
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+console.log('[etapa17] módulo de fluxo visual (campanhas/pastas) carregado');
+
+
+
+// ============================================================================
+// ETAPA 18 — EXECUÇÃO do fluxo visual de grupos — ADITIVO
+// Interpreta o desenho salvo (nodes/edges) da campanha e AGENDA os disparos de
+// verdade na fila_envio existente (status 'camp_pend' -> tickCampanha envia,
+// respeitando agendado_para/anti-ban). Compila ao ATIVAR; cancela ao desativar.
+// Tipos de nó: tag (entrada por tags do grupo), timer (espera), whatsapp (blocos),
+// editar_grupos (add/remove tag no grupo), nota (ignorado).
+// ============================================================================
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS grupo_tags (grupo_id TEXT, tag TEXT, criado_em TEXT, PRIMARY KEY(grupo_id, tag));`);
+} catch (e) { console.error('[etapa18] grupo_tags erro:', e); }
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN campanha_id TEXT`); } catch {}
+
+// ---- tags de grupo (pro bloco Tag escolher a audiência) ----
+app.post('/fluxo/grupo/tag', (req, res) => {
+  try {
+    const b = req.body || {}; const gid = String(b.grupo_id || ''); const tag = String(b.tag || '').trim();
+    if (!gid || !tag) return res.json({ ok: false, erro: 'grupo_id/tag' });
+    if (b.remover) db.prepare(`DELETE FROM grupo_tags WHERE grupo_id=? AND tag=?`).run(gid, tag);
+    else db.prepare(`INSERT OR IGNORE INTO grupo_tags(grupo_id,tag,criado_em) VALUES(?,?,?)`).run(gid, tag, agora());
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/fluxo/grupo/tags', (req, res) => {
+  try {
+    const gid = String((req.query as any).grupo_id || '');
+    if (gid) return res.json({ ok: true, tags: db.prepare(`SELECT tag FROM grupo_tags WHERE grupo_id=?`).all(gid) });
+    res.json({ ok: true, tags: db.prepare(`SELECT tag, COUNT(*) n FROM grupo_tags GROUP BY tag ORDER BY n DESC`).all() });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+function _msUnidade(u: string): number {
+  const s = String(u || '').toLowerCase();
+  if (s.startsWith('min')) return 60 * 1000;
+  if (s.startsWith('hor')) return 3600 * 1000;
+  return 86400 * 1000; // dias (padrão)
+}
+// resolve os grupos-alvo: precisam ter TODAS as tags listadas
+function _gruposPorTags(tags: string[]): any[] {
+  const ts = (tags || []).map((t) => String(t).trim()).filter(Boolean);
+  if (!ts.length) return [];
+  const ph = ts.map(() => '?').join(',');
+  const ids = db.prepare(`SELECT grupo_id FROM grupo_tags WHERE tag IN (${ph}) GROUP BY grupo_id HAVING COUNT(DISTINCT tag)=?`).all(...ts, ts.length) as any[];
+  if (!ids.length) return [];
+  const ph2 = ids.map(() => '?').join(',');
+  return db.prepare(`SELECT id, projeto, instancia, nome FROM grupos_wpp WHERE id IN (${ph2})`).all(...ids.map((r) => r.grupo_id)) as any[];
+}
+function _dataDoNo(n: any): any { return (n && (n.data || n.d)) || {}; }
+function _tipoNo(n: any): string { return String((n && (n.type || n.tipo)) || ''); }
+
+// compila o fluxo -> enfileira em fila_envio (status camp_pend). Retorna resumo.
+function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens: number; ate: string; erros: string[] } {
+  const erros: string[] = [];
+  let fluxo: any = {}; try { fluxo = JSON.parse(camp.fluxo_json || '{}'); } catch { return { grupos: 0, mensagens: 0, ate: '', erros: ['fluxo_json invalido'] }; }
+  const nodes: any[] = Array.isArray(fluxo.nodes) ? fluxo.nodes : [];
+  const edges: any[] = Array.isArray(fluxo.edges) ? fluxo.edges : [];
+  if (!nodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem blocos'] };
+  const byId: any = {}; for (const n of nodes) byId[n.id] = n;
+  const prox: any = {}; for (const e of edges) { (prox[e.source] = prox[e.source] || []).push(e.target); }
+  // entradas = todos os nós 'tag'; audiência = união dos grupos
+  const tagNodes = nodes.filter((n) => _tipoNo(n) === 'tag');
+  if (!tagNodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem bloco Tag de entrada'] };
+  const mapaGrupos: any = {};
+  for (const tn of tagNodes) for (const g of _gruposPorTags(_dataDoNo(tn).tags || [])) mapaGrupos[g.id] = g;
+  const grupos = Object.values(mapaGrupos) as any[];
+  if (!grupos.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['nenhum grupo com essas tags (marque as tags nos grupos em Gerenciar Grupos)'] };
+  // começa a andar a partir do que o(s) Tag apontam
+  let inicio: string | null = null;
+  for (const tn of tagNodes) { const alvo = (prox[tn.id] || [])[0]; if (alvo) { inicio = alvo; break; } }
+  if (!inicio) return { grupos: grupos.length, mensagens: 0, ate: '', erros: ['o bloco Tag não está ligado a nada'] };
+
+  const base = Date.now();
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  let offset = 0; let msgs = 0; let maxWhen = base;
+  const padrao = (CONFIG as any).projetoPadrao || 'teclado';
+  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio' };
+  const andar = db.transaction(() => {
+    let atual: string | null = inicio; let guard = 0;
+    const visto: any = {};
+    while (atual && guard < 200) {
+      guard++; if (visto[atual]) break; visto[atual] = 1;
+      const n = byId[atual]; if (!n) break;
+      const t = _tipoNo(n); const d = _dataDoNo(n);
+      if (t === 'timer') {
+        const val = Math.max(0, Number(d.valor ?? 1));
+        offset += val * _msUnidade(d.unidade || 'Dias');
+      } else if (t === 'whatsapp') {
+        const blocos = (d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+        grupos.forEach((g: any, gi: number) => {
+          blocos.forEach((b: any, bi: number) => {
+            const when = new Date(base + offset + gi * 12000 + bi * 2000);
+            if (when.getTime() > maxWhen) maxWhen = when.getTime();
+            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'document');
+            if (!simular) ins.run(randomUUID(), g.projeto || padrao, String(g.id), 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id));
+            msgs++;
+          });
+        });
+      } else if (t === 'editar_grupos') {
+        const acao = String(d.acao || ''); const tag = String(d.tag || '').trim();
+        if (!simular && tag) for (const g of grupos) {
+          if (acao === 'remove_tag') db.prepare(`DELETE FROM grupo_tags WHERE grupo_id=? AND tag=?`).run(String(g.id), tag);
+          else db.prepare(`INSERT OR IGNORE INTO grupo_tags(grupo_id,tag,criado_em) VALUES(?,?,?)`).run(String(g.id), tag, agora());
+        }
+      } // nota = ignora
+      atual = (prox[atual] || [])[0] || null;
+    }
+  });
+  andar();
+  return { grupos: grupos.length, mensagens: msgs, ate: new Date(maxWhen).toISOString(), erros };
+}
+
+// prévia (não grava nada) — pra conferir antes de ativar
+app.get('/fluxo/campanha/:id/previa', (req, res) => {
+  try {
+    const camp = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(String(req.params.id)) as any;
+    if (!camp) return res.json({ ok: false, erro: 'nao_encontrada' });
+    res.json({ ok: true, previa: _compilarFluxo(camp, true) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// ativar/desativar = compila (agenda) ou cancela os disparos pendentes da campanha
+app.post('/fluxo/campanha/ativar', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || ''); const ativo = b.ativo ? 1 : 0;
+    const camp = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any;
+    if (!camp) return res.json({ ok: false, erro: 'nao_encontrada' });
+    // sempre limpa os pendentes antigos dessa campanha
+    db.prepare(`DELETE FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).run(id);
+    db.prepare(`UPDATE fluxo_campanhas SET ativo=?, atualizado_em=? WHERE id=?`).run(ativo, agora(), id);
+    if (!ativo) return res.json({ ok: true, ativo: 0, cancelados: true });
+    const r = _compilarFluxo(camp, false);
+    res.json({ ok: true, ativo: 1, agendados: r.mensagens, grupos: r.grupos, ate: r.ate, erros: r.erros });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// status de execução de uma campanha (quantos pendentes/enviados/falhou)
+app.get('/fluxo/campanha/:id/status', (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE campanha_id=? GROUP BY status`).all(id);
+    const prox = db.prepare(`SELECT MIN(agendado_para) p FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).get(id) as any;
+    res.json({ ok: true, porStatus, proximoEnvio: prox?.p || null });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+console.log('[etapa18] execução de fluxo de grupos carregada (compila -> fila_envio; inerte até ativar)');
+
+
+// ============================================================================
+// ETAPA 19 — CONEXÕES / DISPOSITIVOS (gerenciar números no app) — ADITIVO
+// Dá ao Ezequias autonomia pra, DENTRO do app (aba Sellflux), ver o status de cada
+// número, reconectar sozinho (QR ou código de pareamento), reiniciar, desconectar,
+// adicionar e excluir — igual a tela "Dispositivos" da SellFlux. Reaproveita os
+// helpers que já existem (evo/statusNumero/normalizaEstado/registrarInstanciaExistente/
+// projetoDaInstancia) e a tabela numeros. Namespace: /conexoes/*
+// ============================================================================
+function rotuloEstado(e: any): string {
+  const s = String(e || '').toLowerCase();
+  if (s === 'open') return 'Conectado';
+  if (s === 'connecting') return 'Conectando';
+  if (s === 'oficial') return 'API Oficial';
+  return 'Desconectado';
+}
+
+// Lista TODAS as conexões: junta o que o Evolution conhece (não-oficial/QR) com o
+// cadastro local (tabela numeros), pra pegar o projeto certo e também os números
+// de API Oficial (que não aparecem no Evolution). Atualiza o status de passagem.
+app.get('/conexoes/listar', async (_req, res) => {
+  try {
+    let evoArr: any[] = [];
+    try {
+      const todas = await evo('/instance/fetchInstances', 'GET');
+      evoArr = Array.isArray(todas) ? todas : (todas?.instances || []);
+    } catch { /* Evolution fora do ar -> mostra só o cadastro */ }
+    const porNome: Record<string, any> = {};
+    for (const i of evoArr) {
+      const nome = i?.name || i?.instance?.instanceName || i?.instanceName;
+      if (!nome) continue;
+      const estado = String(i?.connectionStatus || i?.instance?.state || i?.state || 'close').toLowerCase();
+      const owner = i?.ownerJid || i?.instance?.owner || i?.owner || '';
+      const tel = String(owner).replace(/@.*/, '') || String(i?.number || '');
+      const profile = i?.profileName || i?.instance?.profileName || '';
+      porNome[nome] = { instancia: nome, estado, telefone: tel, profile };
+      const row = db.prepare(`SELECT id FROM numeros WHERE instancia=?`).get(nome) as any;
+      if (row) db.prepare(`UPDATE numeros SET status=?, telefone=COALESCE(NULLIF(?,''),telefone) WHERE instancia=?`).run(normalizaEstado(estado), tel, nome);
+    }
+    const cadastro = db.prepare(`SELECT instancia, projeto, telefone, tipo, status FROM numeros`).all() as any[];
+    const saida: any[] = []; const vistos = new Set<string>();
+    for (const c of cadastro) {
+      vistos.add(c.instancia);
+      const ev = porNome[c.instancia];
+      const estado = ev ? ev.estado : (c.tipo === 'oficial' ? 'oficial' : 'close');
+      saida.push({
+        instancia: c.instancia, projeto: c.projeto,
+        telefone: (ev && ev.telefone) || c.telefone || '',
+        profile: ev ? ev.profile : '', tipo: c.tipo || 'nao-oficial',
+        estado, estadoLabel: rotuloEstado(estado),
+      });
+    }
+    for (const nome in porNome) {
+      if (vistos.has(nome)) continue;
+      const ev = porNome[nome];
+      saida.push({ instancia: nome, projeto: projetoDaInstancia(nome), telefone: ev.telefone, profile: ev.profile, tipo: 'nao-oficial', estado: ev.estado, estadoLabel: rotuloEstado(ev.estado), naoCadastrado: true });
+    }
+    res.json({ ok: true, conexoes: saida });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Estado de uma conexão (pro app ficar fazendo polling enquanto o QR não é lido).
+app.get('/conexoes/estado/:instancia', async (req, res) => {
+  try {
+    const inst = String(req.params.instancia);
+    const st = await statusNumero(inst);
+    const e = st?.instance?.state ?? st?.state;
+    try { db.prepare(`UPDATE numeros SET status=? WHERE instancia=?`).run(normalizaEstado(e), inst); } catch {}
+    res.json({ ok: true, estado: String(e || '').toLowerCase(), estadoLabel: rotuloEstado(e) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Reconectar: devolve o QR (base64 = imagem pronta pro app) e o code.
+app.post('/conexoes/conectar', async (req, res) => {
+  try {
+    const instancia = String((req.body || {}).instancia || '');
+    if (!instancia) return res.json({ ok: false, erro: 'instancia' });
+    let qr: any;
+    try { qr = await evo(`/instance/connect/${encodeURIComponent(instancia)}`, 'GET'); }
+    catch {
+      try { await evo('/instance/create', 'POST', { instanceName: instancia, integration: 'WHATSAPP-BAILEYS', qrcode: true }); } catch {}
+      qr = await evo(`/instance/connect/${encodeURIComponent(instancia)}`, 'GET');
+    }
+    res.json({ ok: true, base64: qr?.base64 || '', code: qr?.code || '', pairingCode: qr?.pairingCode || null });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Reconectar por CÓDIGO DE PAREAMENTO (mais fácil num celular só): desloga pra zerar
+// a sessão de QR e pede o connect com o número -> volta um código de 8 dígitos.
+app.post('/conexoes/pareamento', async (req, res) => {
+  try {
+    const b = req.body || {}; const instancia = String(b.instancia || ''); const numero = String(b.numero || '').replace(/\D/g, '');
+    if (!instancia || !numero) return res.json({ ok: false, erro: 'instancia/numero' });
+    try { await evo(`/instance/logout/${encodeURIComponent(instancia)}`, 'DELETE'); } catch {}
+    await new Promise((r) => setTimeout(r, 1500));
+    let qr: any;
+    try { qr = await evo(`/instance/connect/${encodeURIComponent(instancia)}?number=${numero}`, 'GET'); }
+    catch {
+      try { await evo('/instance/create', 'POST', { instanceName: instancia, integration: 'WHATSAPP-BAILEYS', number: numero, qrcode: true }); } catch {}
+      qr = await evo(`/instance/connect/${encodeURIComponent(instancia)}?number=${numero}`, 'GET');
+    }
+    res.json({ ok: true, pairingCode: qr?.pairingCode || null, base64: qr?.base64 || '', code: qr?.code || '' });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Reiniciar a instância (quando trava em "connecting").
+app.post('/conexoes/reiniciar', async (req, res) => {
+  try {
+    const instancia = String((req.body || {}).instancia || '');
+    if (!instancia) return res.json({ ok: false, erro: 'instancia' });
+    const r = await evo(`/instance/restart/${encodeURIComponent(instancia)}`, 'POST');
+    res.json({ ok: true, resultado: r });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Desconectar (logout) sem apagar a instância.
+app.post('/conexoes/desconectar', async (req, res) => {
+  try {
+    const instancia = String((req.body || {}).instancia || '');
+    if (!instancia) return res.json({ ok: false, erro: 'instancia' });
+    const r = await evo(`/instance/logout/${encodeURIComponent(instancia)}`, 'DELETE');
+    try { db.prepare(`UPDATE numeros SET status='desconectado' WHERE instancia=?`).run(instancia); } catch {}
+    res.json({ ok: true, resultado: r });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Adicionar NOVO número (cria instância Baileys + registra no projeto) e já devolve o QR.
+app.post('/conexoes/criar', async (req, res) => {
+  try {
+    const b = req.body || {}; const projeto = String(b.projeto || '');
+    if (!ehProjeto(projeto)) return res.json({ ok: false, erro: 'projeto_invalido' });
+    let nome = String(b.nome || '').trim().replace(/[^a-zA-Z0-9-]/g, '');
+    if (!nome) nome = `${projeto}-${Date.now().toString(36)}`;
+    const numero = String(b.numero || '').replace(/\D/g, '');
+    try { await evo('/instance/create', 'POST', { instanceName: nome, integration: 'WHATSAPP-BAILEYS', qrcode: true, ...(numero ? { number: numero } : {}) }); } catch { /* talvez já exista */ }
+    const existe = db.prepare(`SELECT id FROM numeros WHERE instancia=?`).get(nome) as any;
+    if (!existe) db.prepare(`INSERT INTO numeros(id,projeto,telefone,instancia,status,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, numero, nome, 'aguardando_qr', agora());
+    else db.prepare(`UPDATE numeros SET projeto=? WHERE instancia=?`).run(projeto, nome);
+    let qr: any; try { qr = await evo(`/instance/connect/${encodeURIComponent(nome)}${numero ? `?number=${numero}` : ''}`, 'GET'); } catch {}
+    res.json({ ok: true, instancia: nome, base64: qr?.base64 || '', code: qr?.code || '', pairingCode: qr?.pairingCode || null });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Registrar no projeto uma instância que apareceu no Evolution mas não estava no cadastro.
+app.post('/conexoes/registrar', async (req, res) => {
+  try {
+    const b = req.body || {}; const projeto = String(b.projeto || ''); const instancia = String(b.instancia || '');
+    if (!ehProjeto(projeto) || !instancia) return res.json({ ok: false, erro: 'projeto/instancia' });
+    res.json(await registrarInstanciaExistente(projeto, instancia, String(b.telefone || '') || undefined));
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// Excluir a conexão (logout + delete no Evolution + tira do cadastro). Ação do dono na UI.
+app.post('/conexoes/excluir', async (req, res) => {
+  try {
+    const instancia = String((req.body || {}).instancia || '');
+    if (!instancia) return res.json({ ok: false, erro: 'instancia' });
+    try { await evo(`/instance/logout/${encodeURIComponent(instancia)}`, 'DELETE'); } catch {}
+    try { await evo(`/instance/delete/${encodeURIComponent(instancia)}`, 'DELETE'); } catch (e: any) { return res.json({ ok: false, erro: String(e.message || e) }); }
+    try { db.prepare(`DELETE FROM numeros WHERE instancia=?`).run(instancia); } catch {}
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
