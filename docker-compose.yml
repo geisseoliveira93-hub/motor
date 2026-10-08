@@ -65,8 +65,14 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      # ---- OneDrive via rclone (Etapa 21): o motor pega mídia do OneDrive ----
+      ONEDRIVE_REMOTE: "onedrive"
+      ONEDRIVE_PASTA_BASE: "Postagem Automatica"
+      RCLONE_CONFIG: /root/.config/rclone/rclone.conf
     volumes:
       - enginedata:/data
+      # config do rclone (token do OneDrive) do HOST -> container. rw p/ renovar token.
+      - /root/.config/rclone:/root/.config/rclone
     ports:
       # SEGURANCA: antes ficava exposto na internet.
       # - "8080:8080"
