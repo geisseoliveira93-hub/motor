@@ -249,7 +249,9 @@ type FluxoPasso = {
 };
 // Um fluxo por PRODUTO: casa pelo id OU por um pedaço do nome do produto, e entrega
 // o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
-type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[] };
+// chamarPeloNome: liga/desliga o uso do nome da pessoa na mensagem (padrão: ligado).
+// nomeFallback: o que usar no lugar do nome quando NÃO há nome (ou quando está desligado).
+type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[]; chamarPeloNome?: boolean; nomeFallback?: string };
 
 type Config = {
   // Mapa de produto (id OU nome, em minúsculas) -> projeto.
@@ -462,17 +464,17 @@ async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: st
 }
 
 /** Envia UM passo de fluxo (texto ou mídia), já com {nome} preenchido. */
-async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, nome?: string) {
+async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, nome?: string, opts?: OpcoesNome) {
   const tipo = passo.tipo || 'texto';
   if (tipo === 'texto') {
-    return enviarTexto(projeto, para, preenche(passo.texto || '', nome));
+    return enviarTexto(projeto, para, preencheNome(passo.texto || '', nome, opts));
   }
-  return enviarMidia(projeto, para, tipo, passo.url || '', preenche(passo.texto || passo.legenda || '', nome));
+  return enviarMidia(projeto, para, tipo, passo.url || '', preencheNome(passo.texto || passo.legenda || '', nome, opts));
 }
 
 /** Enfileira um FLUXO (vários passos com delay) pra um contato. O worker manda no ritmo,
  * respeitando o delay de cada passo (agendado_para). Preenche {nome} em texto/legenda. */
-function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string) {
+function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome) {
   const ins = db.prepare(
     `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em)
      VALUES(?,?,?,?,?,?,?,?,?,?,?)`
@@ -482,8 +484,8 @@ function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], n
     for (const p of passos || []) {
       acumulado += Math.max(0, Number(p.delaySegundos || 0));
       const tipo = p.tipo || 'texto';
-      const texto = tipo === 'texto' ? preenche(p.texto || '', nome) : '';
-      const legenda = tipo === 'texto' ? '' : preenche(p.texto || p.legenda || '', nome);
+      const texto = tipo === 'texto' ? preencheNome(p.texto || '', nome, opts) : '';
+      const legenda = tipo === 'texto' ? '' : preencheNome(p.texto || p.legenda || '', nome, opts);
       ins.run(randomUUID(), projeto, para, 0, texto, tipo, p.url || null, legenda || null,
         'pendente', emSegundos(acumulado), agora());
     }
@@ -507,10 +509,28 @@ function fluxoEntregaDoProduto(projeto: Projeto, produtoId?: string, produtoNome
   return null;
 }
 
+/** Acha o FLUXO DO PRODUTO inteiro (com as opções de nome), se casar por id/nome. */
+function produtoFluxoMatch(produtoId?: string, produtoNome?: string): FluxoProduto | null {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  for (const fp of CONFIG.entregaFluxoProduto || []) {
+    const chave = String(fp.chave || '').toLowerCase();
+    if (!chave) continue;
+    const casa = fp.porId ? (id && id === chave) : alvo.includes(chave);
+    if (casa && Array.isArray(fp.fluxo) && fp.fluxo.length) return fp;
+  }
+  return null;
+}
+
 /** Dispara a ENTREGA: usa o fluxo do produto/projeto se houver; senão a mensagem simples. */
 async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
-  const fluxo = fluxoEntregaDoProduto(projeto, produtoId, produtoNome);
-  if (fluxo) { enfileirarFluxo(projeto, telefone, fluxo, nome); return 'fluxo'; }
+  // Fluxo do PRODUTO (traz junto as opções de "chamar pelo nome"); senão fluxo por projeto.
+  const fpProduto = produtoFluxoMatch(produtoId, produtoNome);
+  const fluxo = fpProduto ? fpProduto.fluxo : fluxoEntregaDoProduto(projeto, produtoId, produtoNome);
+  const optsNome: OpcoesNome | undefined = fpProduto
+    ? { chamarPeloNome: fpProduto.chamarPeloNome, nomeFallback: fpProduto.nomeFallback }
+    : undefined;
+  if (fluxo) { enfileirarFluxo(projeto, telefone, fluxo, nome, optsNome); return 'fluxo'; }
   await enviarTexto(projeto, telefone, preenche(CONFIG.entrega[projeto], nome)).catch(() => {});
   return 'mensagem';
 }
@@ -541,6 +561,25 @@ function aplicarTag(projeto: string, contatoId: string, tagNome: string) {
   db.prepare(`INSERT OR IGNORE INTO contato_tags(contato_id,tag_id,criado_em) VALUES(?,?,?)`).run(contatoId, tag.id, agora());
 }
 const preenche = (tpl: string, nome?: string) => String(tpl || '').replace(/\{nome\}/g, (nome || '').trim());
+
+// Igual ao preenche, mas respeita o liga/desliga de "chamar pela pessoa pelo nome".
+//  - opts.chamarPeloNome === false  -> NÃO usa o nome (mesmo que exista).
+//  - ligado e com nome              -> usa o nome.
+//  - sem nome (ou desligado)        -> usa opts.nomeFallback; se vazio, remove o {nome}
+//    e limpa o resíduo da saudação ("Olá {nome}!" -> "Olá!", "Oi {nome}," -> "Oi,").
+type OpcoesNome = { chamarPeloNome?: boolean; nomeFallback?: string };
+function preencheNome(tpl: string, nome?: string, opts?: OpcoesNome): string {
+  const ligado = !opts || opts.chamarPeloNome !== false; // padrão: ligado
+  const nm = (nome || '').trim();
+  const usar = (ligado && nm) ? nm : String(opts?.nomeFallback || '').trim();
+  let s = String(tpl || '').replace(/\{nome\}/g, usar);
+  if (!usar) {
+    s = s.replace(/\s+([!,.?:;])/g, '$1'); // tira espaço antes da pontuação: "Olá !" -> "Olá!"
+    s = s.replace(/[ \t]{2,}/g, ' ');       // colapsa espaços duplos
+    s = s.replace(/[ \t]+\n/g, '\n').replace(/^[ \t]+|[ \t]+$/g, '');
+  }
+  return s;
+}
 
 // ----------------------- API HTTP -----------------------
 const app = express();
@@ -585,6 +624,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/f/')) return next();
   if (req.path.startsWith('/receive/')) return next();
   if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
+  if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -813,7 +853,8 @@ app.post('/flows/produto', (req, res) => {
   const b = req.body || {};
   const chave = String(b.chave || '').trim();
   if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
-  const item: FluxoProduto = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo) };
+  const item: FluxoProduto = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
+    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined) };
   const lista = CONFIG.entregaFluxoProduto || [];
   const i = lista.findIndex((f) => f.chave.toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
   if (i >= 0) lista[i] = item; else lista.push(item);
@@ -2938,7 +2979,93 @@ app.get('/pub/flags', (_req, res) => {
   catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// ======================= OneDrive: CONECTAR (login único) + LISTAR + BAIXAR (etapa20b) =======================
+// client_id/secret do app da Microsoft e a pasta "pra postar" ficam no pub_kv (secret cifrado).
+// redirect_uri FIXO = PUBLIC_BASE_URL + /pub/onedrive/callback (cadastrar IGUAL no app da Microsoft).
+const _odvRedirect = () => (PUBLIC_BASE_URL || '') + '/pub/onedrive/callback';
+const _ODV_SCOPE = 'offline_access Files.ReadWrite';
+
+// Salva client_id + client_secret (cifrado) + a pasta de vídeos (ex: Melodias/PraPostar).
+app.post('/pub/onedrive/config', (req, res) => {
+  try {
+    const b = req.body || {};
+    if (b.client_id != null) setPubFlag('onedrive_client_id', String(b.client_id).trim());
+    if (b.client_secret != null && String(b.client_secret).trim()) setPubFlag('onedrive_client_secret_enc', cifra(String(b.client_secret).trim()));
+    if (b.pasta != null) setPubFlag('onedrive_pasta', String(b.pasta).replace(/^\/+|\/+$/g, ''));
+    res.json({ ok: true, client_id: pubFlag('onedrive_client_id', ''), pasta: pubFlag('onedrive_pasta', ''), redirect_uri: _odvRedirect(), tem_secret: !!pubFlag('onedrive_client_secret_enc', '') });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// Monta a URL de login da Microsoft (o usuário abre, loga e autoriza 1 vez).
+app.get('/pub/onedrive/connect', (_req, res) => {
+  try {
+    const cid = pubFlag('onedrive_client_id', '');
+    if (!cid) return res.json({ ok: false, erro: 'configure_client_id_primeiro' });
+    const p = new URLSearchParams({ client_id: cid, response_type: 'code', redirect_uri: _odvRedirect(), response_mode: 'query', scope: _ODV_SCOPE });
+    res.json({ ok: true, url: 'https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?' + p.toString(), redirect_uri: _odvRedirect() });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// A Microsoft redireciona pra cá com ?code=... — trocamos por refresh_token e salvamos.
+app.get('/pub/onedrive/callback', async (req, res) => {
+  const code = String((req.query as any).code || '');
+  const erro = String((req.query as any).error_description || (req.query as any).error || '');
+  if (erro) return res.status(400).send('<h3>Falhou: ' + erro.replace(/[<>]/g, '') + '</h3>');
+  if (!code) return res.status(400).send('<h3>Sem código. Tente conectar de novo.</h3>');
+  try {
+    const cid = pubFlag('onedrive_client_id', ''); const csec = decifra(pubFlag('onedrive_client_secret_enc', ''));
+    const body = new URLSearchParams({ client_id: cid, client_secret: csec, code, grant_type: 'authorization_code', redirect_uri: _odvRedirect(), scope: _ODV_SCOPE });
+    const r: any = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const j: any = await r.json();
+    if (!j.refresh_token) return res.status(400).send('<h3>Não veio o refresh_token. Confira o app na Microsoft (precisa do offline_access). Resposta: ' + String(j.error_description || j.error || '?').replace(/[<>]/g, '') + '</h3>');
+    setPubFlag('onedrive_refresh_enc', cifra(String(j.refresh_token)));
+    setPubFlag('onedrive_ativo', '1');
+    res.send('<html><body style="font-family:sans-serif;background:#0f1115;color:#e6e8ec;padding:40px"><h2>✅ OneDrive conectado!</h2><p>Pode fechar esta aba e voltar pro app.</p></body></html>');
+  } catch (e: any) { res.status(500).send('<h3>Erro ao conectar: ' + String(e?.message || e).replace(/[<>]/g, '') + '</h3>'); }
+});
+
+// Lista os arquivos (vídeos) da pasta "pra postar" no OneDrive.
+async function _onedriveListar(): Promise<any[]> {
+  const at = await _onedriveToken();
+  const pasta = pubFlag('onedrive_pasta', '');
+  const url = pasta
+    ? `https://graph.microsoft.com/v1.0/me/drive/root:/${pasta.split('/').map(encodeURIComponent).join('/')}:/children?$top=200`
+    : 'https://graph.microsoft.com/v1.0/me/drive/root/children?$top=200';
+  const r: any = await fetch(url, { headers: { Authorization: 'Bearer ' + at } });
+  const j: any = await r.json();
+  if (!j.value) throw new Error('listar_falhou: ' + String(j.error?.message || r.status));
+  return j.value.filter((x: any) => x.file).map((x: any) => ({ id: x.id, nome: x.name, tamanho: x.size, criado: x.createdDateTime }));
+}
+
+// Baixa um item do OneDrive pro disco do servidor (usado pelos uploaders — próxima etapa).
+async function _onedriveBaixar(itemId: string, destPath: string): Promise<string> {
+  const at = await _onedriveToken();
+  const r: any = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(itemId)}/content`, { headers: { Authorization: 'Bearer ' + at } });
+  if (!r.ok || !r.body) throw new Error('baixar_falhou_' + r.status);
+  const { Readable } = await import('node:stream');
+  try { fs.mkdirSync(destPath.replace(/\/[^/]*$/, ''), { recursive: true }); } catch {}
+  await new Promise<void>((resolve, reject) => {
+    const ws = fs.createWriteStream(destPath);
+    (Readable as any).fromWeb(r.body).pipe(ws); ws.on('finish', () => resolve()); ws.on('error', reject);
+  });
+  return destPath;
+}
+void _onedriveBaixar; // ainda não chamado aqui (usado na etapa do publicador)
+
+// Testa a conexão: lista a pasta configurada (não posta nada).
+app.get('/pub/onedrive/testar', async (_req, res) => {
+  try { res.json({ ok: true, pasta: pubFlag('onedrive_pasta', '') || '(raiz)', arquivos: await _onedriveListar() }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// O APP pede um token CURTO pra subir vídeo direto PC->OneDrive (mesma conexão). Atrás da x-api-key.
+app.get('/pub/onedrive/token-app', async (_req, res) => {
+  try { res.json({ ok: true, access_token: await _onedriveToken(), pasta: pubFlag('onedrive_pasta', '') }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 console.log('[etapa16] módulo de publicação na nuvem carregado (inerte até configurar tokens/sessões)');
+console.log('[etapa20b] OneDrive: conectar(login)/config/callback/listar/baixar/testar prontos');
 
 
 
@@ -3337,6 +3464,7 @@ app.post('/conexoes/excluir', async (req, res) => {
 });
 
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
+console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
 
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
