@@ -3603,6 +3603,172 @@ app.post('/disparo/enviar-onedrive', (req, res) => {
 });
 console.log('[etapa21] rclone OneDrive no motor: /media (público interno) + /pub/onedrive/rclone-status|listar|baixar + /disparo/enviar-onedrive');
 
+// ============================================================================
+// ETAPA 22 (08/10) — DISPARO MULTI-NÚMERO EM PARALELO  [add-only, não mexe no antigo]
+// Permite: (a) escolher POR QUAL número cada grupo é enviado; (b) usar 1,2,3+
+// números ao mesmo tempo, dividindo os grupos entre eles (modo auto) OU atribuindo
+// manualmente número->grupos (modo manual); (c) envio EM PARALELO (um por número
+// por ciclo); (d) mídia via URL PÚBLICA (a Evolution recusa host sem domínio).
+// Status próprio 'cmp_multi' + ticker próprio tickCampanhaMulti (NÃO mexe no
+// tickCampanha/tickFila/enviarTexto/enviarMidia existentes).
+// ============================================================================
+const MEDIA_PUBLIC_BASE = String(process.env.MEDIA_PUBLIC_BASE || PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN instancia TEXT`); } catch { /* ja existe */ }
+
+// baixa do OneDrive e devolve URL PÚBLICA (com domínio) p/ a Evolution conseguir buscar.
+function _odBaixarPub(rel: string): string {
+  const r = _odRcloneBaixar(rel);
+  if (MEDIA_PUBLIC_BASE && r.url) return r.url.replace(MEDIA_INTERNAL_BASE, MEDIA_PUBLIC_BASE);
+  return r.url;
+}
+// envia por uma INSTÂNCIA específica (não pelo projeto). Reusa evo().
+async function enviarTextoVia(instancia: string, para: string, texto: string) {
+  return evo(`/message/sendText/${encodeURIComponent(instancia)}`, 'POST', { number: para, text: texto });
+}
+async function enviarMidiaVia(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
+  if (!url) throw new Error('midia_sem_url');
+  if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url });
+  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const body: any = { number: para, mediatype, media: url };
+  if (legenda) body.caption = legenda;
+  if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
+  return evo(`/message/sendMedia/${encodeURIComponent(instancia)}`, 'POST', body);
+}
+// descobre quais das NOSSAS instâncias são admin de um grupo (cache 10min). Casa pelo phoneNumber (@lid esconde o número).
+const _admCache: Record<string, { ts: number; adm: Record<string, string> }> = {};
+async function _gruposAdmins(jid: string, instancias: string[]): Promise<Record<string, string>> {
+  const c = _admCache[jid];
+  if (c && Date.now() - c.ts < 10 * 60 * 1000) return c.adm;
+  const nums = db.prepare(`SELECT instancia, telefone FROM numeros`).all() as any[];
+  const telToInst: Record<string, string> = {};
+  for (const n of nums) if (n.telefone && n.instancia) telToInst[String(n.telefone).replace(/\D/g, '')] = n.instancia;
+  const adm: Record<string, string> = {};
+  for (const inst of instancias) {
+    let d: any = null;
+    try { d = await evo(`/group/findGroupInfos/${encodeURIComponent(inst)}?groupJid=${encodeURIComponent(jid)}`, 'GET'); } catch { d = null; }
+    const ps = d && Array.isArray(d.participants) ? d.participants : null;
+    if (!ps) continue;
+    for (const p of ps) {
+      if (!p.admin) continue;
+      const tel = String(p.phoneNumber || p.id || '').split('@')[0].replace(/\D/g, '');
+      const mine = telToInst[tel];
+      if (mine) adm[mine] = p.admin;
+    }
+    break; // uma instância que veja o grupo já traz a lista completa de admins
+  }
+  _admCache[jid] = { ts: Date.now(), adm };
+  return adm;
+}
+// enfileira: cada {jid,instancia} recebe os blocos; agendamento POR instância => paralelo entre números.
+function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string) {
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const base = Date.now();
+  const idxPorInst: Record<string, number> = {};
+  let n = 0;
+  const tx = db.transaction(() => {
+    for (const a of assigns) {
+      const i = (idxPorInst[a.instancia] = (idxPorInst[a.instancia] ?? -1) + 1);
+      blocos.forEach((b: any, j: number) => {
+        const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
+        const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
+        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_multi', a.instancia, quando, agora());
+        n++;
+      });
+    }
+  });
+  tx();
+  return n;
+}
+// ticker paralelo: a cada ciclo pega 1 item DEVIDO por instância distinta e envia todos juntos.
+let _multiBusy = false;
+async function tickCampanhaMulti() {
+  if (_multiBusy) return; _multiBusy = true;
+  try {
+    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_multi' AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em`).all(agora()) as any[];
+    const porInst: Record<string, any> = {};
+    for (const r of rows) { const k = r.instancia || '_'; if (!porInst[k]) porInst[k] = r; }
+    const lote = Object.values(porInst) as any[];
+    await Promise.all(lote.map(async (item: any) => {
+      try {
+        if ((item.tipo || 'texto') === 'texto') await enviarTextoVia(item.instancia, item.para, item.texto || '');
+        else await enviarMidiaVia(item.instancia, item.para, item.tipo, item.url || '', item.legenda || '');
+        db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+      } catch {
+        db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_multi' END WHERE id=?`).run(item.id);
+      }
+    }));
+  } finally { _multiBusy = false; }
+}
+setInterval(() => { tickCampanhaMulti().catch(() => {}); }, 1000);
+
+// lista, p/ cada grupo, quais dos NOSSOS números são admin (p/ a tela montar as opções).
+app.post('/disparo/grupos-admins', async (req, res) => {
+  try {
+    const p = req.body || {};
+    const numeros = (p.numeros || []).map((x: any) => String(x));
+    const base = numeros.length ? numeros : (db.prepare(`SELECT instancia FROM numeros WHERE status='conectado'`).all() as any[]).map((n: any) => n.instancia);
+    const out: any[] = [];
+    for (const jid of (p.grupos || [])) { const adm = await _gruposAdmins(String(jid), base); out.push({ jid, admins: Object.keys(adm) }); }
+    res.json({ ok: true, grupos: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// DISPARO MULTI-NÚMERO. body: { modo:'auto'|'manual', numeros:[...], grupos:[jid...] (auto),
+//   atribuicoes:[{instancia,grupos:[jid...]}] (manual), blocos:[{tipo:'imagem',od:'...'}|{tipo:'texto',texto}],
+//   intervaloSegundos, validarAdmin?:bool }. Mídia com od => baixa do OneDrive e usa URL PÚBLICA.
+app.post('/disparo/enviar-multi', async (req, res) => {
+  try {
+    const p = req.body || {};
+    let blocos: any[];
+    try {
+      blocos = (p.blocos || []).map((b: any) => {
+        if (b && b.tipo && b.tipo !== 'texto' && (b.od || b.onedrive)) {
+          if (!_rcloneOk()) throw new Error('rclone_indisponivel');
+          return { ...b, url: _odBaixarPub(String(b.od || b.onedrive)) };
+        }
+        return b;
+      });
+    } catch (e: any) { return res.json({ ok: false, erro: String(e.message || e) }); }
+    blocos = blocos.filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+    if (!blocos.length) return res.json({ ok: false, erro: 'sem blocos válidos' });
+    const intervalo = Math.max(1, Number(p.intervaloSegundos || 8));
+    const projeto = String(p.projeto || 'teclado');
+    const assigns: { jid: string; instancia: string }[] = [];
+    const pulados: any[] = [];
+    if (p.modo === 'manual') {
+      for (const a of (p.atribuicoes || [])) {
+        const inst = String(a.instancia || '');
+        for (const jid of (a.grupos || [])) {
+          if (p.validarAdmin === false) { assigns.push({ jid: String(jid), instancia: inst }); continue; }
+          const adm = await _gruposAdmins(String(jid), [inst]);
+          if (adm[inst]) assigns.push({ jid: String(jid), instancia: inst });
+          else pulados.push({ jid, instancia: inst, motivo: 'nao_admin' });
+        }
+      }
+    } else {
+      const numeros = (p.numeros || []).map((x: any) => String(x));
+      if (!numeros.length) return res.json({ ok: false, erro: 'informe numeros (auto)' });
+      const carga: Record<string, number> = {}; numeros.forEach((n: string) => carga[n] = 0);
+      for (const jid of (p.grupos || [])) {
+        const adm = await _gruposAdmins(String(jid), numeros);
+        const validos = numeros.filter((n: string) => adm[n]);
+        if (!validos.length) { pulados.push({ jid, motivo: 'nenhum_numero_admin' }); continue; }
+        validos.sort((a: string, b: string) => (carga[a] - carga[b]));
+        const esc = validos[0]; carga[esc]++;
+        assigns.push({ jid: String(jid), instancia: esc });
+      }
+    }
+    if (!assigns.length) return res.json({ ok: false, erro: 'nenhum grupo atribuído', pulados });
+    const n = _enfileiraMulti(assigns, blocos, intervalo, projeto);
+    const porNumero = assigns.reduce((o: any, a) => ((o[a.instancia] = (o[a.instancia] || 0) + 1), o), {});
+    res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, pulados });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// acompanha o disparo multi (quanto já saiu por número).
+app.get('/disparo/multi-status', (_req, res) => {
+  res.json({ ok: true, porInstancia: db.prepare(`SELECT instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','enviado','falhou') GROUP BY instancia, status`).all() });
+});
+console.log('[etapa22] disparo multi-número paralelo: POST /disparo/enviar-multi (auto/manual) + /disparo/grupos-admins + /disparo/multi-status (mídia por URL pública)');
+
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
 
