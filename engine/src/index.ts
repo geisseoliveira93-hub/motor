@@ -2933,9 +2933,23 @@ async function _gcalCriarEvento(ev: { tipo: string; refId: string; titulo: strin
 }
 
 // ======================= OneDrive: token + limpeza de postados =======================
+// Cliente público do rclone (etapa20c): permite conectar o OneDrive SEM registrar app no
+// portal da Microsoft. O refresh_token vem do `rclone authorize onedrive` (login único).
+const ONEDRIVE_RCLONE_CLIENT_ID = 'b15665d9-eda6-4092-8539-0eec376afd59';
 async function _onedriveToken(): Promise<string> {
-  const refresh = decifra(pubFlag('onedrive_refresh_enc', '')); const cid = pubFlag('onedrive_client_id', ''); const csec = decifra(pubFlag('onedrive_client_secret_enc', ''));
-  if (!refresh || !cid) throw new Error('onedrive_sem_credencial');
+  const refresh = decifra(pubFlag('onedrive_refresh_enc', ''));
+  if (!refresh) throw new Error('onedrive_sem_credencial');
+  // MODO rclone (sem portal): cliente público, SEM secret, endpoint /common/.
+  if (pubFlag('onedrive_modo', '') === 'rclone') {
+    const body = new URLSearchParams({ client_id: ONEDRIVE_RCLONE_CLIENT_ID, refresh_token: refresh, grant_type: 'refresh_token', scope: 'Files.ReadWrite offline_access' });
+    const r: any = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const j: any = await r.json(); if (!j.access_token) throw new Error('onedrive_token_falhou: ' + String(j.error_description || j.error || '?'));
+    if (j.refresh_token) setPubFlag('onedrive_refresh_enc', cifra(String(j.refresh_token))); // rotação do refresh
+    return j.access_token;
+  }
+  // MODO app próprio (portal): client_id + secret + /consumers/ (mantido).
+  const cid = pubFlag('onedrive_client_id', ''); const csec = decifra(pubFlag('onedrive_client_secret_enc', ''));
+  if (!cid) throw new Error('onedrive_sem_credencial');
   const body = new URLSearchParams({ client_id: cid, client_secret: csec, refresh_token: refresh, grant_type: 'refresh_token', scope: 'offline_access Files.ReadWrite' });
   const r: any = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
   const j: any = await r.json(); if (!j.access_token) throw new Error('onedrive_token_falhou'); return j.access_token;
@@ -3064,8 +3078,30 @@ app.get('/pub/onedrive/token-app', async (_req, res) => {
   catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// MODO SEM PORTAL (etapa20c): cola o token do `rclone authorize onedrive`. Aceita o JSON
+// inteiro do rclone OU só o refresh_token. Liga o modo rclone (cliente público, sem secret).
+app.post('/pub/onedrive/config-rclone', (req, res) => {
+  try {
+    const b = req.body || {};
+    let refresh = String(b.refresh_token || '').trim();
+    if (!refresh && b.token != null) {
+      const raw = b.token;
+      try { const t = typeof raw === 'string' ? JSON.parse(raw) : raw; if (t && t.refresh_token) refresh = String(t.refresh_token); } catch { /* não era JSON */ }
+      if (!refresh) { const m = String(raw).match(/"refresh_token"\s*:\s*"([^"]+)"/); if (m) refresh = m[1]; }
+    }
+    if (!refresh) return res.json({ ok: false, erro: 'sem_refresh_token (cole o token do rclone ou só o refresh_token)' });
+    setPubFlag('onedrive_refresh_enc', cifra(refresh));
+    setPubFlag('onedrive_modo', 'rclone');
+    setPubFlag('onedrive_client_id', ONEDRIVE_RCLONE_CLIENT_ID);
+    setPubFlag('onedrive_ativo', '1');
+    if (b.pasta != null) setPubFlag('onedrive_pasta', String(b.pasta).replace(/^\/+|\/+$/g, ''));
+    res.json({ ok: true, modo: 'rclone', pasta: pubFlag('onedrive_pasta', '') });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 console.log('[etapa16] módulo de publicação na nuvem carregado (inerte até configurar tokens/sessões)');
 console.log('[etapa20b] OneDrive: conectar(login)/config/callback/listar/baixar/testar prontos');
+console.log('[etapa20c] OneDrive SEM portal: config-rclone (cliente público rclone) pronto');
 
 
 
