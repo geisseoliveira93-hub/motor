@@ -3758,14 +3758,14 @@ app.post('/disparo/enviar-multi', async (req, res) => {
       }
     }
     if (!assigns.length) return res.json({ ok: false, erro: 'nenhum grupo atribuído', pulados });
-    const n = _enfileiraMulti(assigns, blocos, intervalo, projeto);
+    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto);
     const porNumero = assigns.reduce((o: any, a) => ((o[a.instancia] = (o[a.instancia] || 0) + 1), o), {});
-    res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, pulados });
+    res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, marcarTodos: !!p.marcarTodos, pulados });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 // acompanha o disparo multi (quanto já saiu por número).
 app.get('/disparo/multi-status', (_req, res) => {
-  res.json({ ok: true, porInstancia: db.prepare(`SELECT instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','enviado','falhou') GROUP BY instancia, status`).all() });
+  res.json({ ok: true, porInstancia: db.prepare(`SELECT instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','cmp_mmk','enviado','falhou') GROUP BY instancia, status`).all() });
 });
 console.log('[etapa22] disparo multi-número paralelo: POST /disparo/enviar-multi (auto/manual) + /disparo/grupos-admins + /disparo/multi-status (mídia por URL pública)');
 
@@ -3811,14 +3811,14 @@ app.post('/disparo/enviar-lote', (req, res) => {
     if (!blocos.length) return res.json({ ok: false, erro: 'sem blocos válidos' });
     const intervalo = Math.max(1, Number(p.intervaloSegundos || 8));
     const assigns = jids.map((j) => ({ jid: j, instancia }));
-    const n = _enfileiraMulti(assigns, blocos, intervalo, String(p.projeto || 'teclado'));
-    res.json({ ok: true, enfileirados: n, grupos: jids.length, instancia, jids });
+    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, String(p.projeto || 'teclado'));
+    res.json({ ok: true, enfileirados: n, grupos: jids.length, instancia, marcarTodos: !!p.marcarTodos, jids });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 // relatório por grupo (o que saiu / falhou / pendente), com nome do grupo.
 app.get('/disparo/multi-relatorio', (_req, res) => {
   try {
-    const rows = db.prepare(`SELECT para, instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','enviado','falhou') GROUP BY para, instancia, status`).all() as any[];
+    const rows = db.prepare(`SELECT para, instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','cmp_mmk','enviado','falhou') GROUP BY para, instancia, status`).all() as any[];
     const porGrupo: Record<string, any> = {};
     for (const r of rows) {
       const k = String(r.para);
@@ -3845,6 +3845,122 @@ app.get('/disparo/multi-relatorio', (_req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 console.log('[etapa23] disparo em lote por filtro (/disparo/enviar-lote) + relatório por grupo (/disparo/multi-relatorio)');
+
+// ============================================================================
+// ETAPA 24 (08/10) — MARCAR MEMBROS (menção @) no disparo [add-only]
+// Caminho PRÓPRIO (status 'cmp_mmk' + ticker próprio) pra NÃO tocar no disparo
+// normal que já roda (tickCampanhaMulti/_enfileiraMulti/enviarTextoVia seguem iguais).
+// Evolution v2: mentionsEveryOne:true no corpo marca todos os membros do grupo =>
+// chega como notificação pra cada pessoa (mesmo no silêncio) e aumenta a abertura.
+// As rotas /disparo/enviar-lote e /disparo/enviar-multi passam a aceitar { marcarTodos:true }.
+// ============================================================================
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN marcar INTEGER`); } catch { /* ja existe */ }
+// envia MARCANDO todos os membros (mentionsEveryOne). Reusa evo(). Não mexe nas enviar*Via normais.
+async function enviarTextoViaMk(instancia: string, para: string, texto: string) {
+  return evo(`/message/sendText/${encodeURIComponent(instancia)}`, 'POST', { number: para, text: texto, mentionsEveryOne: true });
+}
+async function enviarMidiaViaMk(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
+  if (!url) throw new Error('midia_sem_url');
+  if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url, mentionsEveryOne: true });
+  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const body: any = { number: para, mediatype, media: url, mentionsEveryOne: true };
+  if (legenda) body.caption = legenda;
+  if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
+  return evo(`/message/sendMedia/${encodeURIComponent(instancia)}`, 'POST', body);
+}
+// enfileira igual ao _enfileiraMulti, mas com status 'cmp_mmk' + marcar=1 (ticker marcado cuida).
+function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string) {
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,marcar,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const base = Date.now();
+  const idxPorInst: Record<string, number> = {};
+  let n = 0;
+  const tx = db.transaction(() => {
+    for (const a of assigns) {
+      const i = (idxPorInst[a.instancia] = (idxPorInst[a.instancia] ?? -1) + 1);
+      blocos.forEach((b: any, j: number) => {
+        const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
+        const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
+        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_mmk', a.instancia, 1, quando, agora());
+        n++;
+      });
+    }
+  });
+  tx();
+  return n;
+}
+// ticker MARCADO: pega 1 item devido por instância distinta (status 'cmp_mmk') e envia marcando todos.
+let _mkBusy = false;
+async function tickCampanhaMultiMk() {
+  if (_mkBusy) return; _mkBusy = true;
+  try {
+    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_mmk' AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em`).all(agora()) as any[];
+    const porInst: Record<string, any> = {};
+    for (const r of rows) { const k = r.instancia || '_'; if (!porInst[k]) porInst[k] = r; }
+    const lote = Object.values(porInst) as any[];
+    await Promise.all(lote.map(async (item: any) => {
+      try {
+        if ((item.tipo || 'texto') === 'texto') await enviarTextoViaMk(item.instancia, item.para, item.texto || '');
+        else await enviarMidiaViaMk(item.instancia, item.para, item.tipo, item.url || '', item.legenda || '');
+        db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+      } catch {
+        db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_mmk' END WHERE id=?`).run(item.id);
+      }
+    }));
+  } finally { _mkBusy = false; }
+}
+setInterval(() => { tickCampanhaMultiMk().catch(() => {}); }, 1000);
+console.log('[etapa24] marcar membros (menção @ todos) no disparo: { marcarTodos:true } em /disparo/enviar-lote e /disparo/enviar-multi');
+
+// ============================================================================
+// ETAPA 25 (08/10) — EDITAR GRUPOS EM MASSA: nome / descrição / foto [add-only]
+// POST /disparo/grupos-editar { instancia, jids:[...], nome?, descricao?, fotoOd?|fotoUrl?, intervaloSegundos? }
+//   por grupo chama os endpoints do Evolution só pros campos enviados; foto via OneDrive (od) vira URL pública.
+//   Retorna resultado grupo a grupo (nome/descricao/foto = ok|erro).
+// ============================================================================
+async function _grpSubject(instancia: string, jid: string, subject: string) {
+  return evo(`/group/updateGroupSubject/${encodeURIComponent(instancia)}?groupJid=${encodeURIComponent(jid)}`, 'POST', { subject });
+}
+async function _grpDescription(instancia: string, jid: string, description: string) {
+  return evo(`/group/updateGroupDescription/${encodeURIComponent(instancia)}?groupJid=${encodeURIComponent(jid)}`, 'POST', { description });
+}
+async function _grpPicture(instancia: string, jid: string, image: string) {
+  return evo(`/group/updateGroupPicture/${encodeURIComponent(instancia)}?groupJid=${encodeURIComponent(jid)}`, 'POST', { image });
+}
+app.post('/disparo/grupos-editar', async (req, res) => {
+  try {
+    const p = req.body || {};
+    const instancia = String(p.instancia || '').trim();
+    const jids = (p.jids || []).map((x: any) => String(x)).filter(Boolean);
+    if (!instancia) return res.json({ ok: false, erro: 'informe instancia' });
+    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
+    const nome = p.nome != null && String(p.nome) !== '' ? String(p.nome) : null;
+    const descricao = p.descricao != null ? String(p.descricao) : null; // '' = limpar descrição
+    let fotoUrl = p.fotoUrl ? String(p.fotoUrl) : null;
+    if (nome == null && descricao == null && !p.fotoOd && !fotoUrl) return res.json({ ok: false, erro: 'nada pra alterar (nome/descricao/foto)' });
+    try {
+      if (p.fotoOd && !fotoUrl) { if (!_rcloneOk()) throw new Error('rclone_indisponivel'); fotoUrl = _odBaixarPub(String(p.fotoOd)); }
+    } catch (e: any) { return res.json({ ok: false, erro: String(e.message || e) }); }
+    const intervalo = Math.max(0, Number(p.intervaloSegundos != null ? p.intervaloSegundos : 1));
+    const out: any[] = [];
+    for (const jid of jids) {
+      const r: any = { jid };
+      if (nome != null) { try { await _grpSubject(instancia, jid, nome); r.nome = 'ok'; } catch (e: any) { r.nome = 'erro:' + String(e.message || e).slice(0, 80); } }
+      if (descricao != null) { try { await _grpDescription(instancia, jid, descricao); r.descricao = 'ok'; } catch (e: any) { r.descricao = 'erro:' + String(e.message || e).slice(0, 80); } }
+      if (fotoUrl) { try { await _grpPicture(instancia, jid, fotoUrl); r.foto = 'ok'; } catch (e: any) { r.foto = 'erro:' + String(e.message || e).slice(0, 80); } }
+      out.push(r);
+      if (intervalo) await new Promise((rs) => setTimeout(rs, intervalo * 1000));
+    }
+    const resumo = {
+      total: out.length,
+      nomeOk: out.filter((r: any) => r.nome === 'ok').length,
+      descricaoOk: out.filter((r: any) => r.descricao === 'ok').length,
+      fotoOk: out.filter((r: any) => r.foto === 'ok').length,
+      comErro: out.filter((r: any) => [r.nome, r.descricao, r.foto].some((v: any) => v && String(v).startsWith('erro'))).length,
+    };
+    res.json({ ok: true, resumo, grupos: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[etapa25] editar grupos em massa: POST /disparo/grupos-editar (nome/descrição/foto)');
 
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
