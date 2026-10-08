@@ -3769,6 +3769,83 @@ app.get('/disparo/multi-status', (_req, res) => {
 });
 console.log('[etapa22] disparo multi-número paralelo: POST /disparo/enviar-multi (auto/manual) + /disparo/grupos-admins + /disparo/multi-status (mídia por URL pública)');
 
+// ============================================================================
+// ETAPA 23 (08/10) — disparo em LOTE por filtro de nome + RELATÓRIO por grupo [add-only]
+// enviar-lote: seleciona os grupos pelo NOME (ex. "BLACK TECLADO GOSPEL 2026"),
+//   exclui por nome/jid, e manda TODOS por UMA instância (sem depender da validação
+//   de admin ao vivo, que oscila). Reusa _enfileiraMulti + tickCampanhaMulti.
+// multi-relatorio: lista GRUPO A GRUPO o que saiu/falhou/pendente (+ nome), pro
+//   Ezequias saber exatamente quais não foram e reenviar.
+// ============================================================================
+app.post('/disparo/enviar-lote', (req, res) => {
+  try {
+    const p = req.body || {};
+    const filtro = String(p.filtroNome || '').trim();
+    const instancia = String(p.instancia || '').trim();
+    if (!filtro) return res.json({ ok: false, erro: 'informe filtroNome' });
+    if (!instancia) return res.json({ ok: false, erro: 'informe instancia' });
+    const excluirNome = (p.excluirNome ? ([] as any[]).concat(p.excluirNome) : []).map((s: any) => String(s).toLowerCase());
+    const excluirJids = new Set((p.excluirJids || []).map((s: any) => String(s)));
+    const todos = db.prepare(`SELECT id, nome FROM grupos_wpp WHERE nome LIKE ?`).all('%' + filtro + '%') as any[];
+    const jids: string[] = [];
+    const vistos = new Set<string>();
+    for (const g of todos) {
+      const nomeL = String(g.nome || '').toLowerCase();
+      if (excluirNome.some((e: string) => e && nomeL.includes(e))) continue;
+      if (excluirJids.has(String(g.id))) continue;
+      if (vistos.has(String(g.id))) continue;
+      vistos.add(String(g.id)); jids.push(String(g.id));
+    }
+    if (!jids.length) return res.json({ ok: false, erro: 'nenhum grupo no filtro' });
+    let blocos: any[];
+    try {
+      blocos = (p.blocos || []).map((b: any) => {
+        if (b && b.tipo && b.tipo !== 'texto' && (b.od || b.onedrive)) {
+          if (!_rcloneOk()) throw new Error('rclone_indisponivel');
+          return { ...b, url: _odBaixarPub(String(b.od || b.onedrive)) };
+        }
+        return b;
+      });
+    } catch (e: any) { return res.json({ ok: false, erro: String(e.message || e) }); }
+    blocos = blocos.filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+    if (!blocos.length) return res.json({ ok: false, erro: 'sem blocos válidos' });
+    const intervalo = Math.max(1, Number(p.intervaloSegundos || 8));
+    const assigns = jids.map((j) => ({ jid: j, instancia }));
+    const n = _enfileiraMulti(assigns, blocos, intervalo, String(p.projeto || 'teclado'));
+    res.json({ ok: true, enfileirados: n, grupos: jids.length, instancia, jids });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// relatório por grupo (o que saiu / falhou / pendente), com nome do grupo.
+app.get('/disparo/multi-relatorio', (_req, res) => {
+  try {
+    const rows = db.prepare(`SELECT para, instancia, status, COUNT(*) n FROM fila_envio WHERE instancia IS NOT NULL AND status IN ('cmp_multi','enviado','falhou') GROUP BY para, instancia, status`).all() as any[];
+    const porGrupo: Record<string, any> = {};
+    for (const r of rows) {
+      const k = String(r.para);
+      if (!porGrupo[k]) porGrupo[k] = { jid: r.para, instancia: r.instancia, enviado: 0, falhou: 0, pendente: 0 };
+      if (r.status === 'enviado') porGrupo[k].enviado += r.n;
+      else if (r.status === 'falhou') porGrupo[k].falhou += r.n;
+      else porGrupo[k].pendente += r.n;
+    }
+    const nomes = db.prepare(`SELECT id, nome FROM grupos_wpp`).all() as any[];
+    const nomeDe: Record<string, string> = {};
+    for (const g of nomes) nomeDe[String(g.id)] = String(g.nome || '');
+    const grupos = (Object.values(porGrupo) as any[]).map((g: any) => ({
+      ...g, nome: nomeDe[g.jid] || g.jid,
+      situacao: g.pendente > 0 ? 'pendente' : (g.falhou > 0 && g.enviado === 0 ? 'falhou' : (g.falhou > 0 ? 'parcial' : 'enviado')),
+    }));
+    const resumo = {
+      enviados: grupos.filter((g: any) => g.situacao === 'enviado').length,
+      falhou: grupos.filter((g: any) => g.situacao === 'falhou').length,
+      parcial: grupos.filter((g: any) => g.situacao === 'parcial').length,
+      pendente: grupos.filter((g: any) => g.situacao === 'pendente').length,
+      total: grupos.length,
+    };
+    res.json({ ok: true, resumo, grupos });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[etapa23] disparo em lote por filtro (/disparo/enviar-lote) + relatório por grupo (/disparo/multi-relatorio)');
+
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
 
