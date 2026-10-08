@@ -20,6 +20,7 @@ import express from 'express';
 import Database from 'better-sqlite3';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process'; // etapa21: chamar o rclone (OneDrive)
 
 const PORT = Number(process.env.PORT || 8080);
 const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://evolution:8080';
@@ -625,6 +626,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/receive/')) return next();
   if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
   if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
+  if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -3498,6 +3500,108 @@ app.post('/conexoes/excluir', async (req, res) => {
     res.json({ ok: true });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+
+// ============================================================================
+// ETAPA 21 — rclone OneDrive: o MOTOR pega a mídia do OneDrive e usa. ADITIVO.
+// O binário rclone (instalado no container) usa o remote "onedrive" já logado
+// em /root/.config/rclone/rclone.conf (montado via docker-compose). O motor BAIXA
+// o arquivo do OneDrive pra /data/media e serve em /media/<arq> — rota PÚBLICA,
+// pois a Evolution busca a mídia por uma URL INTERNA (http://engine:8080) na mesma
+// rede docker. Assim vídeo/imagem/áudio ficam SÓ no OneDrive e o motor posta 24/7
+// (PC desligado). Namespaces: /pub/onedrive/rclone-*  e  /disparo/enviar-onedrive
+// ============================================================================
+const RCLONE_REMOTE = process.env.ONEDRIVE_REMOTE || 'onedrive';
+const ONEDRIVE_PASTA_BASE = process.env.ONEDRIVE_PASTA_BASE || 'Postagem Automatica';
+const MEDIA_DIR = '/data/media';
+// URL que a EVOLUTION usa pra baixar a mídia DO engine (mesma rede docker; a própria
+// Evolution já fala com http://engine:8080 no WEBHOOK_GLOBAL_URL).
+const MEDIA_INTERNAL_BASE = process.env.MEDIA_INTERNAL_BASE || 'http://engine:8080';
+try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch { /* ok */ }
+
+function _rclone(args: string[], opts: { timeoutMs?: number } = {}): string {
+  return execFileSync('rclone', args, {
+    encoding: 'utf8',
+    timeout: opts.timeoutMs || 120000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+function _rcloneOk(): boolean {
+  try { _rclone(['version'], { timeoutMs: 10000 }); return true; } catch { return false; }
+}
+/** Monta remote:"Base/rel" sem duplicar a pasta base. */
+function _odRemotePath(rel: string): string {
+  let r = String(rel || '').replace(/^\/+/, '');
+  const base = ONEDRIVE_PASTA_BASE.replace(/^\/+|\/+$/g, '');
+  if (base && r.toLowerCase() !== base.toLowerCase() && !r.toLowerCase().startsWith(base.toLowerCase() + '/')) {
+    r = base + '/' + r;
+  }
+  return `${RCLONE_REMOTE}:${r}`;
+}
+/** Lista (recursivo, só arquivos) a pasta base do OneDrive. */
+function _odRcloneListar(subpasta?: string): any[] {
+  const alvo = subpasta ? _odRemotePath(subpasta) : `${RCLONE_REMOTE}:${ONEDRIVE_PASTA_BASE}`;
+  try { return JSON.parse(_rclone(['lsjson', '-R', '--files-only', alvo], { timeoutMs: 90000 })); }
+  catch { return []; }
+}
+/** Baixa 1 arquivo do OneDrive pra /data/media (cache por hash). Devolve {file,url,nome}. */
+function _odRcloneBaixar(rel: string): { file: string; url: string; nome: string } {
+  const remote = _odRemotePath(rel);
+  const nome = (String(rel).split('/').pop() || 'arquivo').split('?')[0];
+  const ext = (nome.includes('.') ? nome.split('.').pop() : '') || '';
+  const safe = createHash('sha1').update(remote).digest('hex').slice(0, 16) + (ext ? '.' + ext.toLowerCase() : '');
+  const dest = MEDIA_DIR + '/' + safe;
+  if (!fs.existsSync(dest)) _rclone(['copyto', remote, dest], { timeoutMs: 180000 });
+  return { file: dest, url: `${MEDIA_INTERNAL_BASE}/media/${safe}`, nome };
+}
+
+// serve a mídia baixada (rota liberada no middleware acima)
+app.use('/media', express.static(MEDIA_DIR));
+
+// status do rclone/OneDrive no motor
+app.get('/pub/onedrive/rclone-status', (_req, res) => {
+  try {
+    const ok = _rcloneOk();
+    let remotes = ''; try { remotes = _rclone(['listremotes'], { timeoutMs: 10000 }).trim(); } catch { /* */ }
+    res.json({ ok, rclone: ok, remotes, remote: RCLONE_REMOTE, base: ONEDRIVE_PASTA_BASE });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// lista a mídia do OneDrive (pro app conferir/escolher)
+app.get('/pub/onedrive/rclone-listar', (req, res) => {
+  try {
+    if (!_rcloneOk()) return res.json({ ok: false, erro: 'rclone_indisponivel' });
+    const sub = String((req.query || {}).subpasta || '') || undefined;
+    res.json({ ok: true, base: ONEDRIVE_PASTA_BASE, arquivos: _odRcloneListar(sub) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// baixa 1 arquivo e devolve a URL interna /media (teste/uso avulso)
+app.post('/pub/onedrive/rclone-baixar', (req, res) => {
+  try {
+    if (!_rcloneOk()) return res.json({ ok: false, erro: 'rclone_indisponivel' });
+    const rel = String((req.body || {}).caminho || (req.body || {}).rel || '');
+    if (!rel) return res.json({ ok: false, erro: 'informe caminho (ex: "Melodias e Riffs Teclado/Reels-Short/x.mp4")' });
+    const r = _odRcloneBaixar(rel);
+    res.json({ ok: true, url: r.url, nome: r.nome });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// DISPARO com mídia vinda do OneDrive. Igual /disparo/enviar, mas os blocos de mídia
+// trazem { od: "caminho/no/onedrive" }: o motor baixa de lá (1x, cache /data/media) e
+// troca por uma URL interna /media/<arq> que a Evolution busca. Reusa _enfileiraDisparo.
+app.post('/disparo/enviar-onedrive', (req, res) => {
+  try {
+    if (!_rcloneOk()) return res.json({ ok: false, erro: 'rclone_indisponivel' });
+    const p = req.body || {};
+    const blocos = (p.blocos || []).map((b: any) => {
+      if (b && b.tipo && b.tipo !== 'texto' && (b.od || b.onedrive)) {
+        const r = _odRcloneBaixar(String(b.od || b.onedrive));
+        return { ...b, url: r.url };
+      }
+      return b;
+    });
+    const n = _enfileiraDisparo({ ...p, blocos });
+    res.json({ ok: true, enfileirados: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[etapa21] rclone OneDrive no motor: /media (público interno) + /pub/onedrive/rclone-status|listar|baixar + /disparo/enviar-onedrive');
 
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
