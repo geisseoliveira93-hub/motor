@@ -3660,9 +3660,9 @@ async function _gruposAdmins(jid: string, instancias: string[]): Promise<Record<
   return adm;
 }
 // enfileira: cada {jid,instancia} recebe os blocos; agendamento POR instância => paralelo entre números.
-function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string) {
+function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number) {
   const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
-  const base = Date.now();
+  const base = (baseTs && !isNaN(baseTs)) ? baseTs : Date.now(); // [etapa26] agendar: hora-base opcional (futuro => fila segura até a hora)
   const idxPorInst: Record<string, number> = {};
   let n = 0;
   const tx = db.transaction(() => {
@@ -3758,7 +3758,8 @@ app.post('/disparo/enviar-multi', async (req, res) => {
       }
     }
     if (!assigns.length) return res.json({ ok: false, erro: 'nenhum grupo atribuído', pulados });
-    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto);
+    const baseTs = p.agendadoPara ? new Date(p.agendadoPara).getTime() : undefined; // [etapa26] agendar vários disparos (hora opcional vinda do app)
+    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto, (baseTs && !isNaN(baseTs) ? baseTs : undefined));
     const porNumero = assigns.reduce((o: any, a) => ((o[a.instancia] = (o[a.instancia] || 0) + 1), o), {});
     res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, marcarTodos: !!p.marcarTodos, pulados });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
@@ -3869,9 +3870,9 @@ async function enviarMidiaViaMk(instancia: string, para: string, tipo: string, u
   return evo(`/message/sendMedia/${encodeURIComponent(instancia)}`, 'POST', body);
 }
 // enfileira igual ao _enfileiraMulti, mas com status 'cmp_mmk' + marcar=1 (ticker marcado cuida).
-function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string) {
+function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number) {
   const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,marcar,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  const base = Date.now();
+  const base = (baseTs && !isNaN(baseTs)) ? baseTs : Date.now(); // [etapa26] agendar: hora-base opcional
   const idxPorInst: Record<string, number> = {};
   let n = 0;
   const tx = db.transaction(() => {
