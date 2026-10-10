@@ -2031,11 +2031,13 @@ function _seedAgentes(): void {
        VALUES(?,?,?,?,?,?,?,?,?,?,?)`
     ).run(
       randomUUID(), projeto, String(seed.nome || ('SDR ' + projeto)), prompt,
-      'gpt-5.4-mini', 0.7, 0, 1, JSON.stringify(seed), agora(), agora()
+      'gpt-4o-mini', 0.7, 0, 1, JSON.stringify(seed), agora(), agora()
     );
   }
 }
 try { _seedAgentes(); } catch (e) { console.log('[agentes] seed falhou:', e); }
+// [etapa27] troca de modelo pra economizar: agentes que estavam no gpt-5.4-mini (caro) passam pro gpt-4o-mini (mesmo da Sellflux, bem mais barato). Idempotente — só mexe em quem ainda está no 5.4-mini.
+try { const _mig = db.prepare(`UPDATE agentes_ia SET modelo='gpt-4o-mini', atualizado_em=? WHERE modelo='gpt-5.4-mini'`).run(agora()); if (_mig.changes) console.log('[etapa27] modelo dos agentes: gpt-5.4-mini -> gpt-4o-mini em', _mig.changes, 'agente(s)'); } catch (e) { console.log('[etapa27] migracao de modelo falhou:', e); }
 
 function agenteDoProjeto(projeto: string): any {
   return db.prepare(`SELECT * FROM agentes_ia WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 1`).get(projeto) as any;
@@ -2229,13 +2231,13 @@ app.post('/agente', (req, res) => {
     const ex = db.prepare(`SELECT id FROM agentes_ia WHERE id=?`).get(id);
     if (ex) {
       db.prepare(`UPDATE agentes_ia SET nome=?, prompt=?, modelo=?, temperatura=?, ativo=?, tools_on=?, config=?, atualizado_em=? WHERE id=?`)
-        .run(String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-5.4-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), id);
+        .run(String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-4o-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), id);
       return res.json({ ok: true, id });
     }
   }
   const novo = id || randomUUID();
   db.prepare(`INSERT INTO agentes_ia(id,projeto,nome,prompt,modelo,temperatura,ativo,tools_on,config,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(novo, String(b.projeto || ''), String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-5.4-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), agora());
+    .run(novo, String(b.projeto || ''), String(b.nome || ''), String(b.prompt || ''), String(b.modelo || 'gpt-4o-mini'), Number(b.temperatura == null ? 0.7 : b.temperatura), b.ativo ? 1 : 0, b.toolsOn === false ? 0 : 1, JSON.stringify(b.config || {}), agora(), agora());
   res.json({ ok: true, id: novo });
 });
 app.post('/agente/remover', (req, res) => { db.prepare(`DELETE FROM agentes_ia WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
@@ -2485,6 +2487,9 @@ app.post('/disparo/tag/criar', (req, res) => {
 function _alvosDisparo(p: any): { projeto: string; para: string; grupo: boolean }[] {
   const out: { projeto: string; para: string; grupo: boolean }[] = [];
   const padrao = (CONFIG as any).projetoPadrao || 'teclado';
+  if (Array.isArray(p.telefones) && p.telefones.length) { // [etapa27] lista explícita de contatos (números) — disparo individual por seleção
+    return p.telefones.filter(Boolean).map((tel: any) => ({ projeto: String(p.projeto || padrao), para: String(tel), grupo: false }));
+  }
   if (p.alvoTipo === 'grupos') {
     for (const jid of (p.grupos || [])) {
       const g = db.prepare(`SELECT projeto FROM grupos_wpp WHERE id=?`).get(jid) as any;
@@ -2541,6 +2546,11 @@ app.post('/disparo/sequencia', (req, res) => {
 // resumo do disparo (pendentes/enviados/falhou)
 app.get('/disparo/resumo', (_req, res) => {
   res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE status IN ('camp_pend','enviado','falhou') GROUP BY status`).all() });
+});
+
+// [etapa27] resumo SÓ dos individuais (is_grupo=0) — pra fila ao vivo do Disparo Individual
+app.get('/disparo/resumo-individual', (_req, res) => {
+  res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE is_grupo=0 AND status IN ('camp_pend','enviado','falhou') GROUP BY status`).all() });
 });
 
 // ticker próprio do disparo (1s; respeita o agendado_para → intervalo/agenda; NÃO toca no tickFila)
@@ -3166,7 +3176,7 @@ app.post('/fluxo/campanha', (req, res) => {
     // ao salvar ATIVADA, já compila/agenda os disparos (Etapa 18); desativada, cancela os pendentes
     try {
       db.prepare(`DELETE FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).run(id);
-      if ((b.ativo ? 1 : 0) === 1) { const _c = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any; if (_c) _compilarFluxo(_c, false); }
+      if ((b.ativo ? 1 : 0) === 1) { const _c = db.prepare(`SELECT id, tipo, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any; if (_c) _compilarFluxo(_c, false); }
     } catch (_e) { /* compilacao nunca derruba o salvar */ }
     res.json({ ok: true, id });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
@@ -3202,6 +3212,7 @@ try {
   db.exec(`CREATE TABLE IF NOT EXISTS grupo_tags (grupo_id TEXT, tag TEXT, criado_em TEXT, PRIMARY KEY(grupo_id, tag));`);
 } catch (e) { console.error('[etapa18] grupo_tags erro:', e); }
 try { db.exec(`ALTER TABLE fila_envio ADD COLUMN campanha_id TEXT`); } catch {}
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN no_id TEXT`); } catch {} // [etapa27] bloco de origem no canvas (contador por bloco)
 
 // ---- tags de grupo (pro bloco Tag escolher a audiência) ----
 app.post('/fluxo/grupo/tag', (req, res) => {
@@ -3240,8 +3251,70 @@ function _gruposPorTags(tags: string[]): any[] {
 function _dataDoNo(n: any): any { return (n && (n.data || n.d)) || {}; }
 function _tipoNo(n: any): string { return String((n && (n.type || n.tipo)) || ''); }
 
+// [etapa27] resolve os CONTATOS-alvo (individual): precisam ter TODAS as tags listadas
+function _contatosPorTags(tags: string[]): any[] {
+  const ts = (tags || []).map((t) => String(t).trim()).filter(Boolean);
+  if (!ts.length) return [];
+  const ph = ts.map(() => '?').join(',');
+  const ids = db.prepare(`SELECT ct.contato_id FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE t.nome IN (${ph}) GROUP BY ct.contato_id HAVING COUNT(DISTINCT t.nome)=?`).all(...ts, ts.length) as any[];
+  if (!ids.length) return [];
+  const ph2 = ids.map(() => '?').join(',');
+  return db.prepare(`SELECT id, projeto, telefone FROM contatos WHERE id IN (${ph2}) AND telefone IS NOT NULL AND telefone<>''`).all(...ids.map((r) => r.contato_id)) as any[];
+}
+
+// [etapa27] compila um fluxo de canvas do tipo INDIVIDUAL -> enfileira pra CONTATOS (is_grupo=0). Espelha _compilarFluxo.
+function _compilarFluxoIndividual(camp: any, simular = false): { grupos: number; mensagens: number; ate: string; erros: string[] } {
+  const erros: string[] = [];
+  let fluxo: any = {}; try { fluxo = JSON.parse(camp.fluxo_json || '{}'); } catch { return { grupos: 0, mensagens: 0, ate: '', erros: ['fluxo_json invalido'] }; }
+  const nodes: any[] = Array.isArray(fluxo.nodes) ? fluxo.nodes : [];
+  const edges: any[] = Array.isArray(fluxo.edges) ? fluxo.edges : [];
+  if (!nodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem blocos'] };
+  const byId: any = {}; for (const n of nodes) byId[n.id] = n;
+  const prox: any = {}; for (const e of edges) { (prox[e.source] = prox[e.source] || []).push(e.target); }
+  const tagNodes = nodes.filter((n) => _tipoNo(n) === 'tag');
+  if (!tagNodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem bloco Tag de entrada'] };
+  const mapa: any = {};
+  for (const tn of tagNodes) for (const c of _contatosPorTags(_dataDoNo(tn).tags || [])) mapa[c.id] = c;
+  const contatos = Object.values(mapa) as any[];
+  if (!contatos.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['nenhum contato com essas tags'] };
+  let inicio: string | null = null;
+  for (const tn of tagNodes) { const alvo = (prox[tn.id] || [])[0]; if (alvo) { inicio = alvo; break; } }
+  if (!inicio) return { grupos: contatos.length, mensagens: 0, ate: '', erros: ['o bloco Tag não está ligado a nada'] };
+  const base = Date.now();
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  let offset = 0; let msgs = 0; let maxWhen = base;
+  const padrao = (CONFIG as any).projetoPadrao || 'teclado';
+  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio' };
+  const andar = db.transaction(() => {
+    let atual: string | null = inicio; let guard = 0; const visto: any = {};
+    while (atual && guard < 200) {
+      guard++; if (visto[atual]) break; visto[atual] = 1;
+      const n = byId[atual]; if (!n) break;
+      const t = _tipoNo(n); const d = _dataDoNo(n);
+      if (t === 'timer') { const val = Math.max(0, Number(d.valor ?? 1)); offset += val * _msUnidade(d.unidade || 'Dias'); }
+      else if (t === 'whatsapp') {
+        const blocos = (d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+        contatos.forEach((c: any, ci: number) => {
+          blocos.forEach((b: any, bi: number) => {
+            const when = new Date(base + offset + ci * 12000 + bi * 2000);
+            if (when.getTime() > maxWhen) maxWhen = when.getTime();
+            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'document');
+            if (!simular) ins.run(randomUUID(), c.projeto || padrao, String(c.telefone), 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id), String(n.id));
+            msgs++;
+          });
+        });
+      }
+      // editar_grupos / nota: ignorados no individual
+      atual = (prox[atual] || [])[0] || null;
+    }
+  });
+  andar();
+  return { grupos: contatos.length, mensagens: msgs, ate: new Date(maxWhen).toISOString(), erros };
+}
+
 // compila o fluxo -> enfileira em fila_envio (status camp_pend). Retorna resumo.
 function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens: number; ate: string; erros: string[] } {
+  if (String(camp?.tipo || '') === 'individual') return _compilarFluxoIndividual(camp, simular); // [etapa27] canvas individual (contatos) — caminho dos grupos fica intacto
   const erros: string[] = [];
   let fluxo: any = {}; try { fluxo = JSON.parse(camp.fluxo_json || '{}'); } catch { return { grupos: 0, mensagens: 0, ate: '', erros: ['fluxo_json invalido'] }; }
   const nodes: any[] = Array.isArray(fluxo.nodes) ? fluxo.nodes : [];
@@ -3262,7 +3335,7 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
   if (!inicio) return { grupos: grupos.length, mensagens: 0, ate: '', erros: ['o bloco Tag não está ligado a nada'] };
 
   const base = Date.now();
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`); // [etapa27] +no_id (bloco de origem)
   let offset = 0; let msgs = 0; let maxWhen = base;
   const padrao = (CONFIG as any).projetoPadrao || 'teclado';
   const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio' };
@@ -3283,7 +3356,7 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
             const when = new Date(base + offset + gi * 12000 + bi * 2000);
             if (when.getTime() > maxWhen) maxWhen = when.getTime();
             const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'document');
-            if (!simular) ins.run(randomUUID(), g.projeto || padrao, String(g.id), 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id));
+            if (!simular) ins.run(randomUUID(), g.projeto || padrao, String(g.id), 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id), String(n.id)); // [etapa27] +no_id
             msgs++;
           });
         });
@@ -3304,7 +3377,7 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
 // prévia (não grava nada) — pra conferir antes de ativar
 app.get('/fluxo/campanha/:id/previa', (req, res) => {
   try {
-    const camp = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(String(req.params.id)) as any;
+    const camp = db.prepare(`SELECT id, tipo, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(String(req.params.id)) as any;
     if (!camp) return res.json({ ok: false, erro: 'nao_encontrada' });
     res.json({ ok: true, previa: _compilarFluxo(camp, true) });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
@@ -3314,7 +3387,7 @@ app.get('/fluxo/campanha/:id/previa', (req, res) => {
 app.post('/fluxo/campanha/ativar', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.id || ''); const ativo = b.ativo ? 1 : 0;
-    const camp = db.prepare(`SELECT id, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any;
+    const camp = db.prepare(`SELECT id, tipo, fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any;
     if (!camp) return res.json({ ok: false, erro: 'nao_encontrada' });
     // sempre limpa os pendentes antigos dessa campanha
     db.prepare(`DELETE FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).run(id);
@@ -3334,6 +3407,25 @@ app.get('/fluxo/campanha/:id/status', (req, res) => {
     res.json({ ok: true, porStatus, proximoEnvio: prox?.p || null });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+
+// [etapa27] contagem POR BLOCO (no_id) da campanha — pro contador embaixo de cada bloco no canvas
+app.get('/fluxo/campanha/:id/status-nos', (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const rows = db.prepare(`SELECT no_id, status, COUNT(*) n FROM fila_envio WHERE campanha_id=? AND no_id IS NOT NULL GROUP BY no_id, status`).all(id) as any[];
+    const porNo: Record<string, { aguardando: number; contatados: number; falha: number }> = {};
+    for (const r of rows) {
+      const k = String(r.no_id);
+      if (!porNo[k]) porNo[k] = { aguardando: 0, contatados: 0, falha: 0 };
+      const st = String(r.status || '').toLowerCase();
+      if (st === 'falhou') porNo[k].falha += r.n;
+      else if (st === 'enviado') porNo[k].contatados += r.n;
+      else porNo[k].aguardando += r.n;
+    }
+    res.json({ ok: true, porNo });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[etapa27] contador por bloco (no_id) + disparo INDIVIDUAL (canvas tipo=individual, lista de contatos, resumo-individual) carregado');
 
 console.log('[etapa18] execução de fluxo de grupos carregada (compila -> fila_envio; inerte até ativar)');
 
