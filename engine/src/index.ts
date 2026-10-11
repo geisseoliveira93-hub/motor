@@ -629,6 +629,7 @@ app.use((req, res, next) => {
   if (req.path === '/pub/youtube/callback') return next(); // etapa28: OAuth YouTube (Google chama sem a x-api-key)
   if (req.path === '/pub/meta/callback') return next(); // etapa28: OAuth Meta/IG/FB (Facebook chama sem a x-api-key)
   if (req.path === '/pub/pinterest/callback') return next(); // etapa28: OAuth Pinterest (chama sem a x-api-key)
+  if (req.path.startsWith('/capi/webhook/')) return next(); // etapa29: webhook público de venda (Hotmart/Kiwify/Guru chamam sem x-api-key)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
@@ -4772,6 +4773,236 @@ app.post('/pub/fila/importar', (req, res) => {
 });
 
 console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativo=1): YT/IG/FB/Threads/Pinterest + worker + import de calendario');
+
+
+// ============================================================================
+// [etapa29] CAPI — Conversions API do Meta (envia vendas pro Meta) — INERTE até capi_ativo=1
+// ----------------------------------------------------------------------------
+// ADITIVO. Bloco inserido no index.ts do motor (antes do app.listen), igual ao etapa28.
+// Reaproveita os helpers já existentes: db (better-sqlite3), app (express), cifra/decifra,
+// pubFlag/setPubFlag, agora(), createHash, randomUUID.
+//
+// O que faz:
+//  - Recebe webhook de venda (Hotmart/Kiwify/Guru/LastLink) em rota PÚBLICA /capi/webhook/:fonte
+//  - Normaliza (email/telefone/valor/produto), faz HASH SHA-256 dos dados pessoais
+//  - Envia o evento (Purchase/Lead/InitiateCheckout) pro Meta via Graph API (CAPI)
+//  - Grava cada envio em capi_eventos (alimenta a aba "Eventos do pixel" do app)
+//  - Config do pixel (pixel_id + token) cifrada em capi_pixels, por produto/canal
+//
+// SEGURANÇA: enquanto pubFlag('capi_ativo') != '1', NADA é enviado ao Meta — só grava o
+// evento como 'inerte' pra você ver que chegou. Ligar é POST /capi/ligar.
+// ============================================================================
+{
+  // --- tabelas (idempotente) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS capi_pixels (
+      id TEXT PRIMARY KEY,
+      produto TEXT,
+      pixel_id TEXT NOT NULL,
+      access_token_enc BLOB NOT NULL,
+      test_event_code TEXT,
+      conta TEXT,
+      criado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS capi_eventos (
+      id TEXT PRIMARY KEY,
+      ts TEXT,
+      status TEXT,            -- ok | erro | inerte
+      fonte TEXT,             -- hotmart | kiwify | guru | lastlink | teste
+      evento TEXT,            -- Purchase | Lead | InitiateCheckout | ViewContent
+      pixel_id TEXT,
+      valor_centavos INTEGER,
+      moeda TEXT,
+      pagina TEXT,
+      produto TEXT,
+      resposta TEXT,
+      erro TEXT
+    );
+  `);
+
+  const capiHash = (v: string | null | undefined): string | undefined => {
+    if (!v) return undefined;
+    const s = String(v).trim().toLowerCase();
+    if (!s) return undefined;
+    return createHash('sha256').update(s).digest('hex');
+  };
+  const capiHashFone = (v: string | null | undefined): string | undefined => {
+    if (!v) return undefined;
+    const so = String(v).replace(/\D/g, '');
+    if (!so) return undefined;
+    // E.164 sem '+', assume BR se vier sem DDI
+    const comDdi = so.length <= 11 ? `55${so}` : so;
+    return createHash('sha256').update(comDdi).digest('hex');
+  };
+
+  interface CapiPixel { id: string; produto: string | null; pixel_id: string; token: string; test_event_code: string | null; conta: string | null }
+  const capiPixelLer = (id: string): CapiPixel | null => {
+    const r: any = db.prepare('SELECT * FROM capi_pixels WHERE id = ?').get(id);
+    if (!r) return null;
+    return { id: r.id, produto: r.produto, pixel_id: r.pixel_id, token: decifra(r.access_token_enc), test_event_code: r.test_event_code, conta: r.conta };
+  };
+  const capiPixelPadrao = (): CapiPixel | null => {
+    const r: any = db.prepare('SELECT * FROM capi_pixels ORDER BY criado_em ASC LIMIT 1').get();
+    if (!r) return null;
+    return { id: r.id, produto: r.produto, pixel_id: r.pixel_id, token: decifra(r.access_token_enc), test_event_code: r.test_event_code, conta: r.conta };
+  };
+
+  const capiLog = (e: {
+    status: string; fonte: string; evento: string; pixel_id?: string; valor_centavos?: number | null;
+    pagina?: string | null; produto?: string | null; resposta?: string | null; erro?: string | null;
+  }): void => {
+    db.prepare(`INSERT INTO capi_eventos (id, ts, status, fonte, evento, pixel_id, valor_centavos, moeda, pagina, produto, resposta, erro)
+      VALUES (@id,@ts,@status,@fonte,@evento,@pixel_id,@valor_centavos,'BRL',@pagina,@produto,@resposta,@erro)`).run({
+      id: randomUUID(), ts: agora(), status: e.status, fonte: e.fonte, evento: e.evento,
+      pixel_id: e.pixel_id || null, valor_centavos: e.valor_centavos ?? null,
+      pagina: e.pagina || null, produto: e.produto || null, resposta: e.resposta || null, erro: e.erro || null
+    });
+  };
+
+  // --- envio pro Meta (Graph API CAPI) ---
+  interface CapiDados { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; pagina?: string | null; eventId?: string | null }
+  const capiEnviar = async (px: CapiPixel, eventName: string, d: CapiDados): Promise<{ ok: boolean; resposta: string }> => {
+    const userData: Record<string, string[]> = {};
+    const em = capiHash(d.email); if (em) userData.em = [em];
+    const ph = capiHashFone(d.telefone); if (ph) userData.ph = [ph];
+    const evento: any = {
+      event_name: eventName,
+      event_time: Math.floor(Date.now() / 1000),
+      action_source: 'website',
+      event_id: d.eventId || randomUUID(),
+      user_data: userData
+    };
+    if (d.pagina) evento.event_source_url = d.pagina;
+    if (d.valorCentavos != null || d.produto) {
+      evento.custom_data = {};
+      if (d.valorCentavos != null) { evento.custom_data.value = Number((d.valorCentavos / 100).toFixed(2)); evento.custom_data.currency = 'BRL'; }
+      if (d.produto) evento.custom_data.content_name = d.produto;
+    }
+    const body: any = { data: [evento] };
+    if (px.test_event_code) body.test_event_code = px.test_event_code;
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(px.pixel_id)}/events?access_token=${encodeURIComponent(px.token)}`;
+    const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const txt = await resp.text();
+    return { ok: resp.ok, resposta: txt.slice(0, 500) };
+  };
+
+  // --- parse dos webhooks por fonte (campos mais comuns; tolerante) ---
+  const capiParse = (fonte: string, p: any): { evento: string; d: CapiDados } => {
+    const g = (o: any, ...ks: string[]): any => { for (const k of ks) { if (o && o[k] != null) return o[k]; } return undefined; };
+    const reaisParaCentavos = (v: any): number | null => { const n = Number(v); return isNaN(n) ? null : Math.round(n * 100); };
+    let email: any, telefone: any, valor: any, produto: any, pagina: any, evento = 'Purchase';
+    try {
+      if (fonte === 'hotmart') {
+        const buyer = g(p?.data, 'buyer') || p?.buyer || {};
+        const purchase = g(p?.data, 'purchase') || p?.purchase || {};
+        const prod = g(p?.data, 'product') || p?.product || {};
+        email = g(buyer, 'email'); telefone = g(buyer, 'checkout_phone', 'phone');
+        valor = g(purchase?.price, 'value') ?? g(purchase, 'full_price', 'price');
+        produto = g(prod, 'name'); pagina = g(purchase, 'origin', 'checkout_country');
+        const status = String(g(purchase, 'status') || '').toUpperCase();
+        evento = status.includes('APPROVED') || status.includes('COMPLETE') ? 'Purchase' : 'InitiateCheckout';
+      } else if (fonte === 'kiwify') {
+        const c = p?.Customer || p?.customer || {};
+        email = g(c, 'email'); telefone = g(c, 'mobile', 'phone');
+        valor = g(p, 'order_amount') ?? g(p?.Commissions, 'charge_amount');
+        if (valor && Number(valor) > 1000) valor = Number(valor) / 100; // kiwify às vezes manda centavos
+        produto = g(p?.Product, 'product_name') || g(p, 'product_name');
+        const st = String(g(p, 'order_status') || '').toLowerCase();
+        evento = st.includes('paid') || st.includes('approved') ? 'Purchase' : 'InitiateCheckout';
+      } else if (fonte === 'guru') {
+        const c = p?.contact || p?.customer || {};
+        email = g(c, 'email'); telefone = g(c, 'phone_number', 'phone');
+        valor = g(p, 'payment')?.total ?? g(p, 'value', 'total');
+        produto = g(p, 'product')?.name || g(p, 'product_name');
+        const st = String(g(p, 'status') || '').toLowerCase();
+        evento = st.includes('approved') || st.includes('paid') ? 'Purchase' : 'InitiateCheckout';
+      } else { // lastlink / genérico
+        email = g(p, 'email') || g(p?.Buyer, 'Email') || g(p?.data, 'email');
+        telefone = g(p, 'phone', 'telefone');
+        valor = g(p, 'value', 'amount', 'total', 'price');
+        produto = g(p, 'product', 'product_name', 'produto');
+      }
+    } catch { /* tolerante */ }
+    return { evento, d: { email, telefone, valorCentavos: reaisParaCentavos(valor), produto: produto ? String(produto) : null, pagina: pagina ? String(pagina) : null } };
+  };
+
+  // --- processa 1 evento (envia se ligado; sempre loga) ---
+  const capiProcessar = async (fonte: string, pix: CapiPixel | null, eventName: string, d: CapiDados): Promise<void> => {
+    const ligado = pubFlag('capi_ativo', '0') === '1';
+    if (!pix) { capiLog({ status: 'erro', fonte, evento: eventName, valor_centavos: d.valorCentavos, pagina: d.pagina, produto: d.produto, erro: 'nenhum pixel configurado' }); return; }
+    if (!ligado) { capiLog({ status: 'inerte', fonte, evento: eventName, pixel_id: pix.pixel_id, valor_centavos: d.valorCentavos, pagina: d.pagina, produto: d.produto, resposta: 'capi_ativo=0 (não enviado)' }); return; }
+    try {
+      const r = await capiEnviar(pix, eventName, d);
+      capiLog({ status: r.ok ? 'ok' : 'erro', fonte, evento: eventName, pixel_id: pix.pixel_id, valor_centavos: d.valorCentavos, pagina: d.pagina, produto: d.produto, resposta: r.resposta, erro: r.ok ? null : r.resposta });
+    } catch (err: any) {
+      capiLog({ status: 'erro', fonte, evento: eventName, pixel_id: pix.pixel_id, valor_centavos: d.valorCentavos, pagina: d.pagina, produto: d.produto, erro: String(err?.message || err) });
+    }
+  };
+
+  // ---------- ROTAS ----------
+  // Config do pixel (pixel_id + token cifrado). id = produto/canal (ex: 'teclado').
+  app.post('/capi/pixel', (req: any, res: any) => {
+    const { id, produto, pixel_id, access_token, test_event_code, conta } = req.body || {};
+    if (!id || !pixel_id || !access_token) return res.status(400).json({ erro: 'id, pixel_id e access_token obrigatórios' });
+    db.prepare(`INSERT INTO capi_pixels (id, produto, pixel_id, access_token_enc, test_event_code, conta, criado_em)
+      VALUES (@id,@produto,@pixel_id,@tok,@tec,@conta,@cri)
+      ON CONFLICT(id) DO UPDATE SET produto=@produto, pixel_id=@pixel_id, access_token_enc=@tok, test_event_code=@tec, conta=@conta`).run({
+      id, produto: produto || null, pixel_id, tok: cifra(String(access_token)), tec: test_event_code || null, conta: conta || null, cri: agora()
+    });
+    res.json({ ok: true });
+  });
+  app.get('/capi/pixels', (_req: any, res: any) => {
+    const rs: any[] = db.prepare('SELECT id, produto, pixel_id, test_event_code, conta, criado_em FROM capi_pixels').all();
+    res.json({ pixels: rs });
+  });
+
+  // Webhook público de venda — Hotmart/Kiwify/Guru/LastLink chamam aqui. SEM x-api-key.
+  app.post('/capi/webhook/:fonte', async (req: any, res: any) => {
+    const fonte = String(req.params.fonte || 'generico').toLowerCase();
+    try {
+      const { evento, d } = capiParse(fonte, req.body || {});
+      // escolhe pixel: por produto (se casar) senão o padrão
+      let pix = capiPixelPadrao();
+      if (d.produto) {
+        const porProd: any = db.prepare('SELECT id FROM capi_pixels WHERE lower(produto)=lower(?) LIMIT 1').get(d.produto);
+        if (porProd) pix = capiPixelLer(porProd.id) || pix;
+      }
+      await capiProcessar(fonte, pix, evento, d);
+      res.json({ ok: true }); // sempre 200 pro gateway não ficar re-tentando
+    } catch (err: any) {
+      capiLog({ status: 'erro', fonte, evento: 'Purchase', erro: String(err?.message || err) });
+      res.json({ ok: true });
+    }
+  });
+
+  // Log de eventos (pra aba "Eventos do pixel")
+  app.get('/capi/eventos', (req: any, res: any) => {
+    const lim = Math.min(Number(req.query.limite || 200), 1000);
+    const rs: any[] = db.prepare('SELECT * FROM capi_eventos ORDER BY ts DESC LIMIT ?').all(lim);
+    const ok = db.prepare("SELECT COUNT(*) n FROM capi_eventos WHERE status='ok'").get() as any;
+    const er = db.prepare("SELECT COUNT(*) n FROM capi_eventos WHERE status='erro'").get() as any;
+    res.json({ eventos: rs, totalOk: ok?.n || 0, totalErro: er?.n || 0 });
+  });
+
+  // Teste: envia 1 evento agora (respeita capi_ativo; se desligado, grava 'inerte')
+  app.post('/capi/testar', async (req: any, res: any) => {
+    const { id, email, valor, produto } = req.body || {};
+    const pix = id ? capiPixelLer(String(id)) : capiPixelPadrao();
+    await capiProcessar('teste', pix, 'Purchase', {
+      email: email || 'teste@melodiaseriffs.com.br',
+      valorCentavos: valor != null ? Math.round(Number(valor) * 100) : 9700,
+      produto: produto || 'Teste CAPI', pagina: PUBLIC_BASE_URL
+    });
+    res.json({ ok: true, enviado: pubFlag('capi_ativo', '0') === '1' });
+  });
+
+  // Controle
+  app.get('/capi/status', (_req: any, res: any) => res.json({ ativo: pubFlag('capi_ativo', '0') === '1', pixels: (db.prepare('SELECT COUNT(*) n FROM capi_pixels').get() as any)?.n || 0 }));
+  app.post('/capi/ligar', (_req: any, res: any) => { setPubFlag('capi_ativo', '1'); res.json({ ok: true, ativo: true }); });
+  app.post('/capi/desligar', (_req: any, res: any) => { setPubFlag('capi_ativo', '0'); res.json({ ok: true, ativo: false }); });
+
+  console.log('[etapa29] CAPI carregado (INERTE ate capi_ativo=1) — /capi/webhook/:fonte, /capi/pixel, /capi/eventos, /capi/testar');
+}
 
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
