@@ -1731,7 +1731,7 @@ function classificaPagamento(provider: string, statusRaw: string): 'aprovado' | 
 // [etapa31] gancho do CAPI: é preenchido dentro do bloco CAPI (etapa29) no boot.
 // Serve pra espelhar a MESMA venda que chega pela entrega (Guru/LastLink) no pixel Meta,
 // sem precisar criar webhook novo. Fica null até o bloco CAPI rodar no startup.
-let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; evento?: string }) => Promise<void>) | null = null;
+let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; produtoId?: string | null; evento?: string }) => Promise<void>) | null = null;
 
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
@@ -1770,7 +1770,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         await capiHookPagamento(provider, {
           email: p.email, telefone: p.telefone,
           valorCentavos: Math.round(Number(p.valor || 0) * 100),
-          produto: p.produtoNome, evento: _capiEv,
+          produto: p.produtoNome, produtoId: p.produtoId, evento: _capiEv,
         }).catch(() => {});
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
@@ -4970,11 +4970,21 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   // também vai pro pixel Meta, sem criar webhook novo na Guru/LastLink.
   capiHookPagamento = async (fonte, dados) => {
     const eventName = dados.evento || 'Purchase';
-    let pix = capiPixelPadrao();
-    if (dados.produto) {
+    // [etapa32] Roteia por INSTRUMENTO reusando projetoDoProduto (palavra-chave baixo/violao/teclado):
+    // robusto p/ QUALQUER nome de produto, sem cadastrar nome por nome. Os vínculos têm
+    // id = 'teclado'/'baixo'/'violao', que batem com o retorno de projetoDoProduto.
+    let pix: CapiPixel | null = null;
+    try {
+      const proj = projetoDoProduto(dados.produtoId || undefined, dados.produto || undefined);
+      if (proj) pix = capiPixelLer(String(proj));
+    } catch { /* se o roteador falhar, cai nos fallbacks abaixo */ }
+    // Fallback 1: match EXATO por nome (caso algum vínculo tenha o nome cheio do produto).
+    if (!pix && dados.produto) {
       const porProd: any = db.prepare('SELECT id FROM capi_pixels WHERE lower(produto)=lower(?) LIMIT 1').get(dados.produto);
-      if (porProd) pix = capiPixelLer(porProd.id) || pix;
+      if (porProd) pix = capiPixelLer(porProd.id);
     }
+    // Fallback 2: padrão (linha mais antiga). Com os 3 vínculos de instrumento, quase nunca usado.
+    if (!pix) pix = capiPixelPadrao();
     await capiProcessar(fonte, pix, eventName, {
       email: dados.email, telefone: dados.telefone,
       valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null,
