@@ -5373,12 +5373,6 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
 
-  app.get('/lives/:id', (req: any, res: any) => {
-    const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
-    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
-    res.json({ ok: true, live: row });
-  });
-
   // cancela (se estiver no ar, encerra os ffmpeg e completa os broadcasts)
   app.post('/lives/cancelar', async (req: any, res: any) => {
     try {
@@ -5435,6 +5429,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       }).filter((c) => c.youtube_conectado);
       res.json({ ok: true, destinos: out });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // detalhe de UMA transmissão (por último: rota com :id não pode capturar /lives/_status e /lives/destinos)
+  app.get('/lives/:id', (req: any, res: any) => {
+    const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+    res.json({ ok: true, live: row });
   });
 
   console.log('[etapa33] lives/transmissao carregado (INERTE ate lives_ativo=1): ao-vivo-gravado YouTube + FFmpeg + worker + /lives/*');
