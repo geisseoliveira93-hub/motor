@@ -4861,7 +4861,14 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
 
   // --- envio pro Meta (Graph API CAPI) ---
   interface CapiDados { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; pagina?: string | null; eventId?: string | null }
+  // etapa30: token CENTRAL (1 token do System User serve pra todos os pixels). Guardado em capi_pixels id='__central__'.
+  const capiTokenCentral = (): string => {
+    const r: any = db.prepare("SELECT access_token_enc FROM capi_pixels WHERE id = '__central__'").get();
+    if (!r) return '';
+    try { return decifra(r.access_token_enc); } catch { return ''; }
+  };
   const capiEnviar = async (px: CapiPixel, eventName: string, d: CapiDados): Promise<{ ok: boolean; resposta: string }> => {
+    const tokenUsar = px.token || capiTokenCentral(); // usa o token do pixel OU o central
     const userData: Record<string, string[]> = {};
     const em = capiHash(d.email); if (em) userData.em = [em];
     const ph = capiHashFone(d.telefone); if (ph) userData.ph = [ph];
@@ -4880,7 +4887,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     }
     const body: any = { data: [evento] };
     if (px.test_event_code) body.test_event_code = px.test_event_code;
-    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(px.pixel_id)}/events?access_token=${encodeURIComponent(px.token)}`;
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(px.pixel_id)}/events?access_token=${encodeURIComponent(tokenUsar)}`;
     const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const txt = await resp.text();
     return { ok: resp.ok, resposta: txt.slice(0, 500) };
@@ -5002,6 +5009,67 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   app.post('/capi/desligar', (_req: any, res: any) => { setPubFlag('capi_ativo', '0'); res.json({ ok: true, ativo: false }); });
 
   console.log('[etapa29] CAPI carregado (INERTE ate capi_ativo=1) — /capi/webhook/:fonte, /capi/pixel, /capi/eventos, /capi/testar');
+}
+
+{
+  // ===== [etapa30] Importar do Meta (lista contas+pixels) + TOKEN CENTRAL (1 token p/ todos) =====
+  const capiCentralTok = (): string => {
+    const r: any = db.prepare("SELECT access_token_enc FROM capi_pixels WHERE id = '__central__'").get();
+    if (!r) return '';
+    try { return decifra(r.access_token_enc); } catch { return ''; }
+  };
+
+  // Salva o token central (System User), cifrado, em capi_pixels id='__central__'.
+  app.post('/capi/token-central', (req: any, res: any) => {
+    const { token } = req.body || {};
+    if (!token) return res.status(400).json({ erro: 'token obrigatorio' });
+    db.prepare(`INSERT INTO capi_pixels (id, produto, pixel_id, access_token_enc, test_event_code, conta, criado_em)
+      VALUES ('__central__','(token central)','__central__',@tok,NULL,NULL,@cri)
+      ON CONFLICT(id) DO UPDATE SET access_token_enc=@tok`).run({ tok: cifra(String(token)), cri: agora() });
+    res.json({ ok: true });
+  });
+  app.get('/capi/token-central/status', (_req: any, res: any) => { res.json({ tem: !!capiCentralTok() }); });
+
+  // Lista TODAS as contas de anuncio + pixels do Meta usando o token central.
+  app.get('/capi/importar', async (_req: any, res: any) => {
+    const tok = capiCentralTok();
+    if (!tok) return res.status(400).json({ erro: 'sem_token_central' });
+    try {
+      const gfetch = async (u: string): Promise<any> => { const r = await fetch(u); return r.json(); };
+      const base = 'https://graph.facebook.com/v21.0';
+      const contasResp = await gfetch(`${base}/me/adaccounts?fields=account_id,name&limit=500&access_token=${encodeURIComponent(tok)}`);
+      if (contasResp?.error) return res.status(400).json({ erro: 'meta_erro', detalhe: contasResp.error });
+      const contas: any[] = (contasResp?.data || []).map((c: any) => ({ id: String(c.account_id), nome: c.name }));
+      const pixMap: Record<string, { id: string; nome: string; contas: string[] }> = {};
+      for (const c of contas) {
+        try {
+          const pr = await gfetch(`${base}/act_${c.id}/adspixels?fields=id,name&limit=200&access_token=${encodeURIComponent(tok)}`);
+          for (const p of (pr?.data || [])) {
+            if (!pixMap[p.id]) pixMap[p.id] = { id: String(p.id), nome: p.name, contas: [] };
+            pixMap[p.id].contas.push(c.nome);
+          }
+        } catch { /* conta sem acesso a pixels: ignora */ }
+      }
+      res.json({ ok: true, contas, pixels: Object.values(pixMap) });
+    } catch (e: any) { res.status(500).json({ erro: String(e?.message || e) }); }
+  });
+
+  // Registra varios pixels de uma vez (produto -> pixel_id). Sem token proprio: usam o central.
+  app.post('/capi/pixels/bulk', (req: any, res: any) => {
+    const lista: any[] = (req.body && req.body.pixels) || [];
+    if (!Array.isArray(lista) || !lista.length) return res.status(400).json({ erro: 'pixels_obrigatorio' });
+    const vazio = cifra('');
+    const stmt = db.prepare(`INSERT INTO capi_pixels (id, produto, pixel_id, access_token_enc, test_event_code, conta, criado_em)
+      VALUES (@id,@produto,@pixel_id,@tok,NULL,@conta,@cri)
+      ON CONFLICT(id) DO UPDATE SET produto=@produto, pixel_id=@pixel_id, conta=@conta`);
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) stmt.run({ id: String(r.id || r.produto || r.pixel_id), produto: r.produto || null, pixel_id: String(r.pixel_id), tok: vazio, conta: r.conta || null, cri: agora() });
+    });
+    tx(lista);
+    res.json({ ok: true, salvos: lista.length });
+  });
+
+  console.log('[etapa30] CAPI importar carregado — /capi/token-central, /capi/importar, /capi/pixels/bulk');
 }
 
 
