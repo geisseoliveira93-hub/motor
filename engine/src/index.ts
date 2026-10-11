@@ -626,6 +626,9 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/receive/')) return next();
   if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
   if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
+  if (req.path === '/pub/youtube/callback') return next(); // etapa28: OAuth YouTube (Google chama sem a x-api-key)
+  if (req.path === '/pub/meta/callback') return next(); // etapa28: OAuth Meta/IG/FB (Facebook chama sem a x-api-key)
+  if (req.path === '/pub/pinterest/callback') return next(); // etapa28: OAuth Pinterest (chama sem a x-api-key)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
@@ -4057,6 +4060,718 @@ console.log('[etapa25] editar grupos em massa: POST /disparo/grupos-editar (nome
 
 console.log('[etapa19] conexões/dispositivos carregado (listar/estado/conectar/pareamento/reiniciar/desconectar/criar/registrar/excluir)');
 console.log('[etapa20] entrega: chamar pela pessoa pelo nome com liga/desliga + fallback por produto');
+
+
+
+// ============================================================================
+// [etapa28] PUBLICADOR NA NUVEM — posta nas redes 24/7 a partir do OneDrive.
+//   Aditivo. INERTE por padrão: só posta quando pub_kv 'publicador_ativo'='1'.
+//   Reusa do motor: db, app, express, cifra/decifra, pubFlag/setPubFlag,
+//   _odRcloneBaixar (baixa do OneDrive), MEDIA_DIR/MEDIA_PUBLIC_BASE,
+//   PUBLIC_BASE_URL, agora(), fs, createHash/randomBytes/randomUUID.
+//   Tabelas já existentes: fila_publicacao, canais_publicacao, oauth_tokens_pub,
+//   conexoes_sociais, pub_kv, horarios_preferidos.
+//   Prefixos próprios (pb*/tickPublicador) pra não colidir com nada existente.
+// ============================================================================
+
+// ---- helpers locais (nome/extensão sem depender de import novo) ----
+function pbBasename(p: string): string { return String(p || '').split(/[\\/]/).pop() || ''; }
+function pbExt(p: string): string { const n = pbBasename(p); return n.includes('.') ? (n.split('.').pop() || '').toLowerCase() : ''; }
+function pbIsImagem(p: string): boolean { return ['jpg', 'jpeg', 'png', 'webp'].includes(pbExt(p)); }
+function pbMime(p: string): string {
+  const e = pbExt(p);
+  if (e === 'png') return 'image/png'; if (e === 'webp') return 'image/webp';
+  if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
+  if (e === 'mov') return 'video/quicktime'; if (e === 'webm') return 'video/webm';
+  if (e === 'mkv') return 'video/x-matroska'; if (e === 'm4v') return 'video/x-m4v';
+  return 'video/mp4';
+}
+function pbSleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+function pbLog(evt: string, ...args: any[]) { try { console.log(`[etapa28] ${evt}`, ...args); } catch { /* */ } }
+
+// ---- store de tokens OAuth (oauth_tokens_pub, cifrado) ----
+interface PbTok { accessToken: string; refreshToken: string | null; expiresAt: string | null; scope: string | null; conta: string | null; }
+function pbTokSalvar(canalId: string, plataforma: string, t: { accessToken?: string; refreshToken?: string | null; expiresAt?: string | null; scope?: string | null; conta?: string | null }) {
+  const atual = pbTokLer(canalId, plataforma);
+  const acc = t.accessToken != null ? t.accessToken : (atual?.accessToken || '');
+  const ref = t.refreshToken !== undefined ? t.refreshToken : (atual?.refreshToken ?? null);
+  const exp = t.expiresAt !== undefined ? t.expiresAt : (atual?.expiresAt ?? null);
+  const scp = t.scope !== undefined ? t.scope : (atual?.scope ?? null);
+  const cnt = t.conta !== undefined ? t.conta : (atual?.conta ?? null);
+  db.prepare(`INSERT INTO oauth_tokens_pub(canal_id,plataforma,access_token_enc,refresh_token_enc,expires_at,scope,conta,atualizado_em)
+    VALUES(?,?,?,?,?,?,?,?)
+    ON CONFLICT(canal_id,plataforma) DO UPDATE SET access_token_enc=excluded.access_token_enc,
+      refresh_token_enc=excluded.refresh_token_enc, expires_at=excluded.expires_at, scope=excluded.scope,
+      conta=excluded.conta, atualizado_em=excluded.atualizado_em`)
+    .run(String(canalId), plataforma, cifra(acc), ref ? cifra(ref) : null, exp, scp, cnt, agora());
+}
+function pbTokLer(canalId: string, plataforma: string): PbTok | null {
+  const r = db.prepare(`SELECT * FROM oauth_tokens_pub WHERE canal_id=? AND plataforma=?`).get(String(canalId), plataforma) as any;
+  if (!r) return null;
+  return {
+    accessToken: r.access_token_enc ? decifra(r.access_token_enc) : '',
+    refreshToken: r.refresh_token_enc ? decifra(r.refresh_token_enc) : null,
+    expiresAt: r.expires_at || null, scope: r.scope || null, conta: r.conta || null,
+  };
+}
+function pbTokApagar(canalId: string, plataforma: string) {
+  try { db.prepare(`DELETE FROM oauth_tokens_pub WHERE canal_id=? AND plataforma=?`).run(String(canalId), plataforma); } catch { /* */ }
+}
+function pbTokValido(t: PbTok | null): boolean {
+  if (!t || !t.accessToken) return false;
+  if (!t.expiresAt) return true; // tokens de página do Meta não expiram
+  return new Date(t.expiresAt).getTime() - 60_000 > Date.now();
+}
+
+// ---- credenciais de app OAuth (client_id/secret) em pub_kv cifrado, com fallback env ----
+function pbCred(plataforma: string): { clientId: string; clientSecret: string } {
+  const ci = decifra(pubFlag(`cred_${plataforma}_client_id`, '')) || process.env[`${plataforma.toUpperCase()}_CLIENT_ID`] || '';
+  const cs = decifra(pubFlag(`cred_${plataforma}_client_secret`, '')) || process.env[`${plataforma.toUpperCase()}_CLIENT_SECRET`] || '';
+  return { clientId: ci, clientSecret: cs };
+}
+function pbCredSalvar(plataforma: string, clientId: string, clientSecret: string) {
+  if (clientId) setPubFlag(`cred_${plataforma}_client_id`, cifra(clientId));
+  if (clientSecret) setPubFlag(`cred_${plataforma}_client_secret`, cifra(clientSecret));
+}
+
+// ---- helper de canal (lê colunas de canais_publicacao) ----
+function pbCanal(canalId: string): any { return db.prepare(`SELECT * FROM canais_publicacao WHERE id=?`).get(String(canalId)); }
+function pbCanalSet(canalId: string, campo: string, valor: string) {
+  const permitido = ['ig_business_id', 'fb_page_id', 'yt_channel_id', 'threads_user_id', 'pinterest_board_id', 'tiktok_open_id'];
+  if (!permitido.includes(campo)) return;
+  db.prepare(`UPDATE canais_publicacao SET ${campo}=?, atualizado_em=? WHERE id=?`).run(valor, agora(), String(canalId));
+}
+
+// ---- baixa a mídia do OneDrive e devolve caminho local + URL PÚBLICA (pras redes que exigem URL) ----
+function pbBaixarMidia(onedriveRef: string): { file: string; publicUrl: string; nome: string } {
+  const r = _odRcloneBaixar(onedriveRef); // {file, url(interna), nome}
+  const safe = pbBasename(r.file);
+  const base = String(MEDIA_PUBLIC_BASE || PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  return { file: r.file, publicUrl: `${base}/media/${safe}`, nome: r.nome };
+}
+
+// ---- marca status de conexão (conexoes_sociais) ----
+function pbConexao(canalId: string, plataforma: string, status: string, detalhe = '') {
+  try {
+    db.prepare(`INSERT INTO conexoes_sociais(id,canal_id,plataforma,metodo,status,detalhe,ultimo_check,atualizado_em)
+      VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET status=excluded.status, detalhe=excluded.detalhe, ultimo_check=excluded.ultimo_check, atualizado_em=excluded.atualizado_em`)
+      .run(`${canalId}:${plataforma}`, String(canalId), plataforma, 'oauth', status, detalhe, agora(), agora());
+  } catch { /* conexoes_sociais usa PK id; se schema diferente, ignora */ }
+}
+
+// ============================ OAUTH — YOUTUBE (Google) ============================
+const PB_YT_SCOPES = [
+  'https://www.googleapis.com/auth/youtube.upload',
+  'https://www.googleapis.com/auth/youtube',
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'openid', 'email', 'profile',
+].join(' ');
+function pbYtRedirect(): string { return (PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/pub/youtube/callback'; }
+
+app.get('/pub/youtube/connect', (req, res) => {
+  try {
+    const canalId = String((req.query.canalId || req.query.canal_id || '')).trim();
+    if (!canalId) return res.status(400).json({ ok: false, erro: 'canalId obrigatório' });
+    const { clientId } = pbCred('youtube');
+    if (!clientId) return res.status(400).json({ ok: false, erro: 'YouTube client_id não configurado (POST /pub/pub-cred)' });
+    const params = new URLSearchParams({
+      client_id: clientId, redirect_uri: pbYtRedirect(), response_type: 'code', scope: PB_YT_SCOPES,
+      access_type: 'offline', prompt: 'select_account consent', include_granted_scopes: 'false', state: `yt:${canalId}`,
+    });
+    res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// ROTA PÚBLICA (Google chama sem x-api-key) — exceção adicionada no middleware.
+app.get('/pub/youtube/callback', async (req, res) => {
+  const enviaHtml = (ok: boolean, msg: string) => res.status(200).type('html').send(pbHtmlResposta(ok, msg));
+  try {
+    const code = String(req.query.code || ''); const state = String(req.query.state || '');
+    if (req.query.error) return enviaHtml(false, `Google: ${req.query.error}`);
+    if (!code || !state.startsWith('yt:')) return enviaHtml(false, 'callback inválido');
+    const canalId = state.slice(3);
+    const { clientId, clientSecret } = pbCred('youtube');
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: pbYtRedirect(), grant_type: 'authorization_code' }),
+    });
+    if (!tr.ok) return enviaHtml(false, `troca de token falhou (${tr.status})`);
+    const td = await tr.json() as any;
+    const expiresAt = new Date(Date.now() + (td.expires_in || 3600) * 1000).toISOString();
+    // conta + channelId
+    let conta = ''; let channelId = '';
+    try { const ui = await (await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${td.access_token}` } })).json() as any; conta = ui.email || ui.name || ''; } catch { /* */ }
+    try {
+      const ch = await (await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: `Bearer ${td.access_token}` } })).json() as any;
+      if (ch.items && ch.items[0]) { channelId = ch.items[0].id; conta = ch.items[0].snippet?.title || conta; }
+    } catch { /* */ }
+    pbTokSalvar(canalId, 'youtube', { accessToken: td.access_token, refreshToken: td.refresh_token || null, expiresAt, scope: td.scope || PB_YT_SCOPES, conta });
+    if (channelId) pbCanalSet(canalId, 'yt_channel_id', channelId);
+    pbConexao(canalId, 'youtube', 'conectado', conta);
+    enviaHtml(true, `YouTube: ${conta || channelId || 'conta'}`);
+  } catch (e: any) { enviaHtml(false, String(e?.message || e)); }
+});
+
+async function pbYtToken(canalId: string): Promise<string> {
+  const rec = pbTokLer(canalId, 'youtube');
+  if (!rec) throw new Error('Canal não conectado ao YouTube.');
+  if (pbTokValido(rec)) return rec.accessToken;
+  if (!rec.refreshToken) throw new Error('Token YouTube expirado e sem refresh — reconecte.');
+  const { clientId, clientSecret } = pbCred('youtube');
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, grant_type: 'refresh_token', refresh_token: rec.refreshToken }),
+  });
+  if (!r.ok) throw new Error(`Refresh YouTube falhou (${r.status}): ${(await r.text()).slice(0, 200)}`);
+  const d = await r.json() as any;
+  const expiresAt = new Date(Date.now() + (d.expires_in || 3600) * 1000).toISOString();
+  pbTokSalvar(canalId, 'youtube', { accessToken: d.access_token, expiresAt, ...(d.scope ? { scope: d.scope } : {}) });
+  return d.access_token;
+}
+
+// ============================ OAUTH — META (Instagram + Facebook) ============================
+const PB_META_VER = 'v21.0';
+const PB_META_SCOPES = ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'business_management', 'instagram_basic', 'instagram_content_publish'].join(',');
+function pbMetaRedirect(): string { return (PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/pub/meta/callback'; }
+
+app.get('/pub/meta/connect', (req, res) => {
+  try {
+    const canalId = String((req.query.canalId || req.query.canal_id || '')).trim();
+    if (!canalId) return res.status(400).json({ ok: false, erro: 'canalId obrigatório' });
+    const { clientId } = pbCred('meta');
+    if (!clientId) return res.status(400).json({ ok: false, erro: 'Meta app_id não configurado (POST /pub/pub-cred)' });
+    const params = new URLSearchParams({ client_id: clientId, redirect_uri: pbMetaRedirect(), state: `meta:${canalId}`, scope: PB_META_SCOPES, response_type: 'code' });
+    res.json({ ok: true, url: `https://www.facebook.com/${PB_META_VER}/dialog/oauth?${params.toString()}` });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// ROTA PÚBLICA (Facebook chama sem x-api-key)
+app.get('/pub/meta/callback', async (req, res) => {
+  const enviaHtml = (ok: boolean, msg: string) => res.status(200).type('html').send(pbHtmlResposta(ok, msg));
+  try {
+    const code = String(req.query.code || ''); const state = String(req.query.state || '');
+    if (req.query.error) return enviaHtml(false, `Meta: ${req.query.error_description || req.query.error}`);
+    if (!code || !state.startsWith('meta:')) return enviaHtml(false, 'callback inválido');
+    const canalId = state.slice(5);
+    const { clientId, clientSecret } = pbCred('meta');
+    // code -> short-lived user token
+    const t1 = await fetch(`https://graph.facebook.com/${PB_META_VER}/oauth/access_token?` + new URLSearchParams({ client_id: clientId, client_secret: clientSecret, redirect_uri: pbMetaRedirect(), code }).toString());
+    if (!t1.ok) return enviaHtml(false, `troca de code falhou (${t1.status})`);
+    const d1 = await t1.json() as any;
+    // short -> long-lived user token (~60d)
+    const t2 = await fetch(`https://graph.facebook.com/${PB_META_VER}/oauth/access_token?` + new URLSearchParams({ grant_type: 'fb_exchange_token', client_id: clientId, client_secret: clientSecret, fb_exchange_token: d1.access_token }).toString());
+    const d2 = t2.ok ? await t2.json() as any : d1;
+    const userTok = d2.access_token || d1.access_token;
+    pbTokSalvar(canalId, 'meta_user', { accessToken: userTok, refreshToken: null, expiresAt: new Date(Date.now() + 55 * 864e5).toISOString(), scope: PB_META_SCOPES, conta: 'user' });
+    // lista páginas + IG vinculado
+    const pr = await fetch(`https://graph.facebook.com/${PB_META_VER}/me/accounts?fields=id,name,access_token,instagram_business_account&access_token=${encodeURIComponent(userTok)}`);
+    const pd = pr.ok ? await pr.json() as any : { data: [] };
+    const paginas = (pd.data || []).map((p: any) => ({ id: p.id, name: p.name, igId: p.instagram_business_account?.id || null }));
+    setPubFlag(`meta_paginas_${canalId}`, JSON.stringify(paginas));
+    pbConexao(canalId, 'meta', 'autorizado', `${paginas.length} página(s)`);
+    const lista = paginas.map((p: any) => `• ${p.name} (page ${p.id}${p.igId ? `, IG ${p.igId}` : ', sem IG'})`).join('<br>');
+    enviaHtml(true, `Meta autorizado. Páginas encontradas:<br>${lista || '(nenhuma)'}<br><br>Volte ao app pra vincular a página a este canal.`);
+  } catch (e: any) { enviaHtml(false, String(e?.message || e)); }
+});
+
+// lista páginas achadas no connect (pro app/Kia escolher)
+app.get('/pub/meta/paginas', (req, res) => {
+  const canalId = String(req.query.canalId || req.query.canal_id || '');
+  res.json({ ok: true, paginas: JSON.parse(pubFlag(`meta_paginas_${canalId}`, '[]')) });
+});
+// vincula uma página (+ IG) ao canal: busca o page token e salva tokens instagram/facebook
+app.post('/pub/meta/vincular', async (req, res) => {
+  try {
+    const { canalId, pageId } = req.body || {};
+    if (!canalId || !pageId) return res.status(400).json({ ok: false, erro: 'canalId e pageId obrigatórios' });
+    const userRec = pbTokLer(String(canalId), 'meta_user');
+    if (!userRec?.accessToken) return res.status(400).json({ ok: false, erro: 'conecte o Meta primeiro (/pub/meta/connect)' });
+    const pr = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}?fields=access_token,name,instagram_business_account&access_token=${encodeURIComponent(userRec.accessToken)}`);
+    const pd = await pr.json() as any;
+    if (!pd.access_token) return res.status(400).json({ ok: false, erro: 'não obtive page token (o usuário tem permissão de conteúdo na página?)' });
+    const igId = pd.instagram_business_account?.id || '';
+    // page tokens de user de longa duração não expiram
+    pbTokSalvar(String(canalId), 'facebook', { accessToken: pd.access_token, refreshToken: null, expiresAt: null, scope: PB_META_SCOPES, conta: pd.name || pageId });
+    pbTokSalvar(String(canalId), 'instagram', { accessToken: pd.access_token, refreshToken: null, expiresAt: null, scope: PB_META_SCOPES, conta: igId });
+    pbCanalSet(String(canalId), 'fb_page_id', String(pageId));
+    if (igId) pbCanalSet(String(canalId), 'ig_business_id', String(igId));
+    pbConexao(String(canalId), 'facebook', 'conectado', pd.name || pageId);
+    if (igId) pbConexao(String(canalId), 'instagram', 'conectado', igId);
+    res.json({ ok: true, pageId, igId });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// vincula o Threads (usa o token do Meta/Facebook; descobre threads_user_id)
+app.post('/pub/threads/vincular', async (req, res) => {
+  try {
+    const { canalId } = req.body || {};
+    const tok = pbTokLer(String(canalId), 'facebook') || pbTokLer(String(canalId), 'instagram') || pbTokLer(String(canalId), 'threads');
+    if (!tok?.accessToken) return res.status(400).json({ ok: false, erro: 'conecte o Meta primeiro' });
+    const r = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username&access_token=${encodeURIComponent(tok.accessToken)}`);
+    const d = await r.json() as any;
+    if (!d.id) return res.status(400).json({ ok: false, erro: `Threads /me falhou: ${JSON.stringify(d).slice(0, 200)}` });
+    pbTokSalvar(String(canalId), 'threads', { accessToken: tok.accessToken, refreshToken: null, expiresAt: null, conta: d.username || d.id });
+    pbCanalSet(String(canalId), 'threads_user_id', String(d.id));
+    pbConexao(String(canalId), 'threads', 'conectado', d.username || d.id);
+    res.json({ ok: true, threadsUserId: d.id, username: d.username });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// ============================ OAUTH — PINTEREST ============================
+function pbPinRedirect(): string { return (PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/pub/pinterest/callback'; }
+const PB_PIN_SCOPES = 'pins:read,pins:write,boards:read,user_accounts:read';
+
+app.get('/pub/pinterest/connect', (req, res) => {
+  try {
+    const canalId = String((req.query.canalId || req.query.canal_id || '')).trim();
+    if (!canalId) return res.status(400).json({ ok: false, erro: 'canalId obrigatório' });
+    const { clientId } = pbCred('pinterest');
+    if (!clientId) return res.status(400).json({ ok: false, erro: 'Pinterest client_id não configurado (POST /pub/pub-cred)' });
+    const params = new URLSearchParams({ client_id: clientId, redirect_uri: pbPinRedirect(), response_type: 'code', scope: PB_PIN_SCOPES, state: `pin:${canalId}` });
+    res.json({ ok: true, url: `https://www.pinterest.com/oauth/?${params.toString()}` });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// ROTA PÚBLICA
+app.get('/pub/pinterest/callback', async (req, res) => {
+  const enviaHtml = (ok: boolean, msg: string) => res.status(200).type('html').send(pbHtmlResposta(ok, msg));
+  try {
+    const code = String(req.query.code || ''); const state = String(req.query.state || '');
+    if (req.query.error) return enviaHtml(false, `Pinterest: ${req.query.error}`);
+    if (!code || !state.startsWith('pin:')) return enviaHtml(false, 'callback inválido');
+    const canalId = state.slice(4);
+    const { clientId, clientSecret } = pbCred('pinterest');
+    const r = await fetch('https://api.pinterest.com/v5/oauth/token', {
+      method: 'POST', headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: pbPinRedirect() }),
+    });
+    if (!r.ok) return enviaHtml(false, `troca de token falhou (${r.status}): ${(await r.text()).slice(0, 150)}`);
+    const d = await r.json() as any;
+    const expiresAt = new Date(Date.now() + (d.expires_in || 30 * 86400) * 1000).toISOString();
+    pbTokSalvar(canalId, 'pinterest', { accessToken: d.access_token, refreshToken: d.refresh_token || null, expiresAt, scope: d.scope || PB_PIN_SCOPES, conta: 'pinterest' });
+    pbConexao(canalId, 'pinterest', 'conectado', 'pinterest');
+    enviaHtml(true, 'Pinterest conectado. Volte ao app pra escolher o board.');
+  } catch (e: any) { enviaHtml(false, String(e?.message || e)); }
+});
+async function pbPinToken(canalId: string): Promise<string> {
+  const rec = pbTokLer(canalId, 'pinterest');
+  if (!rec) throw new Error('Canal não conectado ao Pinterest.');
+  if (pbTokValido(rec)) return rec.accessToken;
+  if (!rec.refreshToken) throw new Error('Token Pinterest expirado e sem refresh — reconecte.');
+  const { clientId, clientSecret } = pbCred('pinterest');
+  const r = await fetch('https://api.pinterest.com/v5/oauth/token', {
+    method: 'POST', headers: { Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rec.refreshToken }),
+  });
+  if (!r.ok) throw new Error(`Refresh Pinterest falhou (${r.status})`);
+  const d = await r.json() as any;
+  const expiresAt = new Date(Date.now() + (d.expires_in || 30 * 86400) * 1000).toISOString();
+  pbTokSalvar(canalId, 'pinterest', { accessToken: d.access_token, expiresAt });
+  return d.access_token;
+}
+app.get('/pub/pinterest/boards', async (req, res) => {
+  try {
+    const canalId = String(req.query.canalId || req.query.canal_id || '');
+    const tok = await pbPinToken(canalId);
+    const r = await fetch('https://api.pinterest.com/v5/boards?page_size=100', { headers: { Authorization: `Bearer ${tok}` } });
+    const d = await r.json() as any;
+    res.json({ ok: true, boards: (d.items || []).map((b: any) => ({ id: b.id, name: b.name })) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/pub/pinterest/vincular', (req, res) => {
+  try {
+    const { canalId, boardId } = req.body || {};
+    if (!canalId || !boardId) return res.status(400).json({ ok: false, erro: 'canalId e boardId obrigatórios' });
+    pbCanalSet(String(canalId), 'pinterest_board_id', String(boardId));
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// HTML simples de retorno dos callbacks OAuth
+function pbHtmlResposta(ok: boolean, msg: string): string {
+  const cor = ok ? '#10b981' : '#ef4444'; const titulo = ok ? '✓ Conectado!' : '✗ Falhou';
+  return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>${titulo}</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0c0e;color:#fff;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.box{background:#131418;border:1px solid #1f2128;border-radius:14px;padding:32px 28px;max-width:460px;text-align:center}
+h1{color:${cor};font-size:26px;margin:0 0 12px}</style></head>
+<body><div class="box"><h1>${titulo}</h1><p>${msg}</p></div></body></html>`;
+}
+
+// ============================ UPLOADER — YOUTUBE ============================
+async function pbYtUpload(canalId: string, filePath: string, opts: { titulo: string; descricao?: string; tags?: string[]; ehShorts?: boolean; privacy?: string; thumbFile?: string | null }): Promise<{ id: string; url: string }> {
+  const token = await pbYtToken(canalId);
+  const size = fs.statSync(filePath).size;
+  let titulo = (opts.titulo || 'Sem título').slice(0, 100);
+  if (opts.ehShorts && !titulo.toLowerCase().includes('#shorts')) titulo = `${titulo} #Shorts`.slice(0, 100);
+  const initBody = {
+    snippet: { title: titulo, description: (opts.descricao || '').slice(0, 5000), tags: (opts.tags || []).slice(0, 30), categoryId: '22' },
+    status: { privacyStatus: opts.privacy || 'public', selfDeclaredMadeForKids: false },
+  };
+  const initResp = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Upload-Content-Type': pbMime(filePath), 'X-Upload-Content-Length': String(size) },
+    body: JSON.stringify(initBody),
+  });
+  if (!initResp.ok) throw new Error(`YT init (${initResp.status}): ${(await initResp.text()).slice(0, 300)}`);
+  const uploadUrl = initResp.headers.get('location');
+  if (!uploadUrl) throw new Error('YT não retornou Location.');
+  const up = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': pbMime(filePath), 'Content-Length': String(size) }, body: fs.createReadStream(filePath) as any, duplex: 'half' } as any);
+  if (!up.ok) throw new Error(`YT upload (${up.status}): ${(await up.text()).slice(0, 300)}`);
+  const result = await up.json() as any;
+  // thumbnail (opcional, não falha o upload)
+  if (opts.thumbFile && fs.existsSync(opts.thumbFile)) {
+    try {
+      const tsize = fs.statSync(opts.thumbFile).size;
+      await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${result.id}`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': pbMime(opts.thumbFile), 'Content-Length': String(tsize) }, body: fs.createReadStream(opts.thumbFile) as any, duplex: 'half' } as any);
+    } catch (e) { pbLog('yt-thumb falhou', (e as any)?.message); }
+  }
+  return { id: result.id, url: `https://youtu.be/${result.id}` };
+}
+
+// ============================ UPLOADER — INSTAGRAM ============================
+async function pbIgPoll(igToken: string, containerId: string, maxIter = 60): Promise<void> {
+  let erros = 0;
+  for (let i = 0; i < maxIter; i++) {
+    await pbSleep(2000);
+    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${containerId}?fields=status_code,status&access_token=${encodeURIComponent(igToken)}`);
+    if (!r.ok) { if (++erros >= 5) throw new Error('IG poll: 5 erros seguidos (container morto)'); continue; }
+    erros = 0; const d = await r.json() as any;
+    if (d.status_code === 'FINISHED') return;
+    if (d.status_code === 'ERROR' || d.status_code === 'EXPIRED') throw new Error(`IG container ${d.status_code}: ${d.status || ''}`);
+  }
+  throw new Error('IG poll: timeout ~2min');
+}
+async function pbIgCriarContainer(igId: string, igToken: string, params: Record<string, string>): Promise<string> {
+  const body = new URLSearchParams({ ...params, access_token: igToken });
+  const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${igId}/media`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const d = await r.json() as any;
+  if (!r.ok || !d.id) throw new Error(`IG container falhou: ${JSON.stringify(d).slice(0, 250)}`);
+  return d.id;
+}
+async function pbIgPublicarContainer(igId: string, igToken: string, creationId: string): Promise<string> {
+  for (let tent = 0; tent < 3; tent++) {
+    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${igId}/media_publish`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ creation_id: creationId, access_token: igToken }) });
+    const d = await r.json() as any;
+    if (r.ok && d.id) return d.id;
+    if (JSON.stringify(d).includes('9007') && tent < 2) { await pbSleep(tent === 0 ? 10000 : 20000); continue; }
+    throw new Error(`IG publish falhou: ${JSON.stringify(d).slice(0, 250)}`);
+  }
+  throw new Error('IG publish: esgotou tentativas');
+}
+async function pbIgRuploadBytes(containerId: string, igToken: string, filePath: string): Promise<void> {
+  const bytes = fs.readFileSync(filePath);
+  const r = await fetch(`https://rupload.facebook.com/ig-api-upload/${PB_META_VER}/${containerId}`, {
+    method: 'POST', headers: { Authorization: `OAuth ${igToken}`, offset: '0', file_size: String(bytes.length) }, body: bytes,
+  });
+  if (!r.ok) throw new Error(`IG rupload (${r.status}): ${(await r.text()).slice(0, 200)}`);
+}
+async function pbIgPermalink(postId: string, igToken: string): Promise<string> {
+  try { const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${postId}?fields=permalink&access_token=${encodeURIComponent(igToken)}`); const d = await r.json() as any; return d.permalink || ''; } catch { return ''; }
+}
+async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: string; formato: string; caption: string }): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const igId = canal?.ig_business_id;
+  const tok = pbTokLer(canalId, 'instagram');
+  if (!igId || !tok?.accessToken) throw new Error('Instagram não conectado neste canal.');
+  const igToken = tok.accessToken; const f = a.formato;
+  // IMAGEM (feed / stories / item de carrossel) — exige URL pública
+  if (pbIsImagem(a.filePath)) {
+    if (f === 'stories') {
+      const c = await pbIgCriarContainer(igId, igToken, { image_url: a.publicUrl, media_type: 'STORIES' });
+      await pbIgPoll(igToken, c); const id = await pbIgPublicarContainer(igId, igToken, c); return { id, url: '' };
+    }
+    const c = await pbIgCriarContainer(igId, igToken, { image_url: a.publicUrl, caption: a.caption });
+    await pbIgPoll(igToken, c); const id = await pbIgPublicarContainer(igId, igToken, c);
+    return { id, url: (await pbIgPermalink(id, igToken)) || `https://instagram.com/` };
+  }
+  // VÍDEO
+  if (f === 'stories') {
+    const c = await pbIgCriarContainer(igId, igToken, { media_type: 'STORIES', upload_type: 'resumable' });
+    await pbIgRuploadBytes(c, igToken, a.filePath); await pbIgPoll(igToken, c);
+    const id = await pbIgPublicarContainer(igId, igToken, c); return { id, url: '' };
+  }
+  const tipo = (f === 'horizontal') ? 'VIDEO' : 'REELS'; // vertical/reels => REELS; horizontal => VIDEO feed
+  const params: Record<string, string> = { media_type: tipo, upload_type: 'resumable', caption: a.caption };
+  if (tipo === 'REELS') params.share_to_feed = 'true';
+  let c = '';
+  try {
+    c = await pbIgCriarContainer(igId, igToken, params);
+    await pbIgRuploadBytes(c, igToken, a.filePath);
+    await pbIgPoll(igToken, c);
+  } catch (e) {
+    // fallback: container por URL pública (crawler do Meta baixa)
+    pbLog('ig rupload falhou, tentando por URL', (e as any)?.message);
+    const p2: Record<string, string> = { media_type: tipo, video_url: a.publicUrl, caption: a.caption };
+    if (tipo === 'REELS') p2.share_to_feed = 'true';
+    c = await pbIgCriarContainer(igId, igToken, p2);
+    await pbIgPoll(igToken, c);
+  }
+  const id = await pbIgPublicarContainer(igId, igToken, c);
+  return { id, url: (await pbIgPermalink(id, igToken)) || `https://instagram.com/` };
+}
+// carrossel (pasta de imagens no OneDrive)
+async function pbIgCarrossel(canalId: string, refsPublicos: string[], caption: string): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const igId = canal?.ig_business_id; const tok = pbTokLer(canalId, 'instagram');
+  if (!igId || !tok?.accessToken) throw new Error('Instagram não conectado neste canal.');
+  const igToken = tok.accessToken;
+  const filhos: string[] = [];
+  for (const url of refsPublicos.slice(0, 10)) {
+    const c = await pbIgCriarContainer(igId, igToken, { image_url: url, is_carousel_item: 'true' });
+    await pbIgPoll(igToken, c); filhos.push(c);
+  }
+  if (filhos.length < 2) throw new Error('Carrossel precisa de 2+ imagens.');
+  const master = await pbIgCriarContainer(igId, igToken, { media_type: 'CAROUSEL', children: filhos.join(','), caption });
+  await pbIgPoll(igToken, master);
+  const id = await pbIgPublicarContainer(igId, igToken, master);
+  return { id, url: (await pbIgPermalink(id, igToken)) || `https://instagram.com/` };
+}
+
+// ============================ UPLOADER — FACEBOOK ============================
+async function pbFbPublicar(canalId: string, a: { filePath: string; publicUrl: string; formato: string; titulo: string; descricao: string }): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const pageId = canal?.fb_page_id;
+  const tok = pbTokLer(canalId, 'facebook');
+  if (!pageId || !tok?.accessToken) throw new Error('Facebook não conectado neste canal.');
+  const pageTok = tok.accessToken; const f = a.formato;
+  const desc = [a.titulo, a.descricao].filter(Boolean).join('\n\n');
+  // FOTO
+  if (pbIsImagem(a.filePath)) {
+    const body = new URLSearchParams({ url: a.publicUrl, access_token: pageTok }); if (desc) body.set('message', desc);
+    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/photos`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const d = await r.json() as any; if (!r.ok) throw new Error(`FB foto: ${JSON.stringify(d).slice(0, 200)}`);
+    const pid = d.post_id || d.id; return { id: pid, url: `https://www.facebook.com/${pid}` };
+  }
+  // VÍDEO horizontal => feed video por file_url (sem subir bytes)
+  if (f === 'horizontal') {
+    const body = new URLSearchParams({ file_url: a.publicUrl, title: a.titulo, description: a.descricao || '', access_token: pageTok });
+    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/videos`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const d = await r.json() as any; if (!r.ok || !d.id) throw new Error(`FB vídeo: ${JSON.stringify(d).slice(0, 200)}`);
+    return { id: d.id, url: `https://www.facebook.com/${pageId}/videos/${d.id}` };
+  }
+  if (f === 'stories') throw new Error('PULAR'); // stories FB fica pra depois
+  // REELS (vertical) — 3 fases com bytes
+  const bytes = fs.readFileSync(a.filePath);
+  const r1 = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/video_reels`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ upload_phase: 'start', access_token: pageTok }) });
+  const d1 = await r1.json() as any; if (!r1.ok || !d1.video_id || !d1.upload_url) throw new Error(`FB reels start: ${JSON.stringify(d1).slice(0, 200)}`);
+  const r2 = await fetch(d1.upload_url, { method: 'POST', headers: { Authorization: `OAuth ${pageTok}`, offset: '0', file_size: String(bytes.length) }, body: bytes });
+  if (!r2.ok) throw new Error(`FB reels transfer (${r2.status}): ${(await r2.text()).slice(0, 150)}`);
+  const r3 = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/video_reels`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ upload_phase: 'finish', video_id: d1.video_id, video_state: 'PUBLISHED', description: desc, access_token: pageTok }) });
+  const d3 = await r3.json() as any; if (!r3.ok) throw new Error(`FB reels finish: ${JSON.stringify(d3).slice(0, 200)}`);
+  return { id: d1.video_id, url: `https://www.facebook.com/reel/${d1.video_id}` };
+}
+
+// ============================ UPLOADER — THREADS ============================
+async function pbThreadsPublicar(canalId: string, a: { publicUrl: string; filePath: string; formato: string; texto: string }): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const uid = canal?.threads_user_id; const tok = pbTokLer(canalId, 'threads');
+  if (!uid || !tok?.accessToken) throw new Error('Threads não conectado neste canal.');
+  const token = tok.accessToken; const texto = (a.texto || '').slice(0, 500);
+  const criar: Record<string, string> = { access_token: token, text: texto };
+  if (pbIsImagem(a.filePath)) { criar.media_type = 'IMAGE'; criar.image_url = a.publicUrl; }
+  else { criar.media_type = 'VIDEO'; criar.video_url = a.publicUrl; }
+  const r1 = await fetch(`https://graph.threads.net/v1.0/${uid}/threads`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(criar) });
+  const d1 = await r1.json() as any; if (!r1.ok || !d1.id) throw new Error(`Threads container: ${JSON.stringify(d1).slice(0, 200)}`);
+  await pbSleep(criar.media_type === 'VIDEO' ? 8000 : 2000); // dá um tempo pro processamento
+  const r2 = await fetch(`https://graph.threads.net/v1.0/${uid}/threads_publish`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ access_token: token, creation_id: d1.id }) });
+  const d2 = await r2.json() as any; if (!r2.ok || !d2.id) throw new Error(`Threads publish: ${JSON.stringify(d2).slice(0, 200)}`);
+  return { id: d2.id, url: `https://www.threads.net/@_/post/${d2.id}` };
+}
+
+// ============================ UPLOADER — PINTEREST ============================
+async function pbPinterestPublicar(canalId: string, a: { filePath: string; formato: string; titulo: string; descricao: string }): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const boardId = canal?.pinterest_board_id;
+  if (!boardId) throw new Error('Pinterest sem board vinculado neste canal.');
+  const token = await pbPinToken(canalId);
+  const titulo = (a.titulo || '').slice(0, 100); const descricao = (a.descricao || '').slice(0, 500);
+  let mediaSource: any;
+  if (pbIsImagem(a.filePath)) {
+    const b64 = fs.readFileSync(a.filePath).toString('base64');
+    mediaSource = { source_type: 'image_base64', content_type: pbMime(a.filePath), data: b64 };
+  } else {
+    // vídeo: registra mídia -> upload presigned -> poll -> cria pin com media_id
+    const reg = await fetch('https://api.pinterest.com/v5/media', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ media_type: 'video' }) });
+    const rd = await reg.json() as any; if (!reg.ok || !rd.media_id) throw new Error(`Pinterest register: ${JSON.stringify(rd).slice(0, 200)}`);
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(rd.upload_parameters || {})) fd.append(k, String(v));
+    fd.append('file', new Blob([fs.readFileSync(a.filePath)]), pbBasename(a.filePath));
+    const up = await fetch(rd.upload_url, { method: 'POST', body: fd as any });
+    if (!(up.ok || up.status === 204)) throw new Error(`Pinterest upload (${up.status})`);
+    let pronto = false;
+    for (let i = 0; i < 30; i++) { await pbSleep(3000); const st = await (await fetch(`https://api.pinterest.com/v5/media/${rd.media_id}`, { headers: { Authorization: `Bearer ${token}` } })).json() as any; if (st.status === 'succeeded') { pronto = true; break; } if (st.status === 'failed') throw new Error('Pinterest media failed'); }
+    if (!pronto) throw new Error('Pinterest media timeout');
+    mediaSource = { source_type: 'video_id', media_id: rd.media_id };
+  }
+  const r = await fetch('https://api.pinterest.com/v5/pins', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ board_id: boardId, title: titulo, description: descricao, media_source: mediaSource }) });
+  const d = await r.json() as any; if (!r.ok || !d.id) throw new Error(`Pinterest pin: ${JSON.stringify(d).slice(0, 200)}`);
+  return { id: d.id, url: `https://www.pinterest.com/pin/${d.id}/` };
+}
+
+// ============================ DESPACHANTE (posta 1 item) ============================
+function pbCarrosselUrls(onedriveRef: string): string[] {
+  try {
+    const arr = _odRcloneListar(onedriveRef) as any[]; // lista arquivos sob base/<ref>
+    const imgs = (arr || []).filter((x) => pbIsImagem(x.Path || x.Name || '')).map((x) => (x.Path ? String(x.Path) : `${onedriveRef}/${x.Name}`));
+    const urls: string[] = [];
+    for (const rel of imgs.slice(0, 10)) { const m = pbBaixarMidia(rel); urls.push(m.publicUrl); }
+    return urls;
+  } catch { return []; }
+}
+async function pbPostarItem(item: any): Promise<void> {
+  const canalId = String(item.canal_id);
+  db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
+  const plataformas: string[] = (() => { try { return JSON.parse(item.plataformas_json || '[]'); } catch { return []; } })();
+  const formato = String(item.formato || 'vertical');
+  const titulo = item.titulo || (item.arquivo_nome ? item.arquivo_nome.replace(/\.[^.]+$/, '') : 'Sem título');
+  const descYt = item.descricao || '';
+  const captionSocial = item.descricao_social || item.descricao || '';
+  const ehVertical = (formato === 'vertical' || formato === 'reels' || formato === 'stories');
+
+  // baixa a mídia principal (carrossel é pasta -> trata à parte)
+  let midia: { file: string; publicUrl: string; nome: string } | null = null;
+  let carrosselUrls: string[] = [];
+  try {
+    if (formato === 'carrossel') { carrosselUrls = pbCarrosselUrls(item.onedrive_ref); if (!carrosselUrls.length) midia = pbBaixarMidia(item.onedrive_ref); }
+    else { midia = pbBaixarMidia(item.onedrive_ref); }
+  } catch (e) {
+    db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(new Date(Date.now() + 30 * 60000).toISOString(), 'falha ao baixar do OneDrive: ' + String((e as any)?.message || e), agora(), item.id);
+    return;
+  }
+  let thumbFile: string | null = null;
+  if (item.thumb_ref) { try { thumbFile = pbBaixarMidia(item.thumb_ref).file; } catch { /* */ } }
+
+  const resultados: Record<string, string> = {};
+  const videoIds: Record<string, string> = {};
+  let sucessos = 0; let tentados = 0;
+
+  for (const p of plataformas) {
+    try {
+      let r: { id: string; url: string };
+      const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
+      if (p === 'youtube') {
+        if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: YouTube só vídeo aqui'; continue; }
+        r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: 'public', thumbFile });
+      } else if (p === 'instagram') {
+        if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
+        else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
+      } else if (p === 'facebook') {
+        if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: FB não faz carrossel aqui'; continue; }
+        r = await pbFbPublicar(canalId, { filePath: file, publicUrl, formato, titulo, descricao: captionSocial });
+      } else if (p === 'threads') {
+        if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: Threads sem carrossel aqui'; continue; }
+        r = await pbThreadsPublicar(canalId, { publicUrl, filePath: file, formato, texto: captionSocial || titulo });
+      } else if (p === 'pinterest') {
+        if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: Pinterest sem carrossel aqui'; continue; }
+        r = await pbPinterestPublicar(canalId, { filePath: file, formato, titulo, descricao: captionSocial || descYt });
+      } else if (p === 'tiktok' || p === 'kwai') {
+        resultados[p] = 'PULADO: ' + p + ' precisa do proxy BR (fase navegador)'; continue;
+      } else { resultados[p] = 'PULADO: plataforma desconhecida'; continue; }
+      resultados[p] = 'OK: ' + (r.url || r.id); videoIds[p] = r.id; sucessos++; tentados++;
+    } catch (e) {
+      const msg = String((e as any)?.message || e);
+      if (msg === 'PULAR' || msg.startsWith('PULAR')) { resultados[p] = 'PULADO: ' + msg.replace(/^PULAR:?\s*/, ''); }
+      else { resultados[p] = 'ERRO: ' + msg; tentados++; }
+    }
+  }
+
+  db.prepare(`UPDATE fila_publicacao SET resultado_por_plataforma_json=?, video_ids_externos_json=?, atualizado_em=? WHERE id=?`)
+    .run(JSON.stringify(resultados), JSON.stringify(videoIds), agora(), item.id);
+
+  if (sucessos > 0) {
+    // sucesso (total ou parcial): marca publicado, nunca re-posta
+    db.prepare(`UPDATE fila_publicacao SET status='publicado', tentativas_consecutivas=0, erro=?, atualizado_em=? WHERE id=?`)
+      .run(sucessos < tentados ? 'parcial: ' + JSON.stringify(resultados) : null, agora(), item.id);
+    pbLog('publicado', item.id, `${sucessos}/${tentados} rede(s)`);
+  } else if (tentados === 0) {
+    // nada aplicável (ex.: imagem só com youtube) — tira da fila
+    db.prepare(`UPDATE fila_publicacao SET status='publicado', erro='nada a postar (todas as redes puladas)', atualizado_em=? WHERE id=?`).run(agora(), item.id);
+  } else {
+    // todas falharam: backoff exponencial até 20 tentativas, depois quarentena
+    const n = (item.tentativas_consecutivas || 0) + 1;
+    if (n >= 20) {
+      db.prepare(`UPDATE fila_publicacao SET status='quarentena', tentativas_consecutivas=?, erro=?, atualizado_em=? WHERE id=?`).run(n, JSON.stringify(resultados).slice(0, 500), agora(), item.id);
+    } else {
+      const horas = Math.min(24, Math.pow(2, n - 1)); const jitterMs = Math.floor(Math.random() * 30 * 60000);
+      const prox = new Date(Date.now() + horas * 3600000 + jitterMs).toISOString();
+      db.prepare(`UPDATE fila_publicacao SET status='agendado', tentativas_consecutivas=?, data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(n, prox, JSON.stringify(resultados).slice(0, 500), agora(), item.id);
+    }
+  }
+}
+
+// ============================ WORKER (inerte até publicador_ativo=1) ============================
+function pbComTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('timeout ' + ms + 'ms')), ms))]);
+}
+let _pubBusy = false;
+async function tickPublicador() {
+  if (pubFlag('publicador_ativo', '0') !== '1') return;
+  if (_pubBusy) return; _pubBusy = true;
+  try {
+    const nowIso = new Date().toISOString();
+    const itens = db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' AND data_agendada<=? AND COALESCE(aguardando_instrumento,0)=0 ORDER BY COALESCE(prioridade,0) DESC, data_agendada ASC LIMIT 5`).all(nowIso) as any[];
+    for (const item of itens) {
+      try { await pbComTimeout(pbPostarItem(item), 8 * 60 * 1000); }
+      catch (e) { try { db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(new Date(Date.now() + 30 * 60000).toISOString(), 'timeout/erro worker: ' + String((e as any)?.message || e), agora(), item.id); } catch { /* */ } }
+    }
+  } finally { _pubBusy = false; }
+}
+setInterval(() => { tickPublicador().catch(() => { }); }, 30000);
+
+// ============================ ENDPOINTS DE CONTROLE / CALENDÁRIO ============================
+// configura client_id/secret de uma plataforma (cifrado)
+app.post('/pub/pub-cred', (req, res) => {
+  try { const { plataforma, clientId, clientSecret } = req.body || {}; if (!plataforma) return res.status(400).json({ ok: false, erro: 'plataforma obrigatória' }); pbCredSalvar(plataforma, clientId || '', clientSecret || ''); res.json({ ok: true }); }
+  catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// liga/desliga o publicador
+app.post('/pub/publicador/ligar', (_req, res) => { setPubFlag('publicador_ativo', '1'); res.json({ ok: true, ativo: true }); });
+app.post('/pub/publicador/desligar', (_req, res) => { setPubFlag('publicador_ativo', '0'); res.json({ ok: true, ativo: false }); });
+app.get('/pub/publicador/status', (_req, res) => {
+  try {
+    const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_publicacao GROUP BY status`).all() as any[];
+    const prox = db.prepare(`SELECT id, canal_id, formato, plataformas_json, titulo, data_agendada FROM fila_publicacao WHERE status='agendado' ORDER BY data_agendada ASC LIMIT 10`).all();
+    res.json({ ok: true, ativo: pubFlag('publicador_ativo', '0') === '1', porStatus, proximos: prox });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// posta 1 item AGORA (teste), mesmo com o publicador desligado. body: {id?}
+app.post('/pub/publicador/testar', async (req, res) => {
+  try {
+    const id = req.body?.id;
+    const item = id ? db.prepare(`SELECT * FROM fila_publicacao WHERE id=?`).get(String(id)) as any
+      : db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' ORDER BY data_agendada ASC LIMIT 1`).get() as any;
+    if (!item) return res.status(404).json({ ok: false, erro: 'nenhum item pra testar' });
+    await pbComTimeout(pbPostarItem(item), 8 * 60 * 1000);
+    const depois = db.prepare(`SELECT status, resultado_por_plataforma_json, erro FROM fila_publicacao WHERE id=?`).get(item.id);
+    res.json({ ok: true, item: item.id, resultado: depois });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// lista conexões por canal/plataforma
+app.get('/pub/conexoes/listar', (_req, res) => {
+  try {
+    const canais = db.prepare(`SELECT id, nome, instrumento FROM canais_publicacao WHERE ativo=1`).all() as any[];
+    const toks = db.prepare(`SELECT canal_id, plataforma, conta, expires_at FROM oauth_tokens_pub`).all() as any[];
+    res.json({ ok: true, canais, conexoes: toks });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// importa/espelha a agenda do app -> motor. body: {itens:[{id,canalId,onedriveRef,thumbRef?,formato,plataformas:[],titulo,descricao?,descricaoSocial?,dataAgendada}]}
+app.post('/pub/fila/importar', (req, res) => {
+  try {
+    const itens: any[] = (req.body?.itens) || [];
+    const stmt = db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,criado_em,atualizado_em)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?, 'agendado', ?, ?)
+      ON CONFLICT(id) DO UPDATE SET canal_id=excluded.canal_id, onedrive_ref=excluded.onedrive_ref, thumb_ref=excluded.thumb_ref,
+        formato=excluded.formato, plataformas_json=excluded.plataformas_json, titulo=excluded.titulo, descricao=excluded.descricao,
+        descricao_social=excluded.descricao_social, data_agendada=excluded.data_agendada, atualizado_em=excluded.atualizado_em`);
+    let n = 0;
+    const tx = db.transaction((rows: any[]) => {
+      for (const it of rows) {
+        const id = String(it.id || randomUUID());
+        stmt.run(id, String(it.canalId ?? it.canal_id ?? ''), it.projeto || null, it.onedriveRef || it.onedrive_ref || '', it.thumbRef || it.thumb_ref || null,
+          it.formato || 'vertical', JSON.stringify(it.plataformas || it.plataformas_json || []), it.titulo || '', it.descricao || null, it.descricaoSocial || it.descricao_social || null,
+          it.dataAgendada || it.data_agendada || new Date().toISOString(), agora(), agora());
+        n++;
+      }
+    });
+    tx(itens);
+    res.json({ ok: true, importados: n });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativo=1): YT/IG/FB/Threads/Pinterest + worker + import de calendario');
 
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
