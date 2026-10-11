@@ -1728,6 +1728,11 @@ function classificaPagamento(provider: string, statusRaw: string): 'aprovado' | 
   return 'outro';
 }
 
+// [etapa31] gancho do CAPI: é preenchido dentro do bloco CAPI (etapa29) no boot.
+// Serve pra espelhar a MESMA venda que chega pela entrega (Guru/LastLink) no pixel Meta,
+// sem precisar criar webhook novo. Fica null até o bloco CAPI rodar no startup.
+let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; evento?: string }) => Promise<void>) | null = null;
+
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
     const provider = String(req.params.provider || '').toLowerCase();
@@ -1756,6 +1761,19 @@ app.post('/webhook/payment/:provider', async (req, res) => {
 
     const projeto = projetoDoProduto(p.produtoId, p.produtoNome);
     const categoria = classificaPagamento(provider, p.status);
+    // [etapa31] ADD: espelha a venda no CAPI (pixel Meta) reusando ESTE webhook de entrega.
+    // Best-effort e envolto em try/catch: NUNCA pode quebrar a entrega. Só Purchase (aprovado)
+    // e InitiateCheckout (perdido). Enquanto capi_ativo=0 no motor, isto só grava log 'inerte'.
+    try {
+      const _capiEv = categoria === 'aprovado' ? 'Purchase' : categoria === 'perdido' ? 'InitiateCheckout' : null;
+      if (_capiEv && capiHookPagamento) {
+        await capiHookPagamento(provider, {
+          email: p.email, telefone: p.telefone,
+          valorCentavos: Math.round(Number(p.valor || 0) * 100),
+          produto: p.produtoNome, evento: _capiEv,
+        }).catch(() => {});
+      }
+    } catch { /* CAPI best-effort: nunca quebra a entrega */ }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       if (categoria === 'aprovado') {
@@ -4944,6 +4962,23 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     } catch (err: any) {
       capiLog({ status: 'erro', fonte, evento: eventName, pixel_id: pix.pixel_id, valor_centavos: d.valorCentavos, pagina: d.pagina, produto: d.produto, erro: String(err?.message || err) });
     }
+  };
+
+  // [etapa31] liga o gancho do CAPI ao webhook de entrega (/webhook/payment/:provider).
+  // Recebe os dados JÁ normalizados do pagamento (produtoNome/valor em centavos) e escolhe
+  // o pixel por produto (igual ao /capi/webhook). Assim a venda que já dispara a entrega
+  // também vai pro pixel Meta, sem criar webhook novo na Guru/LastLink.
+  capiHookPagamento = async (fonte, dados) => {
+    const eventName = dados.evento || 'Purchase';
+    let pix = capiPixelPadrao();
+    if (dados.produto) {
+      const porProd: any = db.prepare('SELECT id FROM capi_pixels WHERE lower(produto)=lower(?) LIMIT 1').get(dados.produto);
+      if (porProd) pix = capiPixelLer(porProd.id) || pix;
+    }
+    await capiProcessar(fonte, pix, eventName, {
+      email: dados.email, telefone: dados.telefone,
+      valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null,
+    });
   };
 
   // ---------- ROTAS ----------
