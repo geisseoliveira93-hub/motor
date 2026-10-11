@@ -20,7 +20,7 @@ import express from 'express';
 import Database from 'better-sqlite3';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process'; // etapa21: chamar o rclone (OneDrive)
+import { execFileSync, spawn } from 'node:child_process'; // etapa21: rclone (OneDrive); etapa33: spawn p/ ffmpeg (lives)
 
 const PORT = Number(process.env.PORT || 8080);
 const EVOLUTION_URL = process.env.EVOLUTION_URL || 'http://evolution:8080';
@@ -5115,6 +5115,329 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   });
 
   console.log('[etapa30] CAPI importar carregado — /capi/token-central, /capi/importar, /capi/pixels/bulk');
+}
+
+
+// ============================================================================
+// [etapa33] LIVES / TRANSMISSÃO — "ao vivo gravado" no YouTube (FFmpeg + Live API)
+// ----------------------------------------------------------------------------
+// ADITIVO. Bloco inserido no index.ts do motor (antes do app.listen), igual às
+// etapas 28/29/30. Reaproveita helpers existentes: db (better-sqlite3), app
+// (express), agora(), randomUUID, pbYtToken(canalId), pbBaixarMidia(ref),
+// pbCanalGet/Set, MEDIA_DIR, spawn (node:child_process).
+//
+// O QUE FAZ:
+//  - Agenda um vídeo (do OneDrive ou de uma URL) pra ir "ao vivo" no YouTube no
+//    horário marcado, aparecendo como uma live de verdade (simulated live).
+//  - Pode mandar pra VÁRIOS canais do YouTube ao mesmo tempo (multistream YT).
+//  - Visibilidade por transmissão: private | unlisted | public.
+//  - Qualidade: auto (deixa o vídeo mandar) / 720p / 1080p / 4k.
+//  - FFmpeg empurra o arquivo em tempo real (-re) com cópia de stream (sem
+//    recodificar vídeo = CPU baixa), áudio normalizado pra AAC.
+//  - Worker tickLives roda no horário, cria o broadcast no YouTube, baixa o
+//    vídeo, transmite, e ao terminar encerra a live (complete).
+//
+// SEGURANÇA: INERTE por padrão. Enquanto pub_kv 'lives_ativo' != '1' o worker
+// NÃO dispara nada sozinho. Ligar = POST /lives/ligar. Dá pra testar 1 por vez
+// com POST /lives/testar mesmo desligado.
+//
+// PRÉ-REQUISITOS no YouTube: o canal precisa estar HABILITADO pra transmitir ao
+// vivo (telefone verificado, sem restrições) e conectado via /pub/youtube/connect
+// (o token já existe — scope "youtube" cobre liveBroadcasts).
+// ============================================================================
+{
+  // --- tabela (idempotente) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fila_lives (
+      id TEXT PRIMARY KEY,
+      projeto TEXT,
+      titulo TEXT,
+      descricao TEXT,
+      fonte_tipo TEXT,            -- 'onedrive' | 'url'
+      fonte_ref TEXT,             -- onedrive_ref OU a URL do vídeo/live
+      tipo TEXT DEFAULT 'ao_vivo_gravado',
+      qualidade TEXT DEFAULT 'auto',       -- auto | 720p | 1080p | 4k
+      privacidade TEXT DEFAULT 'private',  -- private | unlisted | public
+      destinos_json TEXT DEFAULT '[]',     -- [{plataforma:'youtube', canal_id:'...'}]
+      data_agendada TEXT,
+      status TEXT DEFAULT 'agendado',      -- agendado|preparando|no_ar|concluido|erro|cancelado
+      broadcasts_json TEXT DEFAULT '[]',   -- por destino (ids, rtmp, watch_url, status)
+      em_loop INTEGER DEFAULT 0,
+      erro TEXT,
+      criado_em TEXT, atualizado_em TEXT
+    );
+  `);
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN broadcasts_json TEXT DEFAULT '[]'`); } catch { /* já existe */ }
+
+  const livLog = (evt: string, ...a: any[]) => { try { console.log(`[etapa33] ${evt}`, ...a); } catch { /* */ } };
+
+  // processos ffmpeg em andamento, por live id -> array de {canal_id, child, done}
+  const livesRun: Map<string, Array<{ canal_id: string; child: any; done: boolean }>> = new Map();
+
+  // ---------------------- YouTube Live API (fetch) ----------------------
+  const YT = 'https://www.googleapis.com/youtube/v3';
+  async function ytApi(token: string, method: string, path: string, body?: any): Promise<any> {
+    const r = await fetch(`${YT}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const txt = await r.text();
+    let j: any = {}; try { j = txt ? JSON.parse(txt) : {}; } catch { j = { raw: txt }; }
+    if (!r.ok) {
+      const msg = j?.error?.message || j?.raw || `HTTP ${r.status}`;
+      throw new Error(`YouTube ${method} ${path} falhou (${r.status}): ${String(msg).slice(0, 300)}`);
+    }
+    return j;
+  }
+
+  // cria broadcast + stream, vincula, devolve ingestão RTMP + watch url + liveChatId
+  async function ytLiveCriar(canalId: string, opts: { titulo: string; descricao?: string; privacy: string }): Promise<{
+    broadcastId: string; streamId: string; rtmp: string; key: string; watchUrl: string; liveChatId: string;
+  }> {
+    const token = await pbYtToken(canalId);
+    const privacy = ['private', 'unlisted', 'public'].includes(opts.privacy) ? opts.privacy : 'private';
+    const inicio = new Date(Date.now() + 30 * 1000).toISOString();
+    // 1) broadcast (auto-start quando o stream ficar ativo; auto-stop ao parar; DVR liga replay)
+    const bc = await ytApi(token, 'POST', '/liveBroadcasts?part=snippet,status,contentDetails', {
+      snippet: { title: (opts.titulo || 'Live').slice(0, 100), description: (opts.descricao || '').slice(0, 5000), scheduledStartTime: inicio },
+      status: { privacyStatus: privacy, selfDeclaredMadeForKids: false },
+      contentDetails: { enableAutoStart: true, enableAutoStop: true, enableDvr: true, latencyPreference: 'normal', enableContentEncryption: false, recordFromStart: true },
+    });
+    const broadcastId = bc.id;
+    const liveChatId = bc?.snippet?.liveChatId || '';
+    // 2) stream (resolução/fps variável = aceita 720/1080/4k conforme o vídeo manda)
+    const st = await ytApi(token, 'POST', '/liveStreams?part=snippet,cdn,contentDetails', {
+      snippet: { title: (opts.titulo || 'Live').slice(0, 100) },
+      cdn: { frameRate: 'variable', ingestionType: 'rtmp', resolution: 'variable' },
+      contentDetails: { isReusable: false },
+    });
+    const streamId = st.id;
+    const rtmp = st?.cdn?.ingestionInfo?.ingestionAddress || '';
+    const key = st?.cdn?.ingestionInfo?.streamName || '';
+    // 3) vincula o stream ao broadcast
+    await ytApi(token, 'POST', `/liveBroadcasts/bind?id=${encodeURIComponent(broadcastId)}&streamId=${encodeURIComponent(streamId)}&part=id,contentDetails`);
+    return { broadcastId, streamId, rtmp, key, watchUrl: `https://youtu.be/${broadcastId}`, liveChatId };
+  }
+
+  async function ytLiveTransicao(canalId: string, broadcastId: string, status: string): Promise<void> {
+    const token = await pbYtToken(canalId);
+    await ytApi(token, 'POST', `/liveBroadcasts/transition?broadcastStatus=${encodeURIComponent(status)}&id=${encodeURIComponent(broadcastId)}&part=status`);
+  }
+
+  // ---------------------- FFmpeg push ----------------------
+  // Empurra INPUT (arquivo local ou URL) pro RTMP, em tempo real (-re).
+  // Vídeo em cópia (sem recodificar = CPU baixa); áudio pra AAC (compatível FLV/RTMP).
+  function ffmpegPush(input: string, rtmpFull: string): any {
+    const args = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-re',
+      '-i', input,
+      '-c:v', 'copy',
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k',
+      '-f', 'flv',
+      rtmpFull,
+    ];
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let errTail = '';
+    try { child.stderr.on('data', (d: any) => { errTail = (errTail + String(d)).slice(-1200); }); } catch { /* */ }
+    (child as any)._errTail = () => errTail;
+    return child;
+  }
+
+  // atualiza um destino dentro de broadcasts_json
+  function livSetDestino(liveId: string, canalId: string, patch: Record<string, any>) {
+    const row = db.prepare(`SELECT broadcasts_json FROM fila_lives WHERE id=?`).get(liveId) as any;
+    let arr: any[] = []; try { arr = JSON.parse(row?.broadcasts_json || '[]'); } catch { arr = []; }
+    const i = arr.findIndex((x) => String(x.canal_id) === String(canalId));
+    if (i >= 0) arr[i] = { ...arr[i], ...patch }; else arr.push({ canal_id: canalId, ...patch });
+    db.prepare(`UPDATE fila_lives SET broadcasts_json=?, atualizado_em=? WHERE id=?`).run(JSON.stringify(arr), agora(), liveId);
+  }
+
+  // encerra (complete) e marca concluído quando todos os ffmpeg da live terminarem
+  function livTalvezConcluir(liveId: string) {
+    const procs = livesRun.get(liveId) || [];
+    if (procs.length && procs.every((p) => p.done)) {
+      livesRun.delete(liveId);
+      const row = db.prepare(`SELECT status FROM fila_lives WHERE id=?`).get(liveId) as any;
+      if (row && row.status !== 'cancelado') {
+        db.prepare(`UPDATE fila_lives SET status='concluido', atualizado_em=? WHERE id=?`).run(agora(), liveId);
+        livLog('live concluida', liveId);
+      }
+    }
+  }
+
+  // dispara UMA live agora (usado pelo worker e pelo /lives/testar)
+  async function livExecutar(liveId: string): Promise<void> {
+    const live = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(liveId) as any;
+    if (!live) throw new Error('live não encontrada');
+    if (livesRun.has(liveId)) return; // já rodando
+    db.prepare(`UPDATE fila_lives SET status='preparando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), liveId);
+
+    // 1) resolve a fonte do vídeo (OneDrive -> baixa local; URL -> usa direto)
+    let input = '';
+    try {
+      if (String(live.fonte_tipo) === 'url') input = String(live.fonte_ref || '');
+      else input = pbBaixarMidia(String(live.fonte_ref || '')).file; // onedrive
+      if (!input) throw new Error('fonte do vídeo vazia');
+    } catch (e: any) {
+      db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('fonte: ' + String(e?.message || e), agora(), liveId);
+      throw e;
+    }
+
+    // 2) para cada destino YouTube: cria broadcast + empurra ffmpeg
+    let destinos: any[] = []; try { destinos = JSON.parse(live.destinos_json || '[]'); } catch { destinos = []; }
+    const yts = destinos.filter((d) => String(d.plataforma || 'youtube') === 'youtube' && d.canal_id);
+    if (!yts.length) {
+      db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('sem destino YouTube', agora(), liveId);
+      throw new Error('sem destino YouTube');
+    }
+
+    const procs: Array<{ canal_id: string; child: any; done: boolean }> = [];
+    livesRun.set(liveId, procs);
+    let algumOk = false;
+
+    for (const d of yts) {
+      const canalId = String(d.canal_id);
+      try {
+        const info = await ytLiveCriar(canalId, { titulo: live.titulo || 'Live', descricao: live.descricao || '', privacy: live.privacidade || 'private' });
+        livSetDestino(liveId, canalId, { plataforma: 'youtube', broadcast_id: info.broadcastId, stream_id: info.streamId, watch_url: info.watchUrl, live_chat_id: info.liveChatId, status: 'conectando', erro: null });
+        const child = ffmpegPush(input, `${info.rtmp}/${info.key}`);
+        const rec = { canal_id: canalId, child, done: false };
+        procs.push(rec);
+        algumOk = true;
+        livSetDestino(liveId, canalId, { status: 'no_ar' });
+        livLog('empurrando ffmpeg', liveId, canalId, info.watchUrl);
+        child.on('exit', (code: number) => {
+          rec.done = true;
+          const ok = code === 0;
+          livSetDestino(liveId, canalId, { status: ok ? 'encerrado' : 'erro', erro: ok ? null : ('ffmpeg code ' + code + ': ' + (child._errTail ? child._errTail() : '')).slice(0, 400) });
+          // encerra o broadcast no YouTube (complete), por garantia (autoStop já pode ter encerrado)
+          ytLiveTransicao(canalId, info.broadcastId, 'complete').catch(() => { /* já pode estar completo */ });
+          livTalvezConcluir(liveId);
+        });
+      } catch (e: any) {
+        livSetDestino(liveId, canalId, { plataforma: 'youtube', status: 'erro', erro: String(e?.message || e).slice(0, 400) });
+        livLog('falha destino', liveId, canalId, String(e?.message || e));
+      }
+    }
+
+    if (algumOk) {
+      db.prepare(`UPDATE fila_lives SET status='no_ar', atualizado_em=? WHERE id=?`).run(agora(), liveId);
+    } else {
+      livesRun.delete(liveId);
+      db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('nenhum destino subiu', agora(), liveId);
+      throw new Error('nenhum destino subiu');
+    }
+  }
+
+  // ---------------------- Worker (inerte até lives_ativo=1) ----------------------
+  async function tickLives() {
+    if (pubFlag('lives_ativo', '0') !== '1') return;
+    const agoraIso = agora();
+    const pend = db.prepare(`SELECT id FROM fila_lives WHERE status='agendado' AND (data_agendada IS NULL OR data_agendada <= ?) ORDER BY data_agendada ASC LIMIT 3`).all(agoraIso) as any[];
+    for (const p of pend) {
+      if (livesRun.has(p.id)) continue;
+      try { await livExecutar(p.id); } catch (e: any) { livLog('tickLives erro', p.id, String(e?.message || e)); }
+    }
+  }
+  setInterval(() => { tickLives().catch(() => { }); }, 15000);
+
+  // ---------------------- Endpoints ----------------------
+  // agenda uma transmissão
+  app.post('/lives/agendar', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const destinos = Array.isArray(b.destinos) ? b.destinos : [];
+      if (!destinos.length) return res.status(400).json({ ok: false, erro: 'destinos_obrigatorio' });
+      if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
+      const id = String(b.id || randomUUID());
+      const priv = ['private', 'unlisted', 'public'].includes(String(b.privacidade)) ? String(b.privacidade) : 'private';
+      db.prepare(`INSERT INTO fila_lives(id,projeto,titulo,descricao,fonte_tipo,fonte_ref,tipo,qualidade,privacidade,destinos_json,data_agendada,status,broadcasts_json,em_loop,criado_em,atualizado_em)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET projeto=excluded.projeto,titulo=excluded.titulo,descricao=excluded.descricao,fonte_tipo=excluded.fonte_tipo,fonte_ref=excluded.fonte_ref,qualidade=excluded.qualidade,privacidade=excluded.privacidade,destinos_json=excluded.destinos_json,data_agendada=excluded.data_agendada,atualizado_em=excluded.atualizado_em`)
+        .run(id, String(b.projeto || ''), String(b.titulo || 'Live'), String(b.descricao || ''), String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref || ''), String(b.tipo || 'ao_vivo_gravado'), String(b.qualidade || 'auto'), priv, JSON.stringify(destinos), String(b.data_agendada || agora()), 'agendado', '[]', b.em_loop ? 1 : 0, agora(), agora());
+      res.json({ ok: true, id });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // lista transmissões (por projeto/status opcional)
+  app.get('/lives', (req: any, res: any) => {
+    try {
+      const cond: string[] = []; const args: any[] = [];
+      if (req.query.projeto) { cond.push('projeto=?'); args.push(String(req.query.projeto)); }
+      if (req.query.status) { cond.push('status=?'); args.push(String(req.query.status)); }
+      const where = cond.length ? ('WHERE ' + cond.join(' AND ')) : '';
+      const rows = db.prepare(`SELECT * FROM fila_lives ${where} ORDER BY data_agendada DESC LIMIT 200`).all(...args) as any[];
+      res.json({ ok: true, ativo: pubFlag('lives_ativo', '0') === '1', lives: rows });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  app.get('/lives/:id', (req: any, res: any) => {
+    const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+    res.json({ ok: true, live: row });
+  });
+
+  // cancela (se estiver no ar, encerra os ffmpeg e completa os broadcasts)
+  app.post('/lives/cancelar', async (req: any, res: any) => {
+    try {
+      const id = String((req.body || {}).id || '');
+      const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(id) as any;
+      if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+      const procs = livesRun.get(id) || [];
+      for (const p of procs) { try { p.child.kill('SIGINT'); } catch { /* */ } }
+      // completa broadcasts no YouTube
+      try {
+        const arr = JSON.parse(row.broadcasts_json || '[]');
+        for (const d of arr) { if (d.broadcast_id && d.canal_id) { ytLiveTransicao(String(d.canal_id), String(d.broadcast_id), 'complete').catch(() => { /* */ }); } }
+      } catch { /* */ }
+      livesRun.delete(id);
+      db.prepare(`UPDATE fila_lives SET status='cancelado', atualizado_em=? WHERE id=?`).run(agora(), id);
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // remove da lista (não pode estar no ar)
+  app.post('/lives/remover', (req: any, res: any) => {
+    const id = String((req.body || {}).id || '');
+    if (livesRun.has(id)) return res.status(409).json({ ok: false, erro: 'no_ar' });
+    db.prepare(`DELETE FROM fila_lives WHERE id=?`).run(id);
+    res.json({ ok: true });
+  });
+
+  // liga/desliga o worker
+  app.post('/lives/ligar', (_req: any, res: any) => { setPubFlag('lives_ativo', '1'); res.json({ ok: true, ativo: true }); });
+  app.post('/lives/desligar', (_req: any, res: any) => { setPubFlag('lives_ativo', '0'); res.json({ ok: true, ativo: false }); });
+  app.get('/lives/_status', (_req: any, res: any) => {
+    const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_lives GROUP BY status`).all() as any[];
+    res.json({ ok: true, ativo: pubFlag('lives_ativo', '0') === '1', rodando: Array.from(livesRun.keys()), porStatus });
+  });
+
+  // dispara UMA agora (teste), mesmo com o worker desligado. body:{id}
+  app.post('/lives/testar', async (req: any, res: any) => {
+    try {
+      const id = String((req.body || {}).id || '');
+      if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
+      await livExecutar(id);
+      const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(id) as any;
+      res.json({ ok: true, live: row });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // canais do YouTube disponíveis pra escolher como destino
+  app.get('/lives/destinos', (_req: any, res: any) => {
+    try {
+      const canais = db.prepare(`SELECT id,nome,projeto,instrumento,cor,yt_channel_id FROM canais_publicacao WHERE ativo=1`).all() as any[];
+      const out = canais.map((c) => {
+        let conectado = false; try { conectado = !!pbTokLer(String(c.id), 'youtube'); } catch { conectado = false; }
+        return { canal_id: c.id, nome: c.nome, projeto: c.projeto, instrumento: c.instrumento, cor: c.cor, yt_channel_id: c.yt_channel_id, youtube_conectado: conectado };
+      }).filter((c) => c.youtube_conectado);
+      res.json({ ok: true, destinos: out });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  console.log('[etapa33] lives/transmissao carregado (INERTE ate lives_ativo=1): ao-vivo-gravado YouTube + FFmpeg + worker + /lives/*');
 }
 
 
