@@ -3173,6 +3173,27 @@ app.get('/pub/onedrive/testar', async (_req, res) => {
   catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// [lives-extras] lista arquivos de uma SUBPASTA do OneDrive (pro seletor de arquivo do app:
+// escolher vídeo/capa por instrumento sem digitar). Ex.: GET /pub/onedrive/listar?pasta=Lives/Teclado&tipo=video
+// tipo = video | imagem | todos. Devolve caminho RELATIVO à base (serve direto como fonte_ref/capa_ref).
+app.get('/pub/onedrive/listar', (req, res) => {
+  try {
+    const pasta = String(req.query.pasta || '').replace(/^\/+|\/+$/g, '');
+    const tipo = String(req.query.tipo || 'todos').toLowerCase();
+    const EXTV = ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'flv'];
+    const EXTI = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
+    const rows = (_odRcloneListar(pasta || undefined) as any[]) || [];
+    const out = rows.filter((r) => !r.IsDir).map((r) => {
+      const rel = String(r.Path || r.Name || '');
+      const nome = String(r.Name || rel.split('/').pop() || rel);
+      const ext = String(nome.split('.').pop() || '').toLowerCase();
+      return { nome, caminho: (pasta ? pasta + '/' : '') + rel, tamanho: Number(r.Size || 0), ext };
+    }).filter((r) => tipo === 'video' ? EXTV.includes(r.ext) : (tipo === 'imagem' ? EXTI.includes(r.ext) : true))
+      .sort((a, b) => String(a.nome).localeCompare(String(b.nome)));
+    res.json({ ok: true, pasta, arquivos: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 // O APP pede um token CURTO pra subir vídeo direto PC->OneDrive (mesma conexão). Atrás da x-api-key.
 app.get('/pub/onedrive/token-app', async (_req, res) => {
   try { res.json({ ok: true, access_token: await _onedriveToken(), pasta: pubFlag('onedrive_pasta', '') }); }
