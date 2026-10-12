@@ -2887,6 +2887,13 @@ app.get('/pub/conexoes', (_req, res) => {
     for (const c of canais) {
       let plats: string[] = []; try { plats = JSON.parse(c.plataformas_json || '[]'); } catch {}
       for (const p of plats) out.push({ canal_nome: c.nome, projeto: c.projeto, ..._statusConexao(c.id, p) });
+      // [lives-saude] inclui a conexão das LIVES (youtube_lives) se o canal já foi conectado pras lives,
+      // pra ela aparecer no mesmo mapa de saúde da tela inicial.
+      try {
+        const temLives = db.prepare(`SELECT 1 FROM oauth_tokens_pub WHERE canal_id=? AND plataforma='youtube_lives'`).get(c.id)
+          || db.prepare(`SELECT 1 FROM conexoes_sociais WHERE canal_id=? AND plataforma='youtube_lives'`).get(c.id);
+        if (temLives && !plats.includes('youtube_lives')) out.push({ canal_nome: c.nome, projeto: c.projeto, ..._statusConexao(c.id, 'youtube_lives') });
+      } catch { /* */ }
     }
     const resumo = { conectado: out.filter((x) => x.status === 'conectado').length, desconectado: out.filter((x) => x.status === 'desconectado').length, nao_configurado: out.filter((x) => x.status === 'nao_configurado').length, total: out.length };
     res.json({ ok: true, conexoes: out, resumo });
@@ -2900,6 +2907,65 @@ app.post('/pub/conexao/status', (req, res) => {
     res.json({ ok: true });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+
+// ======================= [telegram] AVISO QUANDO UMA CONEXÃO CAI =======================
+// Config do bot (token cifrado + chat id) via endpoint. INERTE até ter token+chat+ativo.
+// Ezequias cria o bot no @BotFather (pega o token) e descobre o chat id (@userinfobot).
+async function tgEnviar(texto: string): Promise<boolean> {
+  try {
+    const token = decifra(pubFlag('telegram_bot_token_enc', ''));
+    const chat = pubFlag('telegram_chat_id', '');
+    if (!token || !chat) return false;
+    const r: any = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chat, text: texto, parse_mode: 'HTML', disable_web_page_preview: true }),
+    });
+    return r.ok;
+  } catch { return false; }
+}
+app.post('/pub/telegram-config', (req, res) => {
+  try {
+    const b = req.body || {};
+    if (b.botToken != null && String(b.botToken).trim()) setPubFlag('telegram_bot_token_enc', cifra(String(b.botToken).trim()));
+    if (b.chatId != null) setPubFlag('telegram_chat_id', String(b.chatId).trim());
+    if (b.ativo != null) setPubFlag('telegram_ativo', b.ativo ? '1' : '0');
+    res.json({ ok: true, ativo: pubFlag('telegram_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), chat_id: pubFlag('telegram_chat_id', '') });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/pub/telegram-config', (_req, res) => {
+  res.json({ ok: true, ativo: pubFlag('telegram_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), chat_id: pubFlag('telegram_chat_id', '') });
+});
+app.post('/pub/telegram-test', async (_req, res) => {
+  const ok = await tgEnviar('✅ Teste do Motor Melodias e Riffs — avisos de conexão ligados.');
+  res.json({ ok, erro: ok ? undefined : 'falhou (confira token/chat id e se está ativo)' });
+});
+// lista as conexões FORA DO AR (publicação + lives), pra comparar entre checagens
+function _conexoesForaDoAr(): string[] {
+  const fora: string[] = [];
+  try {
+    const canais = db.prepare(`SELECT id, nome, plataformas_json FROM canais_publicacao WHERE ativo=1`).all() as any[];
+    for (const c of canais) {
+      let plats: string[] = []; try { plats = JSON.parse(c.plataformas_json || '[]'); } catch { /* */ }
+      const checar = [...plats];
+      try { const temLives = db.prepare(`SELECT 1 FROM conexoes_sociais WHERE canal_id=? AND plataforma='youtube_lives'`).get(c.id); if (temLives && !checar.includes('youtube_lives')) checar.push('youtube_lives'); } catch { /* */ }
+      for (const p of checar) { const s = _statusConexao(c.id, p); if (s.status === 'desconectado') fora.push(`${c.nome}|${p}`); }
+    }
+  } catch { /* */ }
+  return fora;
+}
+async function tickAlertasConexao() {
+  if (pubFlag('telegram_ativo', '0') !== '1') return;
+  const fora = _conexoesForaDoAr();
+  let avisados: string[] = []; try { avisados = JSON.parse(pubFlag('telegram_avisados', '[]')); } catch { avisados = []; }
+  const novos = fora.filter((x) => !avisados.includes(x));
+  for (const n of novos) {
+    const [canal, plat] = n.split('|');
+    const nomePlat = plat === 'youtube_lives' ? 'YouTube (Lives)' : (plat === 'youtube' ? 'YouTube' : (plat === 'instagram' ? 'Instagram' : (plat === 'facebook' ? 'Facebook' : (plat === 'tiktok' ? 'TikTok' : plat))));
+    await tgEnviar(`🔴 <b>Conexão caiu</b>\nCanal: <b>${canal}</b>\nRede: <b>${nomePlat}</b>\n\nReconecte quando puder no app (na tela inicial, no card de atenção, ou em Publicação → editar o canal → Conectar).`);
+  }
+  setPubFlag('telegram_avisados', JSON.stringify(fora)); // guarda o estado atual (quem voltou sai da lista e volta a avisar se cair de novo)
+}
+setInterval(() => { tickAlertasConexao().catch(() => { }); }, 15 * 60 * 1000); // checa a cada 15 min
 
 // ======================= ENDPOINTS: SDR / BOAS-VINDAS (espelho) =======================
 app.get('/sdr/resumo', (_req, res) => {
@@ -4308,15 +4374,17 @@ async function pbYtTokenLives(canalId: string): Promise<string> {
   const rec = pbTokLer(canalId, 'youtube_lives');
   if (!cred.clientId || !rec) return pbYtToken(canalId); // compatível com o comportamento atual
   if (pbTokValido(rec)) return rec.accessToken;
-  if (!rec.refreshToken) throw new Error('Token YouTube (lives) expirado e sem refresh — reconecte em /pub/youtube-lives/connect.');
+  // [lives-saude] marca desconectado se não dá pra renovar — assim a tela inicial e o aviso do Telegram pegam.
+  if (!rec.refreshToken) { try { pbConexao(canalId, 'youtube_lives', 'desconectado', 'token expirado, sem refresh'); } catch { /* */ } throw new Error('Token YouTube (lives) expirado e sem refresh — reconecte em /pub/youtube-lives/connect.'); }
   const r = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ client_id: cred.clientId, client_secret: cred.clientSecret, grant_type: 'refresh_token', refresh_token: rec.refreshToken }),
   });
-  if (!r.ok) throw new Error(`Refresh YouTube (lives) falhou (${r.status}): ${(await r.text()).slice(0, 200)}`);
+  if (!r.ok) { const et = (await r.text()).slice(0, 200); try { pbConexao(canalId, 'youtube_lives', 'desconectado', `refresh ${r.status}`); } catch { /* */ } throw new Error(`Refresh YouTube (lives) falhou (${r.status}): ${et}`); }
   const d = await r.json() as any;
   const expiresAt = new Date(Date.now() + (d.expires_in || 3600) * 1000).toISOString();
   pbTokSalvar(canalId, 'youtube_lives', { accessToken: d.access_token, expiresAt, ...(d.scope ? { scope: d.scope } : {}) });
+  try { pbConexao(canalId, 'youtube_lives', 'conectado', 'API'); } catch { /* */ }
   return d.access_token;
 }
 
@@ -5239,6 +5307,8 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     );
   `);
   try { db.exec(`ALTER TABLE fila_lives ADD COLUMN broadcasts_json TEXT DEFAULT '[]'`); } catch { /* já existe */ }
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN capa_ref TEXT`); } catch { /* já existe */ }        // [lives-capa] caminho da capa (imagem) no OneDrive
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN limpo INTEGER DEFAULT 0`); } catch { /* já existe */ } // [lives-limpeza] 1 = vídeo-fonte já apagado do OneDrive
 
   const livLog = (evt: string, ...a: any[]) => { try { console.log(`[etapa33] ${evt}`, ...a); } catch { /* */ } };
 
@@ -5263,12 +5333,17 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   }
 
   // cria broadcast + stream, vincula, devolve ingestão RTMP + watch url + liveChatId
-  async function ytLiveCriar(canalId: string, opts: { titulo: string; descricao?: string; privacy: string }): Promise<{
+  async function ytLiveCriar(canalId: string, opts: { titulo: string; descricao?: string; privacy: string; scheduledStartTime?: string }): Promise<{
     broadcastId: string; streamId: string; rtmp: string; key: string; watchUrl: string; liveChatId: string;
   }> {
     const token = await pbYtTokenLives(canalId);
     const privacy = ['private', 'unlisted', 'public'].includes(opts.privacy) ? opts.privacy : 'private';
-    const inicio = new Date(Date.now() + 30 * 1000).toISOString();
+    // [lives-link] se veio um horário agendado válido e no futuro, usa ele (pro YouTube mostrar "agendada para X"
+    // e o link já valer pra divulgação antecipada); senão começa em ~30s como antes.
+    const agendadoMs = opts.scheduledStartTime ? Date.parse(opts.scheduledStartTime) : NaN;
+    const inicio = (!isNaN(agendadoMs) && agendadoMs > Date.now() + 15 * 1000)
+      ? new Date(agendadoMs).toISOString()
+      : new Date(Date.now() + 30 * 1000).toISOString();
     // 1) broadcast (auto-start quando o stream ficar ativo; auto-stop ao parar; DVR liga replay)
     const bc = await ytApi(token, 'POST', '/liveBroadcasts?part=snippet,status,contentDetails', {
       snippet: { title: (opts.titulo || 'Live').slice(0, 100), description: (opts.descricao || '').slice(0, 5000), scheduledStartTime: inicio },
@@ -5294,6 +5369,22 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   async function ytLiveTransicao(canalId: string, broadcastId: string, status: string): Promise<void> {
     const token = await pbYtTokenLives(canalId);
     await ytApi(token, 'POST', `/liveBroadcasts/transition?broadcastStatus=${encodeURIComponent(status)}&id=${encodeURIComponent(broadcastId)}&part=status`);
+  }
+
+  // [lives-capa] define a CAPA (thumbnail) do vídeo da live. videoId = o próprio broadcastId.
+  // imagePath = caminho local da imagem (png/jpg/webp), já baixada do OneDrive. Usa o endpoint de
+  // upload de mídia (thumbnails.set). Requisito do YouTube: canal verificado (telefone).
+  async function ytThumbnailSet(canalId: string, videoId: string, imagePath: string): Promise<void> {
+    const token = await pbYtTokenLives(canalId);
+    const buf = fs.readFileSync(imagePath);
+    const ext = String(imagePath.split('.').pop() || '').toLowerCase();
+    const ct = ext === 'png' ? 'image/png' : (ext === 'webp' ? 'image/webp' : 'image/jpeg');
+    const r = await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${encodeURIComponent(videoId)}&uploadType=media`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': ct },
+      body: buf as any,
+    });
+    if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`thumbnail (capa) falhou (${r.status}): ${String(t).slice(0, 300)}`); }
   }
 
   // ---------------------- FFmpeg push ----------------------
@@ -5323,6 +5414,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     const i = arr.findIndex((x) => String(x.canal_id) === String(canalId));
     if (i >= 0) arr[i] = { ...arr[i], ...patch }; else arr.push({ canal_id: canalId, ...patch });
     db.prepare(`UPDATE fila_lives SET broadcasts_json=?, atualizado_em=? WHERE id=?`).run(JSON.stringify(arr), agora(), liveId);
+  }
+
+  // [lives-link] lê UM destino de dentro de broadcasts_json (pra reaproveitar broadcast pré-criado)
+  function livDestinoLer(liveId: string, canalId: string): any | null {
+    const row = db.prepare(`SELECT broadcasts_json FROM fila_lives WHERE id=?`).get(liveId) as any;
+    let arr: any[] = []; try { arr = JSON.parse(row?.broadcasts_json || '[]'); } catch { arr = []; }
+    return arr.find((x) => String(x.canal_id) === String(canalId)) || null;
   }
 
   // encerra (complete) e marca concluído quando todos os ffmpeg da live terminarem
@@ -5371,8 +5469,23 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     for (const d of yts) {
       const canalId = String(d.canal_id);
       try {
-        const info = await ytLiveCriar(canalId, { titulo: live.titulo || 'Live', descricao: live.descricao || '', privacy: live.privacidade || 'private' });
-        livSetDestino(liveId, canalId, { plataforma: 'youtube', broadcast_id: info.broadcastId, stream_id: info.streamId, watch_url: info.watchUrl, live_chat_id: info.liveChatId, status: 'conectando', erro: null });
+        // [lives-link] se a live já foi PREPARADA (broadcast criado antes, pro link antecipado),
+        // reaproveita o broadcast/stream existente em vez de criar outro. Senão cria agora (igual antes).
+        let info: { broadcastId: string; streamId: string; rtmp: string; key: string; watchUrl: string; liveChatId: string };
+        let jaPreparado = false;
+        const pre = livDestinoLer(liveId, canalId);
+        if (pre && pre.broadcast_id && pre.rtmp && pre.key) {
+          info = { broadcastId: String(pre.broadcast_id), streamId: String(pre.stream_id || ''), rtmp: String(pre.rtmp), key: String(pre.key), watchUrl: String(pre.watch_url || ('https://youtu.be/' + pre.broadcast_id)), liveChatId: String(pre.live_chat_id || '') };
+          jaPreparado = true;
+        } else {
+          info = await ytLiveCriar(canalId, { titulo: live.titulo || 'Live', descricao: live.descricao || '', privacy: live.privacidade || 'private', scheduledStartTime: String(live.data_agendada || '') });
+        }
+        livSetDestino(liveId, canalId, { plataforma: 'youtube', broadcast_id: info.broadcastId, stream_id: info.streamId, rtmp: info.rtmp, key: info.key, watch_url: info.watchUrl, live_chat_id: info.liveChatId, status: 'conectando', erro: null });
+        // [lives-capa] se tem capa e o broadcast foi criado AGORA (no preparar já aplicou), sobe a capa
+        if (!jaPreparado && live.capa_ref) {
+          try { const capaFile = pbBaixarMidia(String(live.capa_ref)).file; await ytThumbnailSet(canalId, info.broadcastId, capaFile); }
+          catch (e: any) { livLog('capa falhou', liveId, canalId, String(e?.message || e)); }
+        }
         const child = ffmpegPush(input, `${info.rtmp}/${info.key}`);
         const rec = { canal_id: canalId, child, done: false };
         procs.push(rec);
@@ -5414,6 +5527,43 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   }
   setInterval(() => { tickLives().catch(() => { }); }, 15000);
 
+  // ---------------------- [lives-limpeza] auto-apagar vídeos de live usados do OneDrive ----------------------
+  // INERTE até pub_kv 'lives_limpeza_ativo'='1'. Apaga (hard delete) o vídeo-fonte do OneDrive das lives
+  // JÁ concluídas/canceladas há mais de N horas (padrão 48). A GRAVAÇÃO fica salva no YouTube — não se perde.
+  // Guarda: não apaga arquivo que ainda esteja em uso por outra live pendente/agendada.
+  async function tickLimpezaLives() {
+    if (pubFlag('lives_limpeza_ativo', '0') !== '1') return;
+    const horas = Math.max(1, Number(pubFlag('lives_limpeza_horas', '48')) || 48);
+    const limite = new Date(Date.now() - horas * 3600 * 1000).toISOString();
+    const rows = db.prepare(`SELECT id, fonte_ref FROM fila_lives WHERE fonte_tipo='onedrive' AND (limpo IS NULL OR limpo=0) AND status IN ('concluido','cancelado') AND atualizado_em <= ? ORDER BY atualizado_em ASC LIMIT 10`).all(limite) as any[];
+    for (const r of rows) {
+      const ref = String(r.fonte_ref || '');
+      if (!ref) { db.prepare(`UPDATE fila_lives SET limpo=1 WHERE id=?`).run(r.id); continue; }
+      const emUso = db.prepare(`SELECT COUNT(*) n FROM fila_lives WHERE fonte_ref=? AND status NOT IN ('concluido','cancelado','erro')`).get(ref) as any;
+      if (emUso && emUso.n > 0) continue; // ainda tem live pendente usando esse arquivo -> não apaga
+      try {
+        _rclone(['deletefile', _odRemotePath(ref)], { timeoutMs: 60000 });
+        db.prepare(`UPDATE fila_lives SET limpo=1, atualizado_em=? WHERE id=?`).run(agora(), r.id);
+        livLog('onedrive limpo', r.id, ref);
+      } catch (e: any) {
+        const msg = String(e?.message || e).toLowerCase();
+        livLog('limpeza falhou', r.id, ref, msg);
+        if (msg.includes('not found') || msg.includes("didn't find") || msg.includes('no such')) {
+          db.prepare(`UPDATE fila_lives SET limpo=1 WHERE id=?`).run(r.id); // arquivo já não existe -> não insistir
+        }
+      }
+    }
+  }
+  setInterval(() => { tickLimpezaLives().catch(() => { }); }, 30 * 60 * 1000); // checa a cada 30 min
+  // endpoints de controle da limpeza
+  app.get('/lives/limpeza/status', (_req: any, res: any) => res.json({ ok: true, ativo: pubFlag('lives_limpeza_ativo', '0') === '1', horas: Number(pubFlag('lives_limpeza_horas', '48')) || 48 }));
+  app.post('/lives/limpeza/config', (req: any, res: any) => {
+    const b = req.body || {};
+    if (b.ativo != null) setPubFlag('lives_limpeza_ativo', b.ativo ? '1' : '0');
+    if (b.horas != null && Number(b.horas) > 0) setPubFlag('lives_limpeza_horas', String(Math.floor(Number(b.horas))));
+    res.json({ ok: true, ativo: pubFlag('lives_limpeza_ativo', '0') === '1', horas: Number(pubFlag('lives_limpeza_horas', '48')) || 48 });
+  });
+
   // ---------------------- Endpoints ----------------------
   // agenda uma transmissão
   app.post('/lives/agendar', (req: any, res: any) => {
@@ -5424,11 +5574,42 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
       const id = String(b.id || randomUUID());
       const priv = ['private', 'unlisted', 'public'].includes(String(b.privacidade)) ? String(b.privacidade) : 'private';
-      db.prepare(`INSERT INTO fila_lives(id,projeto,titulo,descricao,fonte_tipo,fonte_ref,tipo,qualidade,privacidade,destinos_json,data_agendada,status,broadcasts_json,em_loop,criado_em,atualizado_em)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET projeto=excluded.projeto,titulo=excluded.titulo,descricao=excluded.descricao,fonte_tipo=excluded.fonte_tipo,fonte_ref=excluded.fonte_ref,qualidade=excluded.qualidade,privacidade=excluded.privacidade,destinos_json=excluded.destinos_json,data_agendada=excluded.data_agendada,atualizado_em=excluded.atualizado_em`)
-        .run(id, String(b.projeto || ''), String(b.titulo || 'Live'), String(b.descricao || ''), String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref || ''), String(b.tipo || 'ao_vivo_gravado'), String(b.qualidade || 'auto'), priv, JSON.stringify(destinos), String(b.data_agendada || agora()), 'agendado', '[]', b.em_loop ? 1 : 0, agora(), agora());
+      db.prepare(`INSERT INTO fila_lives(id,projeto,titulo,descricao,fonte_tipo,fonte_ref,capa_ref,tipo,qualidade,privacidade,destinos_json,data_agendada,status,broadcasts_json,em_loop,criado_em,atualizado_em)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET projeto=excluded.projeto,titulo=excluded.titulo,descricao=excluded.descricao,fonte_tipo=excluded.fonte_tipo,fonte_ref=excluded.fonte_ref,capa_ref=excluded.capa_ref,qualidade=excluded.qualidade,privacidade=excluded.privacidade,destinos_json=excluded.destinos_json,data_agendada=excluded.data_agendada,atualizado_em=excluded.atualizado_em`)
+        .run(id, String(b.projeto || ''), String(b.titulo || 'Live'), String(b.descricao || ''), String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref || ''), String(b.capa_ref || ''), String(b.tipo || 'ao_vivo_gravado'), String(b.qualidade || 'auto'), priv, JSON.stringify(destinos), String(b.data_agendada || agora()), 'agendado', '[]', b.em_loop ? 1 : 0, agora(), agora());
       res.json({ ok: true, id });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [lives-link] PREPARA a live: cria o broadcast no YouTube ANTES (com o horário agendado),
+  // aplica a capa, e devolve o LINK (watch_url) pra divulgar com antecedência — sem transmitir ainda.
+  // Mantém status 'agendado', então o worker/`/lives/testar` depois reaproveita esse broadcast e empurra o vídeo.
+  app.post('/lives/preparar', async (req: any, res: any) => {
+    try {
+      const id = String((req.body || {}).id || '');
+      if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
+      const live = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(id) as any;
+      if (!live) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+      let destinos: any[] = []; try { destinos = JSON.parse(live.destinos_json || '[]'); } catch { destinos = []; }
+      const yts = destinos.filter((d) => String(d.plataforma || 'youtube') === 'youtube' && d.canal_id);
+      if (!yts.length) return res.status(400).json({ ok: false, erro: 'sem destino YouTube' });
+      const links: any[] = [];
+      for (const d of yts) {
+        const canalId = String(d.canal_id);
+        const ja = livDestinoLer(id, canalId);
+        if (ja && ja.broadcast_id && ja.rtmp && ja.key) { links.push({ canal_id: canalId, watch_url: ja.watch_url, broadcast_id: ja.broadcast_id, ja: true }); continue; }
+        try {
+          const info = await ytLiveCriar(canalId, { titulo: live.titulo || 'Live', descricao: live.descricao || '', privacy: live.privacidade || 'private', scheduledStartTime: String(live.data_agendada || '') });
+          livSetDestino(id, canalId, { plataforma: 'youtube', broadcast_id: info.broadcastId, stream_id: info.streamId, rtmp: info.rtmp, key: info.key, watch_url: info.watchUrl, live_chat_id: info.liveChatId, status: 'pronto', erro: null });
+          if (live.capa_ref) { try { const capaFile = pbBaixarMidia(String(live.capa_ref)).file; await ytThumbnailSet(canalId, info.broadcastId, capaFile); } catch (e: any) { livLog('capa (preparar) falhou', id, canalId, String(e?.message || e)); } }
+          links.push({ canal_id: canalId, watch_url: info.watchUrl, broadcast_id: info.broadcastId, ja: false });
+        } catch (e: any) {
+          livSetDestino(id, canalId, { plataforma: 'youtube', status: 'erro', erro: String(e?.message || e).slice(0, 400) });
+          links.push({ canal_id: canalId, erro: String(e?.message || e).slice(0, 300) });
+        }
+      }
+      res.json({ ok: links.some((l) => l.watch_url), id, links });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
 
