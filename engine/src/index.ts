@@ -627,6 +627,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
   if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
   if (req.path === '/pub/youtube/callback') return next(); // etapa28: OAuth YouTube (Google chama sem a x-api-key)
+  if (req.path === '/pub/youtube-lives/callback') return next(); // [lives-sep]: OAuth YouTube LIVES (projeto separado; Google chama sem a x-api-key)
   if (req.path === '/pub/meta/callback') return next(); // etapa28: OAuth Meta/IG/FB (Facebook chama sem a x-api-key)
   if (req.path === '/pub/pinterest/callback') return next(); // etapa28: OAuth Pinterest (chama sem a x-api-key)
   if (req.path.startsWith('/capi/webhook/')) return next(); // etapa29: webhook público de venda (Hotmart/Kiwify/Guru chamam sem x-api-key)
@@ -4249,6 +4250,76 @@ async function pbYtToken(canalId: string): Promise<string> {
   return d.access_token;
 }
 
+// ===================== OAUTH — YOUTUBE (LIVES) — PROJETO/APP SEPARADO ([lives-sep]) =====================
+// As LIVES usam uma 2ª credencial de YouTube ('youtube_lives') vinda de um PROJETO Google
+// Cloud SEPARADO, pra ter COTA PRÓPRIA e NÃO disputar com os uploads do publicador.
+// Mesmos escopos; token guardado sob plataforma 'youtube_lives'; callback próprio.
+// Configurar a credencial: POST /pub/pub-cred { plataforma:'youtube_lives', clientId, clientSecret }.
+// Conectar um canal: GET /pub/youtube-lives/connect?canalId=XXX  (login + autorizar).
+// COMPATÍVEL: se o canal AINDA não tiver 'youtube_lives' configurado/conectado, as lives
+// caem de volta no 'youtube' normal (comportamento atual) — nada quebra.
+function pbYtLivesRedirect(): string { return (PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/pub/youtube-lives/callback'; }
+
+app.get('/pub/youtube-lives/connect', (req, res) => {
+  try {
+    const canalId = String((req.query.canalId || req.query.canal_id || '')).trim();
+    if (!canalId) return res.status(400).json({ ok: false, erro: 'canalId obrigatório' });
+    const { clientId } = pbCred('youtube_lives');
+    if (!clientId) return res.status(400).json({ ok: false, erro: 'YouTube (lives) client_id não configurado (POST /pub/pub-cred plataforma=youtube_lives)' });
+    const params = new URLSearchParams({
+      client_id: clientId, redirect_uri: pbYtLivesRedirect(), response_type: 'code', scope: PB_YT_SCOPES,
+      access_type: 'offline', prompt: 'select_account consent', include_granted_scopes: 'false', state: `ytl:${canalId}`,
+    });
+    res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// ROTA PÚBLICA (Google chama sem x-api-key) — exceção adicionada no middleware.
+app.get('/pub/youtube-lives/callback', async (req, res) => {
+  const enviaHtml = (ok: boolean, msg: string) => res.status(200).type('html').send(pbHtmlResposta(ok, msg));
+  try {
+    const code = String(req.query.code || ''); const state = String(req.query.state || '');
+    if (req.query.error) return enviaHtml(false, `Google: ${req.query.error}`);
+    if (!code || !state.startsWith('ytl:')) return enviaHtml(false, 'callback inválido');
+    const canalId = state.slice(4);
+    const { clientId, clientSecret } = pbCred('youtube_lives');
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: pbYtLivesRedirect(), grant_type: 'authorization_code' }),
+    });
+    if (!tr.ok) return enviaHtml(false, `troca de token falhou (${tr.status})`);
+    const td = await tr.json() as any;
+    const expiresAt = new Date(Date.now() + (td.expires_in || 3600) * 1000).toISOString();
+    let conta = ''; let channelId = '';
+    try { const ui = await (await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${td.access_token}` } })).json() as any; conta = ui.email || ui.name || ''; } catch { /* */ }
+    try {
+      const ch = await (await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: `Bearer ${td.access_token}` } })).json() as any;
+      if (ch.items && ch.items[0]) { channelId = ch.items[0].id; conta = ch.items[0].snippet?.title || conta; }
+    } catch { /* */ }
+    pbTokSalvar(canalId, 'youtube_lives', { accessToken: td.access_token, refreshToken: td.refresh_token || null, expiresAt, scope: td.scope || PB_YT_SCOPES, conta });
+    pbConexao(canalId, 'youtube_lives', 'conectado', conta);
+    enviaHtml(true, `YouTube (lives): ${conta || channelId || 'conta'}`);
+  } catch (e: any) { enviaHtml(false, String(e?.message || e)); }
+});
+
+// Token p/ as LIVES. Se o canal não tiver 'youtube_lives' configurado/conectado, cai no 'youtube' normal.
+async function pbYtTokenLives(canalId: string): Promise<string> {
+  const cred = pbCred('youtube_lives');
+  const rec = pbTokLer(canalId, 'youtube_lives');
+  if (!cred.clientId || !rec) return pbYtToken(canalId); // compatível com o comportamento atual
+  if (pbTokValido(rec)) return rec.accessToken;
+  if (!rec.refreshToken) throw new Error('Token YouTube (lives) expirado e sem refresh — reconecte em /pub/youtube-lives/connect.');
+  const r = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: cred.clientId, client_secret: cred.clientSecret, grant_type: 'refresh_token', refresh_token: rec.refreshToken }),
+  });
+  if (!r.ok) throw new Error(`Refresh YouTube (lives) falhou (${r.status}): ${(await r.text()).slice(0, 200)}`);
+  const d = await r.json() as any;
+  const expiresAt = new Date(Date.now() + (d.expires_in || 3600) * 1000).toISOString();
+  pbTokSalvar(canalId, 'youtube_lives', { accessToken: d.access_token, expiresAt, ...(d.scope ? { scope: d.scope } : {}) });
+  return d.access_token;
+}
+
 // ============================ OAUTH — META (Instagram + Facebook) ============================
 const PB_META_VER = 'v21.0';
 const PB_META_SCOPES = ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', 'business_management', 'instagram_basic', 'instagram_content_publish'].join(',');
@@ -5195,7 +5266,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   async function ytLiveCriar(canalId: string, opts: { titulo: string; descricao?: string; privacy: string }): Promise<{
     broadcastId: string; streamId: string; rtmp: string; key: string; watchUrl: string; liveChatId: string;
   }> {
-    const token = await pbYtToken(canalId);
+    const token = await pbYtTokenLives(canalId);
     const privacy = ['private', 'unlisted', 'public'].includes(opts.privacy) ? opts.privacy : 'private';
     const inicio = new Date(Date.now() + 30 * 1000).toISOString();
     // 1) broadcast (auto-start quando o stream ficar ativo; auto-stop ao parar; DVR liga replay)
@@ -5221,7 +5292,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   }
 
   async function ytLiveTransicao(canalId: string, broadcastId: string, status: string): Promise<void> {
-    const token = await pbYtToken(canalId);
+    const token = await pbYtTokenLives(canalId);
     await ytApi(token, 'POST', `/liveBroadcasts/transition?broadcastStatus=${encodeURIComponent(status)}&id=${encodeURIComponent(broadcastId)}&part=status`);
   }
 
@@ -5439,6 +5510,192 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   });
 
   console.log('[etapa33] lives/transmissao carregado (INERTE ate lives_ativo=1): ao-vivo-gravado YouTube + FFmpeg + worker + /lives/*');
+}
+
+
+// WEBINARIO — configuracao da audiencia demonstrativa e mensagens programadas.
+// Bloco aditivo e isolado: nao altera o worker de lives nem os webhooks existentes.
+db.exec(`CREATE TABLE IF NOT EXISTS webinario_simulacoes (
+  projeto TEXT PRIMARY KEY,
+  contador_json TEXT NOT NULL DEFAULT '{}',
+  comentarios_json TEXT NOT NULL DEFAULT '[]',
+  atualizado_em TEXT NOT NULL
+);`);
+
+app.get('/webinario/simulacao/:projeto', (req: any, res: any) => {
+  try {
+    const projeto = String(req.params.projeto || '').trim().slice(0, 80);
+    const row = db.prepare(`SELECT contador_json, comentarios_json, atualizado_em FROM webinario_simulacoes WHERE projeto=?`).get(projeto) as any;
+    if (!row) return res.json({ ok: true, simulacao: null });
+    res.json({ ok: true, simulacao: { config: JSON.parse(row.contador_json || '{}'), comentarios: JSON.parse(row.comentarios_json || '[]'), atualizado_em: row.atualizado_em } });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+app.post('/webinario/simulacao/:projeto', (req: any, res: any) => {
+  try {
+    const projeto = String(req.params.projeto || '').trim().slice(0, 80);
+    if (!projeto) return res.status(400).json({ ok: false, erro: 'projeto_obrigatorio' });
+    const b = req.body || {};
+    const cfg = b.config || {};
+    const minimo = Math.max(0, Math.round(Number(cfg.minimo) || 0));
+    const maximo = Math.max(minimo, Math.min(1000000, Math.round(Number(cfg.maximo) || minimo)));
+    const config = {
+      ativo: !!cfg.ativo,
+      minimo,
+      maximo,
+      inicial: Math.max(minimo, Math.min(maximo, Math.round(Number(cfg.inicial) || minimo))),
+      intervaloMin: Math.max(1, Math.min(300, Math.round(Number(cfg.intervaloMin) || 4))),
+      intervaloMax: Math.max(1, Math.min(300, Math.round(Number(cfg.intervaloMax) || 10))),
+      variacaoMax: Math.max(1, Math.min(1000, Math.round(Number(cfg.variacaoMax) || 3)))
+    };
+    const entrada = Array.isArray(b.comentarios) ? b.comentarios.slice(0, 20000) : [];
+    const comentarios = entrada.map((c: any, i: number) => ({
+      id: String(c?.id || randomUUID()).slice(0, 120),
+      tempoSeg: Math.max(0, Math.min(86400, Math.round(Number(c?.tempoSeg) || i * 15))),
+      nome: String(c?.nome || `Participante ${i + 1}`).trim().slice(0, 160),
+      texto: String(c?.texto || '').trim().slice(0, 4000),
+      origem: String(c?.origem || 'Manual').trim().slice(0, 80),
+      ativo: c?.ativo !== false
+    })).filter((c: any) => c.texto);
+    const atualizado = agora();
+    db.prepare(`INSERT INTO webinario_simulacoes(projeto,contador_json,comentarios_json,atualizado_em) VALUES(?,?,?,?)
+      ON CONFLICT(projeto) DO UPDATE SET contador_json=excluded.contador_json,comentarios_json=excluded.comentarios_json,atualizado_em=excluded.atualizado_em`)
+      .run(projeto, JSON.stringify(config), JSON.stringify(comentarios), atualizado);
+    res.json({ ok: true, total_comentarios: comentarios.length, atualizado_em: atualizado });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+console.log('[webinario] simulacao e mensagens programadas carregadas: /webinario/simulacao/:projeto');
+
+// ============================================================================
+// [etapa34] FORMATOS VERTICAIS — gera 1080x1920 a partir do vídeo horizontal
+// ----------------------------------------------------------------------------
+// ADITIVO. Bloco antes do app.listen. Reaproveita: db, app, agora(), randomUUID,
+// spawn, pbBaixarMidia, MEDIA_DIR, MEDIA_PUBLIC_BASE/PUBLIC_BASE_URL.
+//
+// Pega um vídeo (OneDrive ou URL) e produz a versão vertical conforme o modo:
+//   0 = tela cheia (zoom, corta laterais)
+//   1 = quadradinho + borda preta
+//   2 = quadradinho + texto (cima/baixo)
+//   3 = quadradinho + arte PNG (1080x1920, centro vazado) por cima
+//   4 = girado (vídeo rotacionado 90°, preenche tudo — assiste deitado)
+// Tamanho (modos 1/2/3): pequeno|medio|grande (largura do vídeo no meio).
+//
+// O resultado é salvo em MEDIA_DIR e servido em /media/<arquivo> (pronto pra
+// o Instagram/PC2 pegar ou pra baixar). Recodifica (CPU) — é geração única,
+// não ao vivo. Roda async: POST devolve job_id; GET acompanha.
+//
+// PENDENTE DE DEPLOY + TESTE no VPS (código novo, ainda não rodado).
+// ============================================================================
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS formatos_jobs (
+      id TEXT PRIMARY KEY,
+      modo INTEGER,
+      fonte_ref TEXT,
+      saida_arquivo TEXT,
+      saida_url TEXT,
+      status TEXT DEFAULT 'processando',   -- processando | pronto | erro
+      erro TEXT,
+      criado_em TEXT, atualizado_em TEXT
+    );
+  `);
+
+  const fvJobs: Map<string, any> = new Map(); // id -> child
+  const FV_FONTE = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+  const fvLarguras: Record<string, number> = { pequeno: 680, medio: 880, grande: 1080 };
+
+  // escapa texto pro drawtext do ffmpeg
+  const fvEscText = (s: string): string => String(s || '').replace(/\\/g, '').replace(/:/g, '\\:').replace(/'/g, '').slice(0, 120);
+
+  // monta os argumentos do ffmpeg conforme o modo
+  function fvArgs(input: string, pngPath: string | null, modo: number, opts: any, outPath: string): string[] {
+    const larg = fvLarguras[String(opts?.tamanho || 'grande')] || 1080;
+    const base = ['-hide_banner', '-loglevel', 'error', '-y', '-i', input];
+    const enc = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outPath];
+    const padQuad = `scale=${larg}:-2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black`;
+    if (modo === 0) {
+      return [...base, '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920', ...enc];
+    }
+    if (modo === 1) {
+      return [...base, '-vf', padQuad, ...enc];
+    }
+    if (modo === 2) {
+      const cima = fvEscText(opts?.texto_cima || '');
+      const baixo = fvEscText(opts?.texto_baixo || '');
+      let vf = padQuad;
+      const dt = (txt: string, y: string) => `,drawtext=fontfile=${FV_FONTE}:text='${txt}':fontcolor=white:fontsize=56:box=1:boxcolor=black@0.45:boxborderw=16:x=(w-text_w)/2:y=${y}`;
+      if (cima) vf += dt(cima, '150');
+      if (baixo) vf += dt(baixo, 'h-th-180');
+      return [...base, '-vf', vf, ...enc];
+    }
+    if (modo === 3 && pngPath) {
+      return ['-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-i', pngPath,
+        '-filter_complex', `[0:v]${padQuad}[bg];[bg][1:v]overlay=0:0`, ...enc];
+    }
+    if (modo === 4) {
+      return [...base, '-vf', 'transpose=1', ...enc];
+    }
+    // fallback = quadradinho
+    return [...base, '-vf', padQuad, ...enc];
+  }
+
+  function fvResolve(tipo: string, ref: string): string {
+    if (String(tipo) === 'url') return String(ref || '');
+    return pbBaixarMidia(String(ref || '')).file; // onedrive
+  }
+
+  // dispara a geração (async)
+  app.post('/formatos/vertical', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const modo = Number(b.modo);
+      if (!(modo >= 0 && modo <= 4)) return res.status(400).json({ ok: false, erro: 'modo_invalido (0..4)' });
+      if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
+      const id = randomUUID();
+      const nome = String(b.saida_nome || `vertical-${id.slice(0, 8)}`).replace(/[^a-zA-Z0-9._-]/g, '_') + '.mp4';
+      const outPath = `${MEDIA_DIR}/${nome}`;
+      let input = '';
+      let pngPath: string | null = null;
+      try {
+        input = fvResolve(String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref));
+        if (modo === 3) {
+          if (!b.png_ref) return res.status(400).json({ ok: false, erro: 'png_ref_obrigatorio no modo 3' });
+          pngPath = pbBaixarMidia(String(b.png_ref)).file;
+        }
+      } catch (e: any) {
+        return res.status(400).json({ ok: false, erro: 'fonte: ' + String(e?.message || e) });
+      }
+      const base = String(MEDIA_PUBLIC_BASE || PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+      db.prepare(`INSERT INTO formatos_jobs(id,modo,fonte_ref,saida_arquivo,saida_url,status,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(id, modo, String(b.fonte_ref), nome, `${base}/media/${nome}`, 'processando', agora(), agora());
+
+      const args = fvArgs(input, pngPath, modo, b.opts || {}, outPath);
+      const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      fvJobs.set(id, child);
+      let errTail = '';
+      try { child.stderr.on('data', (d: any) => { errTail = (errTail + String(d)).slice(-800); }); } catch { /* */ }
+      child.on('exit', (code: number) => {
+        fvJobs.delete(id);
+        if (code === 0) db.prepare(`UPDATE formatos_jobs SET status='pronto', atualizado_em=? WHERE id=?`).run(agora(), id);
+        else db.prepare(`UPDATE formatos_jobs SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run(('ffmpeg code ' + code + ': ' + errTail).slice(0, 500), agora(), id);
+      });
+      res.json({ ok: true, id, saida_url: `${base}/media/${nome}` });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  app.get('/formatos/vertical/:id', (req: any, res: any) => {
+    const row = db.prepare(`SELECT * FROM formatos_jobs WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+    res.json({ ok: true, job: row });
+  });
+
+  app.get('/formatos/vertical', (_req: any, res: any) => {
+    const rows = db.prepare(`SELECT * FROM formatos_jobs ORDER BY criado_em DESC LIMIT 100`).all() as any[];
+    res.json({ ok: true, jobs: rows });
+  });
+
+  console.log('[etapa34] formatos verticais carregado: POST/GET /formatos/vertical (zoom|borda|texto|PNG|girado)');
 }
 
 
