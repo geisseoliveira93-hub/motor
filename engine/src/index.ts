@@ -632,6 +632,8 @@ app.use((req, res, next) => {
   if (req.path === '/pub/pinterest/callback') return next(); // etapa28: OAuth Pinterest (chama sem a x-api-key)
   if (req.path.startsWith('/capi/webhook/')) return next(); // etapa29: webhook público de venda (Hotmart/Kiwify/Guru chamam sem x-api-key)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
+  if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
+  if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -5330,6 +5332,43 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   try { db.exec(`ALTER TABLE fila_lives ADD COLUMN broadcasts_json TEXT DEFAULT '[]'`); } catch { /* já existe */ }
   try { db.exec(`ALTER TABLE fila_lives ADD COLUMN capa_ref TEXT`); } catch { /* já existe */ }        // [lives-capa] caminho da capa (imagem) no OneDrive
   try { db.exec(`ALTER TABLE fila_lives ADD COLUMN limpo INTEGER DEFAULT 0`); } catch { /* já existe */ } // [lives-limpeza] 1 = vídeo-fonte já apagado do OneDrive
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN tentativas_live INTEGER DEFAULT 0`); } catch { /* já existe */ } // [lives-saude] auto-reinício
+  // [lives-chatyt] IA + mensagens programadas no chat AO VIVO do YouTube
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN chat_ia INTEGER DEFAULT 0`); } catch { /* já existe */ }
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN chat_ia_prompt TEXT`); } catch { /* já existe */ }
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN chat_msgs_json TEXT DEFAULT '[]'`); } catch { /* já existe */ } // [{momento:seg, texto}]
+  db.exec(`CREATE TABLE IF NOT EXISTS live_chat_estado (
+    live_id TEXT, canal_id TEXT, live_chat_id TEXT, next_token TEXT, started_at TEXT, fired_json TEXT DEFAULT '[]', last_poll TEXT,
+    PRIMARY KEY (live_id, canal_id)
+  );`);
+  // [lives-mensagens] sequência de mensagens por live (antecipação individual/grupos, "ao vivo", pós-live) + cortes pós-live
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN mensagens_json TEXT DEFAULT '[]'`); } catch { /* já existe */ }        // [{fase,offset_min,alvo_tipo,tag,grupos,texto}]
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN mensagens_fired_json TEXT DEFAULT '[]'`); } catch { /* já existe */ }
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN auto_cortes INTEGER DEFAULT 0`); } catch { /* já existe */ }
+  try { db.exec(`ALTER TABLE fila_lives ADD COLUMN cortes_feitos INTEGER DEFAULT 0`); } catch { /* já existe */ }
+
+  // [multistream-rtmp] destinos RTMP manuais (Facebook e Instagram) — chave de transmissão que você cola.
+  // Não usa API do Facebook/Instagram (sem App Review): o motor só empurra o vídeo pro RTMPS do destino.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lives_rtmp_destinos (
+      id TEXT PRIMARY KEY,
+      plataforma TEXT DEFAULT 'facebook',  -- 'facebook' | 'instagram' | 'tiktok' | 'custom'
+      nome TEXT,
+      rtmp_base TEXT,        -- ex.: rtmps://live-api-s.facebook.com:443/rtmp/
+      stream_key TEXT,       -- a chave de transmissão (segredo)
+      page_url TEXT,         -- link da página/perfil (opcional)
+      ativo INTEGER DEFAULT 1,
+      criado_em TEXT, atualizado_em TEXT
+    );
+  `);
+  const RTMP_BASE_DEFAULT: Record<string, string> = {
+    facebook: 'rtmps://live-api-s.facebook.com:443/rtmp/',
+    instagram: 'rtmps://live-upload.instagram.com:443/rtmp/',
+    tiktok: '',   // o TikTok dá o Servidor (URL) + chave na hora, por sessão — você cola os dois
+    custom: '',
+  };
+  const RTMP_PLATAFORMAS = ['facebook', 'instagram', 'tiktok', 'custom'];
+  function rtmpDestLer(id: string): any { return db.prepare(`SELECT * FROM lives_rtmp_destinos WHERE id=?`).get(String(id)) as any; }
 
   const livLog = (evt: string, ...a: any[]) => { try { console.log(`[etapa33] ${evt}`, ...a); } catch { /* */ } };
 
@@ -5392,6 +5431,23 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     await ytApi(token, 'POST', `/liveBroadcasts/transition?broadcastStatus=${encodeURIComponent(status)}&id=${encodeURIComponent(broadcastId)}&part=status`);
   }
 
+  // [lives-chatyt] lê o chat ao vivo do YouTube (liveChatMessages.list) e posta mensagens (insert).
+  async function ytLiveChatList(canalId: string, liveChatId: string, pageToken?: string): Promise<{ msgs: any[]; next: string }> {
+    const token = await pbYtTokenLives(canalId);
+    const qs = `/liveChat/messages?liveChatId=${encodeURIComponent(liveChatId)}&part=snippet,authorDetails&maxResults=200${pageToken ? ('&pageToken=' + encodeURIComponent(pageToken)) : ''}`;
+    const r = await ytApi(token, 'GET', qs);
+    const msgs = (r?.items || []).map((it: any) => ({ id: it.id, texto: String(it?.snippet?.displayMessage || ''), autor: String(it?.authorDetails?.displayName || ''), isDono: !!(it?.authorDetails?.isChatOwner), ts: it?.snippet?.publishedAt }));
+    return { msgs, next: String(r?.nextPageToken || '') };
+  }
+  async function ytLiveChatInsert(canalId: string, liveChatId: string, texto: string): Promise<void> {
+    const token = await pbYtTokenLives(canalId);
+    await ytApi(token, 'POST', `/liveChat/messages?part=snippet`, { snippet: { liveChatId, type: 'textMessageEvent', textMessageDetails: { messageText: String(texto).slice(0, 200) } } });
+  }
+  // número de espectadores AO VIVO no YouTube (concurrentViewers) — pro contador em tempo real
+  async function ytConcurrentViewers(canalId: string, videoId: string): Promise<number> {
+    try { const token = await pbYtTokenLives(canalId); const r = await ytApi(token, 'GET', `/videos?part=liveStreamingDetails&id=${encodeURIComponent(videoId)}`); return Number(r?.items?.[0]?.liveStreamingDetails?.concurrentViewers || 0) || 0; } catch { return 0; }
+  }
+
   // [lives-capa] define a CAPA (thumbnail) do vídeo da live. videoId = o próprio broadcastId.
   // imagePath = caminho local da imagem (png/jpg/webp), já baixada do OneDrive. Usa o endpoint de
   // upload de mídia (thumbnails.set). Requisito do YouTube: canal verificado (telefone).
@@ -5417,6 +5473,27 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       '-re',
       '-i', input,
       '-c:v', 'copy',
+      '-c:a', 'aac', '-ar', '44100', '-b:a', '128k',
+      '-f', 'flv',
+      rtmpFull,
+    ];
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let errTail = '';
+    try { child.stderr.on('data', (d: any) => { errTail = (errTail + String(d)).slice(-1200); }); } catch { /* */ }
+    (child as any)._errTail = () => errTail;
+    return child;
+  }
+
+  // [multistream-rtmp] push pro Facebook/Instagram/TikTok (RTMPS). Essas redes são mais exigentes com
+  // keyframe/GOP que o YouTube, então aqui RE-CODIFICA com GOP de ~2s (-g 60) em vez de copiar — garante aceite.
+  function ffmpegPushRtmp(input: string, rtmpFull: string): any {
+    const args = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-re',
+      '-i', input,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+      '-b:v', '4000k', '-maxrate', '4000k', '-bufsize', '8000k',
+      '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
       '-c:a', 'aac', '-ar', '44100', '-b:a', '128k',
       '-f', 'flv',
       rtmpFull,
@@ -5478,9 +5555,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     // 2) para cada destino YouTube: cria broadcast + empurra ffmpeg
     let destinos: any[] = []; try { destinos = JSON.parse(live.destinos_json || '[]'); } catch { destinos = []; }
     const yts = destinos.filter((d) => String(d.plataforma || 'youtube') === 'youtube' && d.canal_id);
-    if (!yts.length) {
-      db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('sem destino YouTube', agora(), liveId);
-      throw new Error('sem destino YouTube');
+    // [multistream-rtmp] destinos RTMP manuais (Facebook / Instagram / TikTok)
+    const rtmps = destinos.filter((d) => RTMP_PLATAFORMAS.includes(String(d.plataforma)) && (d.rtmp_id || d.canal_id));
+    if (!yts.length && !rtmps.length) {
+      db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('sem destino', agora(), liveId);
+      throw new Error('sem destino');
     }
 
     const procs: Array<{ canal_id: string; child: any; done: boolean }> = [];
@@ -5524,6 +5603,41 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       } catch (e: any) {
         livSetDestino(liveId, canalId, { plataforma: 'youtube', status: 'erro', erro: String(e?.message || e).slice(0, 400) });
         livLog('falha destino', liveId, canalId, String(e?.message || e));
+      }
+    }
+
+    // [multistream-rtmp] destinos Facebook / Instagram / TikTok (chave RTMP manual) — re-encode e empurra
+    for (const d of rtmps) {
+      let rid = String(d.rtmp_id || d.canal_id || '');
+      if (rid.startsWith('rtmp:')) rid = rid.slice(5);
+      const key = 'rtmp:' + rid;
+      try {
+        const dd = rtmpDestLer(rid);
+        if (!dd || !dd.stream_key) throw new Error('destino sem chave de transmissão');
+        const base = String(dd.rtmp_base || RTMP_BASE_DEFAULT[String(dd.plataforma)] || '').replace(/\/+$/, '') + '/';
+        if (base === '/') throw new Error('servidor RTMP não informado');
+        const full = base + String(dd.stream_key);
+        livSetDestino(liveId, key, { plataforma: dd.plataforma || 'facebook', nome: dd.nome || '', page_url: dd.page_url || '', watch_url: dd.page_url || '', status: 'conectando', erro: null });
+        const child = ffmpegPushRtmp(input, full);
+        const rec = { canal_id: key, child, done: false };
+        procs.push(rec);
+        algumOk = true;
+        livSetDestino(liveId, key, { status: 'no_ar' });
+        livLog('empurrando ffmpeg RTMP', liveId, dd.plataforma, rid);
+        const platNome = dd.plataforma === 'instagram' ? 'Instagram' : dd.plataforma === 'tiktok' ? 'TikTok' : dd.plataforma === 'facebook' ? 'Facebook' : String(dd.plataforma || 'destino');
+        child.on('exit', (code: number) => {
+          rec.done = true;
+          const ok = code === 0;
+          livSetDestino(liveId, key, { status: ok ? 'encerrado' : 'erro', erro: ok ? null : ('ffmpeg code ' + code + ': ' + (child._errTail ? child._errTail() : '')).slice(0, 400) });
+          // [lives-mensagens] avisa no Telegram se um destino caiu com erro no meio (e a live não foi cancelada)
+          if (!ok) {
+            try { const st = (db.prepare(`SELECT status FROM fila_lives WHERE id=?`).get(liveId) as any)?.status; if (st !== 'cancelado') tgEnviar(`🔴 <b>Destino caiu</b>\n${platNome} (${String(dd.nome || '').slice(0, 40)}) parou de transmitir no meio da live. As outras redes continuam.`).catch(() => { /* */ }); } catch { /* */ }
+          }
+          livTalvezConcluir(liveId);
+        });
+      } catch (e: any) {
+        livSetDestino(liveId, key, { plataforma: String(d.plataforma || 'facebook'), status: 'erro', erro: String(e?.message || e).slice(0, 400) });
+        livLog('falha destino RTMP', liveId, rid, String(e?.message || e));
       }
     }
 
@@ -5583,6 +5697,228 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     if (b.ativo != null) setPubFlag('lives_limpeza_ativo', b.ativo ? '1' : '0');
     if (b.horas != null && Number(b.horas) > 0) setPubFlag('lives_limpeza_horas', String(Math.floor(Number(b.horas))));
     res.json({ ok: true, ativo: pubFlag('lives_limpeza_ativo', '0') === '1', horas: Number(pubFlag('lives_limpeza_horas', '48')) || 48 });
+  });
+
+  // [lives-saude] PARTE 6 — auto-reinício de live + aviso Telegram.
+  // Caso principal: o motor/container reiniciou no meio de uma live (status fica 'no_ar'
+  // no banco mas o ffmpeg não está mais rodando) -> reergue a transmissão e avisa no Telegram.
+  // INERTE até pub_kv 'lives_auto_restart'='1'. Até 3 tentativas por live.
+  async function tickLivesSaude() {
+    if (pubFlag('lives_auto_restart', '0') !== '1') return;
+    const rows = db.prepare(`SELECT id,titulo,tentativas_live FROM fila_lives WHERE status='no_ar'`).all() as any[];
+    for (const r of rows) {
+      if (livesRun.has(r.id)) continue; // ainda rodando de verdade -> ok
+      const tent = Number(r.tentativas_live) || 0;
+      if (tent >= 3) {
+        db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('caiu e não reergueu após 3 tentativas', agora(), r.id);
+        tgEnviar(`🔴 <b>Live caiu</b>\n"${String(r.titulo || 'Live').slice(0, 80)}"\nNão consegui reerguer após 3 tentativas. Verifique no app.`).catch(() => { /* */ });
+        continue;
+      }
+      db.prepare(`UPDATE fila_lives SET tentativas_live=?, atualizado_em=? WHERE id=?`).run(tent + 1, agora(), r.id);
+      livLog('auto-reinício de live', r.id, 'tentativa', tent + 1);
+      tgEnviar(`🟡 <b>Reerguendo live</b>\n"${String(r.titulo || 'Live').slice(0, 80)}" (tentativa ${tent + 1}/3).`).catch(() => { /* */ });
+      livExecutar(r.id).catch((e: any) => { livLog('auto-reinício falhou', r.id, String(e?.message || e)); });
+    }
+  }
+  setInterval(() => { tickLivesSaude().catch(() => { }); }, 2 * 60 * 1000); // checa a cada 2 min
+  app.get('/lives/auto-restart/status', (_req: any, res: any) => res.json({ ok: true, ativo: pubFlag('lives_auto_restart', '0') === '1' }));
+  app.post('/lives/auto-restart/config', (req: any, res: any) => {
+    const b = req.body || {}; if (b.ativo != null) setPubFlag('lives_auto_restart', b.ativo ? '1' : '0');
+    res.json({ ok: true, ativo: pubFlag('lives_auto_restart', '0') === '1' });
+  });
+
+  // [lives-chatyt] configura IA + mensagens programadas do chat do YouTube numa live
+  app.post('/lives/chat-config', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const id = String(b.id || ''); if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
+      const msgs = Array.isArray(b.chat_msgs) ? b.chat_msgs.map((m: any) => ({ momento: Math.max(0, Number(m.momento) || 0), texto: String(m.texto || '').slice(0, 200) })).filter((m: any) => m.texto) : [];
+      db.prepare(`UPDATE fila_lives SET chat_ia=?, chat_ia_prompt=?, chat_msgs_json=?, atualizado_em=? WHERE id=?`).run(b.chat_ia ? 1 : 0, String(b.chat_ia_prompt || ''), JSON.stringify(msgs), agora(), id);
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  // espectadores AO VIVO por destino (YouTube real; FB/IG/TikTok = pendente API da Meta/TikTok)
+  app.get('/lives/:id/viewers', async (req: any, res: any) => {
+    try {
+      const live = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
+      if (!live) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+      let bc: any[] = []; try { bc = JSON.parse(live.broadcasts_json || '[]'); } catch { bc = []; }
+      const out: any[] = []; let total = 0;
+      for (const d of bc) {
+        if ((d.plataforma === 'youtube' || !d.plataforma) && d.broadcast_id && d.canal_id) {
+          const v = await ytConcurrentViewers(String(d.canal_id), String(d.broadcast_id));
+          out.push({ plataforma: 'youtube', canal_id: d.canal_id, viewers: v }); total += v;
+        } else if (d.plataforma) {
+          out.push({ plataforma: d.plataforma, canal_id: d.canal_id || null, viewers: null, pendente: 'api_oficial' }); // FB/IG/TikTok via chave manual não expõe contagem
+        }
+      }
+      res.json({ ok: true, por_destino: out, total_youtube: total });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [lives-chatyt] worker: enquanto a live está no ar, posta as mensagens programadas no horário e
+  // (se chat_ia) a IA responde o chat do YouTube — identificada como o canal. Só age em lives configuradas.
+  async function tickLiveChat() {
+    const lives = db.prepare(`SELECT id,titulo,chat_ia,chat_ia_prompt,chat_msgs_json,broadcasts_json FROM fila_lives WHERE status='no_ar'`).all() as any[];
+    for (const live of lives) {
+      let msgs: any[] = []; try { msgs = JSON.parse(live.chat_msgs_json || '[]'); } catch { msgs = []; }
+      const temIA = !!live.chat_ia && !!LLM_API_KEY;
+      if (!temIA && !msgs.length) continue; // nada configurado -> não gasta cota
+      let bc: any[] = []; try { bc = JSON.parse(live.broadcasts_json || '[]'); } catch { bc = []; }
+      for (const d of bc) {
+        const canalId = String(d.canal_id || ''); const liveChatId = String(d.live_chat_id || '');
+        if (!canalId || !liveChatId) continue;
+        let est = db.prepare(`SELECT * FROM live_chat_estado WHERE live_id=? AND canal_id=?`).get(live.id, canalId) as any;
+        if (!est) { db.prepare(`INSERT OR IGNORE INTO live_chat_estado(live_id,canal_id,live_chat_id,next_token,started_at,fired_json,last_poll) VALUES(?,?,?,?,?,?,?)`).run(live.id, canalId, liveChatId, '', agora(), '[]', ''); est = db.prepare(`SELECT * FROM live_chat_estado WHERE live_id=? AND canal_id=?`).get(live.id, canalId) as any; }
+        const elapsed = Math.floor((Date.now() - new Date(est.started_at || agora()).getTime()) / 1000);
+        let fired: number[] = []; try { fired = JSON.parse(est.fired_json || '[]'); } catch { fired = []; }
+        // mensagens programadas
+        for (let i = 0; i < msgs.length; i++) {
+          if (fired.includes(i)) continue; if (elapsed < (Number(msgs[i].momento) || 0)) continue;
+          try { await ytLiveChatInsert(canalId, liveChatId, String(msgs[i].texto)); fired.push(i); } catch { /* */ }
+        }
+        // IA responde (poll das novas mensagens)
+        let nextTok = String(est.next_token || '');
+        if (temIA) {
+          try {
+            const r = await ytLiveChatList(canalId, liveChatId, nextTok || undefined);
+            nextTok = r.next || nextTok;
+            if (est.next_token) { // só responde a partir do 2º poll (evita responder histórico)
+              let respostas = 0;
+              for (const m of r.msgs) {
+                if (respostas >= 2) break; if (m.isDono) continue; const q = String(m.texto || '').trim(); if (q.length < 3) continue;
+                try {
+                  const sys = String(live.chat_ia_prompt || '').trim() || 'Você é a equipe da escola de música Melodias e Riffs respondendo o chat ao vivo de uma live no YouTube. Responda em português, muito breve (1 frase), acolhedora e útil, identificada como a escola. Não invente preços nem promoções.';
+                  const resp = await _chamarLLM([{ role: 'system', content: sys }, { role: 'user', content: m.autor + ': ' + q }], '', 0.6, []);
+                  const txt = String(resp?.content || '').slice(0, 200).trim(); if (txt) { await ytLiveChatInsert(canalId, liveChatId, txt); respostas++; }
+                } catch { /* */ }
+              }
+            }
+          } catch { /* */ }
+        }
+        db.prepare(`UPDATE live_chat_estado SET next_token=?, fired_json=?, last_poll=? WHERE live_id=? AND canal_id=?`).run(nextTok, JSON.stringify(fired), agora(), live.id, canalId);
+      }
+    }
+  }
+  setInterval(() => { tickLiveChat().catch(() => { }); }, 15000); // a cada 15s enquanto houver live no ar
+
+  // [lives-mensagens] enfileira uma mensagem pra uma TAG (contatos) e/ou GRUPOS (reusa a fila_envio existente)
+  function liveEnfileirarMsg(projeto: string, alvoTipo: string, tag: string, grupos: string[], texto: string): number {
+    const alvos: Array<{ para: string; grupo: boolean }> = [];
+    if (alvoTipo === 'grupos') { (grupos || []).forEach((g) => { if (g) alvos.push({ para: String(g), grupo: true }); }); }
+    else if (tag) {
+      const rows = db.prepare(`SELECT DISTINCT c.telefone tel FROM contatos c JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id WHERE c.projeto=? AND t.nome=? AND c.telefone IS NOT NULL AND c.telefone<>''`).all(projeto, tag) as any[];
+      rows.forEach((r) => alvos.push({ para: String(r.tel), grupo: false }));
+    }
+    if (!alvos.length) return 0;
+    const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?)`);
+    const tx = db.transaction(() => alvos.forEach((a) => ins.run(randomUUID(), projeto, a.para, a.grupo ? 1 : 0, texto, agora(), agora())));
+    tx(); return alvos.length;
+  }
+  // worker: dispara a sequência de mensagens por live (antecipação / ao vivo / pós-live)
+  async function tickLiveMensagens() {
+    const lives = db.prepare(`SELECT id,projeto,status,data_agendada,atualizado_em,mensagens_json,mensagens_fired_json FROM fila_lives WHERE status IN ('agendado','no_ar','concluido')`).all() as any[];
+    for (const live of lives) {
+      let msgs: any[] = []; try { msgs = JSON.parse(live.mensagens_json || '[]'); } catch { msgs = []; }
+      if (!msgs.length) continue;
+      let fired: number[] = []; try { fired = JSON.parse(live.mensagens_fired_json || '[]'); } catch { fired = []; }
+      const now = Date.now(); const start = live.data_agendada ? new Date(live.data_agendada).getTime() : 0; let changed = false;
+      for (let i = 0; i < msgs.length; i++) {
+        if (fired.includes(i)) continue; const m = msgs[i]; const off = (Number(m.offset_min) || 0) * 60000; let due = false;
+        if (m.fase === 'antecipacao') due = start > 0 && now >= (start - off);
+        else if (m.fase === 'ao_vivo') due = live.status === 'no_ar';
+        else if (m.fase === 'pos') due = live.status === 'concluido' && now >= (new Date(live.atualizado_em || agora()).getTime() + off);
+        if (!due) continue;
+        const grupos = Array.isArray(m.grupos) ? m.grupos : String(m.grupos || '').split(/[,\n;]+/).map((s: string) => s.trim()).filter(Boolean);
+        try { liveEnfileirarMsg(String(live.projeto || ''), String(m.alvo_tipo || 'tag'), String(m.tag || ''), grupos, String(m.texto || '')); } catch { /* */ }
+        fired.push(i); changed = true;
+      }
+      if (changed) db.prepare(`UPDATE fila_lives SET mensagens_fired_json=? WHERE id=?`).run(JSON.stringify(fired), live.id);
+    }
+  }
+  setInterval(() => { tickLiveMensagens().catch(() => { }); }, 60 * 1000);
+  app.post('/lives/mensagens-config', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const id = String(b.id || ''); if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
+      const msgs = Array.isArray(b.mensagens) ? b.mensagens.map((m: any) => ({ fase: ['antecipacao', 'ao_vivo', 'pos'].includes(String(m.fase)) ? String(m.fase) : 'antecipacao', offset_min: Number(m.offset_min) || 0, alvo_tipo: m.alvo_tipo === 'grupos' ? 'grupos' : 'tag', tag: String(m.tag || ''), grupos: Array.isArray(m.grupos) ? m.grupos : String(m.grupos || '').split(/[,\n;]+/).map((s: string) => s.trim()).filter(Boolean), texto: String(m.texto || '').slice(0, 1000) })).filter((m: any) => m.texto) : [];
+      db.prepare(`UPDATE fila_lives SET mensagens_json=?, auto_cortes=?, atualizado_em=? WHERE id=?`).run(JSON.stringify(msgs), b.auto_cortes ? 1 : 0, agora(), id);
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [lives-cortes] worker: quando a live termina, se auto_cortes=1, gera cortes do vídeo-fonte e avisa no Telegram
+  async function tickLivesCortes() {
+    const lives = db.prepare(`SELECT id,titulo,fonte_tipo,fonte_ref FROM fila_lives WHERE status='concluido' AND auto_cortes=1 AND cortes_feitos=0 AND fonte_ref IS NOT NULL AND fonte_ref<>''`).all() as any[];
+    for (const live of lives) {
+      db.prepare(`UPDATE fila_lives SET cortes_feitos=1 WHERE id=?`).run(live.id);
+      try {
+        const base = (PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+        await fetch(`${base}/cortes/gerar`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ENGINE_API_KEY }, body: JSON.stringify({ fonte_tipo: live.fonte_tipo || 'onedrive', fonte_ref: live.fonte_ref, n: 5 }) });
+        tgEnviar(`✂️ <b>Cortes da live</b>\nGerando cortes automáticos de "${String(live.titulo || 'Live').slice(0, 70)}". Aparecem na aba Formatos (Cortes) quando ficarem prontos.`).catch(() => { /* */ });
+      } catch { /* */ }
+    }
+  }
+  setInterval(() => { tickLivesCortes().catch(() => { }); }, 2 * 60 * 1000);
+
+  // [lives-chat-unificado] todos os comentários do YouTube (de todos os canais da live) num lugar só + responder
+  app.get('/lives/:id/comentarios', async (req: any, res: any) => {
+    try {
+      const live = db.prepare(`SELECT broadcasts_json FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
+      if (!live) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+      let bc: any[] = []; try { bc = JSON.parse(live.broadcasts_json || '[]'); } catch { bc = []; }
+      const todos: any[] = [];
+      for (const d of bc) {
+        if ((d.plataforma === 'youtube' || !d.plataforma) && d.canal_id && d.live_chat_id) {
+          try { const r = await ytLiveChatList(String(d.canal_id), String(d.live_chat_id)); r.msgs.forEach((m: any) => todos.push({ rede: 'youtube', canal_id: d.canal_id, autor: m.autor, texto: m.texto, ts: m.ts })); } catch { /* */ }
+        }
+      }
+      todos.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+      res.json({ ok: true, comentarios: todos.slice(-80) });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/lives/:id/responder', async (req: any, res: any) => {
+    try {
+      const texto = String((req.body || {}).texto || '').trim(); if (!texto) return res.json({ ok: false });
+      const live = db.prepare(`SELECT broadcasts_json FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
+      if (!live) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+      let bc: any[] = []; try { bc = JSON.parse(live.broadcasts_json || '[]'); } catch { bc = []; }
+      let enviados = 0;
+      for (const d of bc) { if ((d.plataforma === 'youtube' || !d.plataforma) && d.canal_id && d.live_chat_id) { try { await ytLiveChatInsert(String(d.canal_id), String(d.live_chat_id), texto); enviados++; } catch { /* */ } } }
+      res.json({ ok: true, enviados });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [lives-upload] upload direto da CAPA (imagem pequena) via base64 -> OneDrive. Vídeo grande continua pela pasta/URL.
+  app.post('/lives/upload-capa', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const pasta = String(b.pasta || '').replace(/^\/+|\/+$/g, ''); let nome = String(b.nome || '').replace(/[^a-zA-Z0-9._ -]/g, '_'); const b64 = String(b.b64 || '');
+      if (!pasta || !nome || !b64) return res.status(400).json({ ok: false, erro: 'faltou_dados' });
+      if (!/\.(jpe?g|png|webp)$/i.test(nome)) nome += '.jpg';
+      const data = b64.includes(',') ? b64.split(',')[1] : b64;
+      const buf = Buffer.from(data, 'base64');
+      if (buf.length > 8 * 1024 * 1024) return res.status(413).json({ ok: false, erro: 'imagem_grande' });
+      const tmp = `${MEDIA_DIR}/up-${randomUUID().slice(0, 8)}-${nome}`;
+      fs.writeFileSync(tmp, buf);
+      try { _rclone(['copyto', tmp, _odRemotePath(pasta + '/' + nome)], { timeoutMs: 120000 }); }
+      finally { try { fs.unlinkSync(tmp); } catch { /* */ } }
+      res.json({ ok: true, caminho: pasta + '/' + nome });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [lives-pasta] auto-casamento: lê a pasta Lives do CANAL no OneDrive (Postagem Automatica/<od>/Lives)
+  // e devolve o vídeo + a capa já pareados. Com 1 de cada = automático; com vários = devolve a lista pra escolher.
+  const LIVES_OD: Record<string, string> = { teclado: 'Melodias e Riffs Teclado', baixo: 'Melodias e Riffs Baixo', violao: 'Melodias e Riffs Violão', comunidade: 'Comunidade da Harpa Cristã' };
+  app.get('/lives/pasta-auto', (req: any, res: any) => {
+    try {
+      const canal = String(req.query.canal || '').toLowerCase().trim();
+      const od = LIVES_OD[canal]; if (!od) return res.status(400).json({ ok: false, erro: 'canal_invalido' });
+      const sub = od + '/Lives';
+      const EXTV = ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'flv']; const EXTI = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
+      let rows: any[] = []; try { rows = (_odRcloneListar(sub) as any[]) || []; } catch { rows = []; }
+      const mapa = rows.filter((r) => !r.IsDir).map((r) => { const rel = String(r.Path || r.Name || ''); const nome = String(r.Name || rel.split('/').pop() || rel); const ext = String(nome.split('.').pop() || '').toLowerCase(); return { nome, caminho: sub + '/' + rel, ext, tamanho: Number(r.Size || 0) }; });
+      const videos = mapa.filter((r) => EXTV.includes(r.ext)).sort((a, b) => b.tamanho - a.tamanho);
+      const imagens = mapa.filter((r) => EXTI.includes(r.ext)).sort((a, b) => String(a.nome).localeCompare(String(b.nome)));
+      res.json({ ok: true, pasta: sub, video_ref: videos.length === 1 ? videos[0].caminho : '', capa_ref: imagens.length === 1 ? imagens[0].caminho : '', videos, imagens, auto: videos.length === 1 });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
 
   // ---------------------- Endpoints ----------------------
@@ -5700,8 +6036,51 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         let conectado = false; try { conectado = !!pbTokLer(String(c.id), 'youtube'); } catch { conectado = false; }
         return { canal_id: c.id, nome: c.nome, projeto: c.projeto, instrumento: c.instrumento, cor: c.cor, yt_channel_id: c.yt_channel_id, youtube_conectado: conectado };
       }).filter((c) => c.youtube_conectado);
-      res.json({ ok: true, destinos: out });
+      // [multistream-rtmp] inclui os destinos RTMP manuais (Facebook/Instagram/TikTok) como selecionáveis
+      let rtmpOut: any[] = [];
+      try {
+        const rs = db.prepare(`SELECT id,plataforma,nome,page_url FROM lives_rtmp_destinos WHERE ativo=1 ORDER BY criado_em ASC`).all() as any[];
+        rtmpOut = rs.map((r) => ({ canal_id: 'rtmp:' + r.id, rtmp_id: r.id, plataforma: r.plataforma, nome: r.nome, instrumento: '', page_url: r.page_url, youtube_conectado: false }));
+      } catch { rtmpOut = []; }
+      res.json({ ok: true, destinos: [...out, ...rtmpOut] });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // [multistream-rtmp] gerenciar destinos RTMP manuais (Facebook / Instagram / TikTok)
+  app.get('/lives/rtmp-destinos', (_req: any, res: any) => {
+    try {
+      const rows = db.prepare(`SELECT id,plataforma,nome,rtmp_base,page_url,ativo,criado_em FROM lives_rtmp_destinos ORDER BY criado_em ASC`).all() as any[];
+      // NÃO devolve a stream_key (segredo) — só sinaliza que existe
+      const out = rows.map((r) => ({ id: r.id, plataforma: r.plataforma, nome: r.nome, rtmp_base: r.rtmp_base, page_url: r.page_url, ativo: r.ativo, tem_chave: true }));
+      res.json({ ok: true, destinos: out, rtmp_base_default: RTMP_BASE_DEFAULT });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/lives/rtmp-destinos', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const plataforma = RTMP_PLATAFORMAS.includes(String(b.plataforma)) ? String(b.plataforma) : 'facebook';
+      const nome = String(b.nome || '').trim();
+      const streamKey = String(b.stream_key || '').trim();
+      const rtmpBase = (String(b.rtmp_base || '').trim() || RTMP_BASE_DEFAULT[plataforma] || '');
+      const pageUrl = String(b.page_url || '').trim();
+      if (!nome) return res.status(400).json({ ok: false, erro: 'nome_obrigatorio' });
+      const id = String(b.id || '').trim();
+      if (id) {
+        const atual = rtmpDestLer(id);
+        if (!atual) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
+        const key = streamKey || String(atual.stream_key || '');   // sem chave nova = mantém a antiga
+        db.prepare(`UPDATE lives_rtmp_destinos SET plataforma=?, nome=?, rtmp_base=?, stream_key=?, page_url=?, atualizado_em=? WHERE id=?`).run(plataforma, nome, rtmpBase, key, pageUrl, agora(), id);
+        return res.json({ ok: true, id });
+      }
+      if (!streamKey) return res.status(400).json({ ok: false, erro: 'chave_obrigatoria' });
+      const novoId = randomUUID();
+      db.prepare(`INSERT INTO lives_rtmp_destinos(id,plataforma,nome,rtmp_base,stream_key,page_url,ativo,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,1,?,?)`).run(novoId, plataforma, nome, rtmpBase, streamKey, pageUrl, agora(), agora());
+      res.json({ ok: true, id: novoId });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/lives/rtmp-destinos/remover', (req: any, res: any) => {
+    try { const id = String((req.body || {}).id || ''); db.prepare(`DELETE FROM lives_rtmp_destinos WHERE id=?`).run(id); res.json({ ok: true }); }
+    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
 
   // detalhe de UMA transmissão (por último: rota com :id não pode capturar /lives/_status e /lives/destinos)
@@ -5900,5 +6279,481 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   console.log('[etapa34] formatos verticais carregado: POST/GET /formatos/vertical (zoom|borda|texto|PNG|girado)');
 }
 
+
+// ============================================================================
+// [webinario-sala] PARTE 4 — Webinário: sala AO VIVO de verdade.
+// Aditivo e isolado. NÃO toca no bloco webinario_simulacoes (do GPT) nem nos
+// workers de lives/webhooks. Rotas /webinarios (config, com x-api-key) e
+// /w/:slug + /w-api/:slug/* (sala pública). Contador REAL (presença), chat REAL,
+// popups de venda REAIS (tabela transacoes), ofertas/linha do tempo, chat IA
+// opcional (reusa _chamarLLM, identificado como a escola). SEM contador inflado
+// nem comentários falsos — essa parte não é construída aqui.
+// ============================================================================
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS webinarios (
+      id TEXT PRIMARY KEY, slug TEXT UNIQUE, nome TEXT,
+      video_tipo TEXT DEFAULT 'url', video_ref TEXT,
+      modo INTEGER DEFAULT 2,
+      youtube_url TEXT, mascara INTEGER DEFAULT 1,
+      chat_real INTEGER DEFAULT 1, chat_ia INTEGER DEFAULT 0,
+      contador INTEGER DEFAULT 1, acumulado INTEGER DEFAULT 1,
+      popups INTEGER DEFAULT 1, autoridade INTEGER DEFAULT 1,
+      ofertas_json TEXT DEFAULT '[]', ia_prompt TEXT, projeto TEXT,
+      ativo INTEGER DEFAULT 1, criado_em TEXT, atualizado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS webinario_chat (
+      id TEXT PRIMARY KEY, slug TEXT, nome TEXT, texto TEXT, origem TEXT DEFAULT 'espectador', criado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS webinario_presenca (
+      slug TEXT, sessao TEXT, lead TEXT, pct INTEGER DEFAULT 0, ultimo_ping TEXT, criado_em TEXT,
+      PRIMARY KEY (slug, sessao)
+    );
+  `);
+
+  const wbSlug = (s: string): string => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || ('w-' + randomUUID().slice(0, 6));
+  const wbBase = (): string => String(PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const wbGet = (slugOrId: string): any => db.prepare(`SELECT * FROM webinarios WHERE slug=? OR id=?`).get(String(slugOrId), String(slugOrId)) as any;
+
+  // config pública (o que a sala precisa; sem nada sensível)
+  function wbConfigPublico(wb: any): any {
+    let ofertas: any[] = []; try { ofertas = JSON.parse(wb.ofertas_json || '[]'); } catch { ofertas = []; }
+    let videoUrl = '';
+    if (Number(wb.modo) === 1) videoUrl = String(wb.video_tipo) === 'url' ? String(wb.video_ref || '') : '';
+    return {
+      slug: wb.slug, nome: wb.nome || 'Webinário', modo: Number(wb.modo) || 2,
+      youtube_url: wb.youtube_url || '', video_url: videoUrl,
+      mascara: !!wb.mascara, chat_real: !!wb.chat_real, chat_ia: !!wb.chat_ia,
+      contador: !!wb.contador, acumulado: !!wb.acumulado, popups: !!wb.popups, autoridade: !!wb.autoridade,
+      ofertas
+    };
+  }
+
+  // ---------- config (app, com x-api-key) ----------
+  app.get('/webinarios', (_req: any, res: any) => {
+    try { const rows = db.prepare(`SELECT * FROM webinarios ORDER BY criado_em DESC LIMIT 100`).all() as any[]; res.json({ ok: true, webinarios: rows, base: wbBase() }); }
+    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/webinarios/:id', (req: any, res: any) => {
+    const wb = wbGet(String(req.params.id)); if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+    res.json({ ok: true, webinario: wb, link: wbBase() + '/w/' + wb.slug });
+  });
+  app.post('/webinarios', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const nome = String(b.nome || 'Webinário').trim();
+      const id = String(b.id || '').trim() || randomUUID();
+      const existe = b.id ? wbGet(String(b.id)) : null;
+      const slug = existe ? existe.slug : wbSlug(nome + '-' + id.slice(0, 4));
+      const num = (v: any, d: number) => (v === undefined || v === null || v === '') ? d : (Number(v) ? 1 : 0);
+      const row = {
+        video_tipo: String(b.video_tipo || 'url'), video_ref: String(b.video_ref || ''),
+        modo: [1, 2, 3].includes(Number(b.modo)) ? Number(b.modo) : 2,
+        youtube_url: String(b.youtube_url || ''), mascara: num(b.mascara, 1),
+        chat_real: num(b.chat_real, 1), chat_ia: num(b.chat_ia, 0),
+        contador: num(b.contador, 1), acumulado: num(b.acumulado, 1),
+        popups: num(b.popups, 1), autoridade: num(b.autoridade, 1),
+        ofertas_json: JSON.stringify(Array.isArray(b.ofertas) ? b.ofertas : []),
+        ia_prompt: String(b.ia_prompt || ''), projeto: String(b.projeto || '')
+      };
+      db.prepare(`INSERT INTO webinarios(id,slug,nome,video_tipo,video_ref,modo,youtube_url,mascara,chat_real,chat_ia,contador,acumulado,popups,autoridade,ofertas_json,ia_prompt,projeto,ativo,criado_em,atualizado_em)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)
+        ON CONFLICT(id) DO UPDATE SET nome=excluded.nome,video_tipo=excluded.video_tipo,video_ref=excluded.video_ref,modo=excluded.modo,youtube_url=excluded.youtube_url,mascara=excluded.mascara,chat_real=excluded.chat_real,chat_ia=excluded.chat_ia,contador=excluded.contador,acumulado=excluded.acumulado,popups=excluded.popups,autoridade=excluded.autoridade,ofertas_json=excluded.ofertas_json,ia_prompt=excluded.ia_prompt,projeto=excluded.projeto,atualizado_em=excluded.atualizado_em`)
+        .run(id, slug, nome, row.video_tipo, row.video_ref, row.modo, row.youtube_url, row.mascara, row.chat_real, row.chat_ia, row.contador, row.acumulado, row.popups, row.autoridade, row.ofertas_json, row.ia_prompt, row.projeto, agora(), agora());
+      res.json({ ok: true, id, slug, link: wbBase() + '/w/' + slug });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/webinarios/remover', (req: any, res: any) => {
+    try { const id = String((req.body || {}).id || ''); db.prepare(`DELETE FROM webinarios WHERE id=?`).run(id); res.json({ ok: true }); }
+    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // ---------- APIs públicas da sala ----------
+  app.get('/w-api/:slug', (req: any, res: any) => {
+    const wb = wbGet(String(req.params.slug)); if (!wb || !wb.ativo) return res.status(404).json({ ok: false });
+    res.json({ ok: true, cfg: wbConfigPublico(wb) });
+  });
+  // presença/contador real
+  app.post('/w-api/:slug/ping', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const b = req.body || {};
+      const sessao = String(b.sessao || '').slice(0, 60); if (!sessao) return res.json({ ok: false });
+      const pct = Math.max(0, Math.min(100, Number(b.pct) || 0));
+      const lead = String(b.lead || '').slice(0, 120);
+      db.prepare(`INSERT INTO webinario_presenca(slug,sessao,lead,pct,ultimo_ping,criado_em) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(slug,sessao) DO UPDATE SET pct=MAX(webinario_presenca.pct,excluded.pct),lead=COALESCE(NULLIF(excluded.lead,''),webinario_presenca.lead),ultimo_ping=excluded.ultimo_ping`)
+        .run(slug, sessao, lead, pct, agora(), agora());
+      const corte = new Date(Date.now() - 45000).toISOString();
+      const online = (db.prepare(`SELECT COUNT(*) n FROM webinario_presenca WHERE slug=? AND ultimo_ping>=?`).get(slug, corte) as any).n;
+      const acumulado = (db.prepare(`SELECT COUNT(*) n FROM webinario_presenca WHERE slug=?`).get(slug) as any).n;
+      res.json({ ok: true, online, acumulado });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  // chat real
+  app.get('/w-api/:slug/chat', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug);
+      const rows = db.prepare(`SELECT id,nome,texto,origem,criado_em FROM webinario_chat WHERE slug=? ORDER BY criado_em DESC LIMIT 60`).all(slug) as any[];
+      res.json({ ok: true, mensagens: rows.reverse() });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  const wbChatRate: Map<string, number> = new Map();
+  app.post('/w-api/:slug/chat', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const b = req.body || {};
+      const wb = wbGet(slug); if (!wb || !wb.chat_real) return res.status(403).json({ ok: false });
+      const nome = String(b.nome || 'Visitante').slice(0, 40).trim() || 'Visitante';
+      const texto = String(b.texto || '').slice(0, 400).trim(); if (!texto) return res.json({ ok: false });
+      const chave = slug + ':' + String(b.sessao || ''); const last = wbChatRate.get(chave) || 0;
+      if (Date.now() - last < 1500) return res.status(429).json({ ok: false, erro: 'devagar' });
+      wbChatRate.set(chave, Date.now());
+      db.prepare(`INSERT INTO webinario_chat(id,slug,nome,texto,origem,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), slug, nome, texto, 'espectador', agora());
+      // chat IA (opcional) — responde identificado como a escola, fire-and-forget
+      if (wb.chat_ia && LLM_API_KEY) {
+        (async () => {
+          try {
+            const sys = String(wb.ia_prompt || '').trim() || 'Você é a equipe da escola de música Melodias e Riffs respondendo o chat de um webinário ao vivo. Responda em português, de forma breve (1-2 frases), acolhedora e útil, identificada como a escola. Não invente promoções, preços ou dados. Se for pergunta de compra, oriente a clicar no botão/link da oferta na tela.';
+            const r = await _chamarLLM([{ role: 'system', content: sys }, { role: 'user', content: nome + ' perguntou: ' + texto }], wb.ia_modelo || '', 0.6, []);
+            const resp = String(r?.content || '').slice(0, 400).trim();
+            if (resp) db.prepare(`INSERT INTO webinario_chat(id,slug,nome,texto,origem,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), slug, 'Equipe Melodias e Riffs', resp, 'ia', agora());
+          } catch { /* ignora */ }
+        })();
+      }
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  // mensagem do HOST (pelo app, com x-api-key) — entra no chat como a escola
+  app.post('/webinarios/:slug/host-msg', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const texto = String((req.body || {}).texto || '').slice(0, 400).trim();
+      if (!texto) return res.json({ ok: false });
+      db.prepare(`INSERT INTO webinario_chat(id,slug,nome,texto,origem,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), slug, String((req.body || {}).nome || 'Professor Ezequias'), texto, 'host', agora());
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  // vendas REAIS recentes (pros popups) — da tabela transacoes, só primeiro nome
+  app.get('/w-api/:slug/vendas', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb || !wb.popups) return res.json({ ok: true, vendas: [] });
+      const desde = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+      const cond = wb.projeto ? `AND t.projeto=?` : '';
+      const args: any[] = [desde]; if (wb.projeto) args.push(String(wb.projeto));
+      const rows = db.prepare(`SELECT t.produto, t.criado_em, c.nome nome FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id
+        WHERE t.status='pago' AND t.criado_em>=? ${cond} ORDER BY t.criado_em DESC LIMIT 12`).all(...args) as any[];
+      const vendas = rows.map((r) => ({ nome: String(r.nome || 'Alguém').trim().split(/\s+/)[0], produto: String(r.produto || '').slice(0, 60) }));
+      res.json({ ok: true, vendas });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // ---------- a SALA (HTML público) ----------
+  app.get('/w/:slug', (req: any, res: any) => {
+    const wb = wbGet(String(req.params.slug));
+    if (!wb || !wb.ativo) { res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;background:#0f1117;color:#eee;display:grid;place-items:center;height:100vh"><div>Webinário não encontrado.</div></body>'); return; }
+    const cfg = wbConfigPublico(wb);
+    const cfgJson = JSON.stringify(cfg).replace(/</g, '\\u003c');
+    res.type('html').send(wbRoomHtml(cfgJson, String(wb.slug), String(wb.nome || 'Webinário')));
+  });
+
+  // JS do cliente da sala — SEM regex com barras e SEM `${`/backticks (pra não conflitar com o template literal)
+  const WB_ROOM_JS = `(function(){
+  var cfg=CFG, slug=SLUG;
+  var sessao='s-'+Math.random().toString(36).slice(2)+Date.now().toString(36);
+  var lead=''; try{ lead=new URLSearchParams(location.search).get('lead')||''; }catch(e){}
+  var vid=document.getElementById('vid'); var videoEl=null;
+  function ytId(u){ u=String(u||''); var keys=['v=','youtu.be/','embed/','live/','shorts/']; for(var i=0;i<keys.length;i++){ var k=keys[i]; var p=u.indexOf(k); if(p>=0){ var rest=u.slice(p+k.length); var id=''; for(var j=0;j<rest.length;j++){ var ch=rest[j]; if((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch==='_'||ch==='-'){ id+=ch; } else { break; } } if(id.length>=6){ return id; } } } return ''; }
+  if(cfg.modo===1 && cfg.video_url){
+    videoEl=document.createElement('video'); videoEl.src=cfg.video_url; videoEl.controls=true; videoEl.playsInline=true; videoEl.autoplay=true; vid.appendChild(videoEl);
+  } else {
+    var yid=ytId(cfg.youtube_url);
+    if(yid){
+      var ifr=document.createElement('iframe'); ifr.src='https://www.youtube.com/embed/'+yid+'?autoplay=1&rel=0&modestbranding=1&playsinline=1';
+      ifr.allow='autoplay; encrypted-media; picture-in-picture'; ifr.allowFullscreen=true; vid.appendChild(ifr);
+      if(cfg.modo===2 && cfg.mascara){ var mk=document.createElement('div'); mk.className='mask'; vid.appendChild(mk); }
+    } else { vid.innerHTML='<div style="position:absolute;inset:0;display:grid;place-items:center;color:#9aa3b2">Configure o vídeo do webinário.</div>'; }
+  }
+  if(cfg.autoridade){ var au=document.getElementById('auth'); if(au){ au.style.display='block'; } }
+  var t0=Date.now();
+  function elapsed(){ return Math.floor((Date.now()-t0)/1000); }
+  function pct(){ if(videoEl && videoEl.duration){ return Math.min(100, Math.floor(videoEl.currentTime/videoEl.duration*100)); } return Math.min(100, Math.floor(elapsed()/36)); }
+  function ping(){
+    fetch('/w-api/'+slug+'/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessao:sessao,lead:lead,pct:pct()})})
+      .then(function(r){return r.json();}).then(function(d){ if(!d||!d.ok){return;}
+        if(cfg.contador){ var o=document.getElementById('online'); if(o){o.textContent=d.online;} }
+        if(cfg.acumulado){ var ab=document.getElementById('acbox'); var ac=document.getElementById('acum'); if(ab){ab.style.display='inline-flex';} if(ac){ac.textContent=d.acumulado;} }
+      }).catch(function(){});
+  }
+  ping(); setInterval(ping, 10000);
+  var chat=document.getElementById('chat');
+  function renderChat(ms){ if(!chat){return;} chat.innerHTML='';
+    ms.forEach(function(m){ var d=document.createElement('div'); d.className='msg'+(m.origem==='host'?' host':m.origem==='ia'?' ia':'');
+      var b=document.createElement('b'); b.textContent=(m.nome||'Visitante')+': '; var s=document.createElement('span'); s.className='t'; s.textContent=m.texto||'';
+      d.appendChild(b); d.appendChild(s); chat.appendChild(d); }); chat.scrollTop=chat.scrollHeight; }
+  function loadChat(){ fetch('/w-api/'+slug+'/chat').then(function(r){return r.json();}).then(function(d){ if(d&&d.ok){renderChat(d.mensagens||[]);} }).catch(function(){}); }
+  if(cfg.chat_real){ loadChat(); setInterval(loadChat, 3000); } else { var cbx=document.getElementById('cbox'); if(cbx){cbx.style.display='none';} }
+  var ci=document.getElementById('ci'), cbtn=document.getElementById('cb');
+  function askName(){ var n=''; try{ n=localStorage.getItem('wb_nome'); }catch(e){} if(!n){ n=prompt('Seu nome pro chat:')||'Visitante'; try{localStorage.setItem('wb_nome',n);}catch(e){} } return n; }
+  function send(){ var tx=(ci.value||'').trim(); if(!tx){return;} ci.value='';
+    fetch('/w-api/'+slug+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nome:askName(),texto:tx,sessao:sessao})}).then(function(){ setTimeout(loadChat,400); }).catch(function(){}); }
+  if(cbtn){cbtn.onclick=send;} if(ci){ci.addEventListener('keydown',function(e){ if(e.key==='Enter'){send();} });}
+  var vIdx=0;
+  function showPop(txt){ var p=document.createElement('div'); p.className='pop'; p.textContent=txt; document.body.appendChild(p); setTimeout(function(){ if(p&&p.parentNode){p.parentNode.removeChild(p);} }, 7000); }
+  function loadVendas(){ if(!cfg.popups){return;} fetch('/w-api/'+slug+'/vendas').then(function(r){return r.json();}).then(function(d){ if(!d||!d.ok||!d.vendas||!d.vendas.length){return;} var v=d.vendas[vIdx%d.vendas.length]; vIdx++; showPop(v.nome+' acabou de garantir'+(v.produto?(': '+v.produto):'')+' ✅'); }).catch(function(){}); }
+  if(cfg.popups){ setTimeout(loadVendas, 15000); setInterval(loadVendas, 30000); }
+  var ofertas=(cfg.ofertas||[]).map(function(o){ o._shown=false; return o; });
+  function mostrarOferta(o){ var tipo=o.tipo||'banner';
+    if(tipo==='popup'){ var m=document.createElement('div'); m.className='modal'; var b=document.createElement('div'); b.className='b';
+      var x=document.createElement('span'); x.textContent='✕'; x.style.position='absolute'; x.style.top='10px'; x.style.right='14px'; x.style.cursor='pointer'; x.onclick=function(){ if(m.parentNode){m.parentNode.removeChild(m);} };
+      var h=document.createElement('div'); h.style.fontSize='17px'; h.style.fontWeight='700'; h.textContent=o.titulo||'Oferta especial';
+      var p=document.createElement('div'); p.style.color='#9aa3b2'; p.style.margin='8px 0 14px'; p.textContent=o.conteudo||'';
+      var a=document.createElement('a'); a.href=o.url||'#'; a.target='_blank'; a.textContent=o.botao||'Quero garantir'; a.style.display='inline-block'; a.style.background='#7c6cf0'; a.style.color='#fff'; a.style.fontWeight='700'; a.style.textDecoration='none'; a.style.padding='11px 22px'; a.style.borderRadius='999px';
+      b.appendChild(x); b.appendChild(h); b.appendChild(p); b.appendChild(a); m.appendChild(b); document.body.appendChild(m);
+    } else { var off=document.getElementById('offer'); if(!off){return;} var ban=document.createElement('div'); ban.className='banner'; ban.style.position='relative';
+      var x2=document.createElement('span'); x2.className='x'; x2.textContent='✕'; x2.onclick=function(){ if(ban.parentNode){ban.parentNode.removeChild(ban);} };
+      var h2=document.createElement('div'); h2.style.fontSize='16px'; h2.style.fontWeight='700'; h2.style.color='#fff'; h2.textContent=o.titulo||'Oferta';
+      var p2=document.createElement('div'); p2.style.color='#eee'; p2.style.fontSize='13px'; p2.textContent=o.conteudo||'';
+      ban.appendChild(x2); ban.appendChild(h2); ban.appendChild(p2);
+      if(o.url){ var a2=document.createElement('a'); a2.href=o.url; a2.target='_blank'; a2.textContent=o.botao||'Garantir agora'; ban.appendChild(a2); } off.appendChild(ban); } }
+  function checkOfertas(){ var e=elapsed(); ofertas.forEach(function(o){ if(o._shown){return;} if(e < (Number(o.momento)||0)){return;} o._shown=true; mostrarOferta(o); }); }
+  setInterval(checkOfertas, 1000);
+})();`;
+
+  // gera o HTML da sala (client JS sem template-literal pra não conflitar com o template do server)
+  function wbRoomHtml(cfgJson: string, slug: string, nome: string): string {
+    const nomeEsc = String(nome).replace(/</g, '&lt;');
+    return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
+      + '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
+      + '<title>' + nomeEsc + '</title><style>'
+      + ':root{--bg:#0f1117;--card:#171a22;--bd:#262a36;--fg:#f2f4f8;--mut:#9aa3b2;--ac:#7c6cf0;--ok:#3fb27f}'
+      + '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}'
+      + '.wrap{max-width:1180px;margin:0 auto;padding:14px;display:grid;grid-template-columns:1fr 340px;gap:14px}'
+      + '@media(max-width:860px){.wrap{grid-template-columns:1fr}}'
+      + '.vid{position:relative;background:#000;border-radius:14px;overflow:hidden;aspect-ratio:16/9}'
+      + '.vid iframe,.vid video{position:absolute;inset:0;width:100%;height:100%;border:0}'
+      + '.mask{position:absolute;inset:0;z-index:5}'
+      + '.top{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}'
+      + '.badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:5px 11px;font-size:12.5px;color:var(--mut)}'
+      + '.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;animation:pulse 1.6s infinite}'
+      + '@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}'
+      + '.side{background:var(--card);border:1px solid var(--bd);border-radius:14px;display:flex;flex-direction:column;height:72vh;min-height:420px}'
+      + '.side h3{margin:0;padding:12px 14px;border-bottom:1px solid var(--bd);font-size:14px}'
+      + '.chat{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:9px}'
+      + '.msg{font-size:13px;line-height:1.4}.msg b{color:#b3a7ff}.msg.host b{color:#ffcf6b}.msg.ia b{color:#7fd6a8}'
+      + '.msg .t{color:var(--fg)}'
+      + '.cbox{display:flex;gap:6px;padding:10px;border-top:1px solid var(--bd)}'
+      + '.cbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--bd);border-radius:9px;color:var(--fg);padding:9px 10px;font-size:13px}'
+      + '.cbox button{background:var(--ac);border:0;color:#fff;border-radius:9px;padding:9px 13px;font-weight:600;cursor:pointer}'
+      + '.pop{position:fixed;left:14px;bottom:14px;background:var(--card);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:11px;padding:11px 14px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.4);z-index:40;max-width:300px}'
+      + '.offer{margin-top:12px}.banner{background:linear-gradient(135deg,#4a3fb0,#7e6cf0);border-radius:12px;padding:16px;text-align:center}'
+      + '.banner a{display:inline-block;margin-top:8px;background:#fff;color:#2a2550;font-weight:700;text-decoration:none;padding:10px 20px;border-radius:999px}'
+      + '.banner .x{position:absolute;top:8px;right:12px;color:#fff;cursor:pointer;font-weight:700}'
+      + '.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:grid;place-items:center;z-index:50;padding:16px}'
+      + '.modal .b{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:22px;max-width:420px;text-align:center;position:relative}'
+      + '.auth{font-size:12px;color:var(--mut);margin-top:10px;text-align:center}'
+      + '</style></head><body>'
+      + '<div class="wrap"><div><div class="top">'
+      + '<div class="badge"><span class="dot"></span><span id="online">—</span> assistindo agora</div>'
+      + '<div class="badge" id="acbox" style="display:none">👥 <span id="acum">—</span> já assistiram</div>'
+      + '<div class="badge" style="font-weight:600;color:var(--fg)">' + nomeEsc + '</div></div>'
+      + '<div class="vid" id="vid"></div>'
+      + '<div class="offer" id="offer"></div>'
+      + '<div class="auth" id="auth" style="display:none">+3.200 músicos já passaram pela escola · depoimentos reais</div>'
+      + '</div><div class="side"><h3>💬 Chat ao vivo</h3><div class="chat" id="chat"></div>'
+      + '<div class="cbox" id="cbox"><input id="ci" maxlength="400" placeholder="Escreva no chat..."><button id="cb">Enviar</button></div></div></div>'
+      + '<script>var CFG=' + cfgJson + ';var SLUG=' + JSON.stringify(slug) + ';</script>'
+      + '<script>' + WB_ROOM_JS + '</script></body></html>';
+  }
+
+  console.log('[webinario-sala] carregado: /webinarios (config) + /w/:slug (sala) + /w-api/:slug/* (chat/contador/vendas reais)');
+}
+
+// ============================================================================
+// [webinario-posaula] PARTE 5 — pós-aula: % assistido -> TAG -> dispara as
+// automações que já existem (reusa aplicarTag + rodarAutomacoes). + relatório.
+// O link da sala por lead usa ?lead=<contatoId> (aí o % fica por pessoa).
+// Aditivo. Não roda sozinho — o app chama POST /webinarios/:slug/processar.
+// ============================================================================
+{
+  try { db.exec(`ALTER TABLE webinario_presenca ADD COLUMN processado INTEGER DEFAULT 0`); } catch { /* já existe */ }
+  db.exec(`CREATE TABLE IF NOT EXISTS webinario_regras (
+    id TEXT PRIMARY KEY, slug TEXT, faixa INTEGER, tag TEXT, criado_em TEXT
+  );`);
+  const wbPGet = (slug: string): any => db.prepare(`SELECT * FROM webinarios WHERE slug=? OR id=?`).get(String(slug), String(slug)) as any;
+
+  app.get('/webinarios/:slug/regras', (req: any, res: any) => {
+    try { const rows = db.prepare(`SELECT id,faixa,tag FROM webinario_regras WHERE slug=? ORDER BY faixa ASC`).all(String(req.params.slug)) as any[]; res.json({ ok: true, regras: rows }); }
+    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/webinarios/:slug/regras', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const regras = Array.isArray((req.body || {}).regras) ? req.body.regras : [];
+      db.prepare(`DELETE FROM webinario_regras WHERE slug=?`).run(slug);
+      const ins = db.prepare(`INSERT INTO webinario_regras(id,slug,faixa,tag,criado_em) VALUES(?,?,?,?,?)`);
+      for (const r of regras) { const faixa = Math.max(0, Math.min(100, Number(r.faixa) || 0)); const tag = String(r.tag || '').trim(); if (tag) ins.run(randomUUID(), slug, faixa, tag, agora()); }
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // processa o pós-aula: aplica a tag da MAIOR faixa que cada lead alcançou + dispara automações
+  app.post('/webinarios/:slug/processar', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const wb = wbPGet(slug);
+      if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+      const projeto = String(wb.projeto || '');
+      const regras = db.prepare(`SELECT faixa,tag FROM webinario_regras WHERE slug=? ORDER BY faixa DESC`).all(slug) as any[];
+      if (!regras.length) return res.json({ ok: true, processados: 0, aviso: 'sem regras' });
+      const soNovos = !((req.body || {}).reprocessar);
+      const pres = db.prepare(`SELECT sessao,lead,pct,processado FROM webinario_presenca WHERE slug=? AND lead IS NOT NULL AND lead<>''`).all(slug) as any[];
+      // consolida por lead (maior pct)
+      const porLead: Record<string, number> = {};
+      for (const p of pres) { if (soNovos && p.processado) continue; const l = String(p.lead); porLead[l] = Math.max(porLead[l] || 0, Number(p.pct) || 0); }
+      let processados = 0; const porTag: Record<string, number> = {};
+      for (const lead of Object.keys(porLead)) {
+        const pct = porLead[lead];
+        const regra = regras.find((r) => pct >= Number(r.faixa)); // regras DESC: pega a maior faixa atingida
+        if (!regra) continue;
+        try {
+          if (projeto) { aplicarTag(projeto, lead, String(regra.tag)); rodarAutomacoes(projeto, 'tag_adicionada', { contatoId: lead, tag: String(regra.tag), origem: 'webinario' }).catch(() => { /* */ }); }
+          porTag[regra.tag] = (porTag[regra.tag] || 0) + 1; processados++;
+        } catch { /* ignora lead inválido */ }
+      }
+      db.prepare(`UPDATE webinario_presenca SET processado=1 WHERE slug=?`).run(slug);
+      res.json({ ok: true, processados, por_tag: porTag, sem_projeto: !projeto });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // relatório: quantos entraram, distribuição por faixa de %, e vendas no período
+  app.get('/webinarios/:slug/relatorio', (req: any, res: any) => {
+    try {
+      const slug = String(req.params.slug); const wb = wbPGet(slug);
+      if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+      const total = (db.prepare(`SELECT COUNT(*) n FROM webinario_presenca WHERE slug=?`).get(slug) as any).n;
+      const comLead = (db.prepare(`SELECT COUNT(*) n FROM webinario_presenca WHERE slug=? AND lead IS NOT NULL AND lead<>''`).get(slug) as any).n;
+      const faixa = (min: number) => (db.prepare(`SELECT COUNT(*) n FROM webinario_presenca WHERE slug=? AND pct>=?`).get(slug, min) as any).n;
+      const pctMedio = (db.prepare(`SELECT AVG(pct) m FROM webinario_presenca WHERE slug=?`).get(slug) as any).m || 0;
+      let vendas = 0;
+      try {
+        const desde = String(wb.criado_em || new Date(Date.now() - 24 * 3600 * 1000).toISOString());
+        const cond = wb.projeto ? `AND projeto=?` : ''; const args: any[] = [desde]; if (wb.projeto) args.push(String(wb.projeto));
+        vendas = (db.prepare(`SELECT COUNT(*) n FROM transacoes WHERE status='pago' AND criado_em>=? ${cond}`).get(...args) as any).n;
+      } catch { vendas = 0; }
+      res.json({ ok: true, relatorio: { total_sessoes: total, com_lead: comLead, pct_medio: Math.round(pctMedio), faixa_10: faixa(10), faixa_20: faixa(20), faixa_50: faixa(50), faixa_100: faixa(100), vendas_periodo: vendas } });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  console.log('[webinario-posaula] carregado: /webinarios/:slug/regras|processar|relatorio (% -> tag -> automações)');
+}
+
+// ============================================================================
+// [midia-ia] PARTE 6 — Transcrição (Whisper) + Legendas (SRT) + Cortes automáticos.
+// Aditivo. Reusa ffmpeg (já instalado), MEDIA_DIR, _chamarLLM, pbBaixarMidia e a
+// API compatível OpenAI (LLM_BASE_URL /audio/transcriptions). Tudo async (job id).
+// ============================================================================
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transcricao_jobs (
+      id TEXT PRIMARY KEY, fonte_ref TEXT, status TEXT DEFAULT 'processando',
+      srt_url TEXT, texto TEXT, segments_json TEXT, erro TEXT, criado_em TEXT, atualizado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS cortes_jobs (
+      id TEXT PRIMARY KEY, fonte_ref TEXT, status TEXT DEFAULT 'processando',
+      resultado_json TEXT DEFAULT '[]', erro TEXT, criado_em TEXT, atualizado_em TEXT
+    );
+  `);
+  const mdBase = (): string => String(MEDIA_PUBLIC_BASE || PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  function ffmpegRun(args: string[]): Promise<number> {
+    return new Promise((resolve) => { const c = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] }); c.on('exit', (code: number) => resolve(code || 0)); c.on('error', () => resolve(1)); });
+  }
+  function segParaTempo(s: number, virg: string): string {
+    const ms = Math.floor((s - Math.floor(s)) * 1000); const tot = Math.floor(s);
+    const hh = String(Math.floor(tot / 3600)).padStart(2, '0'); const mm = String(Math.floor((tot % 3600) / 60)).padStart(2, '0'); const ss = String(tot % 60).padStart(2, '0');
+    return `${hh}:${mm}:${ss}${virg}${String(ms).padStart(3, '0')}`;
+  }
+  function segmentsParaSrt(segs: any[]): string {
+    return segs.map((s, i) => `${i + 1}\n${segParaTempo(Number(s.start) || 0, ',')} --> ${segParaTempo(Number(s.end) || 0, ',')}\n${String(s.text || '').trim()}\n`).join('\n');
+  }
+  async function midiaTranscrever(input: string, idioma?: string): Promise<{ srt: string; texto: string; segments: any[] }> {
+    if (!LLM_API_KEY) throw new Error('sem LLM_API_KEY no motor (configure a chave da OpenAI no .env)');
+    const audio = `${MEDIA_DIR}/aud-${randomUUID().slice(0, 8)}.mp3`;
+    const code = await ffmpegRun(['-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', audio]);
+    if (code !== 0) throw new Error('falha ao extrair o áudio (ffmpeg)');
+    try {
+      const buf = fs.readFileSync(audio);
+      const fd = new FormData();
+      fd.append('file', new Blob([buf]), 'audio.mp3');
+      fd.append('model', process.env.WHISPER_MODEL || 'whisper-1');
+      fd.append('response_format', 'verbose_json');
+      if (idioma) fd.append('language', idioma);
+      const r = await fetch(`${LLM_BASE_URL}/audio/transcriptions`, { method: 'POST', headers: { Authorization: `Bearer ${LLM_API_KEY}` }, body: fd as any });
+      const txt = await r.text(); if (!r.ok) throw new Error(`whisper ${r.status}: ${txt.slice(0, 200)}`);
+      const data: any = JSON.parse(txt);
+      const segments = (data.segments || []).map((s: any) => ({ start: Number(s.start) || 0, end: Number(s.end) || 0, text: String(s.text || '').trim() }));
+      return { srt: segmentsParaSrt(segments), texto: String(data.text || ''), segments };
+    } finally { try { fs.unlinkSync(audio); } catch { /* */ } }
+  }
+
+  // --------- transcrição / legenda ---------
+  app.post('/midia/transcrever', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
+      const id = randomUUID();
+      db.prepare(`INSERT INTO transcricao_jobs(id,fonte_ref,status,criado_em,atualizado_em) VALUES(?,?,?,?,?)`).run(id, String(b.fonte_ref), 'processando', agora(), agora());
+      (async () => {
+        try {
+          const input = String(b.fonte_tipo || 'onedrive') === 'url' ? String(b.fonte_ref) : pbBaixarMidia(String(b.fonte_ref)).file;
+          const r = await midiaTranscrever(input, b.idioma ? String(b.idioma) : 'pt');
+          const nome = `legenda-${id.slice(0, 8)}.srt`; fs.writeFileSync(`${MEDIA_DIR}/${nome}`, r.srt);
+          db.prepare(`UPDATE transcricao_jobs SET status='pronto',srt_url=?,texto=?,segments_json=?,atualizado_em=? WHERE id=?`).run(`${mdBase()}/media/${nome}`, r.texto.slice(0, 100000), JSON.stringify(r.segments).slice(0, 500000), agora(), id);
+        } catch (e: any) { db.prepare(`UPDATE transcricao_jobs SET status='erro',erro=?,atualizado_em=? WHERE id=?`).run(String(e?.message || e).slice(0, 400), agora(), id); }
+      })();
+      res.json({ ok: true, id });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/midia/transcrever/:id', (req: any, res: any) => {
+    const row = db.prepare(`SELECT id,fonte_ref,status,srt_url,erro,criado_em FROM transcricao_jobs WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrado' }); res.json({ ok: true, job: row });
+  });
+
+  // --------- cortes automáticos (transcreve -> IA escolhe trechos -> ffmpeg corta) ---------
+  app.post('/cortes/gerar', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
+      const n = Math.max(1, Math.min(10, Number(b.n) || 4));
+      const id = randomUUID();
+      db.prepare(`INSERT INTO cortes_jobs(id,fonte_ref,status,criado_em,atualizado_em) VALUES(?,?,?,?,?)`).run(id, String(b.fonte_ref), 'processando', agora(), agora());
+      (async () => {
+        try {
+          const input = String(b.fonte_tipo || 'onedrive') === 'url' ? String(b.fonte_ref) : pbBaixarMidia(String(b.fonte_ref)).file;
+          const tr = await midiaTranscrever(input, 'pt');
+          if (!tr.segments.length) throw new Error('transcrição vazia (vídeo sem fala?)');
+          // resume os segmentos pra IA (tempo + texto)
+          const linhas = tr.segments.map((s: any) => `[${Math.floor(s.start)}s] ${s.text}`).join('\n').slice(0, 12000);
+          const sys = 'Você edita cortes de vídeo. Recebe a transcrição com os tempos (em segundos) de uma aula/live. Escolha os ' + n + ' trechos mais interessantes e autoexplicativos para virarem cortes curtos (entre 20 e 60 segundos cada), que façam sentido sozinhos. Responda SOMENTE um JSON: {"cortes":[{"inicio":<segundos>,"fim":<segundos>,"titulo":"frase curta"}]} sem texto fora do JSON.';
+          const r = await _chamarLLM([{ role: 'system', content: sys }, { role: 'user', content: linhas }], '', 0.4, []);
+          let cortes: any[] = [];
+          try { const m = String(r?.content || '').match(/\{[\s\S]*\}/); cortes = m ? (JSON.parse(m[0]).cortes || []) : []; } catch { cortes = []; }
+          if (!cortes.length) throw new Error('a IA não retornou cortes');
+          const out: any[] = [];
+          for (let i = 0; i < cortes.length && i < n; i++) {
+            const c = cortes[i]; const ini = Math.max(0, Number(c.inicio) || 0); let fim = Number(c.fim) || (ini + 40);
+            if (fim <= ini) fim = ini + 40; if (fim - ini > 90) fim = ini + 90;
+            const nome = `corte-${id.slice(0, 6)}-${i + 1}.mp4`; const outPath = `${MEDIA_DIR}/${nome}`;
+            const code = await ffmpegRun(['-hide_banner', '-loglevel', 'error', '-y', '-ss', String(ini), '-to', String(fim), '-i', input, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-movflags', '+faststart', outPath]);
+            if (code === 0) out.push({ titulo: String(c.titulo || ('Corte ' + (i + 1))).slice(0, 120), inicio: ini, fim, url: `${mdBase()}/media/${nome}` });
+            db.prepare(`UPDATE cortes_jobs SET resultado_json=?,atualizado_em=? WHERE id=?`).run(JSON.stringify(out), agora(), id);
+          }
+          db.prepare(`UPDATE cortes_jobs SET status='pronto',resultado_json=?,atualizado_em=? WHERE id=?`).run(JSON.stringify(out), agora(), id);
+        } catch (e: any) { db.prepare(`UPDATE cortes_jobs SET status='erro',erro=?,atualizado_em=? WHERE id=?`).run(String(e?.message || e).slice(0, 400), agora(), id); }
+      })();
+      res.json({ ok: true, id });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/cortes/:id', (req: any, res: any) => {
+    const row = db.prepare(`SELECT * FROM cortes_jobs WHERE id=?`).get(String(req.params.id)) as any;
+    if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrado' }); res.json({ ok: true, job: row });
+  });
+  app.get('/cortes', (_req: any, res: any) => { res.json({ ok: true, jobs: db.prepare(`SELECT id,fonte_ref,status,resultado_json,criado_em FROM cortes_jobs ORDER BY criado_em DESC LIMIT 50`).all() }); });
+
+  console.log('[midia-ia] carregado: /midia/transcrever (legenda SRT) + /cortes/gerar (cortes automáticos via Whisper+IA)');
+}
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
