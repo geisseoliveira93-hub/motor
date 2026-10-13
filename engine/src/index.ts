@@ -3721,8 +3721,6 @@ const MEDIA_DIR = '/data/media';
 // Evolution já fala com http://engine:8080 no WEBHOOK_GLOBAL_URL).
 const MEDIA_INTERNAL_BASE = process.env.MEDIA_INTERNAL_BASE || 'http://engine:8080';
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch { /* ok */ }
-const QUARENTENA_DIR = MEDIA_DIR + '/_quarentena';
-try { fs.mkdirSync(QUARENTENA_DIR, { recursive: true }); } catch { /* ok */ }
 
 function _rclone(args: string[], opts: { timeoutMs?: number } = {}): string {
   return execFileSync('rclone', args, {
@@ -3758,6 +3756,93 @@ function _odRcloneBaixar(rel: string): { file: string; url: string; nome: string
   const dest = MEDIA_DIR + '/' + safe;
   if (!fs.existsSync(dest)) _rclone(['copyto', remote, dest], { timeoutMs: 180000 });
   return { file: dest, url: `${MEDIA_INTERNAL_BASE}/media/${safe}`, nome };
+}
+
+// [lives-fonte-grande 13/10] Videos de aula sao grandes (varios GB). Em vez de baixar o
+// arquivo inteiro com limite de 3min (estourava ETIMEDOUT), este bloco: (1) PRE-BAIXA em
+// segundo plano ao agendar (sem limite, atomico via .part); (2) na live usa o LOCAL se ja
+// estiver pronto; (3) senao TRANSMITE DIRETO do OneDrive via `rclone serve http` (comeca na
+// hora) e segue baixando pro futuro; (4) se o serve nao subir, espera o download e usa local.
+// NAO altera o fluxo de publicacao (pbBaixarMidia/_odRcloneBaixar seguem iguais).
+function _odDestPath(rel: string): string {
+  const remote = _odRemotePath(rel);
+  const nome = (String(rel).split('/').pop() || 'arquivo').split('?')[0];
+  const ext = (nome.includes('.') ? nome.split('.').pop() : '') || '';
+  const safe = createHash('sha1').update(remote).digest('hex').slice(0, 16) + (ext ? '.' + ext.toLowerCase() : '');
+  return MEDIA_DIR + '/' + safe;
+}
+function _odRelToBase(rel: string): string {
+  let r = String(rel || '').replace(/^\/+/, '');
+  const base = ONEDRIVE_PASTA_BASE.replace(/^\/+|\/+$/g, '');
+  if (base && r.toLowerCase().startsWith(base.toLowerCase() + '/')) r = r.slice(base.length + 1);
+  else if (base && r.toLowerCase() === base.toLowerCase()) r = '';
+  return r;
+}
+const _odBaixandoGrande = new Map<string, Promise<string>>();
+function _odBaixarGrande(rel: string): Promise<string> {
+  const dest = _odDestPath(rel);
+  try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return Promise.resolve(dest); } catch { /* */ }
+  const existente = _odBaixandoGrande.get(dest);
+  if (existente) return existente;
+  const remote = _odRemotePath(rel);
+  const part = dest + '.part';
+  const p = new Promise<string>((resolve, reject) => {
+    try { if (fs.existsSync(part)) fs.unlinkSync(part); } catch { /* */ }
+    const ch = spawn('rclone', ['copyto', remote, part, '--transfers', '1', '--low-level-retries', '10'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    try { ch.stderr.on('data', (d: any) => { err = (err + String(d)).slice(-800); }); } catch { /* */ }
+    ch.on('error', (e: any) => reject(e));
+    ch.on('close', (code: number) => {
+      if (code === 0 && fs.existsSync(part)) { try { fs.renameSync(part, dest); } catch (e2) { /* */ } resolve(dest); }
+      else { try { if (fs.existsSync(part)) fs.unlinkSync(part); } catch { /* */ } reject(new Error('rclone copyto code ' + code + ' ' + err)); }
+    });
+  }).then((f) => { _odBaixandoGrande.delete(dest); return f; }, (e) => { _odBaixandoGrande.delete(dest); throw e; });
+  _odBaixandoGrande.set(dest, p);
+  return p;
+}
+let _odServeProc: any = null;
+const OD_SERVE_PORT = Number(process.env.OD_SERVE_PORT || 8699);
+function _odServeBaseUrl(): string {
+  const url = 'http://127.0.0.1:' + OD_SERVE_PORT;
+  if (_odServeProc && !_odServeProc.killed) return url;
+  const base = `${RCLONE_REMOTE}:${ONEDRIVE_PASTA_BASE}`;
+  try {
+    _odServeProc = spawn('rclone', ['serve', 'http', base, '--addr', '127.0.0.1:' + OD_SERVE_PORT, '--read-only', '--vfs-cache-mode', 'off', '--dir-cache-time', '15s'], { stdio: ['ignore', 'ignore', 'ignore'] });
+    _odServeProc.on('exit', () => { _odServeProc = null; });
+    _odServeProc.on('error', () => { _odServeProc = null; });
+  } catch { _odServeProc = null; }
+  return url;
+}
+async function _odServeUrl(rel: string): Promise<string> {
+  const baseUrl = _odServeBaseUrl();
+  let pronto = false;
+  for (let i = 0; i < 24; i++) {
+    try { const r = await fetch(baseUrl + '/', { method: 'GET' }); if (r && (r.ok || r.status === 200)) { pronto = true; break; } } catch { /* subindo */ }
+    await new Promise((rs) => setTimeout(rs, 500));
+  }
+  if (!pronto) throw new Error('rclone serve http nao subiu');
+  const relBase = _odRelToBase(rel);
+  return baseUrl + '/' + relBase.split('/').map(encodeURIComponent).join('/');
+}
+async function livResolverInput(fonteTipo: string, fonteRef: string): Promise<{ input: string; modo: string; preInput: string[] }> {
+  if (String(fonteTipo) === 'url') return { input: String(fonteRef || ''), modo: 'url', preInput: [] };
+  const rel = String(fonteRef || '');
+  if (!rel) return { input: '', modo: 'vazio', preInput: [] };
+  const dest = _odDestPath(rel);
+  try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return { input: dest, modo: 'local', preInput: [] }; } catch { /* */ }
+  _odBaixarGrande(rel).then(() => { /* */ }).catch(() => { /* */ });
+  try {
+    const url = await _odServeUrl(rel);
+    if (url) return { input: url, modo: 'direto', preInput: ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'] };
+  } catch { /* cai pro download */ }
+  const f = await _odBaixarGrande(rel);
+  return { input: f, modo: 'local-apos-espera', preInput: [] };
+}
+function livPreBaixarFonte(fonteTipo: string, fonteRef: string, capaRef?: string): void {
+  try {
+    if (String(fonteTipo || 'onedrive') !== 'url' && fonteRef) _odBaixarGrande(String(fonteRef)).then(() => { /* */ }).catch(() => { /* */ });
+    if (capaRef) _odBaixarGrande(String(capaRef)).then(() => { /* */ }).catch(() => { /* */ });
+  } catch { /* */ }
 }
 
 // serve a mídia baixada (rota liberada no middleware acima)
@@ -4794,44 +4879,6 @@ function pbCarrosselUrls(onedriveRef: string): string[] {
     return urls;
   } catch { return []; }
 }
-// etapa30 (13/10): integridade de video via ffprobe (duracao > 0). Usado antes de postar.
-function pbMidiaVideoIntegra(file: string): { ok: boolean; erro?: string; dur?: number } {
-  try {
-    if (!file || !fs.existsSync(file)) return { ok: false, erro: 'arquivo_inexistente' };
-    const sz = fs.statSync(file).size;
-    if (sz < 1024) return { ok: false, erro: 'arquivo_vazio' };
-    const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file], { timeout: 60000, encoding: 'utf8' }).toString().trim();
-    const dur = parseFloat(out);
-    if (!isFinite(dur) || dur <= 0) return { ok: false, erro: 'sem_duracao_valida' };
-    return { ok: true, dur };
-  } catch (e: any) {
-    return { ok: false, erro: 'ffprobe_falhou:' + String(e?.message || e).slice(0, 120) };
-  }
-}
-
-// etapa31 (13/10): quarentena de VIDEO invalido — move o arquivo quebrado pra pasta
-// separada (_quarentena) e limpa o que tiver mais de 24h (nao acumula video que nao presta).
-function pbMoverQuarentena(file: string, itemId: string): void {
-  try {
-    if (!file || !fs.existsSync(file)) return;
-    const base = (String(file).split('/').pop() || 'arq');
-    const dest = QUARENTENA_DIR + '/' + Date.now() + '-' + String(itemId || 'item').replace(/[^a-zA-Z0-9_.-]/g, '_') + '-' + base;
-    fs.renameSync(file, dest);
-    pbLog('arquivo movido p/ quarentena', itemId, dest);
-  } catch (e) { try { pbLog('mover quarentena falhou', (e as any)?.message); } catch { /* */ } }
-}
-function pbLimparQuarentena(): void {
-  try {
-    const lim = Date.now() - 24 * 60 * 60 * 1000; // 24h
-    for (const nome of fs.readdirSync(QUARENTENA_DIR)) {
-      const fp = QUARENTENA_DIR + '/' + nome;
-      try { if (fs.statSync(fp).mtimeMs < lim) fs.unlinkSync(fp); } catch { /* */ }
-    }
-  } catch { /* */ }
-}
-// limpeza de hora em hora (apaga o que passou de 24h) + 1x pouco depois do start
-try { setInterval(() => { try { pbLimparQuarentena(); } catch { /* */ } }, 60 * 60 * 1000); setTimeout(() => { try { pbLimparQuarentena(); } catch { /* */ } }, 60 * 1000); } catch { /* */ }
-
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -4854,28 +4901,6 @@ async function pbPostarItem(item: any): Promise<void> {
   }
   let thumbFile: string | null = null;
   if (item.thumb_ref) { try { thumbFile = pbBaixarMidia(item.thumb_ref).file; } catch { /* */ } }
-
-  // etapa30 (13/10): valida integridade do VIDEO antes de postar. Evita subir arquivo
-  // corrompido/incompleto do OneDrive (ex.: export truncado "moov atom not found").
-  // Se o cache estiver quebrado, baixa de novo 1x; se ainda falhar -> QUARENTENA c/ aviso
-  // (nao posta video quebrado nem fica retentando a toa). ADITIVO, nao altera o resto.
-  if (midia && midia.file && formato !== 'carrossel' && !pbIsImagem(midia.file)) {
-    let chk = pbMidiaVideoIntegra(midia.file);
-    if (!chk.ok) {
-      try { if (fs.existsSync(midia.file)) fs.unlinkSync(midia.file); } catch { /* */ }
-      try { midia = pbBaixarMidia(item.onedrive_ref); chk = pbMidiaVideoIntegra(midia.file); }
-      catch (e) { chk = { ok: false, erro: 're-download_falhou:' + String((e as any)?.message || e).slice(0, 80) }; }
-    }
-    if (!chk.ok) {
-      const resErr: Record<string, string> = {};
-      for (const p of plataformas) resErr[p] = 'PULADO: video invalido/corrompido na origem (' + chk.erro + ')';
-      db.prepare(`UPDATE fila_publicacao SET status='quarentena', resultado_por_plataforma_json=?, erro=?, atualizado_em=? WHERE id=?`)
-        .run(JSON.stringify(resErr), 'video_invalido: ' + (chk.erro || ''), agora(), item.id);
-      pbMoverQuarentena(midia.file, item.id);
-      pbLog('video invalido, NAO postado', item.id, chk.erro || '');
-      return;
-    }
-  }
 
   const resultados: Record<string, string> = {};
   const videoIds: Record<string, string> = {};
@@ -5545,10 +5570,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   // ---------------------- FFmpeg push ----------------------
   // Empurra INPUT (arquivo local ou URL) pro RTMP, em tempo real (-re).
   // Vídeo em cópia (sem recodificar = CPU baixa); áudio pra AAC (compatível FLV/RTMP).
-  function ffmpegPush(input: string, rtmpFull: string): any {
+  function ffmpegPush(input: string, rtmpFull: string, preInput: string[] = []): any {
     const args = [
       '-hide_banner', '-loglevel', 'warning',
       '-re',
+      ...preInput,
       '-i', input,
       '-c:v', 'copy',
       '-c:a', 'aac', '-ar', '44100', '-b:a', '128k',
@@ -5564,10 +5590,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
 
   // [multistream-rtmp] push pro Facebook/Instagram/TikTok (RTMPS). Essas redes são mais exigentes com
   // keyframe/GOP que o YouTube, então aqui RE-CODIFICA com GOP de ~2s (-g 60) em vez de copiar — garante aceite.
-  function ffmpegPushRtmp(input: string, rtmpFull: string): any {
+  function ffmpegPushRtmp(input: string, rtmpFull: string, preInput: string[] = []): any {
     const args = [
       '-hide_banner', '-loglevel', 'warning',
       '-re',
+      ...preInput,
       '-i', input,
       '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
       '-b:v', '4000k', '-maxrate', '4000k', '-bufsize', '8000k',
@@ -5621,10 +5648,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
 
     // 1) resolve a fonte do vídeo (OneDrive -> baixa local; URL -> usa direto)
     let input = '';
+    let inputPre: string[] = [];
     try {
-      if (String(live.fonte_tipo) === 'url') input = String(live.fonte_ref || '');
-      else input = pbBaixarMidia(String(live.fonte_ref || '')).file; // onedrive
+      // [lives-fonte-grande] local-se-pronto > direto do OneDrive > espera download (sem limite de 3min)
+      const fr = await livResolverInput(String(live.fonte_tipo), String(live.fonte_ref || ''));
+      input = fr.input; inputPre = fr.preInput || [];
       if (!input) throw new Error('fonte do vídeo vazia');
+      livLog('fonte da live', liveId, 'modo=' + fr.modo);
     } catch (e: any) {
       db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('fonte: ' + String(e?.message || e), agora(), liveId);
       throw e;
@@ -5664,7 +5694,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
           try { const capaFile = pbBaixarMidia(String(live.capa_ref)).file; await ytThumbnailSet(canalId, info.broadcastId, capaFile); }
           catch (e: any) { livLog('capa falhou', liveId, canalId, String(e?.message || e)); }
         }
-        const child = ffmpegPush(input, `${info.rtmp}/${info.key}`);
+        const child = ffmpegPush(input, `${info.rtmp}/${info.key}`, inputPre);
         const rec = { canal_id: canalId, child, done: false };
         procs.push(rec);
         algumOk = true;
@@ -5696,7 +5726,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         if (base === '/') throw new Error('servidor RTMP não informado');
         const full = base + String(dd.stream_key);
         livSetDestino(liveId, key, { plataforma: dd.plataforma || 'facebook', nome: dd.nome || '', page_url: dd.page_url || '', watch_url: dd.page_url || '', status: 'conectando', erro: null });
-        const child = ffmpegPushRtmp(input, full);
+        const child = ffmpegPushRtmp(input, full, inputPre);
         const rec = { canal_id: key, child, done: false };
         procs.push(rec);
         algumOk = true;
@@ -6013,6 +6043,8 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET projeto=excluded.projeto,titulo=excluded.titulo,descricao=excluded.descricao,fonte_tipo=excluded.fonte_tipo,fonte_ref=excluded.fonte_ref,capa_ref=excluded.capa_ref,qualidade=excluded.qualidade,privacidade=excluded.privacidade,destinos_json=excluded.destinos_json,data_agendada=excluded.data_agendada,atualizado_em=excluded.atualizado_em`)
         .run(id, String(b.projeto || ''), String(b.titulo || 'Live'), String(b.descricao || ''), String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref || ''), String(b.capa_ref || ''), String(b.tipo || 'ao_vivo_gravado'), String(b.qualidade || 'auto'), priv, JSON.stringify(destinos), String(b.data_agendada || agora()), 'agendado', '[]', b.em_loop ? 1 : 0, agora(), agora());
+      // [lives-fonte-grande] ja comeca a baixar o video (e capa) em segundo plano, sem limite de tempo
+      try { livPreBaixarFonte(String(b.fonte_tipo || 'onedrive'), String(b.fonte_ref || ''), String(b.capa_ref || '')); } catch { /* */ }
       res.json({ ok: true, id });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
