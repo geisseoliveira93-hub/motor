@@ -4792,6 +4792,21 @@ function pbCarrosselUrls(onedriveRef: string): string[] {
     return urls;
   } catch { return []; }
 }
+// etapa30 (13/10): integridade de video via ffprobe (duracao > 0). Usado antes de postar.
+function pbMidiaVideoIntegra(file: string): { ok: boolean; erro?: string; dur?: number } {
+  try {
+    if (!file || !fs.existsSync(file)) return { ok: false, erro: 'arquivo_inexistente' };
+    const sz = fs.statSync(file).size;
+    if (sz < 1024) return { ok: false, erro: 'arquivo_vazio' };
+    const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file], { timeout: 60000, encoding: 'utf8' }).toString().trim();
+    const dur = parseFloat(out);
+    if (!isFinite(dur) || dur <= 0) return { ok: false, erro: 'sem_duracao_valida' };
+    return { ok: true, dur };
+  } catch (e: any) {
+    return { ok: false, erro: 'ffprobe_falhou:' + String(e?.message || e).slice(0, 120) };
+  }
+}
+
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -4814,6 +4829,27 @@ async function pbPostarItem(item: any): Promise<void> {
   }
   let thumbFile: string | null = null;
   if (item.thumb_ref) { try { thumbFile = pbBaixarMidia(item.thumb_ref).file; } catch { /* */ } }
+
+  // etapa30 (13/10): valida integridade do VIDEO antes de postar. Evita subir arquivo
+  // corrompido/incompleto do OneDrive (ex.: export truncado "moov atom not found").
+  // Se o cache estiver quebrado, baixa de novo 1x; se ainda falhar -> QUARENTENA c/ aviso
+  // (nao posta video quebrado nem fica retentando a toa). ADITIVO, nao altera o resto.
+  if (midia && midia.file && formato !== 'carrossel' && !pbIsImagem(midia.file)) {
+    let chk = pbMidiaVideoIntegra(midia.file);
+    if (!chk.ok) {
+      try { if (fs.existsSync(midia.file)) fs.unlinkSync(midia.file); } catch { /* */ }
+      try { midia = pbBaixarMidia(item.onedrive_ref); chk = pbMidiaVideoIntegra(midia.file); }
+      catch (e) { chk = { ok: false, erro: 're-download_falhou:' + String((e as any)?.message || e).slice(0, 80) }; }
+    }
+    if (!chk.ok) {
+      const resErr: Record<string, string> = {};
+      for (const p of plataformas) resErr[p] = 'PULADO: video invalido/corrompido na origem (' + chk.erro + ')';
+      db.prepare(`UPDATE fila_publicacao SET status='quarentena', resultado_por_plataforma_json=?, erro=?, atualizado_em=? WHERE id=?`)
+        .run(JSON.stringify(resErr), 'video_invalido: ' + (chk.erro || ''), agora(), item.id);
+      pbLog('video invalido, NAO postado', item.id, chk.erro || '');
+      return;
+    }
+  }
 
   const resultados: Record<string, string> = {};
   const videoIds: Record<string, string> = {};
