@@ -3721,6 +3721,8 @@ const MEDIA_DIR = '/data/media';
 // Evolution já fala com http://engine:8080 no WEBHOOK_GLOBAL_URL).
 const MEDIA_INTERNAL_BASE = process.env.MEDIA_INTERNAL_BASE || 'http://engine:8080';
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch { /* ok */ }
+const QUARENTENA_DIR = MEDIA_DIR + '/_quarentena';
+try { fs.mkdirSync(QUARENTENA_DIR, { recursive: true }); } catch { /* ok */ }
 
 function _rclone(args: string[], opts: { timeoutMs?: number } = {}): string {
   return execFileSync('rclone', args, {
@@ -4807,6 +4809,29 @@ function pbMidiaVideoIntegra(file: string): { ok: boolean; erro?: string; dur?: 
   }
 }
 
+// etapa31 (13/10): quarentena de VIDEO invalido — move o arquivo quebrado pra pasta
+// separada (_quarentena) e limpa o que tiver mais de 24h (nao acumula video que nao presta).
+function pbMoverQuarentena(file: string, itemId: string): void {
+  try {
+    if (!file || !fs.existsSync(file)) return;
+    const base = (String(file).split('/').pop() || 'arq');
+    const dest = QUARENTENA_DIR + '/' + Date.now() + '-' + String(itemId || 'item').replace(/[^a-zA-Z0-9_.-]/g, '_') + '-' + base;
+    fs.renameSync(file, dest);
+    pbLog('arquivo movido p/ quarentena', itemId, dest);
+  } catch (e) { try { pbLog('mover quarentena falhou', (e as any)?.message); } catch { /* */ } }
+}
+function pbLimparQuarentena(): void {
+  try {
+    const lim = Date.now() - 24 * 60 * 60 * 1000; // 24h
+    for (const nome of fs.readdirSync(QUARENTENA_DIR)) {
+      const fp = QUARENTENA_DIR + '/' + nome;
+      try { if (fs.statSync(fp).mtimeMs < lim) fs.unlinkSync(fp); } catch { /* */ }
+    }
+  } catch { /* */ }
+}
+// limpeza de hora em hora (apaga o que passou de 24h) + 1x pouco depois do start
+try { setInterval(() => { try { pbLimparQuarentena(); } catch { /* */ } }, 60 * 60 * 1000); setTimeout(() => { try { pbLimparQuarentena(); } catch { /* */ } }, 60 * 1000); } catch { /* */ }
+
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -4846,6 +4871,7 @@ async function pbPostarItem(item: any): Promise<void> {
       for (const p of plataformas) resErr[p] = 'PULADO: video invalido/corrompido na origem (' + chk.erro + ')';
       db.prepare(`UPDATE fila_publicacao SET status='quarentena', resultado_por_plataforma_json=?, erro=?, atualizado_em=? WHERE id=?`)
         .run(JSON.stringify(resErr), 'video_invalido: ' + (chk.erro || ''), agora(), item.id);
+      pbMoverQuarentena(midia.file, item.id);
       pbLog('video invalido, NAO postado', item.id, chk.erro || '');
       return;
     }
