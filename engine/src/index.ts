@@ -4825,7 +4825,7 @@ async function pbPostarItem(item: any): Promise<void> {
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
       if (p === 'youtube') {
         if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: YouTube só vídeo aqui'; continue; }
-        r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: 'public', thumbFile });
+        r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: pbFlagPriv(canalId), thumbFile });
       } else if (p === 'instagram') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
         else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
@@ -4900,6 +4900,22 @@ app.post('/pub/pub-cred', (req, res) => {
 });
 // liga/desliga o publicador
 app.post('/pub/publicador/ligar', (_req, res) => { setPubFlag('publicador_ativo', '1'); res.json({ ok: true, ativo: true }); });
+// [yt-privacidade] escolhe public|unlisted|private do YouTube (global e por canal). Padrão: public.
+function pbFlagPriv(canalId) {
+  var v = pubFlag('pub_yt_privacy_' + String(canalId || ''), '') || pubFlag('pub_yt_privacy', 'public');
+  return (v === 'unlisted' || v === 'private') ? v : 'public';
+}
+app.get('/pub/publicador/privacidade', (req, res) => {
+  var canal = String((req.query && req.query.canal) || '');
+  res.json({ ok: true, global: pubFlag('pub_yt_privacy', 'public'), canal: canal, canalValor: pubFlag('pub_yt_privacy_' + canal, ''), efetivo: pbFlagPriv(canal) });
+});
+app.post('/pub/publicador/privacidade', (req, res) => {
+  var b = req.body || {}; var v = String(b.valor || 'public');
+  if (['public','unlisted','private'].indexOf(v) < 0) return res.status(400).json({ ok: false, erro: 'valor: public|unlisted|private' });
+  if (b.canal) setPubFlag('pub_yt_privacy_' + String(b.canal), v); else setPubFlag('pub_yt_privacy', v);
+  res.json({ ok: true, privacidade: v, canal: b.canal || null });
+});
+
 app.post('/pub/publicador/desligar', (_req, res) => { setPubFlag('publicador_ativo', '0'); res.json({ ok: true, ativo: false }); });
 app.get('/pub/publicador/status', (_req, res) => {
   try {
