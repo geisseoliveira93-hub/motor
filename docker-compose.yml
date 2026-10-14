@@ -69,15 +69,31 @@ services:
       ONEDRIVE_REMOTE: "onedrive"
       ONEDRIVE_PASTA_BASE: "Postagem Automatica"
       RCLONE_CONFIG: /root/.config/rclone/rclone.conf
+      # [tg-2gb] se ligado, o motor baixa ate 2GB pelo servidor local do Telegram
+      TELEGRAM_LOCAL_API_BASE: ${TELEGRAM_LOCAL_API_BASE:-}
     volumes:
       - enginedata:/data
       # config do rclone (token do OneDrive) do HOST -> container. rw p/ renovar token.
       - /root/.config/rclone:/root/.config/rclone
+      - tgbotapi:/var/lib/telegram-bot-api
     ports:
       # SEGURANCA: antes ficava exposto na internet.
       # - "8080:8080"
       # Agora só local (host): o app e os webhooks usam o HTTPS motor.melodiaseriffs.com.br (Caddy).
       - "127.0.0.1:8080:8080"
+
+  # ---- (Opcional) Servidor de arquivos do Telegram: baixa ate 2GB (foto/video grande).
+  #      So sobe com API_ID/API_HASH no .env:  docker compose --profile tgbig up -d
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: always
+    profiles: ["tgbig"]
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - tgbotapi:/var/lib/telegram-bot-api
 
   # ---- (Opcional) proxy HTTPS com domínio + SSL automático ----
   # Só sobe quando você tiver um domínio apontado: docker compose --profile proxy up -d
@@ -103,3 +119,4 @@ volumes:
   enginedata:
   caddydata:
   caddyconfig:
+  tgbotapi:
