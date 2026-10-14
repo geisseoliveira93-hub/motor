@@ -5814,19 +5814,22 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   setInterval(() => { tickLives().catch(() => { }); }, 15000);
 
   // ---------------------- [lives-limpeza] auto-apagar vídeos de live usados do OneDrive ----------------------
-  // INERTE até pub_kv 'lives_limpeza_ativo'='1'. Apaga (hard delete) o vídeo-fonte do OneDrive das lives
+  // INERTE até pub_kv 'lives_limpeza_ativo'='1'. Apaga (hard delete) o vídeo-fonte do OneDrive E a cópia local na VPS (/data/media) das lives
   // JÁ concluídas/canceladas há mais de N horas (padrão 48). A GRAVAÇÃO fica salva no YouTube — não se perde.
   // Guarda: não apaga arquivo que ainda esteja em uso por outra live pendente/agendada.
   async function tickLimpezaLives() {
     if (pubFlag('lives_limpeza_ativo', '0') !== '1') return;
     const horas = Math.max(1, Number(pubFlag('lives_limpeza_horas', '48')) || 48);
     const limite = new Date(Date.now() - horas * 3600 * 1000).toISOString();
-    const rows = db.prepare(`SELECT id, fonte_ref FROM fila_lives WHERE fonte_tipo='onedrive' AND (limpo IS NULL OR limpo=0) AND status IN ('concluido','cancelado') AND atualizado_em <= ? ORDER BY atualizado_em ASC LIMIT 10`).all(limite) as any[];
+    const rows = db.prepare(`SELECT id, fonte_ref, capa_ref FROM fila_lives WHERE fonte_tipo='onedrive' AND (limpo IS NULL OR limpo=0) AND status IN ('concluido','cancelado') AND atualizado_em <= ? ORDER BY atualizado_em ASC LIMIT 10`).all(limite) as any[];
     for (const r of rows) {
       const ref = String(r.fonte_ref || '');
       if (!ref) { db.prepare(`UPDATE fila_lives SET limpo=1 WHERE id=?`).run(r.id); continue; }
       const emUso = db.prepare(`SELECT COUNT(*) n FROM fila_lives WHERE fonte_ref=? AND status NOT IN ('concluido','cancelado','erro')`).get(ref) as any;
       if (emUso && emUso.n > 0) continue; // ainda tem live pendente usando esse arquivo -> não apaga
+      // [lives-limpeza-local] apaga TAMBEM a copia local na VPS (/data/media) — mesma regra de 48h
+      try { const lf = _odDestPath(ref); if (fs.existsSync(lf)) { fs.unlinkSync(lf); livLog('vps local limpo', r.id, lf); } } catch { /* */ }
+      try { const cr = String(r.capa_ref || ''); if (cr) { const lc = _odDestPath(cr); if (fs.existsSync(lc)) fs.unlinkSync(lc); } } catch { /* */ }
       try {
         _rclone(['deletefile', _odRemotePath(ref)], { timeoutMs: 60000 });
         db.prepare(`UPDATE fila_lives SET limpo=1, atualizado_em=? WHERE id=?`).run(agora(), r.id);
