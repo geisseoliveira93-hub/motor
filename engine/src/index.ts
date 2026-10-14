@@ -3779,6 +3779,26 @@ function _odRelToBase(rel: string): string {
   return r;
 }
 const _odBaixandoGrande = new Map<string, Promise<string>>();
+// [lives-barra] progresso do pre-download (0..100) por arquivo, pra barrinha na aba Transmissoes
+const _odProgresso = new Map<string, { rel: string; baixados: number; total: number; pct: number; estado: string; ts: number }>();
+function _odProgSet(dest: string, rel: string, patch: { baixados?: number; total?: number; pct?: number; estado?: string }): void {
+  const cur = _odProgresso.get(dest) || { rel, baixados: 0, total: 0, pct: 0, estado: 'baixando', ts: Date.now() };
+  if (patch.baixados != null) cur.baixados = patch.baixados;
+  if (patch.total != null) cur.total = patch.total;
+  if (patch.estado != null) cur.estado = patch.estado;
+  if (patch.pct != null) cur.pct = patch.pct;
+  else if (cur.total > 0) cur.pct = Math.min(100, Math.max(0, Math.round((cur.baixados / cur.total) * 100)));
+  cur.rel = rel; cur.ts = Date.now();
+  _odProgresso.set(dest, cur);
+}
+function _odTamanhoRemotoAsync(rel: string, cb: (n: number) => void): void {
+  try {
+    const c = spawn('rclone', ['lsjson', _odRemotePath(rel)], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let o = ''; try { c.stdout.on('data', (d: any) => { o += String(d); }); } catch { /* */ }
+    c.on('close', () => { try { const a = JSON.parse(o); cb(Array.isArray(a) && a[0] && a[0].Size != null ? Number(a[0].Size) : 0); } catch { cb(0); } });
+    c.on('error', () => cb(0));
+  } catch { cb(0); }
+}
 function _odBaixarGrande(rel: string): Promise<string> {
   const dest = _odDestPath(rel);
   try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return Promise.resolve(dest); } catch { /* */ }
@@ -3786,6 +3806,23 @@ function _odBaixarGrande(rel: string): Promise<string> {
   if (existente) return existente;
   const remote = _odRemotePath(rel);
   const part = dest + '.part';
+  // [lives-barra] acompanha o tamanho do .part vs total pra alimentar a barrinha
+  let _progTimer: any = null;
+  try {
+    _odProgSet(dest, rel, { baixados: 0, estado: 'baixando' });
+    _odTamanhoRemotoAsync(rel, (t) => { if (t > 0) _odProgSet(dest, rel, { total: t }); });
+    _progTimer = setInterval(() => {
+      try {
+        if (!_odBaixandoGrande.has(dest)) {
+          clearInterval(_progTimer);
+          try { const ok = fs.existsSync(dest) && fs.statSync(dest).size > 0; _odProgSet(dest, rel, ok ? { pct: 100, estado: 'pronto' } : { estado: 'erro' }); } catch { /* */ }
+          return;
+        }
+        let sz = 0; try { sz = fs.statSync(part).size; } catch { /* */ }
+        _odProgSet(dest, rel, { baixados: sz });
+      } catch { /* */ }
+    }, 1500);
+  } catch { /* */ }
   const p = new Promise<string>((resolve, reject) => {
     try { if (fs.existsSync(part)) fs.unlinkSync(part); } catch { /* */ }
     const ch = spawn('rclone', ['copyto', remote, part, '--transfers', '1', '--low-level-retries', '10'], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -3847,6 +3884,25 @@ function livPreBaixarFonte(fonteTipo: string, fonteRef: string, capaRef?: string
 
 // serve a mídia baixada (rota liberada no middleware acima)
 app.use('/media', express.static(MEDIA_DIR));
+
+// [lives-barra] progresso do carregamento (pre-download) das lives -> barrinha na aba Transmissoes
+app.get('/lives/progresso', (_req, res) => {
+  try {
+    const linhas = db.prepare(`SELECT id, titulo, status, fonte_tipo, fonte_ref FROM fila_lives WHERE status IN ('agendado','no_ar','preparando','baixando') ORDER BY id DESC`).all() as any[];
+    const itens = (linhas || []).map((r: any) => {
+      const rel = String(r.fonte_ref || '');
+      const base = { id: r.id, titulo: r.titulo, status: r.status };
+      if (!rel || String(r.fonte_tipo || 'onedrive') === 'url') return { ...base, pct: null, estado: 'na', baixados: 0, total: 0 };
+      const dest = _odDestPath(rel);
+      let pronto = false; try { pronto = fs.existsSync(dest) && fs.statSync(dest).size > 0; } catch { /* */ }
+      if (pronto) return { ...base, pct: 100, estado: 'pronto', baixados: 0, total: 0 };
+      const pr = _odProgresso.get(dest);
+      if (pr) return { ...base, pct: pr.pct, estado: pr.estado, baixados: pr.baixados, total: pr.total };
+      return { ...base, pct: 0, estado: 'aguardando', baixados: 0, total: 0 };
+    });
+    res.json({ ok: true, itens });
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 
 // status do rclone/OneDrive no motor
 app.get('/pub/onedrive/rclone-status', (_req, res) => {
@@ -6911,5 +6967,133 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
 
   console.log('[midia-ia] carregado: /midia/transcrever (legenda SRT) + /cortes/gerar (cortes automáticos via Whisper+IA)');
 }
+
+// ============== [telegram-recebedor] motor recebe posts do Telegram -> OneDrive (independente do PC) ==============
+// DESLIGADO por padrao (pub_kv telegram_receiver_ativo != '1'). Quando ligado, o motor faz long-polling
+// no robo do Telegram (mesmo token dos avisos) e, pra cada midia recebida, pergunta instrumento + tipo
+// (teclado inline) e sobe DIRETO pro OneDrive na subpasta certa, na hora, sem depender do PC.
+// OBS: API publica do Telegram limita download a ~20MB (bom p/ Stories e reels curtos); video grande
+// continua pelo caminho do PC ate habilitarmos o Bot API local no VPS.
+const TGR_API = 'https://api.telegram.org';
+function _tgrToken(): string { try { return decifra(pubFlag('telegram_bot_token_enc', '')); } catch { return ''; } }
+async function _tgrCall(metodo: string, corpo: any): Promise<any> {
+  const token = _tgrToken(); if (!token) return null;
+  try {
+    const r = await fetch(`${TGR_API}/bot${token}/${metodo}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(corpo) });
+    return await r.json();
+  } catch { return null; }
+}
+async function _tgrSend(chatId: any, texto: string, teclado?: any): Promise<void> {
+  const corpo: any = { chat_id: chatId, text: texto, parse_mode: 'HTML' };
+  if (teclado) corpo.reply_markup = { inline_keyboard: teclado };
+  await _tgrCall('sendMessage', corpo);
+}
+async function _tgrAck(cbId: string, texto?: string): Promise<void> { await _tgrCall('answerCallbackQuery', { callback_query_id: cbId, text: texto || '' }); }
+const TGR_INSTR: Array<{ k: string; nome: string; pasta: string }> = [
+  { k: 'tec', nome: '🎹 Teclado', pasta: 'Melodias e Riffs Teclado' },
+  { k: 'bax', nome: '🎸 Baixo', pasta: 'Melodias e Riffs Baixo' },
+  { k: 'vio', nome: '🎸 Violão', pasta: 'Melodias e Riffs Violão' },
+  { k: 'har', nome: '🎵 Harpa / Comunidade', pasta: 'Comunidade da Harpa Cristã' },
+];
+const TGR_TIPO: Array<{ k: string; nome: string; pasta: string }> = [
+  { k: 'reels', nome: '🎬 Reels', pasta: 'Vertical' },
+  { k: 'trial', nome: '🧪 Reels de teste', pasta: 'Reels-de-teste' },
+  { k: 'story', nome: '📸 Stories', pasta: 'Stories' },
+  { k: 'feed', nome: '📺 Feed / Horizontal', pasta: 'Horizontal' },
+  { k: 'carr', nome: '🖼️ Carrossel', pasta: 'Carrossel' },
+];
+const _tgrPend = new Map<string, { fileId: string; nome: string; instr?: string; ts: number }>();
+async function _tgrBaixar(fileId: string): Promise<{ buf: Buffer; nome: string } | null> {
+  const token = _tgrToken(); if (!token) return null;
+  const j = await _tgrCall('getFile', { file_id: fileId });
+  const fp = j && j.result && j.result.file_path; if (!fp) return null;
+  try {
+    const r = await fetch(`${TGR_API}/file/bot${token}/${fp}`);
+    if (!r.ok) return null;
+    const ab = await r.arrayBuffer();
+    const nome = (String(fp).split('/').pop() || 'arquivo');
+    return { buf: Buffer.from(ab), nome };
+  } catch { return null; }
+}
+async function _tgrProcessar(upd: any): Promise<void> {
+  const m = upd.message;
+  if (m) {
+    const chatId = m.chat && m.chat.id;
+    const vid = m.video; const doc = m.document; const anim = m.animation;
+    const pho = Array.isArray(m.photo) && m.photo.length ? m.photo[m.photo.length - 1] : null;
+    const media = vid || doc || anim || pho;
+    if (!media) {
+      if (m.text === '/start') await _tgrSend(chatId, '✅ Recebedor da nuvem ligado. Me manda o <b>vídeo</b> ou <b>imagem</b> que eu subo direto pro sistema, sem depender do PC.');
+      else if (m.text && !String(m.text).startsWith('/')) await _tgrSend(chatId, 'Me manda um <b>vídeo</b> ou <b>imagem</b> que eu pergunto instrumento/tipo e já subo pro sistema. 👍');
+      return;
+    }
+    const nomeOrig = (doc && doc.file_name) || (vid && (vid as any).file_name) || (m.caption ? String(m.caption).slice(0, 60).replace(/[\\/:*?"<>|\n\r]+/g, ' ').trim() : '') || ('tg_' + Date.now());
+    _tgrPend.set(String(chatId), { fileId: media.file_id, nome: nomeOrig, ts: Date.now() });
+    const teclado = TGR_INSTR.map((x) => [{ text: x.nome, callback_data: 'tgr:i:' + x.k }]);
+    await _tgrSend(chatId, `📥 Recebi <b>${nomeOrig}</b>.\n\nPra qual <b>instrumento</b>?`, teclado);
+    return;
+  }
+  const cb = upd.callback_query;
+  if (cb) {
+    const chatId = cb.message && cb.message.chat && cb.message.chat.id;
+    const data = String(cb.data || '');
+    const pend = _tgrPend.get(String(chatId));
+    if (!pend) { await _tgrAck(cb.id, 'Esse envio expirou — manda o arquivo de novo.'); return; }
+    if (data.indexOf('tgr:i:') === 0) {
+      pend.instr = data.slice(6); _tgrPend.set(String(chatId), pend);
+      const teclado = TGR_TIPO.map((x) => [{ text: x.nome, callback_data: 'tgr:t:' + x.k }]);
+      await _tgrAck(cb.id); await _tgrSend(chatId, 'E é qual <b>tipo</b> de post?', teclado); return;
+    }
+    if (data.indexOf('tgr:t:') === 0) {
+      const instr = TGR_INSTR.find((x) => x.k === pend.instr);
+      const tipo = TGR_TIPO.find((x) => x.k === data.slice(6));
+      if (!instr || !tipo) { await _tgrAck(cb.id, 'Opção inválida.'); return; }
+      await _tgrAck(cb.id, 'Subindo…');
+      await _tgrSend(chatId, `⏳ Baixando e subindo pro OneDrive em <b>${instr.nome} › ${tipo.nome}</b>…`);
+      const baixado = await _tgrBaixar(pend.fileId);
+      if (!baixado) { await _tgrSend(chatId, '❌ Não consegui baixar do Telegram. Se for vídeo grande (acima de ~20MB), por enquanto suba pelo caminho normal do PC — já habilito arquivos grandes aqui em seguida.'); _tgrPend.delete(String(chatId)); return; }
+      let nome = pend.nome; if (!/\.[a-z0-9]{2,5}$/i.test(nome)) { const ext = (baixado.nome.split('.').pop() || 'mp4'); nome = nome + '.' + ext; }
+      const tmp = MEDIA_DIR + '/tgup_' + Date.now() + '_' + nome.replace(/[^A-Za-z0-9._-]+/g, '_');
+      try { fs.writeFileSync(tmp, baixado.buf); } catch { await _tgrSend(chatId, '❌ Falha ao salvar o arquivo temporário no servidor.'); _tgrPend.delete(String(chatId)); return; }
+      const rel = `${instr.pasta}/${tipo.pasta}/${nome}`;
+      try {
+        _rclone(['copyto', tmp, _odRemotePath(rel)], { timeoutMs: 180000 });
+        await _tgrSend(chatId, `✅ Subido direto pro OneDrive (sem depender do PC):\n<b>${rel}</b>`);
+      } catch (e: any) {
+        await _tgrSend(chatId, `❌ Falhou ao subir pro OneDrive: ${String((e && e.message) || e).slice(0, 200)}`);
+      } finally { try { fs.unlinkSync(tmp); } catch { /* */ } _tgrPend.delete(String(chatId)); }
+      return;
+    }
+    await _tgrAck(cb.id);
+  }
+}
+let _tgrOffset = 0; try { _tgrOffset = parseInt(pubFlag('telegram_recv_offset', '0'), 10) || 0; } catch { _tgrOffset = 0; }
+let _tgrRodando = false;
+async function tickTgReceiver(): Promise<void> {
+  if (pubFlag('telegram_receiver_ativo', '0') !== '1') return;
+  if (_tgrRodando) return; _tgrRodando = true;
+  try {
+    const token = _tgrToken(); if (!token) return;
+    const r = await fetch(`${TGR_API}/bot${token}/getUpdates?offset=${_tgrOffset + 1}&timeout=20&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`);
+    const j: any = await r.json();
+    if (j && j.ok && Array.isArray(j.result)) {
+      for (const upd of j.result) {
+        if (upd.update_id <= _tgrOffset) continue;
+        _tgrOffset = Math.max(_tgrOffset, upd.update_id);
+        try { setPubFlag('telegram_recv_offset', String(_tgrOffset)); } catch { /* */ }
+        try { await _tgrProcessar(upd); } catch { /* */ }
+      }
+    }
+  } catch { /* */ } finally { _tgrRodando = false; }
+}
+setInterval(() => { tickTgReceiver().catch(() => { }); }, 3000);
+app.post('/pub/telegram-receiver/config', (req, res) => {
+  try { const b = req.body || {}; if (b.ativo != null) setPubFlag('telegram_receiver_ativo', b.ativo ? '1' : '0'); res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1' }); }
+  catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.get('/pub/telegram-receiver/status', (_req, res) => {
+  res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), offset: _tgrOffset });
+});
+
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
