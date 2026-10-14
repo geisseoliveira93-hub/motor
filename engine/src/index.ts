@@ -5639,6 +5639,60 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     }
   }
 
+  // [lives-religar] duracao do video (ffprobe, em segundo plano, nao trava o motor).
+  function livDuracaoSegundos(input: string): Promise<number> {
+    return new Promise((resolve) => {
+      try {
+        const p = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        try { p.stdout.on('data', (d: any) => { out += String(d); }); } catch { /* */ }
+        const to = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* */ } resolve(0); }, 15000);
+        p.on('exit', () => { clearTimeout(to); const d = parseFloat(String(out || '').trim()); resolve(isFinite(d) && d > 0 ? d : 0); });
+        p.on('error', () => { clearTimeout(to); resolve(0); });
+      } catch { resolve(0); }
+    });
+  }
+
+  // [lives-religar] empurra o ffmpeg com RECONEXAO AUTOMATICA: se a conexao cair com erro ANTES
+  // do fim do video, religa sozinho (seek pro ponto onde parou) na MESMA chave/broadcast, ate N vezes.
+  // So marca 'erro' de verdade se estourar as tentativas; se o video ja tinha chegado ao fim, marca 'encerrado'.
+  function livPushResiliente(o: { liveId: string; canalId: string; rec: any; input: string; rtmpFull: string; preInput: string[]; isRtmp: boolean; durRef: { seg: number }; inicioMs: number; broadcastId?: string; platNome?: string }): any {
+    const MAXREL = 10;        // maximo de religamentos por destino na mesma live
+    const DELAYMS = 4000;     // espera antes de religar (dentro da janela de tolerancia do YouTube)
+    const MARGEMFIM = 20;     // se faltam <=20s pro fim do video, considera que ja terminou (nao religa)
+    const fmt = (sg: number): string => { sg = Math.max(0, Math.floor(sg)); const m = Math.floor(sg / 60); const ss = sg % 60; return m + 'm' + (ss < 10 ? '0' : '') + ss + 's'; };
+    function subir(seekS: number): any {
+      const pre2 = seekS > 2 ? ['-ss', String(Math.floor(seekS)), ...o.preInput] : o.preInput;
+      const child = o.isRtmp ? ffmpegPushRtmp(o.input, o.rtmpFull, pre2) : ffmpegPush(o.input, o.rtmpFull, pre2);
+      o.rec.child = child;
+      child.on('exit', (code: number) => {
+        const ok = code === 0;
+        const decorridoS = (Date.now() - o.inicioMs) / 1000;
+        const dur = Number(o.durRef.seg) || 0;
+        const faltamS = dur > 0 ? (dur - decorridoS) : 999999;
+        let st = ''; try { st = (db.prepare(`SELECT status FROM fila_lives WHERE id=?`).get(o.liveId) as any)?.status || ''; } catch { /* */ }
+        const pararManual = o.rec.parar === true || st === 'cancelado';
+        const tent = Number(o.rec.religamentos) || 0;
+        if (!ok && !pararManual && faltamS > MARGEMFIM && tent < MAXREL) {
+          o.rec.religamentos = tent + 1;
+          livSetDestino(o.liveId, o.canalId, { status: 'reconectando', erro: ('conexao caiu - religando ' + (tent + 1) + '/' + MAXREL).slice(0, 400) });
+          livLog('religando live', o.liveId, o.canalId, 'tentativa=' + (tent + 1), 'seek=' + Math.floor(decorridoS) + 's');
+          try { tgEnviar(`🔁 <b>Live religando sozinha</b>\n${o.platNome || o.canalId}: a conexao caiu, reconectando (${tent + 1}/${MAXREL}) a partir de ${fmt(decorridoS)}. A live continua.`).catch(() => { /* */ }); } catch { /* */ }
+          setTimeout(() => { try { subir(decorridoS); } catch { /* */ } }, DELAYMS);
+          return;
+        }
+        o.rec.done = true;
+        const terminouBem = ok || faltamS <= MARGEMFIM; // acabou normal OU ja tinha chegado ao fim do video
+        livSetDestino(o.liveId, o.canalId, { status: terminouBem ? 'encerrado' : 'erro', erro: terminouBem ? null : ('ffmpeg code ' + code + ': ' + (child._errTail ? child._errTail() : '')).slice(0, 400) });
+        if (!o.isRtmp && o.broadcastId) ytLiveTransicao(o.canalId, String(o.broadcastId), 'complete').catch(() => { /* ja pode estar completo */ });
+        if (!terminouBem && !pararManual) { try { tgEnviar(`🔴 <b>Live caiu de vez</b>\n${o.platNome || o.canalId}: parou e nao reconectou apos ${MAXREL} tentativas.`).catch(() => { /* */ }); } catch { /* */ } }
+        livTalvezConcluir(o.liveId);
+      });
+      return child;
+    }
+    return subir(0);
+  }
+
   // dispara UMA live agora (usado pelo worker e pelo /lives/testar)
   async function livExecutar(liveId: string): Promise<void> {
     const live = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(liveId) as any;
@@ -5659,6 +5713,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       db.prepare(`UPDATE fila_lives SET status='erro', erro=?, atualizado_em=? WHERE id=?`).run('fonte: ' + String(e?.message || e), agora(), liveId);
       throw e;
     }
+
+    // [lives-religar] duracao do video em segundo plano (pra decidir, se cair, se foi no MEIO ou ja no FIM) + marco de inicio
+    const livDurRef = { seg: 0 };
+    livDuracaoSegundos(input).then((d) => { livDurRef.seg = d; }).catch(() => { /* */ });
+    const livInicioMs = Date.now();
 
     // 2) para cada destino YouTube: cria broadcast + empurra ffmpeg
     let destinos: any[] = []; try { destinos = JSON.parse(live.destinos_json || '[]'); } catch { destinos = []; }
@@ -5694,20 +5753,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
           try { const capaFile = pbBaixarMidia(String(live.capa_ref)).file; await ytThumbnailSet(canalId, info.broadcastId, capaFile); }
           catch (e: any) { livLog('capa falhou', liveId, canalId, String(e?.message || e)); }
         }
-        const child = ffmpegPush(input, `${info.rtmp}/${info.key}`, inputPre);
-        const rec = { canal_id: canalId, child, done: false };
+        const rec: any = { canal_id: canalId, child: null, done: false, religamentos: 0 };
         procs.push(rec);
         algumOk = true;
         livSetDestino(liveId, canalId, { status: 'no_ar' });
         livLog('empurrando ffmpeg', liveId, canalId, info.watchUrl);
-        child.on('exit', (code: number) => {
-          rec.done = true;
-          const ok = code === 0;
-          livSetDestino(liveId, canalId, { status: ok ? 'encerrado' : 'erro', erro: ok ? null : ('ffmpeg code ' + code + ': ' + (child._errTail ? child._errTail() : '')).slice(0, 400) });
-          // encerra o broadcast no YouTube (complete), por garantia (autoStop já pode ter encerrado)
-          ytLiveTransicao(canalId, info.broadcastId, 'complete').catch(() => { /* já pode estar completo */ });
-          livTalvezConcluir(liveId);
-        });
+        // [lives-religar] push com reconexao automatica (se a conexao cair no meio, religa sozinho)
+        livPushResiliente({ liveId, canalId, rec, input, rtmpFull: `${info.rtmp}/${info.key}`, preInput: inputPre, isRtmp: false, durRef: livDurRef, inicioMs: livInicioMs, broadcastId: info.broadcastId, platNome: 'YouTube ' + canalId });
       } catch (e: any) {
         livSetDestino(liveId, canalId, { plataforma: 'youtube', status: 'erro', erro: String(e?.message || e).slice(0, 400) });
         livLog('falha destino', liveId, canalId, String(e?.message || e));
@@ -5726,23 +5778,14 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         if (base === '/') throw new Error('servidor RTMP não informado');
         const full = base + String(dd.stream_key);
         livSetDestino(liveId, key, { plataforma: dd.plataforma || 'facebook', nome: dd.nome || '', page_url: dd.page_url || '', watch_url: dd.page_url || '', status: 'conectando', erro: null });
-        const child = ffmpegPushRtmp(input, full, inputPre);
-        const rec = { canal_id: key, child, done: false };
+        const rec: any = { canal_id: key, child: null, done: false, religamentos: 0 };
         procs.push(rec);
         algumOk = true;
         livSetDestino(liveId, key, { status: 'no_ar' });
         livLog('empurrando ffmpeg RTMP', liveId, dd.plataforma, rid);
         const platNome = dd.plataforma === 'instagram' ? 'Instagram' : dd.plataforma === 'tiktok' ? 'TikTok' : dd.plataforma === 'facebook' ? 'Facebook' : String(dd.plataforma || 'destino');
-        child.on('exit', (code: number) => {
-          rec.done = true;
-          const ok = code === 0;
-          livSetDestino(liveId, key, { status: ok ? 'encerrado' : 'erro', erro: ok ? null : ('ffmpeg code ' + code + ': ' + (child._errTail ? child._errTail() : '')).slice(0, 400) });
-          // [lives-mensagens] avisa no Telegram se um destino caiu com erro no meio (e a live não foi cancelada)
-          if (!ok) {
-            try { const st = (db.prepare(`SELECT status FROM fila_lives WHERE id=?`).get(liveId) as any)?.status; if (st !== 'cancelado') tgEnviar(`🔴 <b>Destino caiu</b>\n${platNome} (${String(dd.nome || '').slice(0, 40)}) parou de transmitir no meio da live. As outras redes continuam.`).catch(() => { /* */ }); } catch { /* */ }
-          }
-          livTalvezConcluir(liveId);
-        });
+        // [lives-religar] push com reconexao automatica
+        livPushResiliente({ liveId, canalId: key, rec, input, rtmpFull: full, preInput: inputPre, isRtmp: true, durRef: livDurRef, inicioMs: livInicioMs, broadcastId: '', platNome: platNome + (dd.nome ? ' (' + String(dd.nome).slice(0, 40) + ')' : '') });
       } catch (e: any) {
         livSetDestino(liveId, key, { plataforma: String(d.plataforma || 'facebook'), status: 'erro', erro: String(e?.message || e).slice(0, 400) });
         livLog('falha destino RTMP', liveId, rid, String(e?.message || e));
@@ -6099,7 +6142,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(id) as any;
       if (!row) return res.status(404).json({ ok: false, erro: 'nao_encontrada' });
       const procs = livesRun.get(id) || [];
-      for (const p of procs) { try { p.child.kill('SIGINT'); } catch { /* */ } }
+      for (const p of procs) { try { (p as any).parar = true; } catch { /* */ } try { p.child.kill('SIGINT'); } catch { /* */ } }
       // completa broadcasts no YouTube
       try {
         const arr = JSON.parse(row.broadcasts_json || '[]');
