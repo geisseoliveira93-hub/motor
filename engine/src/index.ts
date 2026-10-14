@@ -6972,6 +6972,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
 // DESLIGADO por padrao (pub_kv telegram_receiver_ativo != '1'). Quando ligado, o motor faz long-polling
 // no robo do Telegram (mesmo token dos avisos) e, pra cada midia recebida, pergunta instrumento + tipo
 // (teclado inline) e sobe DIRETO pro OneDrive na subpasta certa, na hora, sem depender do PC.
+// [v2] + "Postar em TODOS os instrumentos" + TEXTO QUEIMADO na imagem (igual ao gancho do video).
 // OBS: API publica do Telegram limita download a ~20MB (bom p/ Stories e reels curtos); video grande
 // continua pelo caminho do PC ate habilitarmos o Bot API local no VPS.
 const TGR_API = 'https://api.telegram.org';
@@ -7002,7 +7003,7 @@ const TGR_TIPO: Array<{ k: string; nome: string; pasta: string }> = [
   { k: 'feed', nome: '📺 Feed / Horizontal', pasta: 'Horizontal' },
   { k: 'carr', nome: '🖼️ Carrossel', pasta: 'Carrossel' },
 ];
-const _tgrPend = new Map<string, { fileId: string; nome: string; instr?: string; ts: number }>();
+const _tgrPend = new Map<string, { fileId: string; nome: string; instr?: string; tipoK?: string; ehImagem?: boolean; aguardandoTexto?: boolean; texto?: string; ts: number }>();
 async function _tgrBaixar(fileId: string): Promise<{ buf: Buffer; nome: string } | null> {
   const token = _tgrToken(); if (!token) return null;
   const j = await _tgrCall('getFile', { file_id: fileId });
@@ -7015,6 +7016,59 @@ async function _tgrBaixar(fileId: string): Promise<{ buf: Buffer; nome: string }
     return { buf: Buffer.from(ab), nome };
   } catch { return null; }
 }
+// [v2 texto-queimado] escreve o texto NA imagem (ffmpeg drawtext: branco, caixa preta, centralizado embaixo) — igual ao gancho do video.
+const TGR_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+function _tgrQueimarTextoImg(imgPath: string, texto: string): Promise<string> {
+  return new Promise((resolve) => {
+    try {
+      if (!fs.existsSync(TGR_FONT)) { resolve(''); return; }
+      const palavras = String(texto).split(/\s+/).filter(Boolean);
+      const linhas: string[] = []; let cur = '';
+      for (const p of palavras) { if ((cur + ' ' + p).trim().length > 24) { if (cur) linhas.push(cur); cur = p; } else cur = (cur + ' ' + p).trim(); }
+      if (cur) linhas.push(cur);
+      const txtFile = MEDIA_DIR + '/tgtxt_' + Date.now() + '.txt';
+      fs.writeFileSync(txtFile, linhas.join('\n'), 'utf8');
+      const out = imgPath.replace(/\.[^.]+$/, '') + '_txt.png';
+      const vf = "drawtext=fontfile='" + TGR_FONT + "':textfile='" + txtFile + "':text_align=center:fontcolor=white:fontsize=w*0.055:line_spacing=12:box=1:boxcolor=black@0.58:boxborderw=24:x=(w-text_w)/2:y=h-text_h-(h*0.08)";
+      const c = spawn('ffmpeg', ['-y', '-i', imgPath, '-vf', vf, '-frames:v', '1', out], { stdio: ['ignore', 'ignore', 'ignore'] });
+      const to = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(''); }, 30000);
+      c.on('exit', (code: number) => { clearTimeout(to); try { fs.unlinkSync(txtFile); } catch { /* */ } resolve(code === 0 && fs.existsSync(out) ? out : ''); });
+      c.on('error', () => { clearTimeout(to); resolve(''); });
+    } catch { resolve(''); }
+  });
+}
+// [v2] baixa, (queima texto se imagem+texto) e sobe pro OneDrive (1 ou todos os instrumentos)
+async function _tgrFinalizar(chatId: any, pend: any): Promise<void> {
+  const tipo = TGR_TIPO.find((x) => x.k === pend.tipoK);
+  const todos = pend.instr === 'todos';
+  const instrs = todos ? TGR_INSTR : TGR_INSTR.filter((x) => x.k === pend.instr);
+  if (!instrs.length || !tipo) { await _tgrSend(chatId, 'Opção inválida — manda o arquivo de novo.'); _tgrPend.delete(String(chatId)); return; }
+  const alvoNome = todos ? 'TODOS os instrumentos' : instrs[0].nome;
+  await _tgrSend(chatId, `⏳ Baixando e subindo pro OneDrive em <b>${alvoNome} › ${tipo.nome}</b>…`);
+  const baixado = await _tgrBaixar(pend.fileId);
+  if (!baixado) { await _tgrSend(chatId, '❌ Não consegui baixar do Telegram. Se for vídeo grande (acima de ~20MB), por enquanto suba pelo caminho normal do PC.'); _tgrPend.delete(String(chatId)); return; }
+  let nome = pend.nome; if (!/\.[a-z0-9]{2,5}$/i.test(nome)) { const ext = (baixado.nome.split('.').pop() || 'mp4'); nome = nome + '.' + ext; }
+  let tmp = MEDIA_DIR + '/tgup_' + Date.now() + '_' + nome.replace(/[^A-Za-z0-9._-]+/g, '_');
+  try { fs.writeFileSync(tmp, baixado.buf); } catch { await _tgrSend(chatId, '❌ Falha ao salvar o arquivo temporário no servidor.'); _tgrPend.delete(String(chatId)); return; }
+  let comTexto = false;
+  if (pend.ehImagem && pend.texto && String(pend.texto).trim()) {
+    try {
+      const saida = await _tgrQueimarTextoImg(tmp, String(pend.texto).trim());
+      if (saida) { try { fs.unlinkSync(tmp); } catch { /* */ } tmp = saida; comTexto = true; if (!/\.png$/i.test(nome)) nome = nome.replace(/\.[^.]+$/, '') + '.png'; }
+      else await _tgrSend(chatId, '⚠️ Não consegui escrever o texto na imagem — vou subir sem o texto.');
+    } catch { await _tgrSend(chatId, '⚠️ Não consegui escrever o texto na imagem — vou subir sem o texto.'); }
+  }
+  const oks: string[] = []; const errs: string[] = [];
+  for (const inst of instrs) {
+    const rel = `${inst.pasta}/${tipo.pasta}/${nome}`;
+    try { _rclone(['copyto', tmp, _odRemotePath(rel)], { timeoutMs: 180000 }); oks.push(rel); }
+    catch (e: any) { errs.push(inst.nome + ': ' + String((e && e.message) || e).slice(0, 80)); }
+  }
+  try { fs.unlinkSync(tmp); } catch { /* */ }
+  _tgrPend.delete(String(chatId));
+  if (oks.length) await _tgrSend(chatId, `✅ Subido direto pro OneDrive${comTexto ? ' (com o texto na imagem)' : ''}:\n` + oks.map((r) => '• ' + r).join('\n'));
+  if (errs.length) await _tgrSend(chatId, `⚠️ Não subiu em: ` + errs.join('; '));
+}
 async function _tgrProcessar(upd: any): Promise<void> {
   const m = upd.message;
   if (m) {
@@ -7022,14 +7076,22 @@ async function _tgrProcessar(upd: any): Promise<void> {
     const vid = m.video; const doc = m.document; const anim = m.animation;
     const pho = Array.isArray(m.photo) && m.photo.length ? m.photo[m.photo.length - 1] : null;
     const media = vid || doc || anim || pho;
+    const pendAtual = _tgrPend.get(String(chatId));
+    // [v2] estava esperando o TEXTO da imagem e chegou texto (sem midia nova) -> finaliza queimando
+    if (!media && pendAtual && pendAtual.aguardandoTexto && m.text && !String(m.text).startsWith('/')) {
+      pendAtual.texto = String(m.text).trim(); pendAtual.aguardandoTexto = false; _tgrPend.set(String(chatId), pendAtual);
+      await _tgrFinalizar(chatId, pendAtual); return;
+    }
     if (!media) {
       if (m.text === '/start') await _tgrSend(chatId, '✅ Recebedor da nuvem ligado. Me manda o <b>vídeo</b> ou <b>imagem</b> que eu subo direto pro sistema, sem depender do PC.');
       else if (m.text && !String(m.text).startsWith('/')) await _tgrSend(chatId, 'Me manda um <b>vídeo</b> ou <b>imagem</b> que eu pergunto instrumento/tipo e já subo pro sistema. 👍');
       return;
     }
-    const nomeOrig = (doc && doc.file_name) || (vid && (vid as any).file_name) || (m.caption ? String(m.caption).slice(0, 60).replace(/[\\/:*?"<>|\n\r]+/g, ' ').trim() : '') || ('tg_' + Date.now());
-    _tgrPend.set(String(chatId), { fileId: media.file_id, nome: nomeOrig, ts: Date.now() });
+    const ehImagem = !!pho || (!!doc && /image\//i.test(String((doc as any).mime_type || '')));
+    const nomeOrig = (doc && (doc as any).file_name) || (vid && (vid as any).file_name) || (m.caption ? String(m.caption).slice(0, 60).replace(/[\\/:*?"<>|\n\r]+/g, ' ').trim() : '') || ('tg_' + Date.now());
+    _tgrPend.set(String(chatId), { fileId: media.file_id, nome: nomeOrig, ts: Date.now(), ehImagem });
     const teclado = TGR_INSTR.map((x) => [{ text: x.nome, callback_data: 'tgr:i:' + x.k }]);
+    teclado.push([{ text: '🌐 Postar em TODOS os instrumentos', callback_data: 'tgr:i:todos' }]);
     await _tgrSend(chatId, `📥 Recebi <b>${nomeOrig}</b>.\n\nPra qual <b>instrumento</b>?`, teclado);
     return;
   }
@@ -7045,23 +7107,21 @@ async function _tgrProcessar(upd: any): Promise<void> {
       await _tgrAck(cb.id); await _tgrSend(chatId, 'E é qual <b>tipo</b> de post?', teclado); return;
     }
     if (data.indexOf('tgr:t:') === 0) {
-      const instr = TGR_INSTR.find((x) => x.k === pend.instr);
-      const tipo = TGR_TIPO.find((x) => x.k === data.slice(6));
-      if (!instr || !tipo) { await _tgrAck(cb.id, 'Opção inválida.'); return; }
+      pend.tipoK = data.slice(6); _tgrPend.set(String(chatId), pend);
+      if (pend.ehImagem) {
+        pend.aguardandoTexto = true; _tgrPend.set(String(chatId), pend);
+        await _tgrAck(cb.id);
+        await _tgrSend(chatId, 'Quer escrever um <b>texto na imagem</b> (sai escrito na foto, igual ao vídeo)?\n\nMande o texto agora, ou toque em <b>Pular</b>.', [[{ text: '⏭️ Pular (sem texto)', callback_data: 'tgr:skip' }]]);
+        return;
+      }
       await _tgrAck(cb.id, 'Subindo…');
-      await _tgrSend(chatId, `⏳ Baixando e subindo pro OneDrive em <b>${instr.nome} › ${tipo.nome}</b>…`);
-      const baixado = await _tgrBaixar(pend.fileId);
-      if (!baixado) { await _tgrSend(chatId, '❌ Não consegui baixar do Telegram. Se for vídeo grande (acima de ~20MB), por enquanto suba pelo caminho normal do PC — já habilito arquivos grandes aqui em seguida.'); _tgrPend.delete(String(chatId)); return; }
-      let nome = pend.nome; if (!/\.[a-z0-9]{2,5}$/i.test(nome)) { const ext = (baixado.nome.split('.').pop() || 'mp4'); nome = nome + '.' + ext; }
-      const tmp = MEDIA_DIR + '/tgup_' + Date.now() + '_' + nome.replace(/[^A-Za-z0-9._-]+/g, '_');
-      try { fs.writeFileSync(tmp, baixado.buf); } catch { await _tgrSend(chatId, '❌ Falha ao salvar o arquivo temporário no servidor.'); _tgrPend.delete(String(chatId)); return; }
-      const rel = `${instr.pasta}/${tipo.pasta}/${nome}`;
-      try {
-        _rclone(['copyto', tmp, _odRemotePath(rel)], { timeoutMs: 180000 });
-        await _tgrSend(chatId, `✅ Subido direto pro OneDrive (sem depender do PC):\n<b>${rel}</b>`);
-      } catch (e: any) {
-        await _tgrSend(chatId, `❌ Falhou ao subir pro OneDrive: ${String((e && e.message) || e).slice(0, 200)}`);
-      } finally { try { fs.unlinkSync(tmp); } catch { /* */ } _tgrPend.delete(String(chatId)); }
+      await _tgrFinalizar(chatId, pend);
+      return;
+    }
+    if (data === 'tgr:skip') {
+      pend.texto = ''; pend.aguardandoTexto = false; _tgrPend.set(String(chatId), pend);
+      await _tgrAck(cb.id, 'Subindo…');
+      await _tgrFinalizar(chatId, pend);
       return;
     }
     await _tgrAck(cb.id);
