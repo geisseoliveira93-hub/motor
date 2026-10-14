@@ -6970,17 +6970,21 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
 
 // ============== [telegram-recebedor] motor recebe posts do Telegram -> OneDrive (independente do PC) ==============
 // DESLIGADO por padrao (pub_kv telegram_receiver_ativo != '1'). Quando ligado, o motor faz long-polling
-// no robo do Telegram (mesmo token dos avisos) e, pra cada midia recebida, pergunta instrumento + tipo
-// (teclado inline) e sobe DIRETO pro OneDrive na subpasta certa, na hora, sem depender do PC.
-// [v2] + "Postar em TODOS os instrumentos" + TEXTO QUEIMADO na imagem (igual ao gancho do video).
-// OBS: API publica do Telegram limita download a ~20MB (bom p/ Stories e reels curtos); video grande
-// continua pelo caminho do PC ate habilitarmos o Bot API local no VPS.
+// no robo do Telegram e, pra cada midia, pergunta instrumento + tipo e sobe DIRETO pro OneDrive.
+// [v2] "Postar em TODOS os instrumentos" + TEXTO QUEIMADO na imagem (igual ao gancho do video).
+// [v3] Suporte ao SERVIDOR DE ARQUIVOS LOCAL (telegram-bot-api) pra baixar ate 2GB. Ligado so quando
+//      pub_kv telegram_local_api_base aponta pro servidor local (ex.: http://telegram-bot-api:8081).
+//      Por padrao usa a API publica (limite ~20MB). NAO muda nada ate configurar.
 const TGR_API = 'https://api.telegram.org';
+function _tgrApiBase(): string {
+  const b = (pubFlag('telegram_local_api_base', '') || process.env.TELEGRAM_LOCAL_API_BASE || '').trim();
+  return b || TGR_API;
+}
 function _tgrToken(): string { try { return decifra(pubFlag('telegram_bot_token_enc', '')); } catch { return ''; } }
 async function _tgrCall(metodo: string, corpo: any): Promise<any> {
   const token = _tgrToken(); if (!token) return null;
   try {
-    const r = await fetch(`${TGR_API}/bot${token}/${metodo}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(corpo) });
+    const r = await fetch(`${_tgrApiBase()}/bot${token}/${metodo}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(corpo) });
     return await r.json();
   } catch { return null; }
 }
@@ -7004,19 +7008,26 @@ const TGR_TIPO: Array<{ k: string; nome: string; pasta: string }> = [
   { k: 'carr', nome: '🖼️ Carrossel', pasta: 'Carrossel' },
 ];
 const _tgrPend = new Map<string, { fileId: string; nome: string; instr?: string; tipoK?: string; ehImagem?: boolean; aguardandoTexto?: boolean; texto?: string; ts: number }>();
-async function _tgrBaixar(fileId: string): Promise<{ buf: Buffer; nome: string } | null> {
+async function _tgrBaixar(fileId: string): Promise<{ buf?: Buffer; localPath?: string; nome: string } | null> {
   const token = _tgrToken(); if (!token) return null;
   const j = await _tgrCall('getFile', { file_id: fileId });
   const fp = j && j.result && j.result.file_path; if (!fp) return null;
+  const nome = (String(fp).split('/').pop() || 'arquivo');
+  const base = _tgrApiBase();
+  const ehLocal = base !== TGR_API;
+  // modo servidor local: file_path e um caminho ABSOLUTO no disco (volume compartilhado) — ate 2GB, sem baixar por HTTP
+  if (ehLocal && (String(fp).startsWith('/') || /^[A-Za-z]:[\\/]/.test(String(fp)))) {
+    try { if (fs.existsSync(fp)) return { localPath: fp, nome }; } catch { /* */ }
+    return null;
+  }
   try {
-    const r = await fetch(`${TGR_API}/file/bot${token}/${fp}`);
+    const r = await fetch(`${base}/file/bot${token}/${fp}`);
     if (!r.ok) return null;
     const ab = await r.arrayBuffer();
-    const nome = (String(fp).split('/').pop() || 'arquivo');
     return { buf: Buffer.from(ab), nome };
   } catch { return null; }
 }
-// [v2 texto-queimado] escreve o texto NA imagem (ffmpeg drawtext: branco, caixa preta, centralizado embaixo) — igual ao gancho do video.
+// [texto-queimado] escreve o texto NA imagem (ffmpeg drawtext) — igual ao gancho do video.
 const TGR_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
 function _tgrQueimarTextoImg(imgPath: string, texto: string): Promise<string> {
   return new Promise((resolve) => {
@@ -7028,7 +7039,7 @@ function _tgrQueimarTextoImg(imgPath: string, texto: string): Promise<string> {
       if (cur) linhas.push(cur);
       const txtFile = MEDIA_DIR + '/tgtxt_' + Date.now() + '.txt';
       fs.writeFileSync(txtFile, linhas.join('\n'), 'utf8');
-      const out = imgPath.replace(/\.[^.]+$/, '') + '_txt.png';
+      const out = MEDIA_DIR + '/tgtxtout_' + Date.now() + '.png';
       const vf = "drawtext=fontfile='" + TGR_FONT + "':textfile='" + txtFile + "':text_align=center:fontcolor=white:fontsize=w*0.055:line_spacing=12:box=1:boxcolor=black@0.58:boxborderw=24:x=(w-text_w)/2:y=h-text_h-(h*0.08)";
       const c = spawn('ffmpeg', ['-y', '-i', imgPath, '-vf', vf, '-frames:v', '1', out], { stdio: ['ignore', 'ignore', 'ignore'] });
       const to = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } resolve(''); }, 30000);
@@ -7037,7 +7048,7 @@ function _tgrQueimarTextoImg(imgPath: string, texto: string): Promise<string> {
     } catch { resolve(''); }
   });
 }
-// [v2] baixa, (queima texto se imagem+texto) e sobe pro OneDrive (1 ou todos os instrumentos)
+// baixa (buffer OU arquivo local do servidor 2GB), queima texto se imagem+texto, e sobe pro OneDrive
 async function _tgrFinalizar(chatId: any, pend: any): Promise<void> {
   const tipo = TGR_TIPO.find((x) => x.k === pend.tipoK);
   const todos = pend.instr === 'todos';
@@ -7046,25 +7057,31 @@ async function _tgrFinalizar(chatId: any, pend: any): Promise<void> {
   const alvoNome = todos ? 'TODOS os instrumentos' : instrs[0].nome;
   await _tgrSend(chatId, `⏳ Baixando e subindo pro OneDrive em <b>${alvoNome} › ${tipo.nome}</b>…`);
   const baixado = await _tgrBaixar(pend.fileId);
-  if (!baixado) { await _tgrSend(chatId, '❌ Não consegui baixar do Telegram. Se for vídeo grande (acima de ~20MB), por enquanto suba pelo caminho normal do PC.'); _tgrPend.delete(String(chatId)); return; }
+  if (!baixado) { await _tgrSend(chatId, '❌ Não consegui baixar do Telegram. Se for vídeo grande (acima de ~20MB) e o servidor de 2GB da nuvem não estiver ligado, suba pelo caminho normal do PC.'); _tgrPend.delete(String(chatId)); return; }
   let nome = pend.nome; if (!/\.[a-z0-9]{2,5}$/i.test(nome)) { const ext = (baixado.nome.split('.').pop() || 'mp4'); nome = nome + '.' + ext; }
-  let tmp = MEDIA_DIR + '/tgup_' + Date.now() + '_' + nome.replace(/[^A-Za-z0-9._-]+/g, '_');
-  try { fs.writeFileSync(tmp, baixado.buf); } catch { await _tgrSend(chatId, '❌ Falha ao salvar o arquivo temporário no servidor.'); _tgrPend.delete(String(chatId)); return; }
+  let src = ''; let tmpNosso = ''; let tmpTexto = '';
+  if (baixado.localPath) { src = baixado.localPath; }
+  else {
+    tmpNosso = MEDIA_DIR + '/tgup_' + Date.now() + '_' + nome.replace(/[^A-Za-z0-9._-]+/g, '_');
+    try { fs.writeFileSync(tmpNosso, baixado.buf as Buffer); src = tmpNosso; } catch { await _tgrSend(chatId, '❌ Falha ao salvar o arquivo temporário no servidor.'); _tgrPend.delete(String(chatId)); return; }
+  }
   let comTexto = false;
   if (pend.ehImagem && pend.texto && String(pend.texto).trim()) {
     try {
-      const saida = await _tgrQueimarTextoImg(tmp, String(pend.texto).trim());
-      if (saida) { try { fs.unlinkSync(tmp); } catch { /* */ } tmp = saida; comTexto = true; if (!/\.png$/i.test(nome)) nome = nome.replace(/\.[^.]+$/, '') + '.png'; }
+      const saida = await _tgrQueimarTextoImg(src, String(pend.texto).trim());
+      if (saida) { tmpTexto = saida; src = saida; comTexto = true; if (!/\.png$/i.test(nome)) nome = nome.replace(/\.[^.]+$/, '') + '.png'; }
       else await _tgrSend(chatId, '⚠️ Não consegui escrever o texto na imagem — vou subir sem o texto.');
     } catch { await _tgrSend(chatId, '⚠️ Não consegui escrever o texto na imagem — vou subir sem o texto.'); }
   }
   const oks: string[] = []; const errs: string[] = [];
   for (const inst of instrs) {
     const rel = `${inst.pasta}/${tipo.pasta}/${nome}`;
-    try { _rclone(['copyto', tmp, _odRemotePath(rel)], { timeoutMs: 180000 }); oks.push(rel); }
+    try { _rclone(['copyto', src, _odRemotePath(rel)], { timeoutMs: 600000 }); oks.push(rel); }
     catch (e: any) { errs.push(inst.nome + ': ' + String((e && e.message) || e).slice(0, 80)); }
   }
-  try { fs.unlinkSync(tmp); } catch { /* */ }
+  try { if (tmpNosso) fs.unlinkSync(tmpNosso); } catch { /* */ }
+  try { if (tmpTexto) fs.unlinkSync(tmpTexto); } catch { /* */ }
+  try { if (baixado.localPath) fs.unlinkSync(baixado.localPath); } catch { /* */ }
   _tgrPend.delete(String(chatId));
   if (oks.length) await _tgrSend(chatId, `✅ Subido direto pro OneDrive${comTexto ? ' (com o texto na imagem)' : ''}:\n` + oks.map((r) => '• ' + r).join('\n'));
   if (errs.length) await _tgrSend(chatId, `⚠️ Não subiu em: ` + errs.join('; '));
@@ -7077,7 +7094,6 @@ async function _tgrProcessar(upd: any): Promise<void> {
     const pho = Array.isArray(m.photo) && m.photo.length ? m.photo[m.photo.length - 1] : null;
     const media = vid || doc || anim || pho;
     const pendAtual = _tgrPend.get(String(chatId));
-    // [v2] estava esperando o TEXTO da imagem e chegou texto (sem midia nova) -> finaliza queimando
     if (!media && pendAtual && pendAtual.aguardandoTexto && m.text && !String(m.text).startsWith('/')) {
       pendAtual.texto = String(m.text).trim(); pendAtual.aguardandoTexto = false; _tgrPend.set(String(chatId), pendAtual);
       await _tgrFinalizar(chatId, pendAtual); return;
@@ -7134,7 +7150,7 @@ async function tickTgReceiver(): Promise<void> {
   if (_tgrRodando) return; _tgrRodando = true;
   try {
     const token = _tgrToken(); if (!token) return;
-    const r = await fetch(`${TGR_API}/bot${token}/getUpdates?offset=${_tgrOffset + 1}&timeout=20&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`);
+    const r = await fetch(`${_tgrApiBase()}/bot${token}/getUpdates?offset=${_tgrOffset + 1}&timeout=20&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`);
     const j: any = await r.json();
     if (j && j.ok && Array.isArray(j.result)) {
       for (const upd of j.result) {
@@ -7151,8 +7167,23 @@ app.post('/pub/telegram-receiver/config', (req, res) => {
   try { const b = req.body || {}; if (b.ativo != null) setPubFlag('telegram_receiver_ativo', b.ativo ? '1' : '0'); res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1' }); }
   catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
 });
+// liga/desliga o SERVIDOR DE 2GB (bot "muda de casa"). Ao ligar, faz logOut no Telegram cloud pra o bot migrar pro servidor local.
+app.post('/pub/telegram-receiver/local-api', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const token = _tgrToken(); if (!token) return res.json({ ok: false, erro: 'sem token do Telegram configurado' });
+    if (b.ativo) {
+      let logout = 'nao-tentado';
+      try { const r = await fetch(`${TGR_API}/bot${token}/logOut`, { method: 'POST' }); const jj: any = await r.json(); logout = JSON.stringify(jj); } catch (e: any) { logout = 'erro: ' + String((e && e.message) || e); }
+      setPubFlag('telegram_local_api_base', 'http://telegram-bot-api:8081');
+      return res.json({ ok: true, ativo: true, base: 'http://telegram-bot-api:8081', logout });
+    }
+    setPubFlag('telegram_local_api_base', '');
+    res.json({ ok: true, ativo: false, base: '' });
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 app.get('/pub/telegram-receiver/status', (_req, res) => {
-  res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), offset: _tgrOffset });
+  res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), offset: _tgrOffset, local_api: _tgrApiBase() !== TGR_API, base: _tgrApiBase() });
 });
 
 
