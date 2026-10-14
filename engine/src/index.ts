@@ -457,7 +457,7 @@ async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: st
   if (tipo === 'audio') {
     return evo(`/message/sendWhatsAppAudio/${num.instancia}`, 'POST', { number: para, audio: url });
   }
-  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url };
   if (legenda) body.caption = preenche(legenda);
   if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
@@ -2538,18 +2538,21 @@ function _alvosDisparo(p: any): { projeto: string; para: string; grupo: boolean 
 
 function _enfileiraDisparo(p: any): number {
   const alvos = _alvosDisparo(p);
-  const blocos = (p.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+  const blocos = _resolverBlocosOd(p.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
   if (!alvos.length || !blocos.length) return 0;
   const intervalo = Math.max(1, Number(p.intervaloSegundos || 12));
   const base = p.agendamento ? new Date(p.agendamento).getTime() : Date.now();
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
+  const selInst: string[] = Array.isArray(p.instancias) ? p.instancias.map((x: any) => String(x)).filter(Boolean) : []; // [+seletor-numero]
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
   let n = 0;
   const tx = db.transaction(() => {
     alvos.forEach((a, i) => {
       blocos.forEach((b: any, j: number) => {
         const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
         const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
-        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora());
+        const _inst = (!a.grupo && selInst.length) ? selInst[i % selInst.length] : null; // [+seletor-numero]
+        const _st = _inst ? 'cmp_multi' : 'camp_pend';
+        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), _st, _inst, quando, agora());
         n++;
       });
     });
@@ -2559,12 +2562,12 @@ function _enfileiraDisparo(p: any): number {
 }
 
 app.post('/disparo/enviar', (req, res) => {
-  try { const n = _enfileiraDisparo(req.body || {}); res.json({ ok: true, enfileirados: n }); }
+  try { const n = _enfileiraDisparo(req.body || {}); _salvarEnvio({ canal: 'whatsapp', tipo: 'disparo-rapido', payload: req.body || {} }); res.json({ ok: true, enfileirados: n }); }
   catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 app.post('/disparo/sequencia', (req, res) => {
-  try { let n = 0; for (const passo of (((req.body || {}).sequencia) || [])) n += _enfileiraDisparo(passo); res.json({ ok: true, enfileirados: n }); }
+  try { let n = 0; for (const passo of (((req.body || {}).sequencia) || [])) n += _enfileiraDisparo(passo); _salvarEnvio({ canal: 'whatsapp', tipo: 'sequencia', payload: req.body || {} }); res.json({ ok: true, enfileirados: n }); }
   catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
@@ -3308,6 +3311,26 @@ app.post('/fluxo/pasta', (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// [+merge] acrescenta nós/arestas a uma campanha existente (monta fluxos grandes em partes, sem reenviar tudo).
+app.post('/fluxo/campanha/merge', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || '');
+    const row = db.prepare(`SELECT fluxo_json FROM fluxo_campanhas WHERE id=?`).get(id) as any;
+    if (!row) return res.json({ ok: false, erro: 'nao_encontrada' });
+    let fx: any = {}; try { fx = JSON.parse(row.fluxo_json || '{}'); } catch { fx = {}; }
+    const nodes: any[] = Array.isArray(fx.nodes) ? fx.nodes : [];
+    const edges: any[] = Array.isArray(fx.edges) ? fx.edges : [];
+    const temN = new Set(nodes.map((n: any) => String(n.id)));
+    for (const n of (Array.isArray(b.nodes) ? b.nodes : [])) { if (n && !temN.has(String(n.id))) { nodes.push(n); temN.add(String(n.id)); } }
+    const temE = new Set(edges.map((e: any) => String(e.id)));
+    for (const e of (Array.isArray(b.edges) ? b.edges : [])) { if (e && !temE.has(String(e.id))) { edges.push(e); temE.add(String(e.id)); } }
+    if (Array.isArray(b.instancias)) (fx as any).instancias = b.instancias;
+    fx.nodes = nodes; fx.edges = edges;
+    const fluxoJson = JSON.stringify(fx);
+    db.prepare(`UPDATE fluxo_campanhas SET fluxo_json=?, qtd_nos=?, atualizado_em=? WHERE id=?`).run(fluxoJson, _contaNos(fluxoJson), agora(), id);
+    res.json({ ok: true, id, nos: nodes.length, arestas: edges.length });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
 console.log('[etapa17] módulo de fluxo visual (campanhas/pastas) carregado');
 
 
@@ -3387,16 +3410,17 @@ function _compilarFluxoIndividual(camp: any, simular = false): { grupos: number;
   if (!tagNodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem bloco Tag de entrada'] };
   const mapa: any = {};
   for (const tn of tagNodes) for (const c of _contatosPorTags(_dataDoNo(tn).tags || [])) mapa[c.id] = c;
+  const selInst: string[] = Array.isArray((fluxo as any).instancias) ? (fluxo as any).instancias.map((x: any) => String(x)).filter(Boolean) : []; // [+seletor-numero]
   const contatos = Object.values(mapa) as any[];
   if (!contatos.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['nenhum contato com essas tags'] };
   let inicio: string | null = null;
   for (const tn of tagNodes) { const alvo = (prox[tn.id] || [])[0]; if (alvo) { inicio = alvo; break; } }
   if (!inicio) return { grupos: contatos.length, mensagens: 0, ate: '', erros: ['o bloco Tag não está ligado a nada'] };
   const base = Date.now();
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   let offset = 0; let msgs = 0; let maxWhen = base;
   const padrao = (CONFIG as any).projetoPadrao || 'teclado';
-  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio' };
+  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio', documento: 'documento' }; // [+documento]
   const andar = db.transaction(() => {
     let atual: string | null = inicio; let guard = 0; const visto: any = {};
     while (atual && guard < 200) {
@@ -3405,13 +3429,15 @@ function _compilarFluxoIndividual(camp: any, simular = false): { grupos: number;
       const t = _tipoNo(n); const d = _dataDoNo(n);
       if (t === 'timer') { const val = Math.max(0, Number(d.valor ?? 1)); offset += val * _msUnidade(d.unidade || 'Dias'); }
       else if (t === 'whatsapp') {
-        const blocos = (d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+        const blocos = _resolverBlocosOd(d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
         contatos.forEach((c: any, ci: number) => {
           blocos.forEach((b: any, bi: number) => {
             const when = new Date(base + offset + ci * 12000 + bi * 2000);
             if (when.getTime() > maxWhen) maxWhen = when.getTime();
-            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'document');
-            if (!simular) ins.run(randomUUID(), c.projeto || padrao, String(c.telefone), 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id), String(n.id));
+            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'documento');
+            const _inst = selInst.length ? selInst[ci % selInst.length] : null; // [+seletor-numero]
+            const _st = _inst ? 'cmp_multi' : 'camp_pend';
+            if (!simular) ins.run(randomUUID(), c.projeto || padrao, String(c.telefone), 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), _st, _inst, when.toISOString(), agora(), String(camp.id), String(n.id));
             msgs++;
           });
         });
@@ -3426,6 +3452,7 @@ function _compilarFluxoIndividual(camp: any, simular = false): { grupos: number;
 
 // compila o fluxo -> enfileira em fila_envio (status camp_pend). Retorna resumo.
 function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens: number; ate: string; erros: string[] } {
+  if (String(camp?.tipo || '') === 'ig_individual') return { grupos: 0, mensagens: 0, ate: '', erros: ['Instagram ainda não conectado (falta a permissão instagram_manage_messages da Meta). O fluxo está salvo e dispara automaticamente quando o Instagram for conectado.'] }; // [+instagram] casca: nunca envia por WhatsApp
   if (String(camp?.tipo || '') === 'individual') return _compilarFluxoIndividual(camp, simular); // [etapa27] canvas individual (contatos) — caminho dos grupos fica intacto
   const erros: string[] = [];
   let fluxo: any = {}; try { fluxo = JSON.parse(camp.fluxo_json || '{}'); } catch { return { grupos: 0, mensagens: 0, ate: '', erros: ['fluxo_json invalido'] }; }
@@ -3439,7 +3466,9 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
   if (!tagNodes.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['sem bloco Tag de entrada'] };
   const mapaGrupos: any = {};
   for (const tn of tagNodes) for (const g of _gruposPorTags(_dataDoNo(tn).tags || [])) mapaGrupos[g.id] = g;
+  const selInst: string[] = Array.isArray((fluxo as any).instancias) ? (fluxo as any).instancias.map((x: any) => String(x)).filter(Boolean) : []; // [+seletor-numero]
   const grupos = Object.values(mapaGrupos) as any[];
+  const gruposUso = (grupos as any[]).filter((g: any) => { const i = String(g.instancia || ''); return !!i && (!selInst.length || selInst.includes(i)); }); // [+seletor-numero] só grupos cujo número está dentro (e, se houver seleção, só os escolhidos)
   if (!grupos.length) return { grupos: 0, mensagens: 0, ate: '', erros: ['nenhum grupo com essas tags (marque as tags nos grupos em Gerenciar Grupos)'] };
   // começa a andar a partir do que o(s) Tag apontam
   let inicio: string | null = null;
@@ -3447,10 +3476,10 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
   if (!inicio) return { grupos: grupos.length, mensagens: 0, ate: '', erros: ['o bloco Tag não está ligado a nada'] };
 
   const base = Date.now();
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`); // [etapa27] +no_id (bloco de origem)
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,campanha_id,no_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`); // [etapa27] +no_id (bloco de origem) [+seletor-numero]
   let offset = 0; let msgs = 0; let maxWhen = base;
   const padrao = (CONFIG as any).projetoPadrao || 'teclado';
-  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio' };
+  const mapaMidia: any = { imagem: 'image', video: 'video', audio: 'audio', documento: 'documento' }; // [+documento]
   const andar = db.transaction(() => {
     let atual: string | null = inicio; let guard = 0;
     const visto: any = {};
@@ -3462,13 +3491,13 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
         const val = Math.max(0, Number(d.valor ?? 1));
         offset += val * _msUnidade(d.unidade || 'Dias');
       } else if (t === 'whatsapp') {
-        const blocos = (d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
-        grupos.forEach((g: any, gi: number) => {
+        const blocos = _resolverBlocosOd(d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+        gruposUso.forEach((g: any, gi: number) => {
           blocos.forEach((b: any, bi: number) => {
             const when = new Date(base + offset + gi * 12000 + bi * 2000);
             if (when.getTime() > maxWhen) maxWhen = when.getTime();
-            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'document');
-            if (!simular) ins.run(randomUUID(), g.projeto || padrao, String(g.id), 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', when.toISOString(), agora(), String(camp.id), String(n.id)); // [etapa27] +no_id
+            const tipo = b.tipo === 'texto' ? 'texto' : (mapaMidia[b.midia_tipo] || 'documento');
+            if (!simular) ins.run(randomUUID(), g.projeto || padrao, String(g.id), 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_multi', String(g.instancia || ''), when.toISOString(), agora(), String(camp.id), String(n.id)); // [etapa27] +no_id [+seletor-numero] envia pela instância do grupo
             msgs++;
           });
         });
@@ -3506,6 +3535,7 @@ app.post('/fluxo/campanha/ativar', (req, res) => {
     db.prepare(`UPDATE fluxo_campanhas SET ativo=?, atualizado_em=? WHERE id=?`).run(ativo, agora(), id);
     if (!ativo) return res.json({ ok: true, ativo: 0, cancelados: true });
     const r = _compilarFluxo(camp, false);
+    _salvarEnvio({ canal: String(camp.tipo || '') === 'ig_individual' ? 'instagram' : 'whatsapp', tipo: 'fluxo', payload: { campanhaId: id, tipoFluxo: camp.tipo, agendados: r.mensagens, grupos: r.grupos } });
     res.json({ ok: true, ativo: 1, agendados: r.mensagens, grupos: r.grupos, ate: r.ate, erros: r.erros });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
@@ -3515,7 +3545,7 @@ app.get('/fluxo/campanha/:id/status', (req, res) => {
   try {
     const id = String(req.params.id);
     const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE campanha_id=? GROUP BY status`).all(id);
-    const prox = db.prepare(`SELECT MIN(agendado_para) p FROM fila_envio WHERE campanha_id=? AND status='camp_pend'`).get(id) as any;
+    const prox = db.prepare(`SELECT MIN(agendado_para) p FROM fila_envio WHERE campanha_id=? AND status IN ('camp_pend','cmp_multi')`).get(id) as any;
     res.json({ ok: true, porStatus, proximoEnvio: prox?.p || null });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
@@ -3951,6 +3981,113 @@ app.post('/disparo/enviar-onedrive', (req, res) => {
 console.log('[etapa21] rclone OneDrive no motor: /media (público interno) + /pub/onedrive/rclone-status|listar|baixar + /disparo/enviar-onedrive');
 
 // ============================================================================
+// [+envios-salvos +biblioteca-onedrive] (14/10) — add-only
+//  (1) ENVIOS SALVOS: todo envio cai automatico num historico; da pra nomear,
+//      duplicar (reenviar com edicoes) e excluir. Cobre disparo rapido, multi,
+//      lote, sequencia, fluxo e Instagram — nos 5 lugares do app.
+//  (2) BIBLIOTECA ONEDRIVE p/ fluxos: _resolverBlocosOd resolve blocos de midia
+//      que apontam pra arquivo no OneDrive (campo od) -> URL publica; /midia/upload
+//      sobe arquivo (img/pdf/audio/doc) pro OneDrive; /fluxo/campanha/duplicar.
+// ============================================================================
+try {
+  db.exec(`
+  CREATE TABLE IF NOT EXISTS envios_salvos (
+    id TEXT PRIMARY KEY, nome TEXT, canal TEXT, tipo TEXT, origem TEXT, projeto TEXT,
+    resumo TEXT, payload_json TEXT, criado_em TEXT, atualizado_em TEXT
+  );
+  CREATE INDEX IF NOT EXISTS ix_envios_canal ON envios_salvos(canal, atualizado_em);
+  `);
+} catch (e) { console.error('[envios] schema erro (ignorado):', e); }
+
+function _resumoEnvioBlocos(blocos: any[]): string {
+  try { return (blocos || []).map((b: any) => b.tipo === 'texto' ? '📝' : b.tipo === 'video' ? '🎬' : b.tipo === 'audio' ? '🎤' : (b.tipo === 'documento' || b.tipo === 'document') ? '📎' : '🖼️').join(' '); } catch { return ''; }
+}
+// salva um envio no historico — NUNCA quebra o disparo (try/catch total).
+function _salvarEnvio(info: { canal?: string; tipo?: string; origem?: string; payload?: any; nome?: string }) {
+  try {
+    const p = info.payload || {};
+    const blocos = Array.isArray(p.blocos) ? p.blocos : (Array.isArray(p.sequencia) && p.sequencia[0] && Array.isArray(p.sequencia[0].blocos) ? p.sequencia[0].blocos : []);
+    let resumo = _resumoEnvioBlocos(blocos);
+    if (Array.isArray(p.sequencia) && p.sequencia.length) resumo += ` · ${p.sequencia.length} passo(s)`;
+    if (info.tipo === 'fluxo') resumo = `🧩 fluxo` + (p.grupos ? ` · ${p.grupos} alvo(s)` : '');
+    const nome = String(info.nome || p.nomeEnvio || '').trim() || `Envio ${new Date().toLocaleString('pt-BR')}`;
+    db.prepare(`INSERT INTO envios_salvos(id,nome,canal,tipo,origem,projeto,resumo,payload_json,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), nome, String(info.canal || 'whatsapp'), String(info.tipo || 'disparo'), String(info.origem || p.origem || ''), String(p.projeto || ''), resumo, JSON.stringify(p), agora(), agora());
+  } catch (e) { /* historico e best-effort */ }
+}
+
+// resolve blocos de midia do OneDrive (campo od) -> URL publica p/ a Evolution. Guard: so com od e sem url.
+function _resolverBlocosOd(blocos: any[]): any[] {
+  try {
+    return (blocos || []).map((b: any) => {
+      if (b && b.tipo && b.tipo !== 'texto' && (b.od || b.onedrive) && !String(b.url || '').trim()) {
+        try { return { ...b, url: _odBaixarPub(String(b.od || b.onedrive)) }; } catch { return b; }
+      }
+      return b;
+    });
+  } catch { return blocos || []; }
+}
+
+// --- Historico de envios (endpoints) ---
+app.get('/envios', (req, res) => {
+  try {
+    const conds: string[] = []; const args: any[] = [];
+    for (const k of ['canal', 'tipo', 'origem', 'projeto']) { const v = String((req.query as any)[k] || ''); if (v) { conds.push(`${k}=?`); args.push(v); } }
+    const where = conds.length ? ('WHERE ' + conds.join(' AND ')) : '';
+    const rows = db.prepare(`SELECT id,nome,canal,tipo,origem,projeto,resumo,criado_em,atualizado_em FROM envios_salvos ${where} ORDER BY datetime(atualizado_em) DESC, datetime(criado_em) DESC LIMIT 300`).all(...args);
+    res.json({ ok: true, envios: rows });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/envios/:id', (req, res) => {
+  try { const r = db.prepare(`SELECT * FROM envios_salvos WHERE id=?`).get(String(req.params.id)) as any; if (!r) return res.json({ ok: false, erro: 'nao_encontrado' }); let payload: any = {}; try { payload = JSON.parse(r.payload_json || '{}'); } catch { /* */ } res.json({ ok: true, envio: { ...r, payload } }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/envios/salvar', (req, res) => {
+  try { const b = req.body || {}; _salvarEnvio({ canal: b.canal, tipo: b.tipo, origem: b.origem, nome: b.nome, payload: b.payload || b }); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/envios/:id/nome', (req, res) => {
+  try { const nome = String((req.body || {}).nome || '').trim(); if (!nome) return res.json({ ok: false, erro: 'nome_vazio' }); const r = db.prepare(`UPDATE envios_salvos SET nome=?, atualizado_em=? WHERE id=?`).run(nome, agora(), String(req.params.id)); res.json({ ok: true, alterados: r.changes }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/envios/:id/duplicar', (req, res) => {
+  try { const r = db.prepare(`SELECT * FROM envios_salvos WHERE id=?`).get(String(req.params.id)) as any; if (!r) return res.json({ ok: false, erro: 'nao_encontrado' }); let payload: any = {}; try { payload = JSON.parse(r.payload_json || '{}'); } catch { /* */ } res.json({ ok: true, envio: { ...r, payload }, sugestaoNome: (r.nome || 'Envio') + ' (copia)' }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/envios/excluir', (req, res) => {
+  try { const id = String((req.body || {}).id || ''); const r = db.prepare(`DELETE FROM envios_salvos WHERE id=?`).run(id); res.json({ ok: true, excluidos: r.changes }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// --- Upload geral de arquivo pro OneDrive (img/pdf/audio/doc) — base64 ---
+app.post('/midia/upload', (req: any, res: any) => {
+  try {
+    if (!_rcloneOk()) return res.json({ ok: false, erro: 'rclone_indisponivel' });
+    const b = req.body || {}; const pasta = String(b.pasta || 'Fluxos-Midia').replace(/^\/+|\/+$/g, ''); let nome = String(b.nome || '').replace(/[^a-zA-Z0-9._ -]/g, '_'); const b64 = String(b.b64 || '');
+    if (!nome || !b64) return res.status(400).json({ ok: false, erro: 'faltou_dados' });
+    const data = b64.includes(',') ? b64.split(',')[1] : b64; const buf = Buffer.from(data, 'base64');
+    if (buf.length > 60 * 1024 * 1024) return res.status(413).json({ ok: false, erro: 'arquivo_grande_max_60mb' });
+    const tmp = `${MEDIA_DIR}/up-${randomUUID().slice(0, 8)}-${nome}`; fs.writeFileSync(tmp, buf);
+    try { _rclone(['copyto', tmp, _odRemotePath(pasta + '/' + nome)], { timeoutMs: 180000 }); } finally { try { fs.unlinkSync(tmp); } catch { /* */ } }
+    res.json({ ok: true, caminho: pasta + '/' + nome, nome });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
+// --- Duplicar uma campanha de fluxo (copia o fluxo_json num novo, desativado) ---
+app.post('/fluxo/campanha/duplicar', (req, res) => {
+  try {
+    const b = req.body || {}; const src = db.prepare(`SELECT * FROM fluxo_campanhas WHERE id=?`).get(String(b.id || '')) as any;
+    if (!src) return res.json({ ok: false, erro: 'nao_encontrada' });
+    const novoId = randomUUID(); const nome = String(b.nome || ((src.nome || 'Fluxo') + ' (copia)'));
+    db.prepare(`INSERT INTO fluxo_campanhas(id,nome,pasta_id,tipo,ativo,fluxo_json,qtd_nos,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(novoId, nome, src.pasta_id || null, String(src.tipo || 'grupos'), 0, src.fluxo_json || '{}', Number(src.qtd_nos || 0), agora(), agora());
+    res.json({ ok: true, id: novoId, nome });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[+envios-salvos] /envios (list/get/salvar/nome/duplicar/excluir) + /midia/upload + /fluxo/campanha/duplicar + _resolverBlocosOd(OneDrive nos fluxos)');
+
+
+// ============================================================================
 // ETAPA 22 (08/10) — DISPARO MULTI-NÚMERO EM PARALELO  [add-only, não mexe no antigo]
 // Permite: (a) escolher POR QUAL número cada grupo é enviado; (b) usar 1,2,3+
 // números ao mesmo tempo, dividindo os grupos entre eles (modo auto) OU atribuindo
@@ -3975,7 +4112,7 @@ async function enviarTextoVia(instancia: string, para: string, texto: string) {
 async function enviarMidiaVia(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
   if (!url) throw new Error('midia_sem_url');
   if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url });
-  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url };
   if (legenda) body.caption = legenda;
   if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
@@ -4108,6 +4245,7 @@ app.post('/disparo/enviar-multi', async (req, res) => {
     const baseTs = p.agendadoPara ? new Date(p.agendadoPara).getTime() : undefined; // [etapa26] agendar vários disparos (hora opcional vinda do app)
     const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto, (baseTs && !isNaN(baseTs) ? baseTs : undefined));
     const porNumero = assigns.reduce((o: any, a) => ((o[a.instancia] = (o[a.instancia] || 0) + 1), o), {});
+    _salvarEnvio({ canal: 'whatsapp', tipo: 'disparo-multi', payload: p });
     res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, marcarTodos: !!p.marcarTodos, pulados });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
@@ -4160,6 +4298,7 @@ app.post('/disparo/enviar-lote', (req, res) => {
     const intervalo = Math.max(1, Number(p.intervaloSegundos || 8));
     const assigns = jids.map((j) => ({ jid: j, instancia }));
     const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, String(p.projeto || 'teclado'));
+    _salvarEnvio({ canal: 'whatsapp', tipo: 'disparo-lote', payload: p });
     res.json({ ok: true, enfileirados: n, grupos: jids.length, instancia, marcarTodos: !!p.marcarTodos, jids });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
@@ -4210,7 +4349,7 @@ async function enviarTextoViaMk(instancia: string, para: string, texto: string) 
 async function enviarMidiaViaMk(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
   if (!url) throw new Error('midia_sem_url');
   if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url, mentionsEveryOne: true });
-  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+  const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url, mentionsEveryOne: true };
   if (legenda) body.caption = legenda;
   if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
@@ -4258,6 +4397,20 @@ async function tickCampanhaMultiMk() {
 }
 setInterval(() => { tickCampanhaMultiMk().catch(() => {}); }, 1000);
 console.log('[etapa24] marcar membros (menção @ todos) no disparo: { marcarTodos:true } em /disparo/enviar-lote e /disparo/enviar-multi');
+
+// ============== [instagram] CASCA DM 1-a-1 — só envia depois da permissão instagram_manage_messages ==============
+// Guarda de segurança: por enquanto NÃO envia; responde claro pro app mostrar o aviso.
+// Quando a Meta aprovar, a chamada à Graph API (POST /{ig-user-id}/messages) entra aqui, e a flag vira '1'.
+function _igConectado(): boolean { return pubFlag('ig_manage_messages_ok', '0') === '1'; }
+app.get('/ig/status', (_req, res) => {
+  res.json({ ok: true, conectado: _igConectado(), motivo: _igConectado() ? '' : 'falta permissão instagram_manage_messages (App Review da Meta)' });
+});
+app.post('/ig/enviar', (_req, res) => {
+  _salvarEnvio({ canal: 'instagram', tipo: 'ig-rapido', payload: _req.body || {} });
+  if (!_igConectado()) return res.json({ ok: false, erro: 'Instagram ainda não conectado (falta a permissão instagram_manage_messages da Meta). Monte e salve os fluxos; eles disparam quando o Instagram for conectado.' });
+  res.json({ ok: false, erro: 'Envio de Instagram ainda não implementado (aguardando conexão).' });
+});
+console.log('[instagram] casca DM 1-a-1 carregada (/ig/status, /ig/enviar) — envia só após instagram_manage_messages');
 
 // ============================================================================
 // ETAPA 25 (08/10) — EDITAR GRUPOS EM MASSA: nome / descrição / foto [add-only]
