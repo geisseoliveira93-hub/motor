@@ -2957,6 +2957,11 @@ app.post('/pub/agendar', (req, res) => {
       const dup = db.prepare(`SELECT id FROM fila_publicacao WHERE canal_id=? AND onedrive_ref=? AND status NOT IN ('cancelado','publicado')`).get(String(b.canal_id || ''), String(b.onedrive_ref)) as any;
       if (dup) return res.json({ ok: true, id: dup.id, jaExistia: true });
     }
+    // [#2 nuvem] trava anti-conflito de slot: mesmo canal + mesmo horario ja ocupado (a menos que forcar:true)
+    if (!b.forcar && b.data_agendada) {
+      const slot = db.prepare(`SELECT id, titulo FROM fila_publicacao WHERE canal_id=? AND data_agendada=? AND status NOT IN ('cancelado','publicado')`).get(String(b.canal_id || ''), String(b.data_agendada)) as any;
+      if (slot) return res.json({ ok: false, conflito: true, existente: { id: slot.id, titulo: String(slot.titulo || '') }, erro: 'Ja existe uma publicacao agendada nesse canal e horario. Envie forcar:true para agendar mesmo assim.' });
+    }
     db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,onedrive_item_id,arquivo_nome,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,prioridade,trial_reels,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(id, String(b.canal_id || ''), String(b.projeto || ''), b.onedrive_ref || null, b.onedrive_item_id || null, b.arquivo_nome || null, b.thumb_ref || null, String(b.formato || 'vertical'), JSON.stringify(b.plataformas || []), b.titulo || null, b.descricao || null, b.descricao_social || null, String(b.data_agendada || agora()), 'agendado', Number(b.prioridade || 0), b.trial_reels ? 1 : 0, agora(), agora());
     res.json({ ok: true, id });
@@ -4872,6 +4877,50 @@ app.post('/pub/meta/vincular', async (req, res) => {
     pbConexao(String(canalId), 'facebook', 'conectado', pd.name || pageId);
     if (igId) pbConexao(String(canalId), 'instagram', 'conectado', igId);
     res.json({ ok: true, pageId, igId });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// [#2 nuvem] vincular Meta por TOKEN manual (Usuario do Sistema / Page token de longa duracao),
+// sem depender do login OAuth no navegador (apps tipo Empresa, em negocios diferentes).
+// Recebe { canalId, pageId, token }: tenta obter o PAGE access token real + IG vinculado a partir
+// do token informado e salva igual ao /pub/meta/vincular (facebook+instagram por canal). ADITIVO.
+app.post('/pub/meta/token-manual', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const canalId = String(b.canalId || b.canal_id || '').trim();
+    const pageId = String(b.pageId || b.page_id || '').trim();
+    const tokenIn = String(b.token || b.pageToken || b.page_token || '').trim();
+    if (!canalId || !pageId || !tokenIn) return res.status(400).json({ ok: false, erro: 'canalId, pageId e token obrigatorios' });
+    let pageTok = tokenIn; let nome = ''; let igId = '';
+    // 1) tenta derivar o page token (quando o token informado e de usuario/usuario-do-sistema com acesso a pagina)
+    try {
+      const pr = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}?fields=access_token,name,instagram_business_account&access_token=${encodeURIComponent(tokenIn)}`);
+      const pd = await pr.json() as any;
+      if (pd && pd.access_token) pageTok = String(pd.access_token);
+      if (pd && pd.name) nome = String(pd.name);
+      if (pd && pd.instagram_business_account && pd.instagram_business_account.id) igId = String(pd.instagram_business_account.id);
+    } catch { /* usa o token informado como page token */ }
+    // 2) se ainda nao achou o IG, tenta de novo ja com o page token
+    if (!igId || !nome) {
+      try {
+        const ir = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}?fields=name,instagram_business_account&access_token=${encodeURIComponent(pageTok)}`);
+        const idd = await ir.json() as any;
+        if (!nome && idd && idd.name) nome = String(idd.name);
+        if (!igId && idd && idd.instagram_business_account && idd.instagram_business_account.id) igId = String(idd.instagram_business_account.id);
+      } catch { /* ok */ }
+    }
+    // 3) valida que o page token enxerga a pagina (GET /{pageId} devolve id)
+    try {
+      const vr = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}?fields=id&access_token=${encodeURIComponent(pageTok)}`);
+      const vd = await vr.json() as any;
+      if (!vd || !vd.id) return res.status(400).json({ ok: false, erro: 'token nao tem acesso a essa pagina (confira o pageId e as permissoes do token)', detalhe: (vd && vd.error && vd.error.message) || '' });
+    } catch (e: any) { return res.status(400).json({ ok: false, erro: 'falha ao validar token: ' + String(e?.message || e) }); }
+    pbTokSalvar(canalId, 'facebook', { accessToken: pageTok, refreshToken: null, expiresAt: null, scope: PB_META_SCOPES, conta: nome || pageId });
+    pbTokSalvar(canalId, 'instagram', { accessToken: pageTok, refreshToken: null, expiresAt: null, scope: PB_META_SCOPES, conta: igId || '' });
+    pbCanalSet(canalId, 'fb_page_id', pageId);
+    if (igId) pbCanalSet(canalId, 'ig_business_id', igId);
+    pbConexao(canalId, 'facebook', 'conectado', nome || pageId);
+    if (igId) pbConexao(canalId, 'instagram', 'conectado', igId);
+    res.json({ ok: true, canalId, pageId, igId: igId || null, conta: nome || pageId, derivouPageToken: pageTok !== tokenIn });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
 // vincula o Threads (usa o token do Meta/Facebook; descobre threads_user_id)
