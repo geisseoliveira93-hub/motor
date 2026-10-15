@@ -634,6 +634,8 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
+  if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
+  if (req.path.startsWith('/e-api/')) return next();  // [evento] API publica do evento (inscricao)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -7820,6 +7822,143 @@ app.post('/editor/reframe', _editorAcao);
 app.post('/editor/tela-dividida', _editorAcao);
 app.post('/editor/prompt', _editorAcao);
 app.post('/editor/limpar-audio', _editorAcao);
+// ============================================================================
+// #13 EVENTOS MULTI-AULA — agrupa N aulas/webinarios num evento (ex.: lancamento de 3 dias).
+// Aditivo. Reusa a sala de webinario real (/w/:slug) + upsertContato/aplicarTag/rodarAutomacoes + _ndOk.
+// Config (app, x-api-key): /eventos /evento /evento/aula /evento/:id/inscricoes
+// Publico: /e/:slug (pagina do evento com a programacao) + /e-api/:slug/inscrever (inscricao unica -> tag -> entra no fluxo)
+// ============================================================================
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS webinar_eventos (
+      id TEXT PRIMARY KEY, slug TEXT UNIQUE, projeto TEXT, nome TEXT, descricao TEXT,
+      tag_inscrito TEXT, redirecionar TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT, atualizado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS webinar_evento_aulas (
+      id TEXT PRIMARY KEY, evento_id TEXT, ordem INTEGER DEFAULT 0, titulo TEXT,
+      webinario_slug TEXT, data_hora TEXT, duracao_min INTEGER DEFAULT 60,
+      tag_presenca TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS webinar_evento_inscricoes (
+      id TEXT PRIMARY KEY, evento_id TEXT, contato_id TEXT, nome TEXT, email TEXT, telefone TEXT, origem TEXT, criado_em TEXT
+    );
+  `);
+
+  const evSlug = (s: string): string => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || ('e-' + randomUUID().slice(0, 6));
+  const evBase = (): string => String(PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const evGet = (slugOrId: string): any => db.prepare(`SELECT * FROM webinar_eventos WHERE slug=? OR id=?`).get(String(slugOrId), String(slugOrId)) as any;
+  const evAulas = (eventoId: string): any[] => db.prepare(`SELECT * FROM webinar_evento_aulas WHERE evento_id=? AND ativo=1 ORDER BY ordem ASC, data_hora ASC`).all(String(eventoId)) as any[];
+
+  // -------- config (app, x-api-key) --------
+  app.get('/eventos', (req: any, res: any) => {
+    try {
+      const projeto = String(req.query.projeto || '');
+      const rows = (projeto
+        ? db.prepare(`SELECT * FROM webinar_eventos WHERE projeto=? ORDER BY criado_em DESC LIMIT 100`).all(projeto)
+        : db.prepare(`SELECT * FROM webinar_eventos ORDER BY criado_em DESC LIMIT 100`).all()) as any[];
+      for (const ev of rows) {
+        ev.aulas = (db.prepare(`SELECT COUNT(*) n FROM webinar_evento_aulas WHERE evento_id=? AND ativo=1`).get(ev.id) as any).n;
+        ev.inscritos = (db.prepare(`SELECT COUNT(*) n FROM webinar_evento_inscricoes WHERE evento_id=?`).get(ev.id) as any).n;
+        ev.link = evBase() + '/e/' + ev.slug;
+      }
+      _ndOk(res, { eventos: rows });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.get('/evento/:id', (req: any, res: any) => {
+    try {
+      const ev = evGet(String(req.params.id)); if (!ev) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+      ev.aulasLista = evAulas(ev.id);
+      ev.inscritos = (db.prepare(`SELECT COUNT(*) n FROM webinar_evento_inscricoes WHERE evento_id=?`).get(ev.id) as any).n;
+      ev.link = evBase() + '/e/' + ev.slug;
+      _ndOk(res, { evento: ev });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/evento', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const nome = String(b.nome || 'Evento').trim();
+      const existe = b.id ? evGet(String(b.id)) : null;
+      const id = existe ? existe.id : (String(b.id || '').trim() || randomUUID());
+      const slug = existe ? existe.slug : evSlug(nome + '-' + id.slice(0, 4));
+      if (existe) {
+        db.prepare(`UPDATE webinar_eventos SET projeto=?, nome=?, descricao=?, tag_inscrito=?, redirecionar=?, ativo=?, atualizado_em=? WHERE id=?`)
+          .run(String(b.projeto || existe.projeto || ''), nome, String(b.descricao || ''), String(b.tag_inscrito || ''), String(b.redirecionar || ''), b.ativo === false ? 0 : 1, agora(), id);
+      } else {
+        db.prepare(`INSERT INTO webinar_eventos(id,slug,projeto,nome,descricao,tag_inscrito,redirecionar,ativo,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,1,?,?)`)
+          .run(id, slug, String(b.projeto || ''), nome, String(b.descricao || ''), String(b.tag_inscrito || ''), String(b.redirecionar || ''), agora(), agora());
+      }
+      _ndOk(res, { id, slug, link: evBase() + '/e/' + slug });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/evento/remover', (req: any, res: any) => {
+    try {
+      const id = String((req.body || {}).id || '');
+      db.prepare(`DELETE FROM webinar_evento_aulas WHERE evento_id=?`).run(id);
+      db.prepare(`DELETE FROM webinar_evento_inscricoes WHERE evento_id=?`).run(id);
+      db.prepare(`DELETE FROM webinar_eventos WHERE id=?`).run(id);
+      _ndOk(res, { removido: true });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/evento/aula', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      if (!b.evento_id) return res.status(400).json({ ok: false, erro: 'evento_id_obrigatorio' });
+      const existe = b.id ? db.prepare(`SELECT * FROM webinar_evento_aulas WHERE id=?`).get(String(b.id)) as any : null;
+      const id = existe ? existe.id : randomUUID();
+      if (existe) {
+        db.prepare(`UPDATE webinar_evento_aulas SET ordem=?, titulo=?, webinario_slug=?, data_hora=?, duracao_min=?, tag_presenca=?, ativo=? WHERE id=?`)
+          .run(Number(b.ordem) || 0, String(b.titulo || ''), String(b.webinario_slug || ''), String(b.data_hora || ''), Number(b.duracao_min) || 60, String(b.tag_presenca || ''), b.ativo === false ? 0 : 1, id);
+      } else {
+        db.prepare(`INSERT INTO webinar_evento_aulas(id,evento_id,ordem,titulo,webinario_slug,data_hora,duracao_min,tag_presenca,ativo,criado_em) VALUES(?,?,?,?,?,?,?,?,1,?)`)
+          .run(id, String(b.evento_id), Number(b.ordem) || 0, String(b.titulo || ''), String(b.webinario_slug || ''), String(b.data_hora || ''), Number(b.duracao_min) || 60, String(b.tag_presenca || ''), agora());
+      }
+      _ndOk(res, { id });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/evento/aula/remover', (req: any, res: any) => {
+    try { db.prepare(`DELETE FROM webinar_evento_aulas WHERE id=?`).run(String((req.body || {}).id || '')); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+  });
+  app.get('/evento/:id/inscricoes', (req: any, res: any) => {
+    try {
+      const ev = evGet(String(req.params.id)); if (!ev) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+      const rows = db.prepare(`SELECT * FROM webinar_evento_inscricoes WHERE evento_id=? ORDER BY criado_em DESC LIMIT 1000`).all(ev.id) as any[];
+      _ndOk(res, { inscricoes: rows, total: rows.length });
+    } catch (e) { _ndErr(res, e); }
+  });
+
+  // -------- publico: pagina do evento + inscricao --------
+  app.get('/e/:slug', (req: any, res: any) => {
+    const ev = evGet(String(req.params.slug));
+    if (!ev || !ev.ativo) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Evento nao encontrado</h1>');
+    const aulas = evAulas(ev.id);
+    const fmtData = (s: string): string => { if (!s) return 'em breve'; try { return new Date(s).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch { return String(s); } };
+    const linhasAulas = aulas.map((a: any, i: number) => '<div class="aula"><div class="n">' + (i + 1) + '</div><div><div class="at">' + esc(a.titulo || ('Aula ' + (i + 1))) + '</div><div class="ad">' + esc(fmtData(a.data_hora)) + (a.duracao_min ? ' &middot; ' + a.duracao_min + 'min' : '') + '</div></div></div>').join('');
+    res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(ev.nome) + '</title>'
+      + '<style>body{margin:0;font:16px/1.5 system-ui,Segoe UI,Arial;background:#0e1116;color:#e6e6e6;display:flex;justify-content:center;padding:28px 16px}.card{width:100%;max-width:560px;background:#161b22;border:1px solid #2a313c;border-radius:14px;padding:24px}h1{font-size:24px;margin:0 0 6px}.desc{color:#9aa3b2;margin:0 0 18px}.aula{display:flex;gap:12px;align-items:center;padding:11px 12px;border:1px solid #2a313c;border-radius:10px;margin-bottom:9px;background:#0e1116}.aula .n{width:28px;height:28px;flex:none;border-radius:50%;background:#1db954;color:#07210f;font-weight:700;display:flex;align-items:center;justify-content:center}.at{font-weight:600}.ad{color:#9aa3b2;font-size:13px}label{display:block;margin:12px 0 5px;font-weight:600}input{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:9px;border:1px solid #2a313c;background:#0e1116;color:#e6e6e6;font-size:15px}button{margin-top:18px;width:100%;padding:13px;border:0;border-radius:9px;background:#1db954;color:#07210f;font-weight:700;font-size:16px;cursor:pointer}#ok{display:none;margin-top:16px;padding:12px;border-radius:9px;background:#0f2e1b;border:1px solid #1db95455}h3{margin:22px 0 10px;font-size:16px}</style></head><body><div class="card">'
+      + '<h1>' + esc(ev.nome) + '</h1>' + (ev.descricao ? '<p class="desc">' + esc(ev.descricao) + '</p>' : '')
+      + '<h3>Programacao (' + aulas.length + ' aula' + (aulas.length === 1 ? '' : 's') + ')</h3>' + (linhasAulas || '<p class="desc">Em breve.</p>')
+      + '<h3>Garanta sua vaga</h3><form id="frm"><label>Nome</label><input name="nome" required><label>WhatsApp</label><input name="telefone" type="tel" required><label>E-mail</label><input name="email" type="email"><button type="submit">Quero participar</button></form><div id="ok">✅ Inscricao confirmada! Voce vai receber os links de cada aula.</div></div>'
+      + '<script>document.getElementById("frm").onsubmit=async(e)=>{e.preventDefault();const d={};new FormData(e.target).forEach((v,k)=>d[k]=v);const r=await fetch("/e-api/' + ev.slug + '/inscrever",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});if(r.ok){e.target.style.display="none";document.getElementById("ok").style.display="block";' + (ev.redirecionar ? 'setTimeout(()=>location.href=' + JSON.stringify(String(ev.redirecionar)) + ',1400);' : '') + '}};</script></body></html>');
+  });
+  app.post('/e-api/:slug/inscrever', (req: any, res: any) => {
+    try {
+      const ev = evGet(String(req.params.slug)); if (!ev || !ev.ativo) return res.status(404).json({ ok: false });
+      const dados = (req.body && typeof req.body === 'object') ? req.body : {};
+      const tel = String(dados.telefone || dados.phone || dados.celular || dados.whatsapp || '').replace(/\D/g, '');
+      const nome = dados.nome || dados.name || '';
+      const email = dados.email || '';
+      let contatoId: string | null = null;
+      if (tel && tel.length >= 10) {
+        contatoId = upsertContato(ev.projeto, tel, nome, email, 'evento');
+        if (ev.tag_inscrito) aplicarTag(ev.projeto, contatoId, String(ev.tag_inscrito));
+        if (contatoId) rodarAutomacoes(ev.projeto, 'tag_adicionada', { contatoId, tag: String(ev.tag_inscrito || ''), telefone: tel, nome }).catch(() => {});
+      }
+      db.prepare(`INSERT INTO webinar_evento_inscricoes(id,evento_id,contato_id,nome,email,telefone,origem,criado_em) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(randomUUID(), ev.id, contatoId, String(nome), String(email), tel, 'pagina', agora());
+      res.json({ ok: true, redirecionar: ev.redirecionar || '' });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+}
 // ===================== FIM DO LOTE A =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
