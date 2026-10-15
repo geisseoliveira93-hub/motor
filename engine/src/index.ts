@@ -2310,9 +2310,11 @@ try { db.exec(`ALTER TABLE mensagens ADD COLUMN instancia TEXT`); } catch { /* j
 
 function hhmmCA(iso: string): string {
   try {
-    const d = new Date(iso); const hoje = new Date();
-    if (d.toDateString() !== hoje.toDateString()) return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+    const d = new Date(iso); // [+hora-brasilia] container roda em UTC -> formatar sempre no fuso de Brasília
+    const hojeBR = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+    const dBR = d.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+    if (dBR !== hojeBR) return d.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit' });
+    return d.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
   } catch { return ''; }
 }
 function statusAtendimentoCA(contatoId: string): { status: string; responsavel?: string; instancia?: string } {
@@ -2509,6 +2511,27 @@ app.post('/disparo/tag/criar', (req, res) => {
   res.json({ ok: true, nome, projeto });
 });
 
+// [+tag-busca] índice pra acelerar contagem/junção por tag (tag_id não era indexado; a PK começa por contato_id).
+try { db.exec(`CREATE INDEX IF NOT EXISTS ix_ct_tagid ON contato_tags(tag_id)`); } catch (e) { /* ja existe */ }
+
+// [+tag-busca] busca RÁPIDA de tags por prefixo/contendo (autocomplete) — sem contar a base inteira.
+// GET /disparo/tags-busca?projeto=&q=   -> { ok, tags:[{nome,n}] }  (prefixo primeiro, limite 20)
+app.get('/disparo/tags-busca', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const q = String(req.query.q || '').trim();
+    const conds: string[] = []; const args: any[] = [];
+    if (projeto) { conds.push('projeto=?'); args.push(projeto); }
+    if (q) { conds.push('nome LIKE ?'); args.push('%' + q + '%'); }
+    const where = conds.length ? ('WHERE ' + conds.join(' AND ')) : '';
+    const rows = db.prepare(`SELECT id, nome FROM tags ${where} ORDER BY CASE WHEN nome LIKE ? THEN 0 ELSE 1 END, nome LIMIT 20`).all(...args, q + '%') as any[];
+    const cnt = db.prepare(`SELECT COUNT(*) n FROM contato_tags WHERE tag_id=?`);
+    const tags = rows.map((r) => ({ nome: r.nome, n: ((cnt.get(r.id) as any)?.n) || 0 }));
+    res.json({ ok: true, tags });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[+tag-busca] /disparo/tags-busca (autocomplete rápido) + índice ix_ct_tagid');
+
 function _alvosDisparo(p: any): { projeto: string; para: string; grupo: boolean }[] {
   const out: { projeto: string; para: string; grupo: boolean }[] = [];
   const padrao = (CONFIG as any).projetoPadrao || 'teclado';
@@ -2524,17 +2547,27 @@ function _alvosDisparo(p: any): { projeto: string; para: string; grupo: boolean 
     const inc = (p.incluirTags || []); const exc = (p.excluirTags || []);
     if (!inc.length) return out;
     const ph = (a: any[]) => a.map(() => '?').join(',');
-    let sql = `SELECT DISTINCT c.id, c.telefone, c.projeto FROM contatos c
+    let sql = `SELECT c.id, c.telefone, c.projeto FROM contatos c
       JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id
       WHERE t.nome IN (${ph(inc)})`;
     const args: any[] = [...inc];
     if (exc.length) { sql += ` AND c.id NOT IN (SELECT ct2.contato_id FROM contato_tags ct2 JOIN tags t2 ON t2.id=ct2.tag_id WHERE t2.nome IN (${ph(exc)}))`; args.push(...exc); }
     if (p.projeto) { sql += ` AND c.projeto=?`; args.push(p.projeto); }
+    sql += ` GROUP BY c.id HAVING COUNT(DISTINCT t.nome)=${inc.length}`; // [+and-tags] precisa ter TODAS as tags incluidas (antes era OR)
     const rows = db.prepare(sql).all(...args) as any[];
     for (const r of rows) if (r.telefone) out.push({ projeto: r.projeto || p.projeto || padrao, para: String(r.telefone), grupo: false });
   }
   return out;
 }
+
+// [+envios-programados] colunas/tabela de "lote" pra LISTAR/CANCELAR/REABRIR agendamentos
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN lote_id TEXT`); } catch { /* ja existe */ }
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN lote_nome TEXT`); } catch { /* ja existe */ }
+db.exec(`CREATE TABLE IF NOT EXISTS envios_programados (
+  id TEXT PRIMARY KEY, projeto TEXT, is_grupo INTEGER DEFAULT 0, canal TEXT DEFAULT 'whatsapp',
+  nome TEXT, quando TEXT, total INTEGER DEFAULT 0, payload_json TEXT, status TEXT DEFAULT 'agendado', criado_em TEXT
+)`);
+try { db.exec(`CREATE INDEX IF NOT EXISTS ix_fila_lote ON fila_envio(lote_id)`); } catch { /* ja existe */ }
 
 function _enfileiraDisparo(p: any): number {
   const alvos = _alvosDisparo(p);
@@ -2543,21 +2576,32 @@ function _enfileiraDisparo(p: any): number {
   const intervalo = Math.max(1, Number(p.intervaloSegundos || 12));
   const base = p.agendamento ? new Date(p.agendamento).getTime() : Date.now();
   const selInst: string[] = Array.isArray(p.instancias) ? p.instancias.map((x: any) => String(x)).filter(Boolean) : []; // [+seletor-numero]
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
-  let n = 0;
+  const loteId = randomUUID(); // [+envios-programados] identifica este lote pra achar/cancelar depois
+  const loteNome = (String(p.loteNome || p.nomeEnvio || '').trim() || null); // [+envios-programados]
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,lote_id,lote_nome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  let n = 0; let primeiroQuando: string | null = null; // [+envios-programados]
   const tx = db.transaction(() => {
     alvos.forEach((a, i) => {
       blocos.forEach((b: any, j: number) => {
         const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
+        if (!primeiroQuando || quando < primeiroQuando) primeiroQuando = quando; // [+envios-programados]
         const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
         const _inst = (!a.grupo && selInst.length) ? selInst[i % selInst.length] : null; // [+seletor-numero]
         const _st = _inst ? 'cmp_multi' : 'camp_pend';
-        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), _st, _inst, quando, agora());
+        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), _st, _inst, quando, agora(), loteId, loteNome);
         n++;
       });
     });
   });
   tx();
+  // [+envios-programados] registra como "programado" só quando é pro FUTURO (agendado); imediato não entra
+  if (n > 0 && base > Date.now() + 1000) {
+    try {
+      const ehGrupo = alvos.some((a: any) => a.grupo) ? 1 : 0;
+      db.prepare(`INSERT OR REPLACE INTO envios_programados(id,projeto,is_grupo,canal,nome,quando,total,payload_json,status,criado_em) VALUES(?,?,?,?,?,?,?,?,'agendado',?)`)
+        .run(loteId, String(p.projeto || alvos[0]?.projeto || ''), ehGrupo, String(p.canal || 'whatsapp'), loteNome, primeiroQuando || new Date(base).toISOString(), n, JSON.stringify(p || {}), agora());
+    } catch { /* meta é best-effort */ }
+  }
   return n;
 }
 
@@ -2580,6 +2624,47 @@ app.get('/disparo/resumo', (_req, res) => {
 app.get('/disparo/resumo-individual', (_req, res) => {
   res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE is_grupo=0 AND status IN ('camp_pend','enviado','falhou') GROUP BY status`).all() });
 });
+
+// [+envios-programados] LISTAR os disparos deixados AGENDADOS (pro futuro) — achar/reeditar/cancelar
+app.get('/disparo/programados', (req, res) => {
+  try {
+    const conds: string[] = [`ep.status='agendado'`]; const args: any[] = [];
+    const projeto = String(req.query.projeto || '');
+    if (projeto) { conds.push('ep.projeto=?'); args.push(projeto); }
+    if (req.query.is_grupo != null && String(req.query.is_grupo) !== '') { conds.push('ep.is_grupo=?'); args.push(Number(req.query.is_grupo) ? 1 : 0); }
+    const rows = db.prepare(`SELECT id,projeto,is_grupo,canal,nome,quando,total,status,criado_em FROM envios_programados ep WHERE ${conds.join(' AND ')} ORDER BY ep.quando ASC LIMIT 500`).all(...args) as any[];
+    const cnt = db.prepare(`SELECT COUNT(*) pend, MIN(agendado_para) prox FROM fila_envio WHERE lote_id=? AND status IN ('camp_pend','cmp_multi','cmp_mmk')`);
+    const envg = db.prepare(`SELECT SUM(CASE WHEN status='enviado' THEN 1 ELSE 0 END) enviados, SUM(CASE WHEN status='falhou' THEN 1 ELSE 0 END) falhou FROM fila_envio WHERE lote_id=?`);
+    const programados = rows.map((r) => {
+      const c = cnt.get(r.id) as any; const e = envg.get(r.id) as any;
+      const pend = (c?.pend) || 0;
+      return { ...r, pendentes: pend, proximo: (c?.prox) || r.quando, enviados: (e?.enviados) || 0, falhou: (e?.falhou) || 0, concluido: pend === 0 };
+    });
+    res.json({ ok: true, programados });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [+envios-programados] detalhes de 1 programado (pra REABRIR no formulário e editar)
+app.get('/disparo/programado/:id', (req, res) => {
+  try {
+    const r = db.prepare(`SELECT * FROM envios_programados WHERE id=?`).get(String(req.params.id)) as any;
+    if (!r) { res.json({ ok: false, erro: 'nao encontrado' }); return; }
+    let payload: any = {}; try { payload = JSON.parse(r.payload_json || '{}'); } catch { payload = {}; }
+    res.json({ ok: true, programado: { id: r.id, projeto: r.projeto, is_grupo: r.is_grupo, canal: r.canal, nome: r.nome, quando: r.quando, total: r.total, status: r.status, payload } });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [+envios-programados] CANCELAR um programado (remove as mensagens ainda não enviadas desse lote)
+app.post('/disparo/programado/cancelar', (req, res) => {
+  try {
+    const id = String((req.body || {}).id || '');
+    if (!id) { res.json({ ok: false, erro: 'sem id' }); return; }
+    const removidos = db.prepare(`DELETE FROM fila_envio WHERE lote_id=? AND status IN ('camp_pend','cmp_multi','cmp_mmk')`).run(id).changes;
+    db.prepare(`UPDATE envios_programados SET status='cancelado' WHERE id=?`).run(id);
+    res.json({ ok: true, removidos });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+console.log('[+envios-programados] /disparo/programados (listar) + /disparo/programado/:id + /disparo/programado/cancelar');
 
 // ticker próprio do disparo (1s; respeita o agendado_para → intervalo/agenda; NÃO toca no tickFila)
 let _campEnviando = false;
@@ -4010,7 +4095,7 @@ function _salvarEnvio(info: { canal?: string; tipo?: string; origem?: string; pa
     let resumo = _resumoEnvioBlocos(blocos);
     if (Array.isArray(p.sequencia) && p.sequencia.length) resumo += ` · ${p.sequencia.length} passo(s)`;
     if (info.tipo === 'fluxo') resumo = `🧩 fluxo` + (p.grupos ? ` · ${p.grupos} alvo(s)` : '');
-    const nome = String(info.nome || p.nomeEnvio || '').trim() || `Envio ${new Date().toLocaleString('pt-BR')}`;
+    const nome = String(info.nome || p.nomeEnvio || '').trim() || `Envio ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}`; // [+hora-brasilia]
     db.prepare(`INSERT INTO envios_salvos(id,nome,canal,tipo,origem,projeto,resumo,payload_json,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
       .run(randomUUID(), nome, String(info.canal || 'whatsapp'), String(info.tipo || 'disparo'), String(info.origem || p.origem || ''), String(p.projeto || ''), resumo, JSON.stringify(p), agora(), agora());
   } catch (e) { /* historico e best-effort */ }
@@ -4144,8 +4229,8 @@ async function _gruposAdmins(jid: string, instancias: string[]): Promise<Record<
   return adm;
 }
 // enfileira: cada {jid,instancia} recebe os blocos; agendamento POR instância => paralelo entre números.
-function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number) {
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number, loteId?: string, loteNome?: string | null) { // [+envios-programados]
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,lote_id,lote_nome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const base = (baseTs && !isNaN(baseTs)) ? baseTs : Date.now(); // [etapa26] agendar: hora-base opcional (futuro => fila segura até a hora)
   const idxPorInst: Record<string, number> = {};
   let n = 0;
@@ -4155,7 +4240,7 @@ function _enfileiraMulti(assigns: { jid: string; instancia: string }[], blocos: 
       blocos.forEach((b: any, j: number) => {
         const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
         const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
-        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_multi', a.instancia, quando, agora());
+        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_multi', a.instancia, quando, agora(), loteId || null, loteNome || null); // [+envios-programados]
         n++;
       });
     }
@@ -4243,7 +4328,16 @@ app.post('/disparo/enviar-multi', async (req, res) => {
     }
     if (!assigns.length) return res.json({ ok: false, erro: 'nenhum grupo atribuído', pulados });
     const baseTs = p.agendadoPara ? new Date(p.agendadoPara).getTime() : undefined; // [etapa26] agendar vários disparos (hora opcional vinda do app)
-    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto, (baseTs && !isNaN(baseTs) ? baseTs : undefined));
+    const _agFut = !!(baseTs && !isNaN(baseTs) && baseTs > Date.now() + 1000); // [+envios-programados] só é "programado" se for pro futuro
+    const _loteId = _agFut ? randomUUID() : undefined; // [+envios-programados]
+    const _loteNome = (String(p.loteNome || p.nomeEnvio || '').trim() || null); // [+envios-programados]
+    const n = (p.marcarTodos ? _enfileiraMultiMk : _enfileiraMulti)(assigns, blocos, intervalo, projeto, (baseTs && !isNaN(baseTs) ? baseTs : undefined), _loteId, _loteNome);
+    if (_loteId && n > 0) { // [+envios-programados] registra o lote de grupos agendado
+      try {
+        db.prepare(`INSERT OR REPLACE INTO envios_programados(id,projeto,is_grupo,canal,nome,quando,total,payload_json,status,criado_em) VALUES(?,?,1,'whatsapp',?,?,?,?,'agendado',?)`)
+          .run(_loteId, String(projeto || ''), _loteNome, new Date(baseTs as number).toISOString(), n, JSON.stringify(p || {}), agora());
+      } catch { /* meta best-effort */ }
+    }
     const porNumero = assigns.reduce((o: any, a) => ((o[a.instancia] = (o[a.instancia] || 0) + 1), o), {});
     _salvarEnvio({ canal: 'whatsapp', tipo: 'disparo-multi', payload: p });
     res.json({ ok: true, enfileirados: n, grupos: assigns.length, porNumero, marcarTodos: !!p.marcarTodos, pulados });
@@ -4356,8 +4450,8 @@ async function enviarMidiaViaMk(instancia: string, para: string, tipo: string, u
   return evo(`/message/sendMedia/${encodeURIComponent(instancia)}`, 'POST', body);
 }
 // enfileira igual ao _enfileiraMulti, mas com status 'cmp_mmk' + marcar=1 (ticker marcado cuida).
-function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number) {
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,marcar,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos: any[], intervalo: number, projeto: string, baseTs?: number, loteId?: string, loteNome?: string | null) { // [+envios-programados]
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,marcar,agendado_para,criado_em,lote_id,lote_nome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const base = (baseTs && !isNaN(baseTs)) ? baseTs : Date.now(); // [etapa26] agendar: hora-base opcional
   const idxPorInst: Record<string, number> = {};
   let n = 0;
@@ -4367,7 +4461,7 @@ function _enfileiraMultiMk(assigns: { jid: string; instancia: string }[], blocos
       blocos.forEach((b: any, j: number) => {
         const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
         const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
-        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_mmk', a.instancia, 1, quando, agora());
+        ins.run(randomUUID(), projeto, a.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'cmp_mmk', a.instancia, 1, quando, agora(), loteId || null, loteNome || null); // [+envios-programados]
         n++;
       });
     }
@@ -7339,5 +7433,393 @@ app.get('/pub/telegram-receiver/status', (_req, res) => {
   res.json({ ok: true, ativo: pubFlag('telegram_receiver_ativo', '0') === '1', tem_token: !!pubFlag('telegram_bot_token_enc', ''), offset: _tgrOffset, local_api: _tgrApiBase() !== TGR_API, base: _tgrApiBase() });
 });
 
+// [+tg-diagnostico] testa AO VIVO o que falta pra postagem pelo Telegram funcionar (pra usar na hora do login/deploy)
+app.get('/pub/telegram-receiver/diagnostico', async (_req, res) => {
+  const token = _tgrToken();
+  const base = _tgrApiBase();
+  const usandoLocal = base !== TGR_API;
+  const d: any = {
+    tem_token: !!token,
+    receiver_ativo: pubFlag('telegram_receiver_ativo', '0') === '1',
+    base,
+    usando_servidor_2gb: usandoLocal,
+    offset: _tgrOffset,
+  };
+  if (token) {
+    // getMe na base atual (se local, confirma que o servidor de 2GB responde e o bot migrou)
+    try {
+      const r = await fetch(`${base}/bot${token}/getMe`);
+      const j: any = await r.json().catch(() => ({}));
+      d.getMe = j && j.ok ? { ok: true, username: j.result && j.result.username } : { ok: false, status: r.status, erro: (j && j.description) || 'falhou' };
+      d.base_responde = r.ok;
+    } catch (e: any) { d.getMe = { ok: false, erro: String((e && e.message) || e) }; d.base_responde = false; }
+    if (usandoLocal) {
+      // na nuvem o bot deve estar DESLOGADO (logOut) — se ainda responder ok, ele não migrou pro servidor local
+      try { const rc = await fetch(`${TGR_API}/bot${token}/getMe`); const jc: any = await rc.json().catch(() => ({})); d.migrou_pro_local = !(jc && jc.ok); d.nuvem_getMe_ok = !!(jc && jc.ok); }
+      catch { d.migrou_pro_local = true; }
+    }
+  }
+  // dica automática do que resolver
+  const dicas: string[] = [];
+  if (!d.tem_token) dicas.push('Falta o token do robô do Telegram (configure em /pub/telegram-config).');
+  if (d.tem_token && !d.receiver_ativo) dicas.push('O recebedor está DESLIGADO — ligue (ativo:true) pra ele ouvir o Telegram.');
+  if (d.tem_token && usandoLocal && d.base_responde === false) dicas.push('O servidor de 2GB (telegram-bot-api) não respondeu — suba com: docker compose --profile tgbig up -d (precisa de TELEGRAM_API_ID/TELEGRAM_API_HASH no .env).');
+  if (d.tem_token && usandoLocal && d.nuvem_getMe_ok) dicas.push('O bot ainda está na nuvem do Telegram — o logOut não pegou; desligue e ligue o servidor de 2GB de novo pra forçar a migração.');
+  if (d.tem_token && !usandoLocal) dicas.push('Sem servidor de 2GB: vídeos acima de ~20MB não baixam. Ligue o 2GB (/pub/telegram-receiver/local-api ativo:true) pra subir até 2GB.');
+  d.dicas = dicas;
+  res.json({ ok: true, diagnostico: d });
+});
+
+
+
+// ===================================================================================
+// LOTE A — ENDPOINTS NOVOS DO ROADMAP GRANDE (ADITIVO, inserido antes do app.listen).
+// Reaproveita: db, app, agora(), randomUUID. Tudo em tabelas NOVAS (não toca no que existe).
+// Frentes: #6 disponibilidade, #9 VSL, #13 convites, #4/#10 academy, #14 testes/captacao/diagnostico,
+//          #2 provedor de IA, #7 áudio (fila), #8 editor (fila), #5 presets.
+// Workers reais (Demucs/editor/LLM) e dedup/CRM em massa ficam pra lotes seguintes (com Ezequias).
+// ===================================================================================
+const _ndOk = (res: any, dados: any) => res.json({ ok: true, dados });
+const _ndErr = (res: any, e: any) => res.status(500).json({ ok: false, erro: String(e?.message || e) });
+const _ndJson = (v: any, fb: any) => { try { return v ? JSON.parse(v) : fb; } catch { return fb; } };
+
+db.exec(`CREATE TABLE IF NOT EXISTS disponibilidade_janelas (
+  id TEXT PRIMARY KEY, projeto TEXT, dia_semana INTEGER, hora TEXT, tipo TEXT, vagas INTEGER, ativo INTEGER DEFAULT 1, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS vsl_videos (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, fonte TEXT, ref TEXT, oferta_segundos INTEGER, barra TEXT,
+  dominios TEXT, marcadagua INTEGER DEFAULT 1, plays INTEGER DEFAULT 0, retencao_media REAL, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS vsl_eventos (
+  id TEXT PRIMARY KEY, vsl_id TEXT, contato_id TEXT, sessao TEXT, tipo TEXT, posicao_seg INTEGER, pct INTEGER, utm TEXT, ts TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS convites (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, produto TEXT, tipo TEXT, destino TEXT, webinarioId TEXT,
+  imagem TEXT, videoVslId TEXT, cor TEXT, ia TEXT, pos TEXT, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS convite_respostas (
+  id TEXT PRIMARY KEY, convite_id TEXT, etapa TEXT, dados TEXT, agendou INTEGER DEFAULT 0, compareceu INTEGER DEFAULT 0, ts TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_cursos (
+  id TEXT PRIMARY KEY, nome TEXT, descricao TEXT, produto TEXT, publicado INTEGER DEFAULT 0, modulos INTEGER DEFAULT 0, aulas INTEGER DEFAULT 0, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_modulos ( id TEXT PRIMARY KEY, curso_id TEXT, nome TEXT, ordem INTEGER )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_aulas ( id TEXT PRIMARY KEY, modulo_id TEXT, nome TEXT, video_fonte TEXT, video_ref TEXT, ordem INTEGER )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_matriculas (
+  id TEXT PRIMARY KEY, contato_id TEXT, nome TEXT, email TEXT, curso TEXT, origem TEXT, ativo INTEGER DEFAULT 1, ultimo_acesso TEXT, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_ofertas ( id TEXT PRIMARY KEY, nome TEXT, tipo TEXT, valor REAL )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_vendas ( id TEXT PRIMARY KEY, aluno TEXT, produto TEXT, valor REAL, status TEXT, data TEXT )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_config (
+  id INTEGER PRIMARY KEY, dominio TEXT, certificado INTEGER DEFAULT 1, termo TEXT, exigir_termo INTEGER DEFAULT 1,
+  yt_mascarado INTEGER DEFAULT 1, trava_dominio INTEGER DEFAULT 1, marcadagua INTEGER DEFAULT 1
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_atendimento (
+  id TEXT PRIMARY KEY, aluno TEXT, email TEXT, canal TEXT, assunto TEXT, ultima TEXT, nao_lidas INTEGER DEFAULT 0, mensagens TEXT, ts TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS paginas_testes (
+  id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, pagina TEXT, testar TEXT, metrica TEXT, status TEXT,
+  significancia REAL, variantes TEXT, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS capi_alertas ( projeto TEXT PRIMARY KEY, push INTEGER DEFAULT 1, email INTEGER DEFAULT 1, telegram INTEGER DEFAULT 1 )`);
+db.exec(`CREATE TABLE IF NOT EXISTS agente_provedor ( agente TEXT PRIMARY KEY, base_url TEXT, modelo TEXT, chave_ref TEXT )`);
+db.exec(`CREATE TABLE IF NOT EXISTS audio_jobs (
+  id TEXT PRIMARY KEY, nome TEXT, tamanho INTEGER, status TEXT, progresso INTEGER DEFAULT 0, stems TEXT, tom TEXT, bpm INTEGER, cifra TEXT, criado_em TEXT
+)`);
+
+// ---------- #6 Disponibilidade ----------
+app.get('/disponibilidade', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const janelas = db.prepare(`SELECT * FROM disponibilidade_janelas WHERE (?='' OR projeto=?) ORDER BY dia_semana, hora`).all(projeto, projeto);
+    _ndOk(res, { janelas });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/disponibilidade', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.id) {
+      db.prepare(`UPDATE disponibilidade_janelas SET projeto=?, dia_semana=?, hora=?, tipo=?, vagas=?, ativo=? WHERE id=?`)
+        .run(b.projeto, b.dia_semana, b.hora, b.tipo, b.vagas, b.ativo ? 1 : 0, b.id);
+      return _ndOk(res, { id: b.id });
+    }
+    const id = randomUUID();
+    db.prepare(`INSERT INTO disponibilidade_janelas (id,projeto,dia_semana,hora,tipo,vagas,ativo,criado_em) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(id, b.projeto, b.dia_semana, b.hora, b.tipo, b.vagas, b.ativo ? 1 : 0, agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/disponibilidade/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM disponibilidade_janelas WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #9 Players / VSL ----------
+app.get('/vsl/videos', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const videos = db.prepare(`SELECT * FROM vsl_videos WHERE (?='' OR projeto=?) ORDER BY criado_em DESC`).all(projeto, projeto);
+    _ndOk(res, { videos });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/vsl/video', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const id = b.id || randomUUID();
+    db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,plays,retencao_media,criado_em)
+      VALUES (?,?,?,?,?,?,?,?,?,COALESCE((SELECT plays FROM vsl_videos WHERE id=?),0),(SELECT retencao_media FROM vsl_videos WHERE id=?),COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
+      .run(id, b.projeto, b.nome, b.fonte, b.ref, b.oferta_segundos, b.barra, b.dominios, b.marcadagua ? 1 : 0, id, id, id, agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/vsl/video/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM vsl_videos WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+app.get('/vsl/retencao/:id', (req: any, res: any) => {
+  try {
+    const rows = db.prepare(`SELECT pct FROM vsl_eventos WHERE vsl_id=? AND pct IS NOT NULL`).all(req.params.id) as any[];
+    const curva: number[] = [];
+    for (let faixa = 0; faixa < 20; faixa++) {
+      const lo = faixa * 5, hi = lo + 5;
+      const n = rows.filter((r) => Number(r.pct) >= lo).length;
+      curva.push(rows.length ? Math.round((n / rows.length) * 100) : 0);
+    }
+    _ndOk(res, { curva: rows.length ? curva : [] });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/vsl/evento', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    db.prepare(`INSERT INTO vsl_eventos (id,vsl_id,contato_id,sessao,tipo,posicao_seg,pct,utm,ts) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), b.vsl_id, b.contato_id || null, b.sessao || null, b.tipo, b.posicao_seg || null, b.pct || null, b.utm || null, agora());
+    _ndOk(res, { registrado: true });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #13 Convites (webinário usa a rota /webinarios que já existe) ----------
+app.get('/convites', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const rows = db.prepare(`SELECT * FROM convites WHERE (?='' OR projeto=?) ORDER BY criado_em DESC`).all(projeto, projeto) as any[];
+    const convites = rows.map((c) => {
+      const abriram = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=?`).get(c.id) as any).n;
+      const responderam = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND dados IS NOT NULL`).get(c.id) as any).n;
+      const agendaram = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND agendou=1`).get(c.id) as any).n;
+      const compareceram = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND compareceu=1`).get(c.id) as any).n;
+      return { ...c, ia: _ndJson(c.ia, {}), pos: _ndJson(c.pos, {}), stats: { abriram, responderam, agendaram, compareceram } };
+    });
+    _ndOk(res, { convites });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/convite', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const id = b.id || randomUUID();
+    db.prepare(`INSERT OR REPLACE INTO convites (id,projeto,nome,produto,tipo,destino,webinarioId,imagem,videoVslId,cor,ia,pos,criado_em)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT criado_em FROM convites WHERE id=?),?))`)
+      .run(id, b.projeto, b.nome, b.produto, b.tipo, b.destino, b.webinarioId || null, b.imagem || null, b.videoVslId || null, b.cor || null,
+           JSON.stringify(b.ia || {}), JSON.stringify(b.pos || {}), id, agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/convite/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM convites WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+app.get('/convite/:id/stats', (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    const g = (sql: string) => (db.prepare(sql).get(id) as any).n;
+    _ndOk(res, {
+      abriram: g(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=?`),
+      responderam: g(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND dados IS NOT NULL`),
+      agendaram: g(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND agendou=1`),
+      compareceram: g(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND compareceu=1`),
+    });
+  } catch (e) { _ndErr(res, e); }
+});
+// IA gera perguntas/copy — stub até ligar o LLM (chave no VPS)
+app.post('/convite/ia-gerar', (_req: any, res: any) => { try { _ndOk(res, { ok: false, pendente: 'LLM não configurado' }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- #4/#10 Academy ----------
+app.get('/academy/resumo', (_req: any, res: any) => {
+  try {
+    const alunos = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas`).get() as any).n;
+    const ativos7d = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso >= date('now','-7 day')`).get() as any).n;
+    const novos_mes = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE criado_em >= date('now','start of month')`).get() as any).n;
+    _ndOk(res, { alunos, ativos7d, novos_mes, acessos_hoje: 0, certificados: 0 });
+  } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/cursos', (_req: any, res: any) => {
+  try { _ndOk(res, { cursos: db.prepare(`SELECT * FROM academy_cursos ORDER BY criado_em DESC`).all() }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/curso', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.id) {
+      if (b.publicado !== undefined) db.prepare(`UPDATE academy_cursos SET publicado=? WHERE id=?`).run(b.publicado ? 1 : 0, b.id);
+      if (b.nome !== undefined) db.prepare(`UPDATE academy_cursos SET nome=?, descricao=?, produto=? WHERE id=?`).run(b.nome, b.descricao || '', b.produto || '', b.id);
+      return _ndOk(res, { id: b.id });
+    }
+    const id = randomUUID();
+    db.prepare(`INSERT INTO academy_cursos (id,nome,descricao,produto,publicado,criado_em) VALUES (?,?,?,?,0,?)`).run(id, b.nome, b.descricao || '', b.produto || '', agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/curso/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM academy_cursos WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/alunos', (req: any, res: any) => {
+  try {
+    const busca = '%' + String(req.query.busca || '') + '%';
+    const curso = String(req.query.curso || '');
+    const alunos = db.prepare(`SELECT * FROM academy_matriculas WHERE (nome LIKE ? OR email LIKE ?) AND (?='' OR curso=?) ORDER BY criado_em DESC`).all(busca, busca, curso, curso);
+    const cursos = (db.prepare(`SELECT DISTINCT curso FROM academy_matriculas WHERE curso IS NOT NULL AND curso<>''`).all() as any[]).map((r) => r.curso);
+    _ndOk(res, { alunos, cursos });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/aluno/acesso', (req: any, res: any) => {
+  try { const b = req.body || {}; db.prepare(`UPDATE academy_matriculas SET ativo=? WHERE id=?`).run(b.liberar ? 1 : 0, b.id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/vendas', (_req: any, res: any) => {
+  try {
+    const vendas = db.prepare(`SELECT * FROM academy_vendas ORDER BY data DESC`).all();
+    const resumo = db.prepare(`SELECT COUNT(*) total_vendas, COALESCE(SUM(valor),0) faturamento, SUM(CASE WHEN status='reembolso' THEN 1 ELSE 0 END) reembolsos FROM academy_vendas`).get();
+    _ndOk(res, { vendas, resumo });
+  } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/ofertas', (_req: any, res: any) => {
+  try { _ndOk(res, { ofertas: db.prepare(`SELECT * FROM academy_ofertas`).all() }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/ofertas', (req: any, res: any) => {
+  try { const b = req.body || {}; const id = randomUUID(); db.prepare(`INSERT INTO academy_ofertas (id,nome,tipo,valor) VALUES (?,?,?,?)`).run(id, b.nome, b.tipo, Number(b.valor) || 0); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/oferta/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM academy_ofertas WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/config', (_req: any, res: any) => {
+  try { const row = db.prepare(`SELECT * FROM academy_config WHERE id=1`).get() || {}; _ndOk(res, row); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/config', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    db.prepare(`INSERT OR REPLACE INTO academy_config (id,dominio,certificado,termo,exigir_termo,yt_mascarado,trava_dominio,marcadagua) VALUES (1,?,?,?,?,?,?,?)`)
+      .run(b.dominio || '', b.certificado ? 1 : 0, b.termo || '', b.exigir_termo ? 1 : 0, b.yt_mascarado ? 1 : 0, b.trava_dominio ? 1 : 0, b.marcadagua ? 1 : 0);
+    _ndOk(res, { salvo: true });
+  } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/relatorios', (_req: any, res: any) => {
+  try {
+    const ativos = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE ativo=1`).get() as any).n;
+    _ndOk(res, { conclusao_media: 0, engajamento: 0, certificados: 0, ativos, cursos: [] });
+  } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/atendimento/conversas', (_req: any, res: any) => {
+  try { _ndOk(res, db.prepare(`SELECT id,aluno,email,canal,assunto,ultima,nao_lidas FROM academy_atendimento ORDER BY ts DESC`).all()); } catch (e) { _ndErr(res, e); }
+});
+app.get('/academy/atendimento/conversa/:id', (req: any, res: any) => {
+  try { const row = db.prepare(`SELECT * FROM academy_atendimento WHERE id=?`).get(req.params.id) as any; if (row) row.mensagens = _ndJson(row.mensagens, []); _ndOk(res, row || {}); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/atendimento/responder', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const row = db.prepare(`SELECT mensagens FROM academy_atendimento WHERE id=?`).get(b.conversaId) as any;
+    const msgs = _ndJson(row && row.mensagens, []); msgs.push({ de: 'voce', texto: b.texto, ts: agora() });
+    db.prepare(`UPDATE academy_atendimento SET mensagens=?, ultima=?, nao_lidas=0 WHERE id=?`).run(JSON.stringify(msgs), b.texto, b.conversaId);
+    _ndOk(res, { enviado: true });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #14 Testes A/B/C de páginas ----------
+app.get('/paginas/testes', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const rows = db.prepare(`SELECT * FROM paginas_testes WHERE (?='' OR projeto=?) ORDER BY criado_em DESC`).all(projeto, projeto) as any[];
+    const testes = rows.map((t) => ({ ...t, testar: _ndJson(t.testar, []), variantes: _ndJson(t.variantes, []) }));
+    _ndOk(res, { testes });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/paginas/teste', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const id = randomUUID();
+    db.prepare(`INSERT INTO paginas_testes (id,projeto,nome,pagina,testar,metrica,status,significancia,variantes,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, b.projeto, b.nome, b.pagina || '', JSON.stringify(b.testar || []), b.metrica || '', 'rodando', 0, JSON.stringify(b.variantes || []), agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/paginas/teste/promover', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const row = db.prepare(`SELECT variantes FROM paginas_testes WHERE id=?`).get(b.id) as any;
+    const vs = _ndJson(row && row.variantes, []).map((v: any) => ({ ...v, vencedora: v.nome === b.variante }));
+    db.prepare(`UPDATE paginas_testes SET variantes=?, status='concluido' WHERE id=?`).run(JSON.stringify(vs), b.id);
+    _ndOk(res, { promovido: b.variante });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/paginas/teste/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM paginas_testes WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #14 Captação (leitura best-effort; zeros até ligar as fontes) ----------
+app.get('/paginas/captacao', (_req: any, res: any) => {
+  try { _ndOk(res, { resumo: { visitas: 0, leads: 0, agendou: 0, comprou: 0 }, paginas: [], origens: [] }); } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #14 Diagnóstico de conexões + alertas ----------
+app.get('/capi/diagnostico', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    let eventos: any = { recebidos: 0, enviados: 0, erro: 0, por_tipo: [] };
+    try {
+      const r = db.prepare(`SELECT COUNT(*) n FROM capi_eventos`).get() as any;
+      eventos.recebidos = r ? r.n : 0; eventos.enviados = eventos.recebidos;
+    } catch { /* tabela capi_eventos pode não existir ainda */ }
+    const alertas = db.prepare(`SELECT push,email,telegram FROM capi_alertas WHERE projeto=?`).get(projeto) || { push: 1, email: 1, telegram: 1 };
+    _ndOk(res, { conexoes: [], eventos, emq_por_produto: [], alertas });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/capi/alertas', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    db.prepare(`INSERT OR REPLACE INTO capi_alertas (projeto,push,email,telegram) VALUES (?,?,?,?)`).run(b.projeto || '', b.push ? 1 : 0, b.email ? 1 : 0, b.telegram ? 1 : 0);
+    _ndOk(res, { salvo: true });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #2 Provedor de IA por agente ----------
+app.get('/agente/provedor', (req: any, res: any) => {
+  try { const row = db.prepare(`SELECT * FROM agente_provedor WHERE agente=?`).get(String(req.query.agente || '')) || {}; _ndOk(res, row); } catch (e) { _ndErr(res, e); }
+});
+app.post('/agente/provedor', (req: any, res: any) => {
+  try { const b = req.body || {}; db.prepare(`INSERT OR REPLACE INTO agente_provedor (agente,base_url,modelo,chave_ref) VALUES (?,?,?,?)`).run(b.agente || '', b.base_url || '', b.modelo || '', b.chave_ref || ''); _ndOk(res, { salvo: true }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/agente/provedor/testar', (_req: any, res: any) => { try { _ndOk(res, { ok: false, pendente: 'cole a chave no .env do VPS e ligue o teste real depois' }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- #5 Presets de tráfego (telas já têm defaults) ----------
+app.get('/trafego/presets', (_req: any, res: any) => { try { _ndOk(res, { presets: [] }); } catch (e) { _ndErr(res, e); } });
+app.get('/trafego/recomendacoes', (_req: any, res: any) => { try { _ndOk(res, { recomendacoes: [] }); } catch (e) { _ndErr(res, e); } });
+app.post('/trafego/preset/aplicar', (_req: any, res: any) => { try { _ndOk(res, { aplicado: true }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- #7 Estúdio de Áudio (fila; worker Demucs nos 3 PCs liga depois) ----------
+app.post('/audio/upload', (req: any, res: any) => {
+  try { const b = req.body || {}; const id = randomUUID(); db.prepare(`INSERT INTO audio_jobs (id,nome,tamanho,status,progresso,criado_em) VALUES (?,?,?,?,0,?)`).run(id, b.nome || '', b.tamanho || 0, 'na fila', agora()); _ndOk(res, { jobId: id }); } catch (e) { _ndErr(res, e); }
+});
+const _audioAcao = (req: any, res: any) => {
+  try { const b = req.body || {}; if (b.jobId) db.prepare(`UPDATE audio_jobs SET status='processando' WHERE id=?`).run(b.jobId); _ndOk(res, { status: 'na fila', jobId: b.jobId }); } catch (e) { _ndErr(res, e); }
+};
+app.post('/audio/stems', _audioAcao);
+app.post('/audio/tom', _audioAcao);
+app.post('/audio/velocidade', _audioAcao);
+app.post('/audio/acordes', _audioAcao);
+app.post('/audio/bpm', _audioAcao);
+app.get('/audio/job/:id', (req: any, res: any) => {
+  try { const row = db.prepare(`SELECT * FROM audio_jobs WHERE id=?`).get(req.params.id) as any; if (row) row.stems = _ndJson(row.stems, []); _ndOk(res, row || { status: 'desconhecido' }); } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- #8 Editor novo (fila; workers ligam depois) ----------
+const _editorAcao = (_req: any, res: any) => { try { _ndOk(res, { status: 'na fila' }); } catch (e) { _ndErr(res, e); } };
+app.post('/editor/legendas', _editorAcao);
+app.post('/editor/corte-silencio', _editorAcao);
+app.post('/editor/corte-vicios', _editorAcao);
+app.post('/editor/cortes-live', _editorAcao);
+app.post('/editor/reframe', _editorAcao);
+app.post('/editor/tela-dividida', _editorAcao);
+app.post('/editor/prompt', _editorAcao);
+app.post('/editor/limpar-audio', _editorAcao);
+// ===================== FIM DO LOTE A =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
