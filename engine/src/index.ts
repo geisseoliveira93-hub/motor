@@ -467,14 +467,21 @@ function instanciaRodizio(projeto: Projeto, selecionadas?: string[] | null): str
   _rrIdx[k] = (_rrIdx[k] == null ? 0 : _rrIdx[k] + 1);
   return validas[_rrIdx[k] % validas.length];
 }
+/** [zumbi] Se o erro de envio indicar conexao morta (instancia "open" mas soquete fechado), marca o numero como desconectado. */
+function marcarSeConexaoMorta(instancia: string, e: any) {
+  const msg = String((e && e.message) || e || '');
+  if (/Connection Closed|Connection Terminated|connection is closed|closed connection|not connected|Socket is closed/i.test(msg)) {
+    try { db.prepare(`UPDATE numeros SET status='desconectado' WHERE instancia=?`).run(instancia); } catch { /* best-effort */ }
+  }
+}
 
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
 async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string | null) {
   const inst = instanciaDeEnvio(projeto, instancia); // [multinumero]
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
-  return evo(`/message/sendText/${inst}`, 'POST', {
-    number: para, text: texto,
-  });
+  try {
+    return await evo(`/message/sendText/${inst}`, 'POST', { number: para, text: texto });
+  } catch (e) { marcarSeConexaoMorta(inst, e); throw e; }
 }
 
 /** Envia MÍDIA (imagem/vídeo/áudio/documento) por URL, por um número do projeto. */
@@ -482,14 +489,16 @@ async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: st
   const inst = instanciaDeEnvio(projeto, instancia); // [multinumero]
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
   if (!url) throw new Error('midia_sem_url');
-  if (tipo === 'audio') {
-    return evo(`/message/sendWhatsAppAudio/${inst}`, 'POST', { number: para, audio: url });
-  }
-  const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
-  const body: any = { number: para, mediatype, media: url };
-  if (legenda) body.caption = preenche(legenda);
-  if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
-  return evo(`/message/sendMedia/${inst}`, 'POST', body);
+  try {
+    if (tipo === 'audio') {
+      return await evo(`/message/sendWhatsAppAudio/${inst}`, 'POST', { number: para, audio: url });
+    }
+    const mediatype = tipo === 'video' ? 'video' : tipo === 'documento' ? 'document' : 'image';
+    const body: any = { number: para, mediatype, media: url };
+    if (legenda) body.caption = preenche(legenda);
+    if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
+    return await evo(`/message/sendMedia/${inst}`, 'POST', body);
+  } catch (e) { marcarSeConexaoMorta(inst, e); throw e; }
 }
 
 /** Envia UM passo de fluxo (texto ou mídia), já com {nome} preenchido. */
@@ -2703,6 +2712,38 @@ app.get('/disparo/tags-busca', (req, res) => {
 
 app.get('/disparo/resumo-individual', (_req, res) => {
   res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE is_grupo=0 AND status IN ('camp_pend','pendente','enviado','falhou') GROUP BY status`).all() });
+});
+
+// [reenviar-falhados] Reenvia os envios INDIVIDUAIS que falharam, por um NUMERO novo (ex.: apos trocar numero zumbi).
+// Pega linhas is_grupo=0 status='falhou' (opcionalmente so de uma instancia), reenfileira iguais (mesmo texto/destino)
+// pela instancia nova com ritmo, e marca as antigas como 'reenfileirado' pra nao contar em dobro. ADITIVO.
+app.post('/disparo/reenviar-individual-falhados', (req, res) => {
+  try {
+    const b: any = req.body || {};
+    const instNova = String(b.instancia_nova || b.instancia || '').trim();
+    const deInst = String(b.de_instancia || '').trim();
+    if (!instNova) return res.json({ ok: false, erro: 'instancia_nova obrigatoria' });
+    if (!instanciaConectada(instNova)) return res.json({ ok: false, erro: 'a instancia nova nao esta conectada' });
+    const where = ['is_grupo=0', "status='falhou'"]; const args: any[] = [];
+    if (deInst) { where.push('instancia=?'); args.push(deInst); }
+    const rows = db.prepare(`SELECT * FROM fila_envio WHERE ${where.join(' AND ')}`).all(...args) as any[];
+    if (!rows.length) return res.json({ ok: true, reenfileirados: 0 });
+    const intervalo = Math.max(1, Number(b.intervaloSegundos || 12));
+    const base = Date.now();
+    const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const upd = db.prepare(`UPDATE fila_envio SET status='reenfileirado' WHERE id=?`);
+    let n = 0;
+    const tx = db.transaction(() => {
+      rows.forEach((r, i) => {
+        const quando = new Date(base + i * intervalo * 1000).toISOString();
+        ins.run(randomUUID(), r.projeto, r.para, 0, r.texto, r.tipo || 'texto', r.url || null, r.legenda || null, 'camp_pend', quando, agora(), instNova);
+        upd.run(r.id);
+        n++;
+      });
+    });
+    tx();
+    res.json({ ok: true, reenfileirados: n, instancia: instNova });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 app.get('/disparo/programados', (req, res) => {
