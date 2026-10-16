@@ -2680,6 +2680,11 @@ app.get('/disparo/multi-relatorio', (_req, res) => {
 
 // [disparo-extra] tabela de disparos programados (agendados) — ADITIVO.
 try { db.exec(`CREATE TABLE IF NOT EXISTS disparos_programados (id TEXT PRIMARY KEY, projeto TEXT, is_grupo INTEGER DEFAULT 0, nome TEXT, quando TEXT, payload TEXT, status TEXT DEFAULT 'agendado', criado_em TEXT);`); } catch (e) { console.error('[disparos_programados]', e); }
+// [perf] indices que faltavam — sem eles a contagem de tags (contato_tags tem centenas de milhares de linhas) trava o motor a cada clique.
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_contato_tags_tagid ON contato_tags(tag_id)`); } catch (e) { console.error('[idx tagid]', e); }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fila_lote ON fila_envio(lote_id)`); } catch (e) { console.error('[idx lote]', e); }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fila_status ON fila_envio(status, agendado_para)`); } catch (e) { console.error('[idx fila status]', e); }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fila_grupo ON fila_envio(is_grupo, status)`); } catch (e) { console.error('[idx fila grupo]', e); }
 
 app.get('/disparo/tags-busca', (req, res) => {
   try {
