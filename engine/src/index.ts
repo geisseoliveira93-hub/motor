@@ -2587,6 +2587,107 @@ app.post('/disparo/sequencia', (req, res) => {
   catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// [disparo-multi] Disparo direto em GRUPOS com varios numeros. modo 'auto' = rodizio entre os numeros
+// selecionados; modo 'manual' = atribuicoes {instancia, grupos:[]}. Enfileira em fila_envio (camp_pend);
+// tickCampanha envia pela instancia gravada na linha (multinumero). ADITIVO.
+app.post('/disparo/enviar-multi', (req, res) => {
+  try {
+    const p: any = req.body || {};
+    const padrao = (CONFIG as any).projetoPadrao || 'teclado';
+    const projetoBase = ehProjeto(p.projeto) ? p.projeto : padrao;
+    const blocos = (p.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
+    if (!blocos.length) return res.json({ ok: false, erro: 'sem blocos de mensagem' });
+    const pares: { jid: string; instancia: string | null }[] = [];
+    if (p.modo === 'auto') {
+      const jids: string[] = (p.grupos || []).map(String);
+      const nums: string[] = (p.numeros || []).map(String).filter((i: string) => instanciaConectada(i));
+      if (!jids.length) return res.json({ ok: false, erro: 'sem grupos' });
+      if (!nums.length) return res.json({ ok: false, erro: 'nenhum numero conectado selecionado' });
+      jids.forEach((jid, i) => pares.push({ jid, instancia: nums[i % nums.length] }));
+    } else {
+      for (const a of (p.atribuicoes || [])) {
+        const inst = String((a && a.instancia) || '');
+        for (const jid of ((a && a.grupos) || [])) pares.push({ jid: String(jid), instancia: instanciaConectada(inst) ? inst : null });
+      }
+    }
+    if (!pares.length) return res.json({ ok: false, erro: 'sem grupos/numeros' });
+    const intervalo = Math.max(1, Number(p.intervaloSegundos || 10));
+    const base = p.agendadoPara ? new Date(p.agendadoPara).getTime() : Date.now();
+    const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+    let n = 0;
+    const tx = db.transaction(() => {
+      pares.forEach((par, gi) => {
+        const g = db.prepare(`SELECT projeto FROM grupos_wpp WHERE id=?`).get(par.jid) as any;
+        const proj = (g && ehProjeto(g.projeto)) ? g.projeto : projetoBase;
+        const inst = par.instancia || instanciaDeEnvio(proj as any, null);
+        blocos.forEach((b: any, bi: number) => {
+          const quando = new Date(base + gi * intervalo * 1000 + bi * 2000).toISOString();
+          const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
+          ins.run(randomUUID(), proj, par.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora(), inst || null);
+          n++;
+        });
+      });
+    });
+    tx();
+    res.json({ ok: true, grupos: pares.length, enfileirados: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [disparo-multi] Relatorio ao vivo do disparo em grupos (ultimos 2 dias): situacao por grupo + resumo.
+app.get('/disparo/multi-relatorio', (_req, res) => {
+  try {
+    const desde = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString();
+    const rows = db.prepare(`SELECT para, instancia, status, COUNT(*) n FROM fila_envio WHERE is_grupo=1 AND (status='camp_pend' OR criado_em>=?) GROUP BY para, instancia, status`).all(desde) as any[];
+    const porGrupo: Record<string, any> = {};
+    for (const r of rows) {
+      const g = (porGrupo[r.para] = porGrupo[r.para] || { jid: r.para, instancia: r.instancia || '', e: 0, f: 0, p: 0 });
+      if (!g.instancia && r.instancia) g.instancia = r.instancia;
+      if (r.status === 'enviado') g.e += r.n;
+      else if (r.status === 'falhou') g.f += r.n;
+      else g.p += r.n;
+    }
+    const grupos: any[] = [];
+    const resumo: any = { enviados: 0, parcial: 0, falhou: 0, pendente: 0, total: 0 };
+    for (const jid of Object.keys(porGrupo)) {
+      const g = porGrupo[jid];
+      let situacao = 'enviado';
+      if (g.p > 0) situacao = 'pendente';
+      else if (g.f > 0 && g.e > 0) situacao = 'parcial';
+      else if (g.f > 0) situacao = 'falhou';
+      const nomeRow = db.prepare(`SELECT nome FROM grupos_wpp WHERE id=?`).get(jid) as any;
+      grupos.push({ jid, nome: (nomeRow && nomeRow.nome) || jid, instancia: g.instancia, situacao });
+      if (situacao === 'enviado') resumo.enviados++;
+      else if (situacao === 'parcial') resumo.parcial++;
+      else if (situacao === 'falhou') resumo.falhou++;
+      else resumo.pendente++;
+      resumo.total++;
+    }
+    res.json({ ok: true, grupos, resumo });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [disparo-multi] Editar grupos em massa (nome/descricao/foto por URL) via Evolution. Best-effort por grupo. ADITIVO.
+app.post('/disparo/grupos-editar', async (req, res) => {
+  try {
+    const p: any = req.body || {};
+    const inst = String(p.instancia || '');
+    if (!inst) return res.json({ ok: false, erro: 'escolha o numero (admin dos grupos)' });
+    const jids: string[] = (p.jids || []).map(String);
+    if (!jids.length) return res.json({ ok: false, erro: 'selecione ao menos 1 grupo' });
+    const foto = String(p.fotoUrl || '').trim();
+    let ok = 0; const erros: string[] = [];
+    for (const jid of jids) {
+      try {
+        if (typeof p.nome === 'string' && p.nome.length) await evo(`/group/updateGroupSubject/${inst}?groupJid=${encodeURIComponent(jid)}`, 'POST', { subject: String(p.nome) });
+        if (typeof p.descricao === 'string') await evo(`/group/updateGroupDescription/${inst}?groupJid=${encodeURIComponent(jid)}`, 'POST', { description: String(p.descricao) });
+        if (foto) await evo(`/group/updateGroupPicture/${inst}?groupJid=${encodeURIComponent(jid)}`, 'POST', { image: foto });
+        ok++;
+      } catch (e: any) { erros.push(`${jid}: ${String(e.message || e)}`); }
+    }
+    res.json({ ok: true, editados: ok, falhas: erros.length, erros: erros.slice(0, 10) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
 // resumo do disparo (pendentes/enviados/falhou)
 app.get('/disparo/resumo', (_req, res) => {
   res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE status IN ('camp_pend','enviado','falhou') GROUP BY status`).all() });
