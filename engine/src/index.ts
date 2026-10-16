@@ -2690,12 +2690,14 @@ app.get('/disparo/tags-busca', (req, res) => {
   try {
     const projeto = String(req.query.projeto || '');
     const q = String(req.query.q || '').trim();
-    const wh: string[] = []; const args: any[] = [];
-    if (projeto) { wh.push('t.projeto=?'); args.push(projeto); }
-    if (q) { wh.push('t.nome LIKE ?'); args.push('%' + q + '%'); }
-    const where = wh.length ? 'WHERE ' + wh.join(' AND ') : '';
-    const rows = db.prepare(`SELECT t.nome, COUNT(ct.contato_id) n FROM tags t LEFT JOIN contato_tags ct ON ct.tag_id=t.id ${where} GROUP BY t.id ORDER BY n DESC LIMIT 50`).all(...args) as any[];
-    res.json({ ok: true, tags: rows.map((r) => ({ nome: r.nome, n: r.n })) });
+    // campo vazio = instantaneo (nada de contar a base inteira no onFocus)
+    if (!q) return res.json({ ok: true, tags: [] });
+    const wh: string[] = ['t.nome LIKE ?']; const args: any[] = ['%' + q + '%'];
+    if (projeto) { wh.unshift('t.projeto=?'); args.unshift(projeto); }
+    // pega ate 50 tags por NOME (barato) e conta so essas 50 (via indice tag_id) — nunca varre tudo
+    const rows = db.prepare(`SELECT t.id, t.nome FROM tags t WHERE ${wh.join(' AND ')} ORDER BY t.nome LIMIT 50`).all(...args) as any[];
+    const cnt = db.prepare(`SELECT COUNT(*) n FROM contato_tags WHERE tag_id=?`);
+    res.json({ ok: true, tags: rows.map((r) => ({ nome: r.nome, n: ((cnt.get(r.id) as any) || {}).n || 0 })) });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
