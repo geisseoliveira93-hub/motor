@@ -198,6 +198,7 @@ for (const alter of [
   `ALTER TABLE fila_envio ADD COLUMN url TEXT`,
   `ALTER TABLE fila_envio ADD COLUMN legenda TEXT`,
   `ALTER TABLE fila_envio ADD COLUMN instancia TEXT`,
+  `ALTER TABLE fila_envio ADD COLUMN lote_id TEXT`,
 ]) {
   try { db.exec(alter); } catch { /* coluna já existe */ }
 }
@@ -2561,14 +2562,14 @@ function _enfileiraDisparo(p: any): number {
   if (!alvos.length || !blocos.length) return 0;
   const intervalo = Math.max(1, Number(p.intervaloSegundos || 12));
   const base = p.agendamento ? new Date(p.agendamento).getTime() : Date.now();
-  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia,lote_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   let n = 0;
   const tx = db.transaction(() => {
     alvos.forEach((a, i) => {
       blocos.forEach((b: any, j: number) => {
         const quando = new Date(base + i * intervalo * 1000 + j * 2000).toISOString();
         const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
-        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora(), (a as any).instancia || null);
+        ins.run(randomUUID(), a.projeto, a.para, a.grupo ? 1 : 0, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora(), (a as any).instancia || null, (p.lote_id || null));
         n++;
       });
     });
@@ -2578,8 +2579,15 @@ function _enfileiraDisparo(p: any): number {
 }
 
 app.post('/disparo/enviar', (req, res) => {
-  try { const n = _enfileiraDisparo(req.body || {}); res.json({ ok: true, enfileirados: n }); }
-  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+  try {
+    const p: any = req.body || {};
+    if (p.agendamento) {
+      const lid = randomUUID(); p.lote_id = lid;
+      db.prepare(`INSERT INTO disparos_programados(id,projeto,is_grupo,nome,quando,payload,status,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(lid, String(p.projeto || ''), 0, String(p.loteNome || ''), String(p.agendamento || ''), JSON.stringify(p), 'agendado', agora());
+    }
+    const n = _enfileiraDisparo(p);
+    res.json({ ok: true, enfileirados: n, lote_id: p.lote_id || null });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 app.post('/disparo/sequencia', (req, res) => {
@@ -2595,6 +2603,10 @@ app.post('/disparo/enviar-multi', (req, res) => {
     const p: any = req.body || {};
     const padrao = (CONFIG as any).projetoPadrao || 'teclado';
     const projetoBase = ehProjeto(p.projeto) ? p.projeto : padrao;
+    if (p.agendadoPara) {
+      const lid = randomUUID(); p.lote_id = lid;
+      db.prepare(`INSERT INTO disparos_programados(id,projeto,is_grupo,nome,quando,payload,status,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(lid, String(projetoBase), 1, String(p.loteNome || ''), String(p.agendadoPara || ''), JSON.stringify(p), 'agendado', agora());
+    }
     const blocos = (p.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
     if (!blocos.length) return res.json({ ok: false, erro: 'sem blocos de mensagem' });
     const pares: { jid: string; instancia: string | null }[] = [];
@@ -2613,7 +2625,7 @@ app.post('/disparo/enviar-multi', (req, res) => {
     if (!pares.length) return res.json({ ok: false, erro: 'sem grupos/numeros' });
     const intervalo = Math.max(1, Number(p.intervaloSegundos || 10));
     const base = p.agendadoPara ? new Date(p.agendadoPara).getTime() : Date.now();
-    const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const ins = db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em,instancia,lote_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     let n = 0;
     const tx = db.transaction(() => {
       pares.forEach((par, gi) => {
@@ -2623,7 +2635,7 @@ app.post('/disparo/enviar-multi', (req, res) => {
         blocos.forEach((b: any, bi: number) => {
           const quando = new Date(base + gi * intervalo * 1000 + bi * 2000).toISOString();
           const tipo = b.tipo === 'texto' ? 'texto' : b.tipo;
-          ins.run(randomUUID(), proj, par.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora(), inst || null);
+          ins.run(randomUUID(), proj, par.jid, 1, tipo === 'texto' ? String(b.texto || '') : '', tipo, String(b.url || ''), String(b.texto || ''), 'camp_pend', quando, agora(), inst || null, (p.lote_id || null));
           n++;
         });
       });
@@ -2663,6 +2675,66 @@ app.get('/disparo/multi-relatorio', (_req, res) => {
       resumo.total++;
     }
     res.json({ ok: true, grupos, resumo });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [disparo-extra] tabela de disparos programados (agendados) — ADITIVO.
+try { db.exec(`CREATE TABLE IF NOT EXISTS disparos_programados (id TEXT PRIMARY KEY, projeto TEXT, is_grupo INTEGER DEFAULT 0, nome TEXT, quando TEXT, payload TEXT, status TEXT DEFAULT 'agendado', criado_em TEXT);`); } catch (e) { console.error('[disparos_programados]', e); }
+
+app.get('/disparo/tags-busca', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const q = String(req.query.q || '').trim();
+    const wh: string[] = []; const args: any[] = [];
+    if (projeto) { wh.push('t.projeto=?'); args.push(projeto); }
+    if (q) { wh.push('t.nome LIKE ?'); args.push('%' + q + '%'); }
+    const where = wh.length ? 'WHERE ' + wh.join(' AND ') : '';
+    const rows = db.prepare(`SELECT t.nome, COUNT(ct.contato_id) n FROM tags t LEFT JOIN contato_tags ct ON ct.tag_id=t.id ${where} GROUP BY t.id ORDER BY n DESC LIMIT 50`).all(...args) as any[];
+    res.json({ ok: true, tags: rows.map((r) => ({ nome: r.nome, n: r.n })) });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.get('/disparo/resumo-individual', (_req, res) => {
+  res.json({ ok: true, porStatus: db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE is_grupo=0 AND status IN ('camp_pend','pendente','enviado','falhou') GROUP BY status`).all() });
+});
+
+app.get('/disparo/programados', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const isGrupo = String(req.query.is_grupo || '0') === '1' ? 1 : 0;
+    const wh = ['is_grupo=?']; const args: any[] = [isGrupo];
+    if (projeto) { wh.push("(projeto=? OR projeto='')"); args.push(projeto); }
+    const progs = db.prepare(`SELECT * FROM disparos_programados WHERE ${wh.join(' AND ')} ORDER BY criado_em DESC LIMIT 200`).all(...args) as any[];
+    const out = progs.map((pr) => {
+      const c = db.prepare(`SELECT status, COUNT(*) n, MIN(agendado_para) prox FROM fila_envio WHERE lote_id=? GROUP BY status`).all(pr.id) as any[];
+      let pend = 0, env = 0, fal = 0, prox = '';
+      for (const r of c) {
+        if (r.status === 'enviado') env += r.n;
+        else if (r.status === 'falhou') fal += r.n;
+        else { pend += r.n; if (r.prox && (!prox || r.prox < prox)) prox = r.prox; }
+      }
+      return { id: pr.id, projeto: pr.projeto, is_grupo: pr.is_grupo, nome: pr.nome, quando: pr.quando, proximo: prox || pr.quando, total: pend + env + fal, pendentes: pend, enviados: env, falhou: fal, status: pr.status, concluido: pend === 0 };
+    });
+    res.json({ ok: true, programados: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.get('/disparo/programado/:id', (req, res) => {
+  try {
+    const pr = db.prepare(`SELECT * FROM disparos_programados WHERE id=?`).get(String(req.params.id)) as any;
+    if (!pr) return res.json({ ok: false, erro: 'nao encontrado' });
+    let payload: any = {}; try { payload = JSON.parse(pr.payload || '{}'); } catch { payload = {}; }
+    res.json({ ok: true, programado: { id: pr.id, nome: pr.nome, payload } });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+app.post('/disparo/programado/cancelar', (req, res) => {
+  try {
+    const id = String((req.body || {}).id || '');
+    if (!id) return res.json({ ok: false, erro: 'id' });
+    db.prepare(`UPDATE disparos_programados SET status='cancelado' WHERE id=?`).run(id);
+    db.prepare(`DELETE FROM fila_envio WHERE lote_id=? AND status IN ('camp_pend','pendente')`).run(id);
+    res.json({ ok: true });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
