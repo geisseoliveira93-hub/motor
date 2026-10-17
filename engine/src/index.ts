@@ -1527,10 +1527,23 @@ app.post('/pagina/ia', async (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 // publico: serve a pagina publicada
+// [#5 rastreio] injeta pixel + CAPI(dedup) + eventos de funil + banner LGPD nas paginas servidas
+function _injecaoRastreio(projeto: string, base: string): string {
+  return '\n<script src="' + base + '/track/snippet.js?projeto=' + encodeURIComponent(projeto) + '"></script>\n'
+  + '<script>(function(){function grab(f){var o={};try{var ins=f.querySelectorAll("input,textarea,select");for(var i=0;i<ins.length;i++){var el=ins[i];var n=((el.name||"")+" "+(el.type||"")+" "+(el.placeholder||"")).toLowerCase();var v=(el.value||"").trim();if(!v)continue;if(!o.email&&(el.type==="email"||n.indexOf("email")>=0||n.indexOf("mail")>=0))o.email=v;else if(!o.telefone&&(el.type==="tel"||n.indexOf("fone")>=0||n.indexOf("phone")>=0||n.indexOf("whats")>=0||n.indexOf("celular")>=0))o.telefone=v;else if(!o.nome&&(n.indexOf("nome")>=0||n.indexOf("name")>=0))o.nome=v;}}catch(e){}return o;}'
+  + 'document.addEventListener("submit",function(e){try{var f=e.target;var id="lead"+Date.now()+Math.random().toString(36).slice(2,7);if(f.querySelector){var h=f.querySelector("input[name=mr_event_id]");if(!h){h=document.createElement("input");h.type="hidden";h.name="mr_event_id";f.appendChild(h);}h.value=id;}if(window.mrTrack)window.mrTrack("Lead",Object.assign({event_id:id},grab(f)));}catch(x){}},true);'
+  + 'var CK=/(guru|lastlink|checkout|pagar|comprar|carrinho|hotmart|kiwify|eduzz|monetiz|pay)/i;'
+  + 'document.addEventListener("click",function(e){try{var a=e.target.closest&&e.target.closest("a,button,[data-mr-event]");if(!a)return;var ev=a.getAttribute&&a.getAttribute("data-mr-event");if(ev){window.mrTrack&&window.mrTrack(ev);return;}var href=(a.getAttribute&&a.getAttribute("href"))||"";if(href&&CK.test(href)){window.mrTrack&&window.mrTrack("InitiateCheckout");}}catch(x){}},true);})();</script>'
+  + '<style>#mrLgpd{position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;background:#14161b;color:#e6e8ec;border:1px solid #2a2f3a;border-radius:10px;padding:12px 14px;font:13px system-ui,Segoe UI,sans-serif;display:flex;gap:12px;align-items:center;flex-wrap:wrap;box-shadow:0 8px 24px rgba(0,0,0,.4)}#mrLgpd button{margin-left:auto;background:#22c55e;color:#06230f;border:0;border-radius:8px;padding:8px 16px;font-weight:700;cursor:pointer}</style>'
+  + '<script>(function(){try{if(document.cookie.indexOf("mr_consent=1")>=0)return;function sh(){var d=document.createElement("div");d.id="mrLgpd";d.innerHTML="<span>Usamos cookies para melhorar sua experiência e medir resultados. Ao continuar, você concorda.</span>";var b=document.createElement("button");b.textContent="Entendi";b.onclick=function(){try{document.cookie="mr_consent=1;path=/;max-age=15552000";}catch(e){}d.remove();};d.appendChild(b);document.body.appendChild(d);}if(document.body)sh();else document.addEventListener("DOMContentLoaded",sh);}catch(e){}})();</script>\n';
+}
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
-  res.type('html').send(String(p.html || ''));
+  const _html = String(p.html || '');
+  const _inj = _injecaoRastreio(String(p.projeto || ''), PUBLIC_BASE_URL || '');
+  const _out = _html.indexOf('</head>') >= 0 ? _html.replace('</head>', _inj + '</head>') : (_html.indexOf('</body>') >= 0 ? _html.replace('</body>', _inj + '</body>') : _html + _inj);
+  res.type('html').send(_out);
 });
 
 // ---- FORMULARIOS / QUIZ (servidos pelo motor; resposta salva + cria contato + tag) ----
@@ -1586,6 +1599,7 @@ app.post('/f/:id', (req, res) => {
     if (contatoId) rodarAutomacoes(f.projeto, 'tag_adicionada', { contatoId, tag: String(f.tag || ''), telefone: tel, nome }).catch(() => {});
   }
   db.prepare(`INSERT INTO formulario_respostas(id,formulario_id,projeto,contato_id,dados,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), f.id, f.projeto, contatoId, JSON.stringify(dados), agora());
+  try { const _clk = _getClickIds({ telefone: tel, email: email }); void rastrear(f.projeto, 'Lead', { ..._clk, email: email, telefone: tel, nome: nome, external_id: tel || email, action_source: 'website', event_id: String((dados as any).mr_event_id || ('lead_' + f.id + '_' + (contatoId || randomUUID()))), origem: 'server' }).catch(() => {}); } catch {} // [#5 Lead CAPI/GA4]
   res.json({ ok: true });
 });
 
@@ -1599,6 +1613,128 @@ app.post('/pixel', (req, res) => {
   res.json({ ok: true, id });
 });
 app.post('/pixel/remover', (req, res) => { db.prepare(`DELETE FROM pixels WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// [#5 rastreio] configuracao por projeto (token do CAPI e secret do GA4 NUNCA voltam pro front; so flags)
+app.get('/track/config', (req, res) => {
+  const projeto = String(req.query.projeto || ''); const c: any = _trkCfg(projeto) || {};
+  res.json({ ok: true, config: { projeto, meta_pixel_id: c.meta_pixel_id || '', ga4_mid: c.ga4_mid || '', test_code: c.test_code || '', dominio: c.dominio || '', ativo: c.ativo == null ? 1 : c.ativo, temMetaToken: !!c.meta_token, temGa4Secret: !!c.ga4_secret } });
+});
+app.post('/track/config', (req, res) => {
+  try {
+    const b = req.body || {}; const projeto = String(b.projeto || ''); if (!projeto) return res.json({ ok: false, erro: 'projeto' });
+    const cur: any = _trkCfg(projeto) || {};
+    const meta_token = (typeof b.meta_token === 'string' && b.meta_token.trim()) ? b.meta_token.trim() : (cur.meta_token || '');
+    const ga4_secret = (typeof b.ga4_secret === 'string' && b.ga4_secret.trim()) ? b.ga4_secret.trim() : (cur.ga4_secret || '');
+    db.prepare(`INSERT INTO rastreio_config(projeto,meta_pixel_id,meta_token,test_code,ga4_mid,ga4_secret,dominio,ativo,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(projeto) DO UPDATE SET meta_pixel_id=excluded.meta_pixel_id, meta_token=excluded.meta_token, test_code=excluded.test_code, ga4_mid=excluded.ga4_mid, ga4_secret=excluded.ga4_secret, dominio=excluded.dominio, ativo=excluded.ativo, atualizado_em=excluded.atualizado_em`)
+      .run(projeto, String(b.meta_pixel_id||''), meta_token, String(b.test_code||''), String(b.ga4_mid||''), ga4_secret, String(b.dominio||''), (b.ativo === 0 || b.ativo === false) ? 0 : 1, agora());
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+function _trkCors(res: any) { res.header('Access-Control-Allow-Origin', '*'); res.header('Access-Control-Allow-Headers', 'Content-Type'); res.header('Access-Control-Allow-Methods', 'POST, OPTIONS'); }
+app.options('/track/evento', (_req, res) => { _trkCors(res); res.sendStatus(204); });
+app.options('/track/offline', (_req, res) => { _trkCors(res); res.sendStatus(204); });
+// evento do navegador -> servidor (DEDUP: o pixel no navegador usa o MESMO event_id). Captura ip/ua e guarda clickids.
+app.post('/track/evento', async (req, res) => {
+  try {
+    _trkCors(res);
+    const b = req.body || {}; const projeto = String(b.projeto || '');
+    const ip = String(((req.headers['x-forwarded-for'] as string) || '').split(',')[0].trim() || (req.socket && (req.socket as any).remoteAddress) || '');
+    const ua = String(req.headers['user-agent'] || '');
+    const d: any = { ...b, ip, ua, origem: 'client', event_id: b.event_id || randomUUID() };
+    _saveClickIds(projeto, d);
+    await rastrear(projeto, String(b.evento || 'PageView'), d);
+    res.json({ ok: true, event_id: d.event_id });
+  } catch (e: any) { _trkCors(res); res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// conversao OFFLINE / fundo de funil (agendou, compareceu, comprou high...) - so servidor
+app.post('/track/offline', async (req, res) => {
+  try {
+    _trkCors(res);
+    const b = req.body || {}; const projeto = String(b.projeto || ''); const clk = _getClickIds(b);
+    await rastrear(projeto, String(b.evento || 'Lead'), { ...clk, ...b, action_source: b.action_source || 'system_generated', origem: 'offline', event_id: b.event_id || randomUUID() });
+    res.json({ ok: true });
+  } catch (e: any) { _trkCors(res); res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// saude do rastreio + atribuicao (pro painel do app)
+app.get('/track/resumo', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || ''); const dias = Math.max(1, Math.min(365, Number(req.query.dias || 30)));
+    const desde = new Date(Date.now() - dias * 86400000).toISOString();
+    const whP = projeto ? 'AND projeto=?' : ''; const aP: any[] = projeto ? [projeto] : [];
+    const porEvento = db.prepare(`SELECT evento, destino, status, COUNT(*) n FROM rastreio_eventos WHERE criado_em>=? ${whP} GROUP BY evento,destino,status`).all(desde, ...aP) as any[];
+    const tOk = db.prepare(`SELECT COUNT(*) n FROM rastreio_eventos WHERE criado_em>=? AND status='ok' ${whP}`).get(desde, ...aP) as any;
+    const tErr = db.prepare(`SELECT COUNT(*) n FROM rastreio_eventos WHERE criado_em>=? AND status='erro' ${whP}`).get(desde, ...aP) as any;
+    const ultimos = db.prepare(`SELECT evento,destino,status,http,valor,criado_em FROM rastreio_eventos WHERE criado_em>=? ${whP} ORDER BY criado_em DESC LIMIT 30`).all(desde, ...aP) as any[];
+    const vendas = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(valor),0) total FROM transacoes WHERE criado_em>=? AND status IN ('pago','aprovado') ${projeto ? 'AND projeto=?' : ''}`).get(desde, ...(projeto ? [projeto] : [])) as any;
+    const saude = (tOk.n + tErr.n) ? Math.round((tOk.n / (tOk.n + tErr.n)) * 100) : 100;
+    let ultimoAlerta: any = null; try { ultimoAlerta = db.prepare(`SELECT tipo,msg,criado_em FROM rastreio_alertas ORDER BY criado_em DESC LIMIT 1`).get() || null; } catch {}
+    let emFila = 0; try { emFila = (db.prepare(`SELECT COUNT(*) n FROM rastreio_retry`).get() as any).n; } catch {}
+    res.json({ ok: true, dias, porEvento, enviadosOk: tOk.n, enviadosErro: tErr.n, saude, ultimos, vendas, ultimoAlerta, emFila });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/track/alertas', (req, res) => { try { const a = db.prepare(`SELECT tipo,msg,criado_em FROM rastreio_alertas ORDER BY criado_em DESC LIMIT 20`).all(); res.json({ ok: true, alertas: a }); } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); } });
+// teste: dispara 1 evento de teste pra Meta (test event) e pro GA4 (debug) e devolve o resultado
+app.post('/track/testar', async (req, res) => {
+  try {
+    const projeto = String((req.body||{}).projeto || ''); const cfg = _trkCfg(projeto);
+    if (!cfg || (!cfg.meta_pixel_id && !cfg.ga4_mid)) return res.json({ ok: false, erro: 'Configure o Pixel/CAPI ou o GA4 deste instrumento antes de testar.' });
+    const eid = 'teste_' + randomUUID();
+    const dados: any = { event_id: eid, email: 'teste@melodiaseriffs.com.br', telefone: '5516999999999', nome: 'Teste Rastreio', valor: 1, moeda: 'BRL', url: (PUBLIC_BASE_URL||'') + '/teste' };
+    const out: any = { meta: null, ga4: null };
+    if (cfg.meta_pixel_id && cfg.meta_token) {
+      try {
+        const body: any = { data: [{ event_name: 'Lead', event_time: Math.floor(Date.now()/1000), event_id: eid, action_source: 'website', event_source_url: dados.url, user_data: _metaUserData(dados), custom_data: { value: 1, currency: 'BRL' } }] };
+        if (cfg.test_code) body.test_event_code = cfg.test_code;
+        const r: any = await fetch('https://graph.facebook.com/v21.0/' + encodeURIComponent(cfg.meta_pixel_id) + '/events?access_token=' + encodeURIComponent(cfg.meta_token), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const txt = await r.text(); out.meta = { ok: r.ok, status: r.status, resposta: txt.slice(0, 400) };
+      } catch (e: any) { out.meta = { ok: false, erro: String(e.message || e) }; }
+    } else out.meta = { ok: false, erro: 'sem pixel/token' };
+    if (cfg.ga4_mid && cfg.ga4_secret) {
+      try {
+        const r: any = await fetch('https://www.google-analytics.com/debug/mp/collect?measurement_id=' + encodeURIComponent(cfg.ga4_mid) + '&api_secret=' + encodeURIComponent(cfg.ga4_secret), { method: 'POST', body: JSON.stringify({ client_id: eid, events: [{ name: 'generate_lead', params: { value: 1, currency: 'BRL' } }] }) });
+        const txt = await r.text(); out.ga4 = { ok: r.ok, status: r.status, resposta: txt.slice(0, 400) };
+      } catch (e: any) { out.ga4 = { ok: false, erro: String(e.message || e) }; }
+    } else out.ga4 = { ok: false, erro: 'sem GA4' };
+    res.json({ ok: true, meta: out.meta, ga4: out.ga4, dica: cfg.test_code ? 'Veja em Gerenciador de Eventos > Eventos de Teste.' : 'Sem Test Event Code: confira no Gerenciador de Eventos (pode levar alguns minutos).' });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/track/alerta-config', (_req, res) => { try { const d = db.prepare(`SELECT valor FROM flags_sistema WHERE chave='alerta_destino'`).get() as any; res.json({ ok: true, whatsapp: (d && d.valor) || '' }); } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); } });
+app.post('/track/alerta-config', (req, res) => { try { const w = String((req.body||{}).whatsapp || '').replace(/\D/g, ''); db.prepare(`INSERT INTO flags_sistema(chave,valor) VALUES('alerta_destino',?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor`).run(w); res.json({ ok: true, whatsapp: w }); } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); } });
+// atribuicao por campanha: cruza UTM (click ids) com as vendas (transacoes)
+app.get('/track/atribuicao', (req, res) => {
+  try {
+    const projeto = String(req.query.projeto || ''); const dias = Math.max(1, Math.min(365, Number(req.query.dias || 30)));
+    const desde = new Date(Date.now() - dias * 86400000).toISOString();
+    const argsV: any[] = [desde]; let whV = ''; if (projeto) { whV = 'AND t.projeto=?'; argsV.push(projeto); }
+    const vendas = db.prepare(`SELECT COALESCE(NULLIF(rc.utm_campaign,''),'(sem campanha)') campanha, COALESCE(NULLIF(rc.utm_source,''),'(direto)') fonte, COUNT(DISTINCT t.id) vendas, COALESCE(SUM(t.valor),0) total FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id LEFT JOIN rastreio_clickids rc ON (rc.chave=c.telefone OR rc.chave=LOWER(c.email)) WHERE t.criado_em>=? AND t.status IN ('pago','aprovado') ${whV} GROUP BY campanha,fonte ORDER BY total DESC LIMIT 100`).all(...argsV) as any[];
+    const argsL: any[] = [desde]; let whL = ''; if (projeto) { whL = 'AND projeto=?'; argsL.push(projeto); }
+    const leads = db.prepare(`SELECT COALESCE(NULLIF(utm_campaign,''),'(sem campanha)') campanha, COUNT(*) leads FROM rastreio_clickids WHERE atualizado_em>=? ${whL} GROUP BY campanha ORDER BY leads DESC LIMIT 100`).all(...argsL) as any[];
+    const leadMap: any = {}; for (const l of leads) leadMap[l.campanha] = l.leads;
+    const linhas = vendas.map((v: any) => ({ campanha: v.campanha, fonte: v.fonte, leads: leadMap[v.campanha] || 0, vendas: v.vendas, total: v.total }));
+    for (const l of leads) { if (!vendas.find((v: any) => v.campanha === l.campanha)) linhas.push({ campanha: l.campanha, fonte: '', leads: l.leads, vendas: 0, total: 0 }); }
+    res.json({ ok: true, dias, linhas });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// snippet pronto pra colar nas paginas (pixel do navegador + dedup com o servidor)
+app.get('/track/snippet.js', (req, res) => {
+  const projeto = String(req.query.projeto || ''); const cfg: any = _trkCfg(projeto) || {};
+  const base = PUBLIC_BASE_URL || '';
+  res.type('application/javascript');
+  res.send(`(function(){
+  var PROJ=${JSON.stringify(projeto)}, PIX=${JSON.stringify(cfg.meta_pixel_id || '')}, BASE=${JSON.stringify(base)};
+  function uid(){return 'e'+Date.now()+Math.random().toString(36).slice(2,9);}
+  function qp(n){try{return new URLSearchParams(location.search).get(n)||'';}catch(e){return '';}}
+  function ck(n){try{var a=document.cookie.split('; ');for(var i=0;i<a.length;i++){var pp=a[i].split('=');if(pp[0]===n)return decodeURIComponent(pp[1]||'');}return '';}catch(e){return '';}}
+  var fbclid=qp('fbclid'), gclid=qp('gclid');
+  if(fbclid){try{document.cookie='_fbc=fb.1.'+Date.now()+'.'+fbclid+';path=/;max-age=7776000';}catch(e){}}
+  if(!ck('_fbp')){try{document.cookie='_fbp=fb.1.'+Date.now()+'.'+Math.floor(Math.random()*1e10)+';path=/;max-age=7776000';}catch(e){}}
+  if(PIX){!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments);};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s);}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');fbq('init',PIX);}
+  window.mrTrack=function(evento,dados){dados=dados||{};var id=dados.event_id||uid();
+    if(window.fbq){try{fbq('track',evento,{value:dados.valor,currency:dados.moeda||'BRL'},{eventID:id});}catch(e){}}
+    try{fetch(BASE+'/track/evento',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({projeto:PROJ,evento:evento,event_id:id,fbc:ck('_fbc'),fbp:ck('_fbp'),fbclid:fbclid,gclid:gclid,url:location.href,utm_source:qp('utm_source'),utm_medium:qp('utm_medium'),utm_campaign:qp('utm_campaign'),utm_content:qp('utm_content'),utm_term:qp('utm_term')},dados))});}catch(e){}
+    return id;};
+  window.mrTrack('PageView');
+})();`);
+});
 
 // ---- E-MAIL: templates, dominios (SMTP) e fila (envio real liga no fim) ----
 app.get('/email/templates', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, templates: db.prepare(`SELECT * FROM email_templates WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
@@ -1816,6 +1952,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         aplicarTag(projeto, cid, 'comprou');
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
         await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
+        try { const _clk = _getClickIds({ telefone: p.telefone, email: p.email }); void rastrear(projeto, 'Purchase', { ..._clk, valor: p.valor, moeda: 'BRL', email: p.email, telefone: p.telefone, nome: p.nome, external_id: p.telefone || p.email, produto: p.produtoNome, pedido: p.pedido, action_source: 'website', event_id: 'purchase_' + provider + '_' + p.pedido, origem: 'server' }).catch(() => {}); } catch {} // [#5 Purchase CAPI/GA4]
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
         await dispararRecuperacao(projeto, p.telefone, p.nome).catch(() => {});
@@ -2594,7 +2731,9 @@ app.post('/disparo/enviar', (req, res) => {
       const lid = randomUUID(); p.lote_id = lid;
       db.prepare(`INSERT INTO disparos_programados(id,projeto,is_grupo,nome,quando,payload,status,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(lid, String(p.projeto || ''), 0, String(p.loteNome || ''), String(p.agendamento || ''), JSON.stringify(p), 'agendado', agora());
     }
+    if (!p.agendamento) { if (!p.lote_id) p.lote_id = randomUUID(); _criaLote(p, p.lote_id); }
     const n = _enfileiraDisparo(p);
+    try { if (p.lote_id) db.prepare(`UPDATE lotes_envio SET total=? WHERE id=?`).run(n, p.lote_id); } catch {}
     res.json({ ok: true, enfileirados: n, lote_id: p.lote_id || null });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
@@ -2689,6 +2828,145 @@ app.get('/disparo/multi-relatorio', (_req, res) => {
 
 // [disparo-extra] tabela de disparos programados (agendados) — ADITIVO.
 try { db.exec(`CREATE TABLE IF NOT EXISTS disparos_programados (id TEXT PRIMARY KEY, projeto TEXT, is_grupo INTEGER DEFAULT 0, nome TEXT, quando TEXT, payload TEXT, status TEXT DEFAULT 'agendado', criado_em TEXT);`); } catch (e) { console.error('[disparos_programados]', e); }
+// [lotes/pausa] tabelas de controle de envio (add-only)
+try { db.exec(`CREATE TABLE IF NOT EXISTS lotes_envio (id TEXT PRIMARY KEY, projeto TEXT, nome TEXT, instancia TEXT, is_grupo INTEGER DEFAULT 0, total INTEGER DEFAULT 0, status TEXT DEFAULT 'rodando', criado_em TEXT);`); } catch (e) { console.error('[lotes_envio]', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS flags_sistema (chave TEXT PRIMARY KEY, valor TEXT);`); } catch (e) { console.error('[flags_sistema]', e); }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lotes_status ON lotes_envio(status, criado_em)`); } catch {}
+// [#5 rastreio] config/eventos/clickids server-side (add-only)
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_config (projeto TEXT PRIMARY KEY, meta_pixel_id TEXT, meta_token TEXT, test_code TEXT, ga4_mid TEXT, ga4_secret TEXT, dominio TEXT, ativo INTEGER DEFAULT 1, atualizado_em TEXT);`); } catch (e) { console.error('[rastreio_config]', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_eventos (id TEXT PRIMARY KEY, projeto TEXT, evento TEXT, event_id TEXT, origem TEXT, destino TEXT, status TEXT, http INTEGER, valor REAL, moeda TEXT, resposta TEXT, criado_em TEXT);`); } catch (e) { console.error('[rastreio_eventos]', e); }
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_clickids (chave TEXT PRIMARY KEY, projeto TEXT, fbc TEXT, fbp TEXT, gclid TEXT, utm_source TEXT, utm_medium TEXT, utm_campaign TEXT, utm_content TEXT, utm_term TEXT, ip TEXT, ua TEXT, atualizado_em TEXT);`); } catch (e) { console.error('[rastreio_clickids]', e); }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_rastreio_evt ON rastreio_eventos(projeto, criado_em)`); } catch {}
+function _trkCfg(projeto: string): any { try { return db.prepare(`SELECT * FROM rastreio_config WHERE projeto=?`).get(String(projeto || '')) || null; } catch { return null; } }
+function _trkNorm(v: any): string { return String(v == null ? '' : v).trim().toLowerCase(); }
+function _hsha(v: any): string { const x = _trkNorm(v); if (!x) return ''; try { return createHash('sha256').update(x).digest('hex'); } catch { return ''; } }
+function _hphone(v: any): string { const dd = String(v == null ? '' : v).replace(/\D/g, ''); if (!dd) return ''; const full = dd.length <= 11 ? '55' + dd : dd; try { return createHash('sha256').update(full).digest('hex'); } catch { return ''; } }
+function _fbc(fbclid: any, ts?: number): string { const f = String(fbclid || '').trim(); return f ? ('fb.1.' + (ts || Date.now()) + '.' + f) : ''; }
+function _metaUserData(d: any): any {
+  const ud: any = {};
+  if (d.email) ud.em = [_hsha(d.email)];
+  if (d.telefone || d.phone) ud.ph = [_hphone(d.telefone || d.phone)];
+  if (d.nome) { const parts = String(d.nome).trim().split(/\s+/); if (parts[0]) ud.fn = [_hsha(parts[0])]; if (parts.length > 1) ud.ln = [_hsha(parts[parts.length - 1])]; }
+  if (d.cidade) ud.ct = [_hsha(d.cidade)];
+  if (d.estado) ud.st = [_hsha(d.estado)];
+  if (d.cep) ud.zp = [_hsha(String(d.cep).replace(/\D/g, ''))];
+  if (d.pais) ud.country = [_hsha(d.pais)];
+  const ext = d.external_id || d.telefone || d.email; if (ext) ud.external_id = [_hsha(ext)];
+  if (d.fbc) ud.fbc = String(d.fbc); else if (d.fbclid) ud.fbc = _fbc(d.fbclid);
+  if (d.fbp) ud.fbp = String(d.fbp);
+  if (d.ip) ud.client_ip_address = String(d.ip);
+  if (d.ua) ud.client_user_agent = String(d.ua);
+  return ud;
+}
+function _logEvt(projeto: string, evento: string, eventId: string, origem: string, destino: string, status: string, http: number, valor: number, moeda: string, resposta: string) {
+  try { db.prepare(`INSERT INTO rastreio_eventos(id,projeto,evento,event_id,origem,destino,status,http,valor,moeda,resposta,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), String(projeto||''), String(evento||''), String(eventId||''), origem, destino, status, http|0, Number(valor||0), String(moeda||'BRL'), String(resposta||'').slice(0,500), agora()); } catch {}
+}
+async function capiMeta(projeto: string, evento: string, d: any): Promise<void> {
+  const cfg = _trkCfg(projeto); if (!cfg || !cfg.meta_pixel_id || !cfg.meta_token || cfg.ativo === 0) return;
+  const eventId = String(d.event_id || randomUUID());
+  const body: any = { data: [{ event_name: evento, event_time: Math.floor((d.event_time ? new Date(d.event_time).getTime() : Date.now()) / 1000), event_id: eventId, action_source: d.action_source || 'website', ...(d.url ? { event_source_url: d.url } : {}), user_data: _metaUserData(d), custom_data: { ...(d.valor != null ? { value: Number(d.valor) } : {}), currency: d.moeda || 'BRL', ...(d.produto ? { content_name: String(d.produto) } : {}), ...(d.custom || {}) } }] };
+  if (cfg.test_code) body.test_event_code = cfg.test_code;
+  const _url = 'https://graph.facebook.com/v21.0/' + encodeURIComponent(cfg.meta_pixel_id) + '/events?access_token=' + encodeURIComponent(cfg.meta_token);
+  const _bodyStr = JSON.stringify(body);
+  try {
+    const r: any = await fetch(_url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: _bodyStr });
+    let txt = ''; try { txt = await r.text(); } catch {}
+    _logEvt(projeto, evento, eventId, d.origem || 'server', 'meta', r.ok ? 'ok' : 'erro', r.status, Number(d.valor||0), d.moeda || 'BRL', txt);
+    if (!r.ok && (r.status >= 500 || r.status === 429)) _enfileiraRetry('meta', _url, _bodyStr, projeto, evento);
+  } catch (e: any) { _logEvt(projeto, evento, eventId, d.origem || 'server', 'meta', 'erro', 0, Number(d.valor||0), d.moeda || 'BRL', String(e.message || e)); _enfileiraRetry('meta', _url, _bodyStr, projeto, evento); }
+}
+async function ga4Send(projeto: string, evento: string, d: any): Promise<void> {
+  const cfg = _trkCfg(projeto); if (!cfg || !cfg.ga4_mid || !cfg.ga4_secret || cfg.ativo === 0) return;
+  const cid = String(d.client_id || d.fbp || d.external_id || d.telefone || d.email || randomUUID());
+  const nome = ({ Purchase: 'purchase', Lead: 'generate_lead', InitiateCheckout: 'begin_checkout', PageView: 'page_view', ViewContent: 'view_item' } as any)[evento] || String(evento).toLowerCase();
+  const body: any = { client_id: cid, events: [{ name: nome, params: { ...(d.valor != null ? { value: Number(d.valor), currency: d.moeda || 'BRL' } : {}), ...(d.produto ? { items: [{ item_name: String(d.produto) }] } : {}) } }] };
+  const _gurl = 'https://www.google-analytics.com/mp/collect?measurement_id=' + encodeURIComponent(cfg.ga4_mid) + '&api_secret=' + encodeURIComponent(cfg.ga4_secret);
+  const _gbody = JSON.stringify(body);
+  try {
+    const r: any = await fetch(_gurl, { method: 'POST', body: _gbody });
+    _logEvt(projeto, evento, String(d.event_id || cid), d.origem || 'server', 'ga4', r.ok ? 'ok' : 'erro', r.status, Number(d.valor||0), d.moeda || 'BRL', 'ga4 ' + r.status);
+    if (!r.ok && (r.status >= 500 || r.status === 429)) _enfileiraRetry('ga4', _gurl, _gbody, projeto, evento);
+  } catch (e: any) { _logEvt(projeto, evento, String(d.event_id || ''), d.origem || 'server', 'ga4', 'erro', 0, Number(d.valor||0), d.moeda || 'BRL', String(e.message || e)); _enfileiraRetry('ga4', _gurl, _gbody, projeto, evento); }
+}
+async function rastrear(projeto: string, evento: string, d: any): Promise<void> { await Promise.all([capiMeta(projeto, evento, d).catch(() => {}), ga4Send(projeto, evento, d).catch(() => {})]); }
+function _chaveClick(d: any): string { return String(d.external_id || d.telefone || d.email || '').trim().toLowerCase(); }
+function _saveClickIds(projeto: string, d: any): void {
+  const chave = _chaveClick(d); if (!chave) return;
+  try {
+    db.prepare(`INSERT INTO rastreio_clickids(chave,projeto,fbc,fbp,gclid,utm_source,utm_medium,utm_campaign,utm_content,utm_term,ip,ua,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chave) DO UPDATE SET fbc=COALESCE(NULLIF(excluded.fbc,''),rastreio_clickids.fbc), fbp=COALESCE(NULLIF(excluded.fbp,''),rastreio_clickids.fbp), gclid=COALESCE(NULLIF(excluded.gclid,''),rastreio_clickids.gclid), utm_source=COALESCE(NULLIF(excluded.utm_source,''),rastreio_clickids.utm_source), utm_medium=COALESCE(NULLIF(excluded.utm_medium,''),rastreio_clickids.utm_medium), utm_campaign=COALESCE(NULLIF(excluded.utm_campaign,''),rastreio_clickids.utm_campaign), utm_content=COALESCE(NULLIF(excluded.utm_content,''),rastreio_clickids.utm_content), utm_term=COALESCE(NULLIF(excluded.utm_term,''),rastreio_clickids.utm_term), ip=excluded.ip, ua=excluded.ua, atualizado_em=excluded.atualizado_em`)
+      .run(chave, String(projeto||''), String(d.fbc || (d.fbclid ? _fbc(d.fbclid) : '') || ''), String(d.fbp||''), String(d.gclid||''), String(d.utm_source||''), String(d.utm_medium||''), String(d.utm_campaign||''), String(d.utm_content||''), String(d.utm_term||''), String(d.ip||''), String(d.ua||''), agora());
+  } catch {}
+}
+function _getClickIds(d: any): any { const chave = _chaveClick(d); if (!chave) return {}; try { return db.prepare(`SELECT * FROM rastreio_clickids WHERE chave=?`).get(chave) || {}; } catch { return {}; } }
+// [#5 confiabilidade] fila de reenvio dos eventos que falharam (5xx/429/rede) + alertas de saude
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_retry (id TEXT PRIMARY KEY, destino TEXT, url TEXT, body TEXT, projeto TEXT, evento TEXT, tentativas INTEGER DEFAULT 0, proxima TEXT, criado_em TEXT);`); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_alertas (id TEXT PRIMARY KEY, tipo TEXT, msg TEXT, criado_em TEXT);`); } catch {}
+function _enfileiraRetry(destino: string, url: string, body: string, projeto: string, evento: string) {
+  try { db.prepare(`INSERT INTO rastreio_retry(id,destino,url,body,projeto,evento,tentativas,proxima,criado_em) VALUES(?,?,?,?,?,?,0,?,?)`).run(randomUUID(), destino, url, body, String(projeto||''), String(evento||''), agora(), agora()); } catch {}
+}
+let _retryRodando = false;
+async function tickRetry() {
+  if (_retryRodando) return; _retryRodando = true;
+  try {
+    const rows = db.prepare(`SELECT * FROM rastreio_retry WHERE proxima<=? AND tentativas<8 ORDER BY proxima LIMIT 20`).all(agora()) as any[];
+    for (const row of rows) {
+      let ok = false;
+      try { const r: any = await fetch(row.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: row.body }); ok = !!r.ok; } catch { ok = false; }
+      if (ok) { try { db.prepare(`DELETE FROM rastreio_retry WHERE id=?`).run(row.id); } catch {} _logEvt(row.projeto, row.evento, '', 'retry', row.destino, 'ok', 200, 0, 'BRL', 'reenvio ok'); }
+      else { const t = (row.tentativas || 0) + 1; const prox = new Date(Date.now() + Math.min(360, Math.pow(2, t)) * 60000).toISOString(); try { db.prepare(`UPDATE rastreio_retry SET tentativas=?, proxima=? WHERE id=?`).run(t, prox, row.id); } catch {} }
+    }
+  } catch {} finally { _retryRodando = false; }
+}
+setInterval(tickRetry, 60000);
+function _registraAlerta(tipo: string, msg: string) {
+  try {
+    const recente = db.prepare(`SELECT 1 FROM rastreio_alertas WHERE tipo=? AND criado_em>=?`).get(tipo, new Date(Date.now() - 6 * 3600000).toISOString());
+    if (recente) return;
+    db.prepare(`INSERT INTO rastreio_alertas(id,tipo,msg,criado_em) VALUES(?,?,?,?)`).run(randomUUID(), tipo, msg, agora());
+    console.warn('[rastreio-alerta]', tipo, msg);
+    try { const dest = db.prepare(`SELECT valor FROM flags_sistema WHERE chave='alerta_destino'`).get() as any; if (dest && dest.valor) { const instF = db.prepare(`SELECT valor FROM flags_sistema WHERE chave='alerta_instancia'`).get() as any; void enviarTexto('teclado', String(dest.valor), '\u26a0\ufe0f Rastreio: ' + msg, (instF && instF.valor) || null).catch(() => {}); } } catch {}
+  } catch {}
+}
+async function tickAlertaRastreio() {
+  try {
+    const h30 = new Date(Date.now() - 30 * 60000).toISOString();
+    const tot = db.prepare(`SELECT COUNT(*) n FROM rastreio_eventos WHERE criado_em>=?`).get(h30) as any;
+    const err = db.prepare(`SELECT COUNT(*) n FROM rastreio_eventos WHERE criado_em>=? AND status='erro'`).get(h30) as any;
+    if (tot.n >= 5 && (err.n / tot.n) > 0.5) _registraAlerta('falhas', 'muitas falhas no envio (' + err.n + '/' + tot.n + ' nos ultimos 30min). Confira token do CAPI / GA4.');
+    const h2 = new Date(Date.now() - 120 * 60000).toISOString();
+    const antes = db.prepare(`SELECT COUNT(*) n FROM rastreio_eventos WHERE criado_em>=? AND criado_em<?`).get(h2, h30) as any;
+    if (antes.n >= 15 && tot.n === 0) _registraAlerta('parou', 'os eventos pararam de sair (0 nos ultimos 30min, ' + antes.n + ' antes). Confira o motor/conexao.');
+  } catch {}
+}
+setInterval(tickAlertaRastreio, 30 * 60000);
+// [pausa] pausa global dos envios manuais (persistida; cache em memoria)
+let _pausaManuaisCache: boolean | null = null;
+function _pausaManuais(): boolean {
+  if (_pausaManuaisCache !== null) return _pausaManuaisCache;
+  try { const r = db.prepare(`SELECT valor FROM flags_sistema WHERE chave='disparos_pausados'`).get() as any; _pausaManuaisCache = !!(r && r.valor === '1'); } catch { _pausaManuaisCache = false; }
+  return _pausaManuaisCache;
+}
+function _setPausaManuais(v: boolean) {
+  _pausaManuaisCache = !!v;
+  try { db.prepare(`INSERT INTO flags_sistema(chave,valor) VALUES('disparos_pausados',?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor`).run(v ? '1' : '0'); } catch {}
+}
+// [lotes] rotulo do numero/alvo do lote (pro painel)
+function _loteInstanciaLabel(p: any): string {
+  if (p.alvoTipo === 'grupos') return (p.grupos || []).length ? 'grupos' : '';
+  const ins = p.instancias || [];
+  if (ins.length === 1) return String(ins[0]);
+  if (ins.length > 1) return 'rodizio (' + ins.length + ')';
+  return 'padrao';
+}
+// [lotes] cria o registro do lote (envio imediato) pro painel "Fila de envios"
+function _criaLote(p: any, id: string) {
+  try {
+    let nome = String(p.loteNome || '').trim();
+    if (!nome) { let h = ''; try { h = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }); } catch { h = agora(); } nome = (p.alvoTipo === 'grupos' ? 'Grupos ' : 'Envio ') + String(p.projeto || '') + ' ' + h; }
+    db.prepare(`INSERT OR IGNORE INTO lotes_envio(id,projeto,nome,instancia,is_grupo,total,status,criado_em) VALUES(?,?,?,?,?,?,?,?)`)
+      .run(id, String(p.projeto || ''), nome, _loteInstanciaLabel(p), p.alvoTipo === 'grupos' ? 1 : 0, 0, 'rodando', agora());
+  } catch (e) { /* best-effort */ }
+}
 // [perf] indices que faltavam — sem eles a contagem de tags (contato_tags tem centenas de milhares de linhas) trava o motor a cada clique.
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_contato_tags_tagid ON contato_tags(tag_id)`); } catch (e) { console.error('[idx tagid]', e); }
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fila_lote ON fila_envio(lote_id)`); } catch (e) { console.error('[idx lote]', e); }
@@ -2746,6 +3024,64 @@ app.post('/disparo/reenviar-individual-falhados', (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// [lotes] fila separada por envio: lista + detalhe + pausar/retomar/cancelar/editar + pausa global
+app.get('/disparo/lotes', (req, res) => {
+  try {
+    const proj = String((req.query.projeto as string) || '');
+    const lotes = (proj
+      ? db.prepare(`SELECT * FROM lotes_envio WHERE projeto=? ORDER BY criado_em DESC LIMIT 100`).all(proj)
+      : db.prepare(`SELECT * FROM lotes_envio ORDER BY criado_em DESC LIMIT 100`).all()) as any[];
+    const saida = lotes.map((l: any) => {
+      const c = db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE lote_id=? GROUP BY status`).all(l.id) as any[];
+      const by: any = {}; let tot = 0; for (const x of c) { by[x.status] = x.n; tot += x.n; }
+      const prox = db.prepare(`SELECT MIN(agendado_para) p FROM fila_envio WHERE lote_id=? AND status='camp_pend'`).get(l.id) as any;
+      return { id: l.id, projeto: l.projeto, nome: l.nome, instancia: l.instancia, is_grupo: l.is_grupo, status: l.status, criado_em: l.criado_em,
+        total: l.total || tot, enviado: by.enviado || 0, pendente: by.camp_pend || 0, falhou: by.falhou || 0, cancelado: by.cancelado || 0, prox: prox && prox.p || null };
+    });
+    res.json({ ok: true, lotes: saida, pausaGlobal: _pausaManuais() });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/disparo/lote/:id', (req, res) => {
+  try {
+    const l = db.prepare(`SELECT * FROM lotes_envio WHERE id=?`).get(String(req.params.id)) as any;
+    if (!l) return res.json({ ok: false, erro: 'nao_encontrado' });
+    const c = db.prepare(`SELECT status, COUNT(*) n FROM fila_envio WHERE lote_id=? GROUP BY status`).all(l.id) as any[];
+    const by: any = {}; let tot = 0; for (const x of c) { by[x.status] = x.n; tot += x.n; }
+    const amostra = db.prepare(`SELECT texto, legenda, tipo, url FROM fila_envio WHERE lote_id=? ORDER BY criado_em LIMIT 1`).get(l.id) as any;
+    res.json({ ok: true, lote: { id: l.id, projeto: l.projeto, nome: l.nome, instancia: l.instancia, is_grupo: l.is_grupo, status: l.status, total: l.total || tot, enviado: by.enviado || 0, pendente: by.camp_pend || 0, falhou: by.falhou || 0 }, amostra: amostra || null, pausaGlobal: _pausaManuais() });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/disparo/lote/pausar', (req, res) => {
+  try { db.prepare(`UPDATE lotes_envio SET status='pausado' WHERE id=? AND status='rodando'`).run(String((req.body || {}).lote_id || '')); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/disparo/lote/retomar', (req, res) => {
+  try { db.prepare(`UPDATE lotes_envio SET status='rodando' WHERE id=? AND status='pausado'`).run(String((req.body || {}).lote_id || '')); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/disparo/lote/cancelar', (req, res) => {
+  try {
+    const id = String((req.body || {}).lote_id || '');
+    db.prepare(`UPDATE lotes_envio SET status='cancelado' WHERE id=?`).run(id);
+    db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE lote_id=? AND status='camp_pend'`).run(id);
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/disparo/lote/editar-mensagem', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.lote_id || '');
+    if (!id) return res.json({ ok: false, erro: 'lote_id' });
+    if (typeof b.texto === 'string') db.prepare(`UPDATE fila_envio SET texto=? WHERE lote_id=? AND status='camp_pend' AND (tipo='texto' OR tipo IS NULL)`).run(String(b.texto), id);
+    if (typeof b.legenda === 'string') db.prepare(`UPDATE fila_envio SET legenda=? WHERE lote_id=? AND status='camp_pend' AND tipo<>'texto'`).run(String(b.legenda), id);
+    const n = db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE lote_id=? AND status='camp_pend'`).get(id) as any;
+    res.json({ ok: true, atualizados: n && n.n || 0 });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.post('/disparo/pausar-todos', (req, res) => {
+  try { _setPausaManuais(!!(req.body || {}).pausado); res.json({ ok: true, pausado: _pausaManuais() }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+app.get('/disparo/pausa-status', (_req, res) => { res.json({ ok: true, pausado: _pausaManuais() }); });
 app.get('/disparo/programados', (req, res) => {
   try {
     const projeto = String(req.query.projeto || '');
@@ -2818,8 +3154,18 @@ let _campEnviando = false;
 async function tickCampanha() {
   if (_campEnviando) return; _campEnviando = true;
   try {
-    const item = db.prepare(`SELECT * FROM fila_envio WHERE status='camp_pend' AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em LIMIT 1`).get(agora()) as any;
-    if (item) {
+    if (_pausaManuais()) return; // [pausa] pausa global dos envios manuais
+    const nowISO = agora();
+    // [paralelo] pega os devidos (pulando lotes pausados/cancelados) e manda 1 por INSTANCIA por tick => numeros diferentes enviam ao mesmo tempo
+    const itens = db.prepare(
+      `SELECT * FROM fila_envio
+       WHERE status='camp_pend' AND (agendado_para IS NULL OR agendado_para <= ?)
+         AND (lote_id IS NULL OR lote_id NOT IN (SELECT id FROM lotes_envio WHERE status IN ('pausado','cancelado')))
+       ORDER BY agendado_para IS NULL DESC, agendado_para, criado_em`
+    ).all(nowISO) as any[];
+    const porInst = new Map<string, any>();
+    for (const it of itens) { const k = String(it.instancia || '_'); if (!porInst.has(k)) porInst.set(k, it); }
+    await Promise.all(Array.from(porInst.values()).map(async (item: any) => {
       try {
         if ((item.tipo || 'texto') === 'texto') await enviarTexto(item.projeto, item.para, item.texto || '', item.instancia);
         else await enviarMidia(item.projeto, item.para, item.tipo, item.url || '', item.legenda || '', item.instancia);
@@ -2827,7 +3173,9 @@ async function tickCampanha() {
       } catch {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'camp_pend' END WHERE id=?`).run(item.id);
       }
-    }
+    }));
+    // [lotes] marca como concluido os lotes 'rodando' que nao tem mais nada pendente
+    try { db.prepare(`UPDATE lotes_envio SET status='concluido' WHERE status='rodando' AND id NOT IN (SELECT DISTINCT lote_id FROM fila_envio WHERE lote_id IS NOT NULL AND status='camp_pend')`).run(); } catch {}
   } finally { _campEnviando = false; }
 }
 setInterval(tickCampanha, 1000);
@@ -3765,8 +4113,18 @@ app.post('/conexoes/excluir', async (req, res) => {
     const instancia = String((req.body || {}).instancia || '');
     if (!instancia) return res.json({ ok: false, erro: 'instancia' });
     try { await evo(`/instance/logout/${encodeURIComponent(instancia)}`, 'DELETE'); } catch {}
-    try { await evo(`/instance/delete/${encodeURIComponent(instancia)}`, 'DELETE'); } catch (e: any) { return res.json({ ok: false, erro: String(e.message || e) }); }
+    let _evoDelErro = '';
+    try { await evo(`/instance/delete/${encodeURIComponent(instancia)}`, 'DELETE'); } catch (e: any) {
+      // [zumbi] instancia presa (estado "open" mas soquete morto): Evolution recusa o delete na 1a tentativa.
+      _evoDelErro = String(e.message || e);
+      try { await evo(`/instance/restart/${encodeURIComponent(instancia)}`, 'POST'); } catch {}
+      await new Promise((r) => setTimeout(r, 1800));
+      try { await evo(`/instance/logout/${encodeURIComponent(instancia)}`, 'DELETE'); } catch {}
+      try { await evo(`/instance/delete/${encodeURIComponent(instancia)}`, 'DELETE'); _evoDelErro = ''; } catch (e2: any) { _evoDelErro = String(e2.message || e2); }
+    }
+    // tira do cadastro local de qualquer jeito -> some do app e do rodizio de envio.
     try { db.prepare(`DELETE FROM numeros WHERE instancia=?`).run(instancia); } catch {}
+    if (_evoDelErro) return res.json({ ok: true, aviso: `Removido do app. O servidor WhatsApp ainda nao confirmou o delete (${_evoDelErro}); se o cartao reaparecer ao Atualizar, reinicie o container do Evolution e exclua de novo.` });
     res.json({ ok: true });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
