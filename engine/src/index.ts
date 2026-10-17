@@ -2113,6 +2113,52 @@ function _slotsLivres(projeto: string, periodo: string, limite = 10): any[] {
   return out;
 }
 
+// [gcal-fonte] liga/desliga sincronizacao com Google Agenda POR FONTE (default ligado). Controle do Ezequias.
+function _gcalFonteLigada(fonte: string): boolean { try { return pubFlag('gcal_sync_' + fonte, '1') === '1'; } catch { return true; } }
+
+// [disp-janelas] oferta de horarios lendo a tela "Minha Disponibilidade" (#6). Se a tabela estiver vazia,
+// cai no comportamento antigo (_slotsLivres, grade fixa do seed) — nada quebra.
+function _slotsLivresV2(projeto: string, periodo: string, limite = 10): any[] {
+  let janelas: any[] = [];
+  try { janelas = db.prepare(`SELECT dia_semana, hora, tipo, vagas FROM disponibilidade_janelas WHERE projeto=? AND ativo=1`).all(projeto) as any[]; } catch { janelas = []; }
+  if (!janelas || !janelas.length) return _slotsLivres(projeto, periodo, limite);
+  const seed = AGENTE_SEED[projeto] || {};
+  const antecedenciaH = (seed.grade && seed.grade.antecedenciaH) || 2;
+  const noPeriodo = (h: string): boolean => {
+    const hh = Number(String(h).split(':')[0]);
+    if (periodo === 'manha') return hh < 12;
+    if (periodo === 'tarde') return hh >= 12 && hh < 18;
+    if (periodo === 'noite') return hh >= 18;
+    return true;
+  };
+  const agoraMs = Date.now();
+  const minMs = agoraMs + antecedenciaH * 3600 * 1000;
+  const ocup: any = {};
+  try { (db.prepare(`SELECT inicio, COUNT(*) c FROM eventos WHERE projeto=? GROUP BY inicio`).all(projeto) as any[]).forEach((e) => { ocup[String(e.inicio)] = Number(e.c || 0); }); } catch { /* best-effort */ }
+  const porDia: any = {};
+  for (const j of janelas) { const d = Number(j.dia_semana); if (!porDia[d]) porDia[d] = []; porDia[d].push(j); }
+  const out: any[] = [];
+  for (let d = 0; d < 21 && out.length < limite; d++) {
+    const brt = new Date(agoraMs + d * 86400000 - 3 * 3600000);
+    const dow = brt.getUTCDay();
+    const doDia = porDia[dow]; if (!doDia || !doDia.length) continue;
+    doDia.sort((a: any, b: any) => String(a.hora).localeCompare(String(b.hora)));
+    for (const j of doDia) {
+      const h = String(j.hora);
+      if (!noPeriodo(h)) continue;
+      const parts = h.split(':'); const hh = Number(parts[0]); const mm = Number(parts[1] || 0);
+      const inicioUtcMs = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), hh + 3, mm);
+      if (inicioUtcMs < minMs) continue;
+      const iso = new Date(inicioUtcMs).toISOString();
+      const vagas = Math.max(1, Number(j.vagas || 1));
+      if (Number(ocup[iso] || 0) >= vagas) continue;
+      out.push({ iso, label: _DIAS_PT[dow] + ' ' + String(brt.getUTCDate()).padStart(2, '0') + '/' + String(brt.getUTCMonth() + 1).padStart(2, '0') + ' as ' + h, tipo: j.tipo || '', vagas });
+      if (out.length >= limite) break;
+    }
+  }
+  return out;
+}
+
 // --------- Ferramentas (function-calling) que o agente pode chamar ---------
 function _toolsDef(): any[] {
   return [
@@ -2129,7 +2175,7 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
   const seed = AGENTE_SEED[projeto] || {};
   try {
     if (nomeFerr === 'listar_horarios_livres') {
-      const slots = _slotsLivres(projeto, String(args.periodo || ''), 10);
+      const slots = _slotsLivresV2(projeto, String(args.periodo || ''), 10); // [disp-janelas] le a tela de Disponibilidade; fallback no seed
       return { ok: true, horarios: slots, sala: seed.sala || '' };
     }
     if (nomeFerr === 'salvar_whatsapp') {
@@ -2144,7 +2190,13 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       const id = randomUUID();
       db.prepare(`INSERT INTO eventos(id,projeto,titulo,inicio,fim,contato_id,obs,criado_em) VALUES(?,?,?,?,?,?,?,?)`)
         .run(id, projeto, 'Sessao ' + projeto + ' - ' + String(args.nome || conversa.telefone), inicio, fim, conversa.contato_id || null, String(args.observacao || ''), agora());
-      return { ok: true, id, inicio, fim, sala: seed.sala || '' };
+      // [gcal-ia] se o Google Agenda (nuvem) estiver ligado E a fonte "ia" marcada pelo Ezequias, cria tambem no Google
+      let _gcalIaId: string | null = null; let _gcalIaAviso = '';
+      if (pubFlag('gcal_ativo') === '1' && _gcalFonteLigada('ia')) {
+        try { _gcalIaId = await _gcalCriarEvento({ tipo: 'ia', refId: id, titulo: 'Sessao ' + projeto + ' - ' + String(args.nome || conversa.telefone), inicio, fim, descricao: String(args.observacao || '') }); }
+        catch (e: any) { _gcalIaAviso = 'google_falhou: ' + String(e && e.message || e); }
+      } else if (pubFlag('gcal_ativo') === '1') { _gcalIaAviso = 'fonte_ia_desligada'; }
+      return { ok: true, id, inicio, fim, sala: seed.sala || '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
     }
     if (nomeFerr === 'registrar_card_crm') {
       const id = randomUUID();
@@ -3094,7 +3146,7 @@ app.post('/agenda/reuniao', async (req, res) => {
     db.prepare(`INSERT INTO reunioes_sdr(id,projeto,lead_nome,lead_telefone,lead_email,origem,titulo,inicio,fim,observacao,status,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET inicio=excluded.inicio, fim=excluded.fim, titulo=excluded.titulo, atualizado_em=excluded.atualizado_em`)
       .run(id, String(b.projeto || ''), b.lead_nome || null, b.lead_telefone || null, b.lead_email || null, b.origem || null, titulo, inicio, fim, b.observacao || null, 'agendada', agora(), agora());
     let googleEventId: string | null = null; let avisoGoogle = '';
-    if (pubFlag('gcal_ativo') === '1') {
+    if (pubFlag('gcal_ativo') === '1' && _gcalFonteLigada('reuniao')) { // [gcal-fonte] toggle da reuniao manual
       try { googleEventId = await _gcalCriarEvento({ tipo: 'reuniao', refId: id, titulo, inicio, fim, descricao: (b.observacao || '') + '\nLead: ' + (b.lead_nome || '') + ' ' + (b.lead_telefone || ''), convidadoEmail: b.lead_email || '' }); }
       catch (e: any) { avisoGoogle = 'google_falhou: ' + String(e.message || e); }
       if (googleEventId) db.prepare(`UPDATE reunioes_sdr SET google_event_id=? WHERE id=?`).run(googleEventId, id);
@@ -3107,6 +3159,28 @@ app.get('/agenda/reunioes', (req, res) => {
     const dias = Math.min(180, Number((req.query as any).dias || 30));
     res.json({ ok: true, reunioes: db.prepare(`SELECT * FROM reunioes_sdr WHERE date(inicio)>=date('now','-2 day') AND date(inicio)<=date('now','+${dias} day') ORDER BY inicio ASC`).all() });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
+// [gcal-config] status + liga/desliga por fonte o que a NUVEM manda pra Agenda do Google do Ezequias.
+// Fontes que hoje criam evento no Google: 'ia' (quando o agente marca) e 'reuniao' (reuniao SDR manual).
+const _GCAL_FONTES = ['ia', 'reuniao'];
+app.get('/gcal/status', (_req, res) => {
+  try {
+    const fontes: any = {}; for (const f of _GCAL_FONTES) fontes[f] = _gcalFonteLigada(f);
+    res.json({ ok: true, conectado: pubFlag('gcal_ativo') === '1', calendario: pubFlag('gcal_calendar_id', 'primary'), fontes });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/gcal/sync-config', (_req, res) => {
+  try { const fontes: any = {}; for (const f of _GCAL_FONTES) fontes[f] = _gcalFonteLigada(f); res.json({ ok: true, conectado: pubFlag('gcal_ativo') === '1', fontes }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/gcal/sync-config', (req, res) => {
+  try {
+    const b: any = (req.body || {}).fontes || req.body || {};
+    for (const f of _GCAL_FONTES) { if (b[f] !== undefined) setPubFlag('gcal_sync_' + f, (b[f] === true || b[f] === '1' || b[f] === 1 || b[f] === 'on') ? '1' : '0'); }
+    const fontes: any = {}; for (const f of _GCAL_FONTES) fontes[f] = _gcalFonteLigada(f);
+    res.json({ ok: true, fontes });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
 // ---- Google Calendar: refresh token + criar evento (gated por gcal_ativo) ----
