@@ -3167,7 +3167,7 @@ const _GCAL_FONTES = ['ia', 'reuniao'];
 app.get('/gcal/status', (_req, res) => {
   try {
     const fontes: any = {}; for (const f of _GCAL_FONTES) fontes[f] = _gcalFonteLigada(f);
-    res.json({ ok: true, conectado: pubFlag('gcal_ativo') === '1', calendario: pubFlag('gcal_calendar_id', 'primary'), fontes });
+    res.json({ ok: true, conectado: pubFlag('gcal_ativo') === '1', conta: pubFlag('gcal_conta', ''), calendario: pubFlag('gcal_calendar_id', 'primary'), fontes });
   } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
 });
 app.get('/gcal/sync-config', (_req, res) => {
@@ -3181,6 +3181,37 @@ app.post('/gcal/sync-config', (req, res) => {
     const fontes: any = {}; for (const f of _GCAL_FONTES) fontes[f] = _gcalFonteLigada(f);
     res.json({ ok: true, fontes });
   } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+
+// [gcal-connect] conectar o Google Agenda da NUVEM reaproveitando o app Google do YouTube (sem novo cadastro no Google Cloud).
+const GCAL_SCOPE_CONNECT = 'https://www.googleapis.com/auth/calendar openid email';
+app.get('/gcal/connect', (_req, res) => {
+  try {
+    const { clientId } = pbCred('youtube');
+    if (!clientId) return res.status(400).json({ ok: false, erro: 'App Google do YouTube nao configurado no motor.' });
+    const params = new URLSearchParams({
+      client_id: clientId, redirect_uri: pbYtRedirect(), response_type: 'code', scope: GCAL_SCOPE_CONNECT,
+      access_type: 'offline', prompt: 'consent', include_granted_scopes: 'false', state: 'gcal:connect',
+    });
+    res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/gcal/agendas', async (_req, res) => {
+  try {
+    const at = await _gcalAccessToken();
+    const r: any = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=writer', { headers: { Authorization: 'Bearer ' + at } });
+    const j: any = await r.json();
+    const agendas = (j.items || []).map((c: any) => ({ id: c.id, nome: c.summary, primary: !!c.primary }));
+    res.json({ ok: true, agendas, atual: pubFlag('gcal_calendar_id', 'primary') });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/gcal/calendario', (req, res) => {
+  try { const id = String((req.body || {}).calendarId || (req.body || {}).id || '').trim(); if (id) setPubFlag('gcal_calendar_id', id); res.json({ ok: true, calendario: pubFlag('gcal_calendar_id', 'primary') }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/gcal/desconectar', (_req, res) => {
+  try { setPubFlag('gcal_ativo', '0'); setPubFlag('gcal_refresh_enc', ''); res.json({ ok: true }); }
+  catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
 // ---- Google Calendar: refresh token + criar evento (gated por gcal_ativo) ----
@@ -4771,6 +4802,27 @@ app.get('/pub/youtube/callback', async (req, res) => {
   try {
     const code = String(req.query.code || ''); const state = String(req.query.state || '');
     if (req.query.error) return enviaHtml(false, `Google: ${req.query.error}`);
+    // [gcal-connect] reaproveita o MESMO redirect do YouTube pra conectar o Google Agenda (state 'gcal:')
+    if (state.startsWith('gcal:')) {
+      try {
+        const { clientId: gci, clientSecret: gcs } = pbCred('youtube');
+        const tr2: any = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ code, client_id: gci, client_secret: gcs, redirect_uri: pbYtRedirect(), grant_type: 'authorization_code' }),
+        });
+        if (!tr2.ok) return enviaHtml(false, `Google Agenda: troca de token falhou (${tr2.status})`);
+        const td2: any = await tr2.json();
+        if (!td2.refresh_token) return enviaHtml(false, 'Google nao devolveu refresh_token. Tente conectar de novo.');
+        setPubFlag('gcal_client_id', gci);
+        setPubFlag('gcal_client_secret_enc', cifra(gcs));
+        setPubFlag('gcal_refresh_enc', cifra(String(td2.refresh_token)));
+        setPubFlag('gcal_ativo', '1');
+        let contaG = '';
+        try { const ui: any = await (await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: `Bearer ${td2.access_token}` } })).json(); contaG = ui.email || ui.name || ''; } catch { /* */ }
+        if (contaG) setPubFlag('gcal_conta', contaG);
+        return enviaHtml(true, `Google Agenda conectado: ${contaG || 'conta'}. Pode fechar esta aba.`);
+      } catch (e: any) { return enviaHtml(false, 'Google Agenda: ' + String(e?.message || e)); }
+    }
     if (!code || !state.startsWith('yt:')) return enviaHtml(false, 'callback inválido');
     const canalId = state.slice(3);
     const { clientId, clientSecret } = pbCred('youtube');
