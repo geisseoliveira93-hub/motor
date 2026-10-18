@@ -252,7 +252,7 @@ type FluxoPasso = {
 // o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
 // chamarPeloNome: liga/desliga o uso do nome da pessoa na mensagem (padrão: ligado).
 // nomeFallback: o que usar no lugar do nome quando NÃO há nome (ou quando está desligado).
-type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[]; chamarPeloNome?: boolean; nomeFallback?: string };
+type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[]; chamarPeloNome?: boolean; nomeFallback?: string; instancia?: string };
 
 type Config = {
   // Mapa de produto (id OU nome, em minúsculas) -> projeto.
@@ -274,6 +274,17 @@ type Config = {
   // (Opcional) FLUXOS por PRODUTO (ex.: um low-ticket que entrega o ebook direto no WhatsApp).
   // Tem prioridade sobre o fluxo do projeto. Casa pelo nome (padrão) ou por id (porId:true).
   entregaFluxoProduto?: FluxoProduto[];
+  // [motor2] TAGS DA TRILHA por PRODUTO: casa por id (porId:true) OU por pedaço do nome (padrão),
+  // minúsculas. Na compra aprovada (inclusive order bump/upsell), cada tag é aplicada e dispara
+  // rodarAutomacoes('tag_adicionada'), reaproveitando os fluxos/automações que já existem
+  // (grupo, webinário, sequência de mensagens, qualificação...). INERTE até pubFlag motor2_ativo=1.
+  produtoTags?: { chave: string; porId?: boolean; tags: string[] }[];
+  // [motor2] Tags (pedaço, minúsculas) que AUTORIZAM o agente IA a responder no número compartilhado
+  // (8151). Sem tag casada => lead fica na FILA pra atendente humano. Somadas às padrão do código.
+  agenteTagsGatilho?: string[];
+  // [num-escolha] Número PADRÃO de envio por projeto (nome da instância). Usado por numeroConectado
+  // como preferência; se vazio/desconectado, cai no 1º conectado. Evita mandar do número errado (ex.: pessoal).
+  numeroPadrao?: Partial<Record<Projeto, string>>;
 };
 const CONFIG_DEFAULT: Config = {
   produtoProjeto: {},
@@ -294,6 +305,17 @@ const CONFIG_DEFAULT: Config = {
     violao: 'Oi {nome}! Vi que sua compra do curso de violão não foi concluída. Posso te ajudar a finalizar? 👇',
     teclado: 'Oi {nome}! Vi que sua compra do curso de teclado não foi concluída. Posso te ajudar a finalizar? 👇',
   },
+  // [motor2] SEED inicial das tags por produto = os 4 LOW TICKETS confirmados, com os NOMES EXATOS
+  // das tags do Sellflux (pra seguir idêntico ao que já acontecia) + marcadores 'low-ticket' e
+  // 'qualificar-24h' (o marcador 'low-ticket' é o que o gate do agente usa — exclui high ticket).
+  // Chave = pedaço do NOME do produto (SEM acento; o matcher não tira acento), igual chega no webhook.
+  produtoTags: [
+    { chave: '20 dedilhados',       tags: ['compra-realizada-20-dedilhados-para-sair-do-basico-em-video-aula-com-pdf', 'low-ticket', 'qualificar-24h'] },
+    { chave: 'combo de 200 cifras', tags: ['compra-realizada-combo-de-200-cifras-100-hinos-da-harpa-crista-e-100-classicos-do-gospel', 'low-ticket', 'qualificar-24h'] },
+    { chave: 'melhores cifras',     tags: ['compra-realizada-100-melhores-cifras-melodicas-dos-classicos-do-gospel-teclado-volume-1', 'low-ticket', 'qualificar-24h'] },
+    { chave: 'ebook 200 cifras',    tags: ['compra-realizada-ebook-digital-com-200-cifras-com-60-de-desconto-4-video-aulas-de-ritmos-no-teclado', 'low-ticket', 'qualificar-24h'] },
+  ],
+  agenteTagsGatilho: ['low-ticket', 'grupo-vip', 'qualificar'],
 };
 function carregarConfig(): Config {
   try {
@@ -435,33 +457,42 @@ function projetoDaInstancia(instancia: string): Projeto {
 
 /** Pega o 1º número conectado do projeto (base do rodízio, que entra depois). */
 function numeroConectado(projeto: Projeto): any {
+  // [num-escolha] Preferir o número PADRÃO escolhido pro projeto (CONFIG.numeroPadrao), se conectado.
+  // Senão, o 1º conectado (comportamento antigo). Corrige o motor pegar o número errado por ordem de criação.
+  const padraoNome = ((CONFIG as any).numeroPadrao || {})[projeto];
+  if (padraoNome) {
+    const pref = db.prepare(`SELECT * FROM numeros WHERE projeto=? AND instancia=? AND status='conectado'`).get(projeto, String(padraoNome));
+    if (pref) return pref;
+  }
   return db.prepare(
     `SELECT * FROM numeros WHERE projeto=? AND status='conectado' ORDER BY criado_em LIMIT 1`
   ).get(projeto);
 }
 
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
-async function enviarTexto(projeto: Projeto, para: string, texto: string) {
-  const num = numeroConectado(projeto);
-  if (!num) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
-  return evo(`/message/sendText/${num.instancia}`, 'POST', {
+async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string) {
+  // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
+  const inst = instancia || numeroConectado(projeto)?.instancia;
+  if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
+  return evo(`/message/sendText/${inst}`, 'POST', {
     number: para, text: texto,
   });
 }
 
 /** Envia MÍDIA (imagem/vídeo/áudio/documento) por URL, por um número do projeto. */
-async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: string, legenda?: string) {
-  const num = numeroConectado(projeto);
-  if (!num) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
+async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: string, legenda?: string, instancia?: string) {
+  // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
+  const inst = instancia || numeroConectado(projeto)?.instancia;
+  if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
   if (!url) throw new Error('midia_sem_url');
   if (tipo === 'audio') {
-    return evo(`/message/sendWhatsAppAudio/${num.instancia}`, 'POST', { number: para, audio: url });
+    return evo(`/message/sendWhatsAppAudio/${inst}`, 'POST', { number: para, audio: url });
   }
   const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url };
   if (legenda) body.caption = preenche(legenda);
   if (mediatype === 'document') body.fileName = (url.split('/').pop() || 'arquivo').split('?')[0];
-  return evo(`/message/sendMedia/${num.instancia}`, 'POST', body);
+  return evo(`/message/sendMedia/${inst}`, 'POST', body);
 }
 
 /** Envia UM passo de fluxo (texto ou mídia), já com {nome} preenchido. */
@@ -475,10 +506,11 @@ async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, no
 
 /** Enfileira um FLUXO (vários passos com delay) pra um contato. O worker manda no ritmo,
  * respeitando o delay de cada passo (agendado_para). Preenche {nome} em texto/legenda. */
-function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome) {
+function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome, instancia?: string) {
+  // [num-escolha] instancia opcional: grava o número de envio na fila; o tickFila respeita.
   const ins = db.prepare(
-    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,agendado_para,criado_em)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
   );
   let acumulado = 0;
   const tx = db.transaction(() => {
@@ -488,7 +520,7 @@ function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], n
       const texto = tipo === 'texto' ? preencheNome(p.texto || '', nome, opts) : '';
       const legenda = tipo === 'texto' ? '' : preencheNome(p.texto || p.legenda || '', nome, opts);
       ins.run(randomUUID(), projeto, para, 0, texto, tipo, p.url || null, legenda || null,
-        'pendente', emSegundos(acumulado), agora());
+        'pendente', instancia || null, emSegundos(acumulado), agora());
     }
   });
   tx();
@@ -531,7 +563,7 @@ async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string
   const optsNome: OpcoesNome | undefined = fpProduto
     ? { chamarPeloNome: fpProduto.chamarPeloNome, nomeFallback: fpProduto.nomeFallback }
     : undefined;
-  if (fluxo) { enfileirarFluxo(projeto, telefone, fluxo, nome, optsNome); return 'fluxo'; }
+  if (fluxo) { enfileirarFluxo(projeto, telefone, fluxo, nome, optsNome, fpProduto?.instancia || undefined); return 'fluxo'; }
   await enviarTexto(projeto, telefone, preenche(CONFIG.entrega[projeto], nome)).catch(() => {});
   return 'mensagem';
 }
@@ -867,7 +899,8 @@ app.post('/flows/produto', (req, res) => {
   const chave = String(b.chave || '').trim();
   if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
   const item: FluxoProduto = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
-    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined) };
+    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined),
+    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined) };
   const lista = CONFIG.entregaFluxoProduto || [];
   const i = lista.findIndex((f) => f.chave.toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
   if (i >= 0) lista[i] = item; else lista.push(item);
@@ -1648,6 +1681,74 @@ app.all('/receive/:token', (req, res) => {
   res.json({ ok: true, recebido: true });
 });
 
+// ======================= [motor2] Trilha por tag + bump/upsell + gate do agente =======================
+// Tudo aditivo e INERTE por padrão. O fluxo de compra/entrega antigo continua igual; os blocos novos
+// só agem quando pubFlag('motor2_ativo')==='1'. O gate do agente (8151) é LIGADO por padrão (seguro):
+// o agente só responde a lead com tag gatilho; sem tag, fica na fila pra humano.
+
+/** [motor2] Extrai TODOS os itens de uma compra (produto principal + order bump + upsell). */
+function _itensPagamento(provider: string, b: any): { produtoId: string; produtoNome: string; valor: number }[] {
+  const out: { produtoId: string; produtoNome: string; valor: number }[] = [];
+  const push = (id: any, nome: any, valor: any) => {
+    const pid = String(id || '').trim(); const pn = String(nome || '').trim();
+    if (!pid && !pn) return;
+    if (out.some((x) => (pid && x.produtoId === pid) || (pn && x.produtoNome.toLowerCase() === pn.toLowerCase()))) return; // dedupe
+    out.push({ produtoId: pid, produtoNome: pn, valor: Number(valor || 0) });
+  };
+  try {
+    if (provider === 'lastlink') {
+      const d = b?.Data || b?.data || b;
+      const arr = d?.Products || d?.products || [];
+      for (const pr of (Array.isArray(arr) ? arr : [])) push(pr?.Id || pr?.id, pr?.Name || pr?.name, pr?.Price || pr?.price);
+      for (const k of ['Bumps', 'bumps', 'OrderBumps', 'orderBumps', 'Upsell', 'upsell', 'Upsells', 'upsells']) {
+        const ex = d?.[k]; if (Array.isArray(ex)) for (const pr of ex) push(pr?.Id || pr?.id || pr?.ProductId, pr?.Name || pr?.name, pr?.Price || pr?.price);
+      }
+    } else {
+      const arr = b?.items || b?.products || [];
+      for (const pr of (Array.isArray(arr) ? arr : [])) push(pr?.id || pr?.marketplace_id || pr?.product_id, pr?.name, pr?.total_value || pr?.unit_value);
+      const prod = b?.product; if (prod) push(prod?.id || prod?.marketplace_id, prod?.name, b?.payment?.total);
+      for (const k of ['bumps', 'order_bumps', 'orderBumps', 'upsell', 'upsells']) {
+        const ex = b?.[k]; if (Array.isArray(ex)) for (const pr of ex) push(pr?.id || pr?.marketplace_id, pr?.name, pr?.total_value || pr?.unit_value);
+      }
+    }
+  } catch { /* best-effort */ }
+  return out;
+}
+
+/** [motor2] Tags da trilha configuradas pro produto (casa por id/nome, igual à entrega). */
+function _produtoTags(produtoId?: string, produtoNome?: string): string[] {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  const out: string[] = [];
+  for (const pt of ((CONFIG as any).produtoTags || []) as { chave: string; porId?: boolean; tags: string[] }[]) {
+    const chave = String(pt?.chave || '').toLowerCase(); if (!chave) continue;
+    const casa = pt?.porId ? (id && id === chave) : alvo.includes(chave);
+    if (casa && Array.isArray(pt.tags)) for (const t of pt.tags) { const tn = String(t || '').trim(); if (tn && !out.includes(tn)) out.push(tn); }
+  }
+  return out;
+}
+
+/** [motor2] Lista de tags-gatilho (padrão do código + CONFIG.agenteTagsGatilho). */
+const _AGENTE_TAGS_GATILHO_PADRAO = ['low-ticket', 'lowticket', 'grupo-vip', 'qualificar', 'qualificacao', 'qualificação'];
+function _agenteTagsGatilho(): string[] {
+  const extra = Array.isArray((CONFIG as any).agenteTagsGatilho) ? (CONFIG as any).agenteTagsGatilho.map((s: any) => String(s).toLowerCase()) : [];
+  return [..._AGENTE_TAGS_GATILHO_PADRAO, ...extra];
+}
+/** [motor2] O contato tem alguma tag que autoriza o agente? (casa por pedaço, minúsculas) */
+function _contatoTemTagGatilho(projeto: string, contatoId: string): boolean {
+  try {
+    const tags = db.prepare(`SELECT t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.contato_id=? AND t.projeto=?`).all(contatoId, projeto) as any[];
+    const alvo = _agenteTagsGatilho();
+    for (const row of tags) { const n = String(row?.nome || '').toLowerCase(); if (alvo.some((g) => g && n.includes(g))) return true; }
+  } catch { /* best-effort */ }
+  return false;
+}
+/** [motor2] O agente PODE responder a esse contato? Gate LIGADO (padrão) exige tag-gatilho. */
+function _agenteDevResponder(projeto: string, contatoId: string): boolean {
+  if (pubFlag('agente_tag_gate', '1') !== '1') return true; // gate desligado => comportamento antigo (responde a todos)
+  return _contatoTemTagGatilho(projeto, contatoId);
+}
+
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----
 app.post('/webhook/evolution', (req, res) => {
   try {
@@ -1664,7 +1765,7 @@ app.post('/webhook/evolution', (req, res) => {
         catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         if (!ehGrupo) rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
-        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto]) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo */ }
+        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && _agenteDevResponder(projeto, cid)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila */ }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -1786,6 +1887,30 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       if (categoria === 'aprovado') {
         aplicarTag(projeto, cid, 'comprou');
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        // [motor2] Trilha por produto + order bump/upsell. INERTE até pubFlag('motor2_ativo')==='1'.
+        // Aplica as tags da trilha de CADA item (principal + bump + upsell), dispara os fluxos pela tag,
+        // e entrega no WhatsApp os itens EXTRAS que tenham fluxo próprio (o principal já foi entregue acima).
+        if (pubFlag('motor2_ativo', '0') === '1') {
+          try {
+            const itens = _itensPagamento(provider, b);
+            for (let i = 0; i < itens.length; i++) {
+              const it = itens[i];
+              const projItem = projetoDoProduto(it.produtoId, it.produtoNome);
+              const cidItem = (projItem === projeto) ? cid : upsertContato(projItem, p.telefone, p.nome, p.email, `pagamento:${provider}`);
+              for (const tg of _produtoTags(it.produtoId, it.produtoNome)) {
+                aplicarTag(projItem, cidItem, tg);
+                await rodarAutomacoes(projItem, 'tag_adicionada', { contatoId: cidItem, tag: tg, telefone: p.telefone, nome: p.nome }).catch(() => {});
+              }
+              const ehPrincipal = (projItem === projeto) && (
+                (it.produtoId && it.produtoId === String(p.produtoId || '')) ||
+                (it.produtoNome && it.produtoNome.toLowerCase() === String(p.produtoNome || '').toLowerCase())
+              );
+              if (!ehPrincipal && produtoFluxoMatch(it.produtoId, it.produtoNome)) {
+                await dispararEntrega(projItem, p.telefone, p.nome, it.produtoId, it.produtoNome).catch(() => {});
+              }
+            }
+          } catch { /* [motor2] best-effort: nunca quebra a entrega padrão */ }
+        }
         await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
@@ -1934,10 +2059,11 @@ async function tickFila() {
     if (item) {
       try {
         const tipo = item.tipo || 'texto';
+        // [num-escolha] respeita o número de envio gravado na fila (item.instancia); sem ele, usa o padrão do projeto.
         if (tipo === 'texto') {
-          await enviarTexto(item.projeto, item.para, item.texto || '');
+          await enviarTexto(item.projeto, item.para, item.texto || '', item.instancia || undefined);
         } else {
-          await enviarMidia(item.projeto, item.para, tipo, item.url || '', item.legenda || '');
+          await enviarMidia(item.projeto, item.para, tipo, item.url || '', item.legenda || '', item.instancia || undefined);
         }
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
       } catch {
@@ -3185,6 +3311,58 @@ app.post('/gcal/sync-config', (req, res) => {
 
 // [gcal-connect] conectar o Google Agenda da NUVEM reaproveitando o app Google do YouTube (sem novo cadastro no Google Cloud).
 const GCAL_SCOPE_CONNECT = 'https://www.googleapis.com/auth/calendar openid email';
+// ======================= [num-escolha] Escolha do número de envio =======================
+// Lista os números conectados por projeto + o padrão escolhido (pro app montar o seletor).
+app.get('/config/numeros', (_req, res) => {
+  const numeros = db.prepare(`SELECT projeto, instancia, telefone, status FROM numeros ORDER BY projeto, criado_em`).all();
+  res.json({ ok: true, numeros, numeroPadrao: (CONFIG as any).numeroPadrao || {} });
+});
+// Define o número PADRÃO de envio de um projeto (nome da instância). instancia vazia = volta ao 1º conectado.
+app.post('/config/numero-padrao', (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '');
+  if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
+  if (!(CONFIG as any).numeroPadrao) (CONFIG as any).numeroPadrao = {};
+  const inst = String(b.instancia || '').trim();
+  if (inst) (CONFIG as any).numeroPadrao[projeto] = inst; else delete (CONFIG as any).numeroPadrao[projeto];
+  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  res.json({ ok: true, numeroPadrao: (CONFIG as any).numeroPadrao });
+});
+
+// ======================= [motor2] Endpoints de gestão (trilha/tags/flags) =======================
+// Deixam o app ligar/desligar e editar as tags por produto SEM redeploy. Exigem x-api-key (middleware global).
+app.get('/motor2/config', (_req, res) => {
+  res.json({
+    ok: true,
+    motor2_ativo: pubFlag('motor2_ativo', '0') === '1',
+    agente_tag_gate: pubFlag('agente_tag_gate', '1') === '1',
+    produtoTags: (CONFIG as any).produtoTags || [],
+    agenteTagsGatilho: (CONFIG as any).agenteTagsGatilho || [],
+    agenteTagsGatilhoEfetivo: _agenteTagsGatilho(),
+  });
+});
+// Substitui a lista de tags por produto (array completo). Grava no config.json.
+app.post('/motor2/produto-tags', (req, res) => {
+  const b = req.body || {};
+  if (!Array.isArray(b.produtoTags)) return res.status(400).json({ ok: false, erro: 'produtoTags_deve_ser_array' });
+  (CONFIG as any).produtoTags = b.produtoTags.map((pt: any) => ({
+    chave: String(pt?.chave || ''), porId: !!pt?.porId,
+    tags: Array.isArray(pt?.tags) ? pt.tags.map((t: any) => String(t || '')).filter(Boolean) : [],
+  })).filter((pt: any) => pt.chave);
+  if (Array.isArray(b.agenteTagsGatilho)) (CONFIG as any).agenteTagsGatilho = b.agenteTagsGatilho.map((t: any) => String(t || '')).filter(Boolean);
+  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  res.json({ ok: true, produtoTags: (CONFIG as any).produtoTags, agenteTagsGatilho: (CONFIG as any).agenteTagsGatilho || [] });
+});
+// Liga/desliga as flags do motor2. flag = 'motor2_ativo' | 'agente_tag_gate'. on = true/false.
+app.post('/motor2/flag', (req, res) => {
+  const b = req.body || {};
+  const flag = String(b.flag || '');
+  if (flag !== 'motor2_ativo' && flag !== 'agente_tag_gate') return res.status(400).json({ ok: false, erro: 'flag_invalida' });
+  const on = (b.on === true || b.on === '1' || b.on === 1 || b.on === 'on');
+  setPubFlag(flag, on ? '1' : '0');
+  res.json({ ok: true, flag, valor: pubFlag(flag, flag === 'agente_tag_gate' ? '1' : '0') === '1' });
+});
+
 app.get('/gcal/connect', (_req, res) => {
   try {
     const { clientId } = pbCred('youtube');
