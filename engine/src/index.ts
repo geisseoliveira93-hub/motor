@@ -660,6 +660,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/v/')) return next(); // [#9 VSL] player publico (/v/:id e /v/:id.js)
   if (req.path === '/vsl/evento') return next(); // [#9 VSL] ingest de eventos do player (browser, sem x-api-key)
   if (req.path.startsWith('/vsl/media/')) return next(); // [#9 VSL upload] serve o video proprio (storage/OneDrive) pro player, sem x-api-key
+  if (req.path === '/vsl/lead') return next(); // [#9 VSL camada3] gate de e-mail/WhatsApp: captura do navegador, sem x-api-key
   if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
   if (req.path === '/pub/youtube/callback') return next(); // etapa28: OAuth YouTube (Google chama sem a x-api-key)
   if (req.path === '/pub/youtube-lives/callback') return next(); // [lives-sep]: OAuth YouTube LIVES (projeto separado; Google chama sem a x-api-key)
@@ -8105,6 +8106,19 @@ try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN escassez_texto TEXT`); } catch 
 try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN cta_utm INTEGER`); } catch { /* existe */ }     // passa UTM+contato pro link do CTA (0/1)
 try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN marco_tag TEXT`); } catch { /* existe */ }      // tag aplicada no marco (precisa ?c= do contato)
 try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN marco_evento TEXT`); } catch { /* existe */ }   // oferta | fim | play
+// [#9 VSL camada3] prova social + gate de e-mail/WhatsApp + teste A/B
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN prova_on INTEGER`); } catch { /* existe */ }       // liga pop-ups de prova social (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN prova_texto TEXT`); } catch { /* existe */ }       // 1 mensagem por linha
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN prova_intervalo INTEGER`); } catch { /* existe */ } // seg entre pop-ups (default 25)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_on INTEGER`); } catch { /* existe */ }         // liga o gate de contato (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_momento INTEGER`); } catch { /* existe */ }    // seg do vídeo p/ pedir o contato (0 = antes de começar)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_titulo TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_campos TEXT`); } catch { /* existe */ }        // email | whatsapp | ambos
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_obrigatorio INTEGER`); } catch { /* existe */ } // trava o vídeo até preencher (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN gate_tag TEXT`); } catch { /* existe */ }           // tag aplicada no lead capturado (opcional)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN ab_par TEXT`); } catch { /* existe */ }             // id do vídeo B (variante) do teste A/B
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN ab_peso INTEGER`); } catch { /* existe */ }         // % do tráfego pra ESTE vídeo (A); resto vai pro B (default 50)
+db.exec(`CREATE TABLE IF NOT EXISTS vsl_leads (id TEXT PRIMARY KEY, vsl_id TEXT, projeto TEXT, email TEXT, whatsapp TEXT, sessao TEXT, contato_id TEXT, utm TEXT, ts TEXT)`);
 app.get('/vsl/videos', (req: any, res: any) => {
   try {
     const projeto = String(req.query.projeto || '');
@@ -8115,8 +8129,8 @@ app.get('/vsl/videos', (req: any, res: any) => {
 app.post('/vsl/video', (req: any, res: any) => {
   try {
     const b = req.body || {}; const id = b.id || randomUUID();
-    db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,cta_texto,cta_link,formato,cor,inicio,pausa_titulo,pausa_texto,pausa_botao,poster,resume,protecao,tarja_texto,tarja_pos,tarja_fonte,tarja_bg,tarja_cor,tarja_largura,tarja_passando,escassez_segundos,escassez_texto,cta_utm,marco_tag,marco_evento,plays,retencao_media,criado_em)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT plays FROM vsl_videos WHERE id=?),0),(SELECT retencao_media FROM vsl_videos WHERE id=?),COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
+    db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,cta_texto,cta_link,formato,cor,inicio,pausa_titulo,pausa_texto,pausa_botao,poster,resume,protecao,tarja_texto,tarja_pos,tarja_fonte,tarja_bg,tarja_cor,tarja_largura,tarja_passando,escassez_segundos,escassez_texto,cta_utm,marco_tag,marco_evento,prova_on,prova_texto,prova_intervalo,gate_on,gate_momento,gate_titulo,gate_campos,gate_obrigatorio,gate_tag,ab_par,ab_peso,plays,retencao_media,criado_em)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT plays FROM vsl_videos WHERE id=?),0),(SELECT retencao_media FROM vsl_videos WHERE id=?),COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
       .run(id, b.projeto, b.nome, b.fonte, b.ref, b.oferta_segundos, b.barra, b.dominios, b.marcadagua ? 1 : 0,
         (b.cta_texto != null ? String(b.cta_texto) : null), (b.cta_link != null ? String(b.cta_link) : null),
         (b.formato != null ? String(b.formato) : null), (b.cor != null ? String(b.cor) : null), (b.inicio != null ? String(b.inicio) : null),
@@ -8128,6 +8142,10 @@ app.post('/vsl/video', (req: any, res: any) => {
         (b.tarja_passando ? 1 : 0), (b.escassez_segundos != null ? (Number(b.escassez_segundos) || 0) : null),
         (b.escassez_texto != null ? String(b.escassez_texto) : null), (b.cta_utm ? 1 : 0),
         (b.marco_tag != null ? String(b.marco_tag) : null), (b.marco_evento != null ? String(b.marco_evento) : null),
+        (b.prova_on ? 1 : 0), (b.prova_texto != null ? String(b.prova_texto) : null), (b.prova_intervalo != null ? (Number(b.prova_intervalo) || 0) : null),
+        (b.gate_on ? 1 : 0), (b.gate_momento != null ? (Number(b.gate_momento) || 0) : null), (b.gate_titulo != null ? String(b.gate_titulo) : null),
+        (b.gate_campos != null ? String(b.gate_campos) : null), (b.gate_obrigatorio ? 1 : 0), (b.gate_tag != null ? String(b.gate_tag) : null),
+        (b.ab_par != null ? String(b.ab_par) : null), (b.ab_peso != null ? (Number(b.ab_peso) || 0) : null),
         id, id, id, agora());
     // [#9 VSL upload] pré-baixa o vídeo próprio do OneDrive em 2º plano (igual às Lives), pro player já
     // ter a mídia pronta na 1ª visita. Só pra fonte 'storage' com ref RELATIVO (não http). Não trava o salvar.
@@ -8215,6 +8233,31 @@ app.post('/vsl/evento', (req: any, res: any) => {
 app.get('/vsl/capi/status', (_req: any, res: any) => { try { _ndOk(res, { ativo: pubFlag('vsl_capi_ativo', '0') === '1' }); } catch (e) { _ndErr(res, e); } });
 app.post('/vsl/capi/flag', (req: any, res: any) => { try { setPubFlag('vsl_capi_ativo', (req.body || {}).ativo ? '1' : '0'); _ndOk(res, { ativo: pubFlag('vsl_capi_ativo', '0') === '1' }); } catch (e) { _ndErr(res, e); } });
 
+// [#9 VSL camada3] GATE: o player manda o e-mail/WhatsApp capturado. Grava em vsl_leads e, se tiver WhatsApp,
+// cria/acha o contato no projeto do vídeo e aplica a tag (gate_tag ou 'lead-vsl') + dispara automações.
+app.post('/vsl/lead', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (!b.vsl_id || (!b.email && !b.whatsapp)) return res.json({ ok: false, erro: 'faltou_vsl_id_ou_contato' });
+    const vv = db.prepare(`SELECT projeto, gate_tag FROM vsl_videos WHERE id=?`).get(b.vsl_id) as any;
+    const projeto = vv && vv.projeto ? String(vv.projeto) : '';
+    const email = b.email != null ? String(b.email).trim().slice(0, 160) : '';
+    const fone = b.whatsapp != null ? String(b.whatsapp).replace(/\D/g, '').slice(0, 15) : '';
+    let contatoId: string | null = null;
+    if (fone && projeto) {
+      try {
+        contatoId = upsertContato(projeto, fone, undefined, email || undefined, 'vsl');
+        const tag = (vv && vv.gate_tag && String(vv.gate_tag).trim()) ? String(vv.gate_tag).trim() : 'lead-vsl';
+        aplicarTag(projeto, contatoId, tag);
+        rodarAutomacoes(projeto, 'tag_adicionada', { contatoId, tag, telefone: fone }).catch(() => { /* */ });
+      } catch { /* captura best-effort: nunca quebra o player */ }
+    }
+    db.prepare(`INSERT INTO vsl_leads (id,vsl_id,projeto,email,whatsapp,sessao,contato_id,utm,ts) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), String(b.vsl_id), projeto, email || null, fone || null, b.sessao || null, contatoId, b.utm || null, agora());
+    res.json({ ok: true, contato_id: contatoId });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 // [#9 VSL camada2] RELATÓRIO: plays, % que chega na oferta, cliques no CTA, CTR, tempo médio, por UTM.
 app.get('/vsl/relatorio/:id', (req: any, res: any) => {
   try {
@@ -8223,11 +8266,12 @@ app.get('/vsl/relatorio/:id', (req: any, res: any) => {
     const chegouOferta = (db.prepare(`SELECT COUNT(DISTINCT sessao) n FROM vsl_eventos WHERE vsl_id=? AND tipo='oferta'`).get(id) as any).n || 0;
     const cliques = (db.prepare(`SELECT COUNT(*) n FROM vsl_eventos WHERE vsl_id=? AND tipo='cta_click'`).get(id) as any).n || 0;
     const tm = (db.prepare(`SELECT AVG(m) a FROM (SELECT MAX(posicao_seg) m FROM vsl_eventos WHERE vsl_id=? AND posicao_seg IS NOT NULL GROUP BY sessao)`).get(id) as any).a;
+    const leads = (db.prepare(`SELECT COUNT(*) n FROM vsl_leads WHERE vsl_id=?`).get(id) as any).n || 0; // [#9 VSL camada3] gate
     const porUtm = db.prepare(`SELECT COALESCE(NULLIF(utm,''),'(sem utm)') utm, COUNT(DISTINCT sessao) sessoes,
         SUM(CASE WHEN tipo='play' THEN 1 ELSE 0 END) plays, SUM(CASE WHEN tipo='oferta' THEN 1 ELSE 0 END) ofertas,
         SUM(CASE WHEN tipo='cta_click' THEN 1 ELSE 0 END) cliques
       FROM vsl_eventos WHERE vsl_id=? GROUP BY COALESCE(NULLIF(utm,''),'(sem utm)') ORDER BY sessoes DESC LIMIT 30`).all(id);
-    _ndOk(res, { plays, chegouOferta, cliques, ctr: plays ? Math.round(cliques / plays * 100) : 0, taxaOferta: plays ? Math.round(chegouOferta / plays * 100) : 0, tempoMedioSeg: tm != null ? Math.round(Number(tm)) : 0, porUtm });
+    _ndOk(res, { plays, chegouOferta, cliques, leads, ctr: plays ? Math.round(cliques / plays * 100) : 0, taxaOferta: plays ? Math.round(chegouOferta / plays * 100) : 0, tempoMedioSeg: tm != null ? Math.round(Number(tm)) : 0, porUtm });
   } catch (e) { _ndErr(res, e); }
 });
 
@@ -8247,10 +8291,23 @@ const PLAYER_VSL_JS = `
   var dur=0,cur=0;
   var barf=document.getElementById('barf'),bar=document.getElementById('bar'),big=document.getElementById('big'),wm=document.getElementById('wm'),cta=document.getElementById('cta'),poster=document.getElementById('poster'),sound=document.getElementById('sound'),pausaBox=document.getElementById('pausa');
   var escBox=document.getElementById('escassez'),escTime=document.getElementById('escTime');
+  var gEl=document.getElementById('gate'); var gateDone=false, gateShownInline=false, provaTimer=null;
   var ctaA=cta?cta.querySelector('a'):null;
   if(ctaA){ if(CFG.ctaUtm){ var ex=location.search?location.search.replace(/^[?]/,''):''; if(ex){ ctaA.href += (ctaA.href.indexOf('?')>=0?'&':'?')+ex; } } ctaA.addEventListener('click',function(){ ev('cta_click',null,cur); }); }
   var escIniciado=false;
   function startEscassez(){ if(escIniciado||!CFG.escassez||CFG.escassez<=0||!escBox)return; escIniciado=true; escBox.style.display='flex'; var left=CFG.escassez; function tk(){ var mm=Math.floor(left/60),ss=left%60; if(escTime)escTime.textContent=mm+':'+(ss<10?'0':'')+ss; if(left<=0)return; left--; setTimeout(tk,1000); } tk(); }
+  function startProva(){ if(!CFG.provaOn||!CFG.provaMsgs||!CFG.provaMsgs.length)return; var box=document.getElementById('prova'); if(!box||provaTimer)return;
+    function mostra(){ var m=CFG.provaMsgs[Math.floor(Math.random()*CFG.provaMsgs.length)]; var d=document.createElement('div'); d.className='pv'; d.textContent=m; box.innerHTML=''; box.appendChild(d); box.style.display='block'; setTimeout(function(){ box.style.display='none'; },5000); }
+    setTimeout(mostra,4000); provaTimer=setInterval(mostra, Math.max(8,CFG.provaInt||25)*1000); }
+  function mostrarGate(){ if(!CFG.gateOn||gateDone||!gEl)return; try{ api.pause(); }catch(e){} gEl.style.display='flex'; }
+  function fecharGate(){ gateDone=true; if(gEl)gEl.style.display='none'; }
+  function enviarGate(){ var ie=document.getElementById('gEmail'),iz=document.getElementById('gZap'),er=document.getElementById('gErr');
+    var em=ie?(ie.value||'').trim():''; var zap=iz?(iz.value||'').replace(/\\D/g,''):''; if(er)er.textContent='';
+    if(!em&&!zap){ if(er)er.textContent='Preencha pra continuar.'; return; }
+    if(em&&em.indexOf('@')<1){ if(er)er.textContent='E-mail inválido.'; return; }
+    if(!em&&zap&&zap.length<10){ if(er)er.textContent='WhatsApp com DDD, por favor.'; return; }
+    try{ var body=JSON.stringify({vsl_id:CFG.id,email:em||null,whatsapp:zap||null,sessao:sess,contato_id:contato||null,utm:utm}); fetch('/vsl/lead',{method:'POST',headers:{'Content-Type':'application/json'},body:body,keepalive:true}); }catch(e){}
+    fecharGate(); if(!modoReal){ usuarioClicou(); } else { try{ api.play(); }catch(e){} } }
   function displayPct(x){ if(CFG.barra==='inteligente'){ return Math.round((1-Math.pow(1-x,1.8))*100); } return Math.round(x*100); }
   function onTick(){
     if(!modoReal) return;
@@ -8259,8 +8316,9 @@ const PLAYER_VSL_JS = `
       try{ if(CFG.resume&&CFG.inicio==='click') localStorage.setItem('vslpos_'+CFG.id,String(Math.floor(cur))); }catch(e){}
     }
     if(CFG.oferta>0&&cur>=CFG.oferta&&!sent.oferta){ sent.oferta=1; if(cta)cta.style.display='flex'; startEscassez(); try{parent.postMessage({type:'vsl-oferta',id:CFG.id},'*');}catch(e){} ev('oferta',null,cur); }
+    if(CFG.gateOn&&CFG.gateMomento>0&&!gateDone&&!gateShownInline&&cur>=CFG.gateMomento){ gateShownInline=true; mostrarGate(); }
   }
-  function realStart(){ if(counted)return; counted=true; if(CFG.marcadagua&&wm)wm.textContent=(contato||'Melodias e Riffs'); ev('play',0,0);
+  function realStart(){ if(counted)return; counted=true; if(CFG.marcadagua&&wm)wm.textContent=(contato||'Melodias e Riffs'); ev('play',0,0); startProva();
     if(CFG.resume&&CFG.inicio==='click'){ try{ var sp=parseFloat(localStorage.getItem('vslpos_'+CFG.id)||'0'); if(sp>3) setTimeout(function(){ api.seek(sp); },400); }catch(e){} } }
   function onPlaying(){ if(poster)poster.style.display='none'; if(big)big.style.display='none'; if(pausaBox)pausaBox.style.display='none'; }
   function onPause(){ if(ended)return; if(CFG.pausaOn&&pausaBox){ pausaBox.style.display='flex'; } else if(big){ big.style.display='flex'; } }
@@ -8286,6 +8344,7 @@ const PLAYER_VSL_JS = `
     if(CFG.inicio==='mudo_som'){ api.mute(); api.play(); mostrarSom(); modoReal=true; realStart(); if(poster)poster.style.display='none'; if(big)big.style.display='none'; }
     else if(CFG.inicio==='preroll'){ api.mute(); api.play(); mostrarSom(); if(poster)poster.style.display='none'; if(big)big.style.display='none'; }
     else { if(poster&&CFG.poster)poster.style.display='block'; if(big)big.style.display='flex'; }
+    if(CFG.gateOn&&CFG.gateMomento<=0&&!gateDone){ mostrarGate(); }
   }
   function usuarioClicou(){
     esconderSom();
@@ -8298,6 +8357,8 @@ const PLAYER_VSL_JS = `
   var g=document.getElementById('guard'); if(g)g.addEventListener('click',usuarioClicou);
   if(sound)sound.addEventListener('click',usuarioClicou);
   var pb=document.getElementById('pausaBtn'); if(pb)pb.addEventListener('click',function(e){ e.stopPropagation(); if(pausaBox)pausaBox.style.display='none'; api.play(); });
+  var gBtn=document.getElementById('gBtn'); if(gBtn)gBtn.addEventListener('click',function(e){ e.stopPropagation(); enviarGate(); });
+  var gSkip=document.getElementById('gSkip'); if(gSkip)gSkip.addEventListener('click',function(e){ e.stopPropagation(); fecharGate(); if(!modoReal){ usuarioClicou(); } else { try{ api.play(); }catch(err){} } });
 })();
 `;
 
@@ -8324,11 +8385,15 @@ app.get('/vsl/media/:id', async (req: any, res: any) => {
 app.get('/v/:id.js', (req: any, res: any) => {
   const id = String(req.params.id || '');
   const base = PUBLIC_BASE_URL || '';
-  const v = db.prepare(`SELECT formato FROM vsl_videos WHERE id=?`).get(id) as any;
+  const v = db.prepare(`SELECT formato, ab_par, ab_peso FROM vsl_videos WHERE id=?`).get(id) as any;
   const fmt = v && v.formato === '9:16' ? '9/16' : v && v.formato === '1:1' ? '1/1' : '16/9';
   const maxw = fmt === '9/16' ? '420px' : fmt === '1/1' ? '620px' : '820px';
+  // [#9 VSL camada3] teste A/B: se tem variante B, o embed sorteia A ou B (fixo por visitante via localStorage).
+  const abB = (v && v.ab_par) ? String(v.ab_par) : '';
+  const abPeso = (v && v.ab_peso != null) ? Math.max(0, Math.min(100, Number(v.ab_peso))) : 50;
   res.type('application/javascript').send(
-    '(function(){var id=' + JSON.stringify(id) + ';var base=' + JSON.stringify(base) + ';'
+    '(function(){var A=' + JSON.stringify(id) + ';var B=' + JSON.stringify(abB) + ';var peso=' + JSON.stringify(abPeso) + ';var base=' + JSON.stringify(base) + ';'
+    + 'var id=A;if(B){try{var k="vslab_"+A;var st=localStorage.getItem(k);if(st!=="A"&&st!=="B"){st=(Math.random()*100<peso)?"A":"B";localStorage.setItem(k,st);}id=(st==="B")?B:A;}catch(e){id=A;}}'
     + 'var s=document.currentScript;var q=location.search||"";'
     + 'var w=document.createElement("div");w.style.position="relative";w.style.width="100%";w.style.maxWidth=' + JSON.stringify(maxw) + ';w.style.margin="0 auto";w.style.aspectRatio=' + JSON.stringify(fmt) + ';w.style.background="#000";'
     + 'var f=document.createElement("iframe");f.src=base+"/v/"+id+q;f.style.position="absolute";f.style.inset="0";f.style.width="100%";f.style.height="100%";f.style.border="0";f.setAttribute("allow","autoplay; fullscreen; encrypted-media");f.setAttribute("allowfullscreen","");'
@@ -8358,6 +8423,13 @@ app.get('/v/:id', (req: any, res: any) => {
     poster: v.poster || '', resume: v.resume ? 1 : 0, protecao: v.protecao ? 1 : 0,
     pausaOn: !!(v.pausa_titulo || v.pausa_texto),
     escassez: Number(v.escassez_segundos || 0), ctaUtm: v.cta_utm ? 1 : 0,
+    // [#9 VSL camada3] prova social + gate de contato
+    provaOn: v.prova_on ? 1 : 0,
+    provaMsgs: String(v.prova_texto || '').split('\n').map((s: string) => s.trim()).filter(Boolean).slice(0, 40),
+    provaInt: Math.max(8, Number(v.prova_intervalo || 25)),
+    gateOn: v.gate_on ? 1 : 0, gateMomento: Number(v.gate_momento || 0),
+    gateCampos: (v.gate_campos === 'email' || v.gate_campos === 'whatsapp') ? v.gate_campos : 'ambos',
+    gateObrig: v.gate_obrigatorio ? 1 : 0,
   };
   const cfgJson = JSON.stringify(cfg);
   const temCta = v.cta_texto && v.cta_link;
@@ -8378,6 +8450,18 @@ app.get('/v/:id', (req: any, res: any) => {
   const pTit = v.pausa_titulo ? String(v.pausa_titulo) : 'Espera! 🙏';
   const pTxt = v.pausa_texto ? String(v.pausa_texto) : 'Continue assistindo pra não perder o conteúdo.';
   const pBtn = v.pausa_botao ? String(v.pausa_botao) : '▶ Continuar assistindo';
+  // [#9 VSL camada3] prova social (container) + gate de contato (overlay com formulário)
+  const provaHtml = (cfg.provaOn && cfg.provaMsgs.length) ? '<div id="prova"></div>' : '';
+  const gTit = v.gate_titulo ? String(v.gate_titulo) : 'Pra continuar assistindo, deixe seu contato 👇';
+  const gCampos = cfg.gateCampos;
+  const gateHtml = cfg.gateOn
+    ? '<div id="gate"><div class="gbox"><h3>' + esc(gTit) + '</h3><div class="gerr" id="gErr"></div>'
+      + ((gCampos === 'email' || gCampos === 'ambos') ? '<input id="gEmail" type="email" placeholder="Seu melhor e-mail" />' : '')
+      + ((gCampos === 'whatsapp' || gCampos === 'ambos') ? '<input id="gZap" type="tel" placeholder="Seu WhatsApp com DDD" />' : '')
+      + '<button id="gBtn">Liberar o vídeo ▶</button>'
+      + (cfg.gateObrig ? '' : '<div id="gSkip">pular</div>')
+      + '</div></div>'
+    : '';
   res.type('html').send(
     '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(v.nome || 'Vídeo') + '</title>'
     + '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial}'
@@ -8392,7 +8476,9 @@ app.get('/v/:id', (req: any, res: any) => {
     + '#pausa{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:12;background:rgba(0,0,0,.72);text-align:center;padding:24px}#pausa h3{color:#fff;font-size:22px;margin:0 0 10px}#pausa p{color:#dcdcdc;font-size:15px;margin:0 0 18px;max-width:420px}#pausa button{background:' + corSafe + ';color:#06230f;font-weight:800;font-size:16px;border:0;padding:13px 24px;border-radius:10px;cursor:pointer}'
     + '#blk{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#bbb;background:#000;z-index:20;text-align:center;padding:20px;font-size:15px}'
     + '#tarja{position:absolute;left:50%;transform:translateX(-50%);z-index:10;padding:7px 14px;font-size:14px;font-weight:700;text-align:center;box-sizing:border-box;max-width:100%;overflow:hidden;white-space:nowrap}#tarja.scroll span{display:inline-block;padding-left:100%;animation:mq 14s linear infinite}@keyframes mq{from{transform:translateX(0)}to{transform:translateX(-100%)}}'
-    + '#escassez{position:absolute;left:0;right:0;bottom:74px;display:none;justify-content:center;z-index:9;color:#fff;font-weight:700;font-size:14px;text-shadow:0 1px 3px rgba(0,0,0,.7)}#escassez b{margin-left:6px;color:' + corSafe + '}</style></head><body>'
+    + '#escassez{position:absolute;left:0;right:0;bottom:74px;display:none;justify-content:center;z-index:9;color:#fff;font-weight:700;font-size:14px;text-shadow:0 1px 3px rgba(0,0,0,.7)}#escassez b{margin-left:6px;color:' + corSafe + '}'
+    + '#prova{position:absolute;left:14px;bottom:88px;z-index:11;max-width:78%;display:none}#prova .pv{background:rgba(20,22,28,.93);color:#fff;border-left:3px solid ' + corSafe + ';border-radius:8px;padding:8px 12px;font-size:12.5px;line-height:1.35;box-shadow:0 4px 14px rgba(0,0,0,.45);animation:pvin .4s ease}@keyframes pvin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}'
+    + '#gate{position:absolute;inset:0;display:none;align-items:center;justify-content:center;z-index:15;background:rgba(0,0,0,.82);padding:20px}#gate .gbox{background:#15171d;border-radius:14px;padding:22px;max-width:360px;width:100%;text-align:center}#gate h3{color:#fff;font-size:17px;margin:0 0 14px;line-height:1.3}#gate input{width:100%;box-sizing:border-box;margin-bottom:10px;padding:12px;border-radius:8px;border:1px solid #333;background:#0e1014;color:#fff;font-size:14px}#gate button{width:100%;background:' + corSafe + ';color:#06230f;font-weight:800;font-size:15px;border:0;padding:13px;border-radius:8px;cursor:pointer}#gate #gSkip{color:#8a8f98;font-size:12px;margin-top:10px;cursor:pointer;text-decoration:underline}#gate .gerr{color:#ff8a8a;font-size:12px;margin:-4px 0 8px;min-height:14px}</style></head><body>'
     + '<div id="wrap"><div id="ply"></div>'
     + (cfg.poster ? '<div id="poster" style="background-image:url(\'' + esc(String(cfg.poster)) + '\')"></div>' : '')
     + '<div id="guard"></div><div id="big"><div><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div></div>'
@@ -8402,6 +8488,7 @@ app.get('/v/:id', (req: any, res: any) => {
     + tarjaHtml + escHtml
     + (temCta ? '<div id="cta"><a href="' + esc(String(v.cta_link)) + '" target="_blank" rel="noopener">' + esc(String(v.cta_texto)) + '</a></div>' : '')
     + '<div id="pausa"><h3>' + esc(pTit) + '</h3><p>' + esc(pTxt) + '</p><button id="pausaBtn">' + esc(pBtn) + '</button></div>'
+    + provaHtml + gateHtml
     + '<div id="blk">Este vídeo não está disponível neste site.</div></div>'
     + '<script>var CFG=' + cfgJson + ';</script>'
     + (cfg.fonte === 'storage' ? '' : '<script src="https://www.youtube.com/iframe_api"></script>')
