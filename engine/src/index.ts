@@ -5811,7 +5811,21 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   };
 
   // --- envio pro Meta (Graph API CAPI) ---
-  interface CapiDados { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; pagina?: string | null; eventId?: string | null }
+  // [#5 rastreio EMQ] Advanced Matching máximo: além de email/telefone, mandamos nome/cidade/UF/CEP/país
+  // (hash SHA-256), fbc/fbp (cookies do clique), IP e user-agent (sem hash) e external_id estável → sobe o EMQ.
+  interface CapiDados { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; pagina?: string | null; eventId?: string | null;
+    fbc?: string | null; fbp?: string | null; clientIp?: string | null; userAgent?: string | null;
+    firstName?: string | null; lastName?: string | null; city?: string | null; state?: string | null; zip?: string | null; country?: string | null; externalId?: string | null }
+  // normaliza + hash SHA-256 (nomes/cidade/UF: minúsculo sem espaço nas bordas; CEP: só dígitos; país: 2 letras).
+  const capiHashCampo = (v: string | null | undefined, tipo?: 'zip' | 'pais'): string | undefined => {
+    if (v == null) return undefined;
+    let s = String(v).trim().toLowerCase();
+    if (tipo === 'zip') s = s.replace(/[^a-z0-9]/g, '');
+    else if (tipo === 'pais') { s = s.replace(/[^a-z]/g, ''); if (s === 'brasil' || s === 'brazil') s = 'br'; s = s.slice(0, 2); }
+    else s = s.replace(/\s+/g, ' ').trim();
+    if (!s) return undefined;
+    return createHash('sha256').update(s).digest('hex');
+  };
   // etapa30: token CENTRAL (1 token do System User serve pra todos os pixels). Guardado em capi_pixels id='__central__'.
   const capiTokenCentral = (): string => {
     const r: any = db.prepare("SELECT access_token_enc FROM capi_pixels WHERE id = '__central__'").get();
@@ -5820,9 +5834,21 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   };
   const capiEnviar = async (px: CapiPixel, eventName: string, d: CapiDados): Promise<{ ok: boolean; resposta: string }> => {
     const tokenUsar = px.token || capiTokenCentral(); // usa o token do pixel OU o central
-    const userData: Record<string, string[]> = {};
+    const userData: Record<string, any> = {};
     const em = capiHash(d.email); if (em) userData.em = [em];
     const ph = capiHashFone(d.telefone); if (ph) userData.ph = [ph];
+    // [#5 rastreio EMQ] mais sinais de correspondência (quanto mais, maior o match quality)
+    const fn = capiHashCampo(d.firstName); if (fn) userData.fn = [fn];
+    const ln = capiHashCampo(d.lastName); if (ln) userData.ln = [ln];
+    const ct = capiHashCampo(d.city); if (ct) userData.ct = [ct];
+    const st = capiHashCampo(d.state); if (st) userData.st = [st];
+    const zp = capiHashCampo(d.zip, 'zip'); if (zp) userData.zp = [zp];
+    const co = capiHashCampo(d.country, 'pais'); if (co) userData.country = [co];
+    const exid = d.externalId ? (capiHash(d.externalId) || capiHash(d.email)) : capiHash(d.email); if (exid) userData.external_id = [exid];
+    if (d.fbc) userData.fbc = String(d.fbc);
+    if (d.fbp) userData.fbp = String(d.fbp);
+    if (d.clientIp) userData.client_ip_address = String(d.clientIp);
+    if (d.userAgent) userData.client_user_agent = String(d.userAgent);
     const evento: any = {
       event_name: eventName,
       event_time: Math.floor(Date.now() / 1000),
@@ -5881,7 +5907,17 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     const userData:any = {};
     const em = capiHash(d.email); if (em) userData.sha256_email_address = [em];
     const ph = ga4HashFone(d.telefone); if (ph) userData.sha256_phone_number = [ph];
-    const body:any = { client_id: String(d.eventId || randomUUID()), events: [{ name, params }] };
+    // [#5 rastreio EMQ] Enhanced Conversions: nome (hash) + cidade/UF/CEP/país (texto) no address
+    const fn = capiHashCampo(d.firstName); const ln = capiHashCampo(d.lastName);
+    const addr:any = {};
+    if (fn) addr.sha256_first_name = fn;
+    if (ln) addr.sha256_last_name = ln;
+    if (d.city) addr.city = String(d.city).trim().toLowerCase();
+    if (d.state) addr.region = String(d.state).trim().toLowerCase();
+    if (d.zip) addr.postal_code = String(d.zip).replace(/\s+/g, '');
+    if (d.country) addr.country = String(d.country).trim().toLowerCase().slice(0, 2);
+    if (Object.keys(addr).length) userData.address = [addr];
+    const body:any = { client_id: String(d.externalId || d.eventId || randomUUID()), events: [{ name, params }] };
     if (Object.keys(userData).length) body.user_data = userData;
     const url = 'https://www.google-analytics.com/mp/collect?measurement_id=' + encodeURIComponent(mid) + '&api_secret=' + encodeURIComponent(secret);
     const resp = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -5976,7 +6012,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       if (projT) {
         const cfgT = trackLer(String(projT));
         if (cfgT && cfgT.ativo !== 0 && (cfgT.meta_pixel_id || cfgT.ga4_mid)) {
-          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null }, fonte);
+          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, externalId: dados.email || dados.telefone || null }, fonte);
           return;
         }
       }
@@ -6140,7 +6176,16 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       const cfg = trackLer(projeto);
       if (cfg && cfg.ativo !== 0 && (cfg.meta_pixel_id || cfg.ga4_mid) && evento !== 'PageView') {
         const p = b.params || {};
-        const d:CapiDados = { email: p.email||null, telefone: p.telefone||p.phone||null, valorCentavos: (p.value!=null? Math.round(Number(p.value)*100): null), produto: p.content_name||p.item_name||null, pagina: b.url||null, eventId: b.event_id||undefined };
+        // [#5 rastreio EMQ] fbc/fbp dos cookies + IP + user-agent do próprio request (sobe o match quality)
+        const ck = String(req.headers.cookie || '');
+        const lerCk = (n: string): string => { const m = ck.match(new RegExp('(?:^|;\\s*)' + n + '=([^;]+)')); return m ? decodeURIComponent(m[1]) : ''; };
+        const fbc = lerCk('_fbc') || lerCk('_mr_fbc') || (p.fbc || '');
+        const fbp = lerCk('_fbp') || (p.fbp || '');
+        const ip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '');
+        const ua = String(req.headers['user-agent'] || '');
+        const d:CapiDados = { email: p.email||null, telefone: p.telefone||p.phone||null, valorCentavos: (p.value!=null? Math.round(Number(p.value)*100): null), produto: p.content_name||p.item_name||null, pagina: b.url||null, eventId: b.event_id||undefined,
+          fbc: fbc||null, fbp: fbp||null, clientIp: ip||null, userAgent: ua||null,
+          firstName: p.first_name||p.fn||null, lastName: p.last_name||p.ln||null, city: p.city||p.ct||null, state: p.state||p.st||null, zip: p.zip||p.zp||null, country: p.country||null, externalId: p.external_id||p.email||null };
         await trackEnviarTudo(cfg, evento, d, 'navegador');
       }
     } catch { /* best-effort */ }
