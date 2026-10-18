@@ -657,6 +657,9 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/f/')) return next();
   if (req.path.startsWith('/receive/')) return next();
   if (req.path.startsWith('/q/')) return next(); // Etapa 9: quiz multi-passos publico
+  if (req.path.startsWith('/v/')) return next(); // [#9 VSL] player publico (/v/:id e /v/:id.js)
+  if (req.path === '/vsl/evento') return next(); // [#9 VSL] ingest de eventos do player (browser, sem x-api-key)
+  if (req.path.startsWith('/vsl/media/')) return next(); // [#9 VSL upload] serve o video proprio (storage/OneDrive) pro player, sem x-api-key
   if (req.path === '/pub/onedrive/callback') return next(); // etapa20b: retorno do login OneDrive (Microsoft chama sem a chave)
   if (req.path === '/pub/youtube/callback') return next(); // etapa28: OAuth YouTube (Google chama sem a x-api-key)
   if (req.path === '/pub/youtube-lives/callback') return next(); // [lives-sep]: OAuth YouTube LIVES (projeto separado; Google chama sem a x-api-key)
@@ -1840,6 +1843,10 @@ function classificaPagamento(provider: string, statusRaw: string): 'aprovado' | 
 // Serve pra espelhar a MESMA venda que chega pela entrega (Guru/LastLink) no pixel Meta,
 // sem precisar criar webhook novo. Fica null até o bloco CAPI rodar no startup.
 let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; produtoId?: string | null; evento?: string }) => Promise<void>) | null = null;
+// [#9 VSL camada2 batch B] gancho de rastreio por MARCO do player de VSL (play/oferta/cta_click ->
+// Meta CAPI + GA4, reusa track_config do projeto). Preenchido no bloco CAPI (etapa29) no boot.
+// Inerte até pubFlag('vsl_capi_ativo')='1'.
+let vslTrackHook: ((projeto: string, eventName: string, dados: { email?: string | null; telefone?: string | null; pagina?: string | null }) => Promise<void>) | null = null;
 
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
@@ -5994,6 +6001,17 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     });
   };
 
+  // [#9 VSL camada2 batch B] marco do player de VSL -> Meta CAPI + GA4 (reusa track_config do projeto).
+  // Só dispara quando há config ativa pro projeto; valor/produto ficam nulos (é topo/meio de funil).
+  vslTrackHook = async (projeto, eventName, dados) => {
+    try {
+      const cfgT = trackLer(String(projeto || ''));
+      if (cfgT && cfgT.ativo !== 0 && (cfgT.meta_pixel_id || cfgT.ga4_mid)) {
+        await trackEnviarTudo(cfgT, eventName, { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: null, produto: null, pagina: dados.pagina || null }, 'vsl');
+      }
+    } catch { /* best-effort: nunca quebra o ingest do player */ }
+  };
+
   // ---------- ROTAS ----------
   // Config do pixel (pixel_id + token cifrado). id = produto/canal (ex: 'teclado').
   app.post('/capi/pixel', (req: any, res: any) => {
@@ -8061,6 +8079,32 @@ app.post('/disponibilidade/remover', (req: any, res: any) => {
 });
 
 // ---------- #9 Players / VSL ----------
+// [#9 VSL] colunas do CTA (oferta "os dois": botão no player + libera conteúdo da página). Guarded (add-only).
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN cta_texto TEXT`); } catch { /* coluna já existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN cta_link TEXT`); } catch { /* coluna já existe */ }
+// [#9 VSL camada1] experiência do player (VTurb completo)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN formato TEXT`); } catch { /* existe */ }      // 16:9 | 9:16 | 1:1
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN cor TEXT`); } catch { /* existe */ }           // cor da barra/botão (hex)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN inicio TEXT`); } catch { /* existe */ }        // click | mudo_som | preroll
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN pausa_titulo TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN pausa_texto TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN pausa_botao TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN poster TEXT`); } catch { /* existe */ }        // URL da capa
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN resume INTEGER`); } catch { /* existe */ }     // continuar de onde parou (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN protecao INTEGER`); } catch { /* existe */ }   // anti-download básico (0/1)
+// [#9 VSL camada2] tarja + escassez + CTA inteligente + tag/fluxo por marco
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_texto TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_pos TEXT`); } catch { /* existe */ }     // cima | baixo
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_fonte TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_bg TEXT`); } catch { /* existe */ }       // cor de fundo
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_cor TEXT`); } catch { /* existe */ }      // cor do texto
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_largura TEXT`); } catch { /* existe */ }  // ex.: 100% ou 600px
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN tarja_passando INTEGER`); } catch { /* existe */ } // letreiro rolando (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN escassez_segundos INTEGER`); } catch { /* existe */ } // contador após a oferta (0=off)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN escassez_texto TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN cta_utm INTEGER`); } catch { /* existe */ }     // passa UTM+contato pro link do CTA (0/1)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN marco_tag TEXT`); } catch { /* existe */ }      // tag aplicada no marco (precisa ?c= do contato)
+try { db.exec(`ALTER TABLE vsl_videos ADD COLUMN marco_evento TEXT`); } catch { /* existe */ }   // oferta | fim | play
 app.get('/vsl/videos', (req: any, res: any) => {
   try {
     const projeto = String(req.query.projeto || '');
@@ -8071,10 +8115,43 @@ app.get('/vsl/videos', (req: any, res: any) => {
 app.post('/vsl/video', (req: any, res: any) => {
   try {
     const b = req.body || {}; const id = b.id || randomUUID();
-    db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,plays,retencao_media,criado_em)
-      VALUES (?,?,?,?,?,?,?,?,?,COALESCE((SELECT plays FROM vsl_videos WHERE id=?),0),(SELECT retencao_media FROM vsl_videos WHERE id=?),COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
-      .run(id, b.projeto, b.nome, b.fonte, b.ref, b.oferta_segundos, b.barra, b.dominios, b.marcadagua ? 1 : 0, id, id, id, agora());
+    db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,cta_texto,cta_link,formato,cor,inicio,pausa_titulo,pausa_texto,pausa_botao,poster,resume,protecao,tarja_texto,tarja_pos,tarja_fonte,tarja_bg,tarja_cor,tarja_largura,tarja_passando,escassez_segundos,escassez_texto,cta_utm,marco_tag,marco_evento,plays,retencao_media,criado_em)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT plays FROM vsl_videos WHERE id=?),0),(SELECT retencao_media FROM vsl_videos WHERE id=?),COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
+      .run(id, b.projeto, b.nome, b.fonte, b.ref, b.oferta_segundos, b.barra, b.dominios, b.marcadagua ? 1 : 0,
+        (b.cta_texto != null ? String(b.cta_texto) : null), (b.cta_link != null ? String(b.cta_link) : null),
+        (b.formato != null ? String(b.formato) : null), (b.cor != null ? String(b.cor) : null), (b.inicio != null ? String(b.inicio) : null),
+        (b.pausa_titulo != null ? String(b.pausa_titulo) : null), (b.pausa_texto != null ? String(b.pausa_texto) : null), (b.pausa_botao != null ? String(b.pausa_botao) : null),
+        (b.poster != null ? String(b.poster) : null), (b.resume ? 1 : 0), (b.protecao ? 1 : 0),
+        (b.tarja_texto != null ? String(b.tarja_texto) : null), (b.tarja_pos != null ? String(b.tarja_pos) : null),
+        (b.tarja_fonte != null ? String(b.tarja_fonte) : null), (b.tarja_bg != null ? String(b.tarja_bg) : null),
+        (b.tarja_cor != null ? String(b.tarja_cor) : null), (b.tarja_largura != null ? String(b.tarja_largura) : null),
+        (b.tarja_passando ? 1 : 0), (b.escassez_segundos != null ? (Number(b.escassez_segundos) || 0) : null),
+        (b.escassez_texto != null ? String(b.escassez_texto) : null), (b.cta_utm ? 1 : 0),
+        (b.marco_tag != null ? String(b.marco_tag) : null), (b.marco_evento != null ? String(b.marco_evento) : null),
+        id, id, id, agora());
+    // [#9 VSL upload] pré-baixa o vídeo próprio do OneDrive em 2º plano (igual às Lives), pro player já
+    // ter a mídia pronta na 1ª visita. Só pra fonte 'storage' com ref RELATIVO (não http). Não trava o salvar.
+    try {
+      const ref = b.ref != null ? String(b.ref).trim() : '';
+      if (String(b.fonte || '') === 'storage' && ref && !/^https?:\/\//i.test(ref)) {
+        _odBaixarGrande(ref).then(() => { /* pronto */ }).catch(() => { /* tenta de novo no 1º acesso */ });
+      }
+    } catch { /* */ }
     _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+// [#9 VSL upload] pré-aquecer (baixar agora) o vídeo próprio sob demanda — botão opcional no app.
+app.post('/vsl/media/preaquecer', async (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const v = db.prepare(`SELECT fonte, ref FROM vsl_videos WHERE id=?`).get(b.id) as any;
+    const ref = v && v.ref ? String(v.ref).trim() : '';
+    if (!ref) return _ndErr(res, new Error('sem_video'));
+    if (/^https?:\/\//i.test(ref)) return _ndOk(res, { pronto: true, tipo: 'url' });
+    const dest = _odDestPath(ref);
+    try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return _ndOk(res, { pronto: true, tipo: 'cache' }); } catch { /* */ }
+    _odBaixarGrande(ref).then(() => { /* */ }).catch(() => { /* */ });
+    _ndOk(res, { pronto: false, baixando: true });
   } catch (e) { _ndErr(res, e); }
 });
 app.post('/vsl/video/remover', (req: any, res: any) => {
@@ -8097,8 +8174,239 @@ app.post('/vsl/evento', (req: any, res: any) => {
     const b = req.body || {};
     db.prepare(`INSERT INTO vsl_eventos (id,vsl_id,contato_id,sessao,tipo,posicao_seg,pct,utm,ts) VALUES (?,?,?,?,?,?,?,?,?)`)
       .run(randomUUID(), b.vsl_id, b.contato_id || null, b.sessao || null, b.tipo, b.posicao_seg || null, b.pct || null, b.utm || null, agora());
+    // [#9 VSL] conta 1 play quando o vídeo começa; atualiza a retenção média (média do maior pct por sessão).
+    try {
+      if (b.tipo === 'play' && b.vsl_id) db.prepare(`UPDATE vsl_videos SET plays=COALESCE(plays,0)+1 WHERE id=?`).run(b.vsl_id);
+      if ((b.tipo === 'fim' || b.tipo === 'progress') && b.vsl_id) {
+        const r = db.prepare(`SELECT AVG(m) a FROM (SELECT MAX(pct) m FROM vsl_eventos WHERE vsl_id=? AND pct IS NOT NULL GROUP BY sessao)`).get(b.vsl_id) as any;
+        if (r && r.a != null) db.prepare(`UPDATE vsl_videos SET retencao_media=? WHERE id=?`).run(Math.round(Number(r.a)), b.vsl_id);
+      }
+    } catch { /* métricas best-effort */ }
+    // [#9 VSL camada2] tag + fluxo por MARCO: no evento configurado (padrão 'oferta'), se veio o contato (?c=),
+    // aplica a tag e dispara as automações (rodarAutomacoes tag_adicionada reusa grupo/webinário/sequência).
+    try {
+      if (b.vsl_id && b.contato_id) {
+        const vv = db.prepare(`SELECT projeto, marco_tag, marco_evento FROM vsl_videos WHERE id=?`).get(b.vsl_id) as any;
+        const mev = (vv && vv.marco_evento) ? String(vv.marco_evento) : 'oferta';
+        if (vv && vv.marco_tag && String(b.tipo) === mev) {
+          aplicarTag(String(vv.projeto || ''), String(b.contato_id), String(vv.marco_tag));
+          rodarAutomacoes(String(vv.projeto || ''), 'tag_adicionada', { contatoId: String(b.contato_id), tag: String(vv.marco_tag) }).catch(() => {});
+        }
+      }
+    } catch { /* marco best-effort */ }
+    // [#9 VSL camada2 batch B] cada marco vira evento pro Meta (CAPI) + Google (GA4) — remarketing/otimização.
+    // play->ViewContent, oferta->AddToCart, cta_click->InitiateCheckout. Inerte até vsl_capi_ativo=1.
+    try {
+      const mapaEv: Record<string, string> = { play: 'ViewContent', oferta: 'AddToCart', cta_click: 'InitiateCheckout' };
+      const evName = mapaEv[String(b.tipo)];
+      if (evName && b.vsl_id && vslTrackHook && pubFlag('vsl_capi_ativo', '0') === '1') {
+        const vv2 = db.prepare(`SELECT projeto FROM vsl_videos WHERE id=?`).get(b.vsl_id) as any;
+        if (vv2 && vv2.projeto) {
+          let em: string | null = null, tel: string | null = null;
+          if (b.contato_id) { try { const ct = db.prepare(`SELECT email, telefone FROM contatos WHERE id=?`).get(String(b.contato_id)) as any; if (ct) { em = ct.email || null; tel = ct.telefone || null; } } catch { /* */ } }
+          vslTrackHook(String(vv2.projeto), evName, { email: em, telefone: tel, pagina: null }).catch(() => { /* */ });
+        }
+      }
+    } catch { /* capi marco best-effort */ }
     _ndOk(res, { registrado: true });
   } catch (e) { _ndErr(res, e); }
+});
+// [#9 VSL camada2 batch B] liga/desliga o envio dos marcos do player pro Meta/Google (default OFF).
+app.get('/vsl/capi/status', (_req: any, res: any) => { try { _ndOk(res, { ativo: pubFlag('vsl_capi_ativo', '0') === '1' }); } catch (e) { _ndErr(res, e); } });
+app.post('/vsl/capi/flag', (req: any, res: any) => { try { setPubFlag('vsl_capi_ativo', (req.body || {}).ativo ? '1' : '0'); _ndOk(res, { ativo: pubFlag('vsl_capi_ativo', '0') === '1' }); } catch (e) { _ndErr(res, e); } });
+
+// [#9 VSL camada2] RELATÓRIO: plays, % que chega na oferta, cliques no CTA, CTR, tempo médio, por UTM.
+app.get('/vsl/relatorio/:id', (req: any, res: any) => {
+  try {
+    const id = req.params.id;
+    const plays = (db.prepare(`SELECT COUNT(*) n FROM vsl_eventos WHERE vsl_id=? AND tipo='play'`).get(id) as any).n || 0;
+    const chegouOferta = (db.prepare(`SELECT COUNT(DISTINCT sessao) n FROM vsl_eventos WHERE vsl_id=? AND tipo='oferta'`).get(id) as any).n || 0;
+    const cliques = (db.prepare(`SELECT COUNT(*) n FROM vsl_eventos WHERE vsl_id=? AND tipo='cta_click'`).get(id) as any).n || 0;
+    const tm = (db.prepare(`SELECT AVG(m) a FROM (SELECT MAX(posicao_seg) m FROM vsl_eventos WHERE vsl_id=? AND posicao_seg IS NOT NULL GROUP BY sessao)`).get(id) as any).a;
+    const porUtm = db.prepare(`SELECT COALESCE(NULLIF(utm,''),'(sem utm)') utm, COUNT(DISTINCT sessao) sessoes,
+        SUM(CASE WHEN tipo='play' THEN 1 ELSE 0 END) plays, SUM(CASE WHEN tipo='oferta' THEN 1 ELSE 0 END) ofertas,
+        SUM(CASE WHEN tipo='cta_click' THEN 1 ELSE 0 END) cliques
+      FROM vsl_eventos WHERE vsl_id=? GROUP BY COALESCE(NULLIF(utm,''),'(sem utm)') ORDER BY sessoes DESC LIMIT 30`).all(id);
+    _ndOk(res, { plays, chegouOferta, cliques, ctr: plays ? Math.round(cliques / plays * 100) : 0, taxaOferta: plays ? Math.round(chegouOferta / plays * 100) : 0, tempoMedioSeg: tm != null ? Math.round(Number(tm)) : 0, porUtm });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// [#9 VSL camada1] JS do player VTurb completo (estático; roda no navegador). SEM backtick e SEM ${} aqui dentro.
+const PLAYER_VSL_JS = `
+(function(){
+  var CFG=window.CFG||{};
+  var sent={}, sess=null, counted=false, modoReal=false, somAtivo=false, ended=false;
+  try{ sess=sessionStorage.getItem('vslsess_'+CFG.id); }catch(e){}
+  if(!sess){ sess=Date.now().toString(36)+Math.random().toString(36).slice(2,8); try{sessionStorage.setItem('vslsess_'+CFG.id,sess);}catch(e){} }
+  var qs=new URLSearchParams(location.search);
+  var contato=qs.get('c')||qs.get('contato')||'';
+  var utm=location.search?location.search.replace(/^[?]/,''):'';
+  function hostOf(u){ try{return new URL(u).hostname.toLowerCase();}catch(e){return '';} }
+  if(CFG.dominios&&CFG.dominios.length){ var h=hostOf(document.referrer||''); if(h){ var ok=false; for(var i=0;i<CFG.dominios.length;i++){ var d=CFG.dominios[i]; if(d&&(h===d||h.indexOf('.'+d)>=0||h===('www.'+d)))ok=true; } if(!ok){ var b=document.getElementById('blk'); if(b)b.style.display='flex'; return; } } }
+  function ev(tipo,pct,pos){ try{ var body=JSON.stringify({vsl_id:CFG.id,sessao:sess,contato_id:contato||null,tipo:tipo,pct:(pct!=null?pct:null),posicao_seg:(pos!=null?Math.round(pos):null),utm:utm}); if(navigator.sendBeacon){ navigator.sendBeacon('/vsl/evento', new Blob([body],{type:'application/json'})); } else { fetch('/vsl/evento',{method:'POST',headers:{'Content-Type':'application/json'},body:body,keepalive:true}); } }catch(e){} }
+  var dur=0,cur=0;
+  var barf=document.getElementById('barf'),bar=document.getElementById('bar'),big=document.getElementById('big'),wm=document.getElementById('wm'),cta=document.getElementById('cta'),poster=document.getElementById('poster'),sound=document.getElementById('sound'),pausaBox=document.getElementById('pausa');
+  var escBox=document.getElementById('escassez'),escTime=document.getElementById('escTime');
+  var ctaA=cta?cta.querySelector('a'):null;
+  if(ctaA){ if(CFG.ctaUtm){ var ex=location.search?location.search.replace(/^[?]/,''):''; if(ex){ ctaA.href += (ctaA.href.indexOf('?')>=0?'&':'?')+ex; } } ctaA.addEventListener('click',function(){ ev('cta_click',null,cur); }); }
+  var escIniciado=false;
+  function startEscassez(){ if(escIniciado||!CFG.escassez||CFG.escassez<=0||!escBox)return; escIniciado=true; escBox.style.display='flex'; var left=CFG.escassez; function tk(){ var mm=Math.floor(left/60),ss=left%60; if(escTime)escTime.textContent=mm+':'+(ss<10?'0':'')+ss; if(left<=0)return; left--; setTimeout(tk,1000); } tk(); }
+  function displayPct(x){ if(CFG.barra==='inteligente'){ return Math.round((1-Math.pow(1-x,1.8))*100); } return Math.round(x*100); }
+  function onTick(){
+    if(!modoReal) return;
+    if(dur>0){ var x=Math.min(1,cur/dur); if(barf)barf.style.width=displayPct(x)+'%';
+      var rp=Math.round(x*100); for(var m=10;m<=90;m+=10){ if(rp>=m&&!sent['p'+m]){ sent['p'+m]=1; ev('progress',rp,cur); } }
+      try{ if(CFG.resume&&CFG.inicio==='click') localStorage.setItem('vslpos_'+CFG.id,String(Math.floor(cur))); }catch(e){}
+    }
+    if(CFG.oferta>0&&cur>=CFG.oferta&&!sent.oferta){ sent.oferta=1; if(cta)cta.style.display='flex'; startEscassez(); try{parent.postMessage({type:'vsl-oferta',id:CFG.id},'*');}catch(e){} ev('oferta',null,cur); }
+  }
+  function realStart(){ if(counted)return; counted=true; if(CFG.marcadagua&&wm)wm.textContent=(contato||'Melodias e Riffs'); ev('play',0,0);
+    if(CFG.resume&&CFG.inicio==='click'){ try{ var sp=parseFloat(localStorage.getItem('vslpos_'+CFG.id)||'0'); if(sp>3) setTimeout(function(){ api.seek(sp); },400); }catch(e){} } }
+  function onPlaying(){ if(poster)poster.style.display='none'; if(big)big.style.display='none'; if(pausaBox)pausaBox.style.display='none'; }
+  function onPause(){ if(ended)return; if(CFG.pausaOn&&pausaBox){ pausaBox.style.display='flex'; } else if(big){ big.style.display='flex'; } }
+  function onEnd(){ if(ended)return; ended=true; ev('fim',100,dur); try{ localStorage.removeItem('vslpos_'+CFG.id); }catch(e){} if(big)big.style.display='none'; }
+  if(CFG.marcadagua&&wm){ wm.style.left='8%'; wm.style.top='8%'; setInterval(function(){ wm.style.left=(8+Math.random()*78)+'%'; wm.style.top=(8+Math.random()*78)+'%'; },4000); }
+  if(CFG.protecao){ document.addEventListener('contextmenu',function(e){e.preventDefault();}); document.addEventListener('selectstart',function(e){e.preventDefault();}); }
+  var api={ play:function(){}, pause:function(){}, mute:function(){}, unmute:function(){}, seek:function(){}, paused:function(){return true;} };
+  function seekTo(p){ api.seek(p); }
+  if(CFG.barra==='real'&&bar){ bar.style.height='10px'; bar.style.cursor='pointer'; bar.addEventListener('click',function(e){ if(dur>0){ var r=bar.getBoundingClientRect(); seekTo((e.clientX-r.left)/r.width*dur); } }); }
+  if(CFG.fonte==='storage'){
+    var elp=document.getElementById('ply'); var v=document.createElement('video'); v.src=CFG.ref; v.setAttribute('playsinline',''); v.playsInline=true; v.preload='auto'; elp.appendChild(v);
+    v.addEventListener('loadedmetadata',function(){ dur=v.duration||0; });
+    v.addEventListener('timeupdate',function(){ cur=v.currentTime; onTick(); });
+    v.addEventListener('play',onPlaying); v.addEventListener('pause',onPause); v.addEventListener('ended',onEnd);
+    api={ play:function(){var p=v.play();if(p&&p.catch)p.catch(function(){});}, pause:function(){v.pause();}, mute:function(){v.muted=true;}, unmute:function(){v.muted=false;}, seek:function(p){try{v.currentTime=p;}catch(e){}}, paused:function(){return v.paused;} };
+    iniciar();
+  } else {
+    window.onYouTubeIframeAPIReady=function(){ var yt=new YT.Player('ply',{ videoId:CFG.ref, playerVars:{controls:0,modestbranding:1,rel:0,disablekb:1,fs:0,playsinline:1,iv_load_policy:3}, events:{ onReady:function(){ dur=yt.getDuration()||0; api={ play:function(){yt.playVideo();}, pause:function(){yt.pauseVideo();}, mute:function(){yt.mute();}, unmute:function(){yt.unMute();}, seek:function(p){yt.seekTo(p,true);}, paused:function(){return yt.getPlayerState&&yt.getPlayerState()!==YT.PlayerState.PLAYING;} }; iniciar(); setInterval(function(){ if(yt.getCurrentTime){ cur=yt.getCurrentTime(); if(!dur)dur=yt.getDuration()||0; onTick(); } },400); }, onStateChange:function(e){ if(e.data===YT.PlayerState.PLAYING){ onPlaying(); } else if(e.data===YT.PlayerState.PAUSED){ onPause(); } else if(e.data===YT.PlayerState.ENDED){ onEnd(); } } } }); };
+  }
+  function mostrarSom(){ if(sound)sound.style.display='flex'; }
+  function esconderSom(){ if(sound)sound.style.display='none'; }
+  function iniciar(){
+    if(CFG.inicio==='mudo_som'){ api.mute(); api.play(); mostrarSom(); modoReal=true; realStart(); if(poster)poster.style.display='none'; if(big)big.style.display='none'; }
+    else if(CFG.inicio==='preroll'){ api.mute(); api.play(); mostrarSom(); if(poster)poster.style.display='none'; if(big)big.style.display='none'; }
+    else { if(poster&&CFG.poster)poster.style.display='block'; if(big)big.style.display='flex'; }
+  }
+  function usuarioClicou(){
+    esconderSom();
+    if(CFG.inicio==='preroll'&&!modoReal){ modoReal=true; api.seek(0); api.unmute(); api.play(); realStart(); return; }
+    if(CFG.inicio==='mudo_som'&&!somAtivo){ somAtivo=true; api.unmute(); return; }
+    if(!modoReal){ modoReal=true; realStart(); }
+    if(pausaBox)pausaBox.style.display='none';
+    if(api.paused()){ api.play(); } else { api.pause(); }
+  }
+  var g=document.getElementById('guard'); if(g)g.addEventListener('click',usuarioClicou);
+  if(sound)sound.addEventListener('click',usuarioClicou);
+  var pb=document.getElementById('pausaBtn'); if(pb)pb.addEventListener('click',function(e){ e.stopPropagation(); if(pausaBox)pausaBox.style.display='none'; api.play(); });
+})();
+`;
+
+// [#9 VSL upload] RESOLVEDOR do vídeo próprio (fonte 'storage'): entrega a mídia pro <video> do player.
+// ref http(s) -> redireciona direto; ref RELATIVO do OneDrive -> baixa 1x pro /data/media (cache, igual às
+// Lives, via rclone, SEM marca d'água e SEM YouTube) e redireciona pra /media/<hash> (que aceita Range -> seek).
+// A pré-baixa já é disparada ao salvar o vídeo, então quase sempre o arquivo já está pronto aqui.
+app.get('/vsl/media/:id', async (req: any, res: any) => {
+  try {
+    const v = db.prepare(`SELECT fonte, ref FROM vsl_videos WHERE id=?`).get(req.params.id) as any;
+    const ref = v && v.ref ? String(v.ref).trim() : '';
+    if (!ref) return res.status(404).type('text/plain').send('sem video');
+    if (/^https?:\/\//i.test(ref)) return res.redirect(302, ref);
+    const dest = _odDestPath(ref);
+    const nome = dest.split('/').pop();
+    try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return res.redirect(302, '/media/' + nome); } catch { /* */ }
+    await _odBaixarGrande(ref); // dedupe + atômico (.part), sem timeout curto; cacheia em /data/media
+    return res.redirect(302, '/media/' + nome);
+  } catch (e: any) { return res.status(502).type('text/plain').send('indisponivel'); }
+});
+
+// [#9 VSL] EMBED: <script src="/v/:id.js"> injeta o player (iframe no formato certo) na página de vendas
+// e, no minuto da oferta, LIBERA os elementos com data-vsl-oferta (que o dono deixa escondidos).
+app.get('/v/:id.js', (req: any, res: any) => {
+  const id = String(req.params.id || '');
+  const base = PUBLIC_BASE_URL || '';
+  const v = db.prepare(`SELECT formato FROM vsl_videos WHERE id=?`).get(id) as any;
+  const fmt = v && v.formato === '9:16' ? '9/16' : v && v.formato === '1:1' ? '1/1' : '16/9';
+  const maxw = fmt === '9/16' ? '420px' : fmt === '1/1' ? '620px' : '820px';
+  res.type('application/javascript').send(
+    '(function(){var id=' + JSON.stringify(id) + ';var base=' + JSON.stringify(base) + ';'
+    + 'var s=document.currentScript;var q=location.search||"";'
+    + 'var w=document.createElement("div");w.style.position="relative";w.style.width="100%";w.style.maxWidth=' + JSON.stringify(maxw) + ';w.style.margin="0 auto";w.style.aspectRatio=' + JSON.stringify(fmt) + ';w.style.background="#000";'
+    + 'var f=document.createElement("iframe");f.src=base+"/v/"+id+q;f.style.position="absolute";f.style.inset="0";f.style.width="100%";f.style.height="100%";f.style.border="0";f.setAttribute("allow","autoplay; fullscreen; encrypted-media");f.setAttribute("allowfullscreen","");'
+    + 'w.appendChild(f);if(s&&s.parentNode){s.parentNode.insertBefore(w,s);}else{document.body.appendChild(w);}'
+    + 'window.addEventListener("message",function(e){if(e.data&&e.data.type==="vsl-oferta"&&e.data.id===id){var els=document.querySelectorAll("[data-vsl-oferta]");for(var i=0;i<els.length;i++){els[i].style.display="";}}});'
+    + '})();'
+  );
+});
+
+// [#9 VSL] PLAYER público estilo VTurb: YouTube mascarado ou vídeo próprio (storage, sem marca/sem YouTube);
+// formatos 16:9/9:16/1:1; início click/mudo-com-som/PRÉ-ROLL (reinicia no clique); barra real ou inteligente
+// (rampa de velocidade); cor; trava de domínio; marca d'água; capa; continuar de onde parou; proteção; overlay de pausa; CTA.
+app.get('/v/:id', (req: any, res: any) => {
+  const v = db.prepare(`SELECT * FROM vsl_videos WHERE id=?`).get(req.params.id) as any;
+  if (!v) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Vídeo não encontrado</h1>');
+  const corSafe = /^#[0-9a-fA-F]{3,8}$/.test(String(v.cor || '')) ? String(v.cor) : '#1db954';
+  const _fonte = v.fonte || 'youtube';
+  // [#9 VSL upload] vídeo próprio (storage): o player busca pelo resolvedor /vsl/media/:id
+  // (OneDrive→URL pública /media, sem marca d'água/sem YouTube). YouTube segue com o ref cru.
+  const _refPlayer = (_fonte === 'storage') ? ('/vsl/media/' + v.id) : (v.ref || '');
+  const cfg = {
+    id: v.id, fonte: _fonte, ref: _refPlayer,
+    oferta: Number(v.oferta_segundos || 0), barra: v.barra || 'inteligente',
+    dominios: String(v.dominios || '').split(',').map((s: string) => s.trim().toLowerCase()).filter(Boolean),
+    marcadagua: v.marcadagua ? 1 : 0, formato: v.formato || '16:9',
+    inicio: (v.inicio === 'mudo_som' || v.inicio === 'preroll') ? v.inicio : 'click',
+    poster: v.poster || '', resume: v.resume ? 1 : 0, protecao: v.protecao ? 1 : 0,
+    pausaOn: !!(v.pausa_titulo || v.pausa_texto),
+    escassez: Number(v.escassez_segundos || 0), ctaUtm: v.cta_utm ? 1 : 0,
+  };
+  const cfgJson = JSON.stringify(cfg);
+  const temCta = v.cta_texto && v.cta_link;
+  // [#9 VSL camada2] tarja (faixa) sanitizada + escassez
+  const tBg = /^#[0-9a-fA-F]{3,8}$/.test(String(v.tarja_bg || '')) ? String(v.tarja_bg) : '#111318';
+  const tCor = /^#[0-9a-fA-F]{3,8}$/.test(String(v.tarja_cor || '')) ? String(v.tarja_cor) : '#ffffff';
+  const tFonte = /^[a-zA-Z0-9 ,'\-]{1,60}$/.test(String(v.tarja_fonte || '')) ? String(v.tarja_fonte) : 'system-ui, Segoe UI, Arial';
+  const tLarg = /^[0-9]{1,4}(px|%)$/.test(String(v.tarja_largura || '')) ? String(v.tarja_largura) : '100%';
+  const tPos = v.tarja_pos === 'cima' ? 'cima' : 'baixo';
+  const temTarja = !!(v.tarja_texto && String(v.tarja_texto).trim());
+  const tScroll = v.tarja_passando ? 1 : 0;
+  const tarjaHtml = temTarja
+    ? '<div id="tarja" class="' + (tScroll ? 'scroll' : '') + '" style="' + (tPos === 'cima' ? 'top:0' : 'bottom:0') + ';background:' + tBg + ';color:' + tCor + ';font-family:' + tFonte + ';width:' + tLarg + '"><span>' + esc(String(v.tarja_texto)) + '</span></div>'
+    : '';
+  const temEsc = Number(v.escassez_segundos || 0) > 0;
+  const escTxt = v.escassez_texto ? String(v.escassez_texto) : 'Oferta por tempo limitado:';
+  const escHtml = temEsc ? '<div id="escassez"><span>' + esc(escTxt) + '</span> <b id="escTime"></b></div>' : '';
+  const pTit = v.pausa_titulo ? String(v.pausa_titulo) : 'Espera! 🙏';
+  const pTxt = v.pausa_texto ? String(v.pausa_texto) : 'Continue assistindo pra não perder o conteúdo.';
+  const pBtn = v.pausa_botao ? String(v.pausa_botao) : '▶ Continuar assistindo';
+  res.type('html').send(
+    '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(v.nome || 'Vídeo') + '</title>'
+    + '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,Segoe UI,Arial}'
+    + '#wrap{position:relative;width:100%;height:100%;background:#000}#ply{position:absolute;inset:0}#ply iframe,#ply video{width:100%;height:100%;display:block;border:0;background:#000;object-fit:contain}'
+    + '#poster{position:absolute;inset:0;z-index:4;background:#000 center/contain no-repeat;display:none}'
+    + '#guard{position:absolute;inset:0;z-index:5;cursor:pointer}'
+    + '#big{position:absolute;inset:0;display:none;align-items:center;justify-content:center;z-index:6;pointer-events:none}#big div{width:86px;height:86px;border-radius:50%;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center}#big svg{width:36px;height:36px;fill:' + corSafe + ';margin-left:4px}'
+    + '#sound{position:absolute;inset:0;display:none;align-items:flex-end;justify-content:center;padding-bottom:14%;z-index:9;pointer-events:none}#sound div{pointer-events:auto;background:' + corSafe + ';color:#06230f;font-weight:800;font-size:15px;padding:12px 20px;border-radius:30px;box-shadow:0 4px 16px rgba(0,0,0,.5);animation:pz 1.3s infinite}'
+    + '#bar{position:absolute;left:0;right:0;bottom:0;height:6px;background:rgba(255,255,255,.18);z-index:7}#barf{height:100%;width:0;background:' + corSafe + ';transition:width .3s linear}'
+    + '#wm{position:absolute;left:8%;top:8%;z-index:8;color:rgba(255,255,255,.35);font-size:13px;font-weight:600;pointer-events:none;text-shadow:0 1px 2px rgba(0,0,0,.6);transition:all .8s linear}'
+    + '#cta{position:absolute;left:0;right:0;bottom:26px;display:none;justify-content:center;z-index:9;padding:0 16px}#cta a{background:' + corSafe + ';color:#06230f;font-weight:800;font-size:17px;padding:14px 26px;border-radius:10px;text-decoration:none;box-shadow:0 6px 20px rgba(0,0,0,.45);animation:pz 1.4s infinite}@keyframes pz{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}'
+    + '#pausa{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:12;background:rgba(0,0,0,.72);text-align:center;padding:24px}#pausa h3{color:#fff;font-size:22px;margin:0 0 10px}#pausa p{color:#dcdcdc;font-size:15px;margin:0 0 18px;max-width:420px}#pausa button{background:' + corSafe + ';color:#06230f;font-weight:800;font-size:16px;border:0;padding:13px 24px;border-radius:10px;cursor:pointer}'
+    + '#blk{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#bbb;background:#000;z-index:20;text-align:center;padding:20px;font-size:15px}'
+    + '#tarja{position:absolute;left:50%;transform:translateX(-50%);z-index:10;padding:7px 14px;font-size:14px;font-weight:700;text-align:center;box-sizing:border-box;max-width:100%;overflow:hidden;white-space:nowrap}#tarja.scroll span{display:inline-block;padding-left:100%;animation:mq 14s linear infinite}@keyframes mq{from{transform:translateX(0)}to{transform:translateX(-100%)}}'
+    + '#escassez{position:absolute;left:0;right:0;bottom:74px;display:none;justify-content:center;z-index:9;color:#fff;font-weight:700;font-size:14px;text-shadow:0 1px 3px rgba(0,0,0,.7)}#escassez b{margin-left:6px;color:' + corSafe + '}</style></head><body>'
+    + '<div id="wrap"><div id="ply"></div>'
+    + (cfg.poster ? '<div id="poster" style="background-image:url(\'' + esc(String(cfg.poster)) + '\')"></div>' : '')
+    + '<div id="guard"></div><div id="big"><div><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div></div>'
+    + '<div id="sound"><div>🔊 Toque para ativar o som</div></div>'
+    + (cfg.marcadagua ? '<div id="wm"></div>' : '')
+    + '<div id="bar"><div id="barf"></div></div>'
+    + tarjaHtml + escHtml
+    + (temCta ? '<div id="cta"><a href="' + esc(String(v.cta_link)) + '" target="_blank" rel="noopener">' + esc(String(v.cta_texto)) + '</a></div>' : '')
+    + '<div id="pausa"><h3>' + esc(pTit) + '</h3><p>' + esc(pTxt) + '</p><button id="pausaBtn">' + esc(pBtn) + '</button></div>'
+    + '<div id="blk">Este vídeo não está disponível neste site.</div></div>'
+    + '<script>var CFG=' + cfgJson + ';</script>'
+    + (cfg.fonte === 'storage' ? '' : '<script src="https://www.youtube.com/iframe_api"></script>')
+    + '<script>' + PLAYER_VSL_JS + '</script></body></html>'
+  );
 });
 
 // ---------- #13 Convites (webinário usa a rota /webinarios que já existe) ----------
