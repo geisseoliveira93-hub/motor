@@ -674,6 +674,8 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
   if (req.path.startsWith('/e-api/')) return next();  // [evento] API publica do evento (inscricao)
+  if (req.path.startsWith('/c/')) return next();      // [#13 convite] pagina publica do convite (o aluno ve e agenda)
+  if (req.path.startsWith('/c-api/')) return next();  // [#13 convite] API publica do convite (agendamento, sem x-api-key)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -8551,7 +8553,8 @@ app.get('/convites', (req: any, res: any) => {
       const responderam = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND dados IS NOT NULL`).get(c.id) as any).n;
       const agendaram = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND agendou=1`).get(c.id) as any).n;
       const compareceram = (db.prepare(`SELECT COUNT(*) n FROM convite_respostas WHERE convite_id=? AND compareceu=1`).get(c.id) as any).n;
-      return { ...c, ia: _ndJson(c.ia, {}), pos: _ndJson(c.pos, {}), stats: { abriram, responderam, agendaram, compareceram } };
+      const link = String(PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/c/' + c.id;
+      return { ...c, link, ia: _ndJson(c.ia, {}), pos: _ndJson(c.pos, {}), stats: { abriram, responderam, agendaram, compareceram } };
     });
     _ndOk(res, { convites });
   } catch (e) { _ndErr(res, e); }
@@ -8563,7 +8566,7 @@ app.post('/convite', (req: any, res: any) => {
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT criado_em FROM convites WHERE id=?),?))`)
       .run(id, b.projeto, b.nome, b.produto, b.tipo, b.destino, b.webinarioId || null, b.imagem || null, b.videoVslId || null, b.cor || null,
            JSON.stringify(b.ia || {}), JSON.stringify(b.pos || {}), id, agora());
-    _ndOk(res, { id });
+    _ndOk(res, { id, link: String(PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/c/' + id });
   } catch (e) { _ndErr(res, e); }
 });
 app.post('/convite/remover', (req: any, res: any) => {
@@ -8583,6 +8586,69 @@ app.get('/convite/:id/stats', (req: any, res: any) => {
 });
 // IA gera perguntas/copy — stub até ligar o LLM (chave no VPS)
 app.post('/convite/ia-gerar', (_req: any, res: any) => { try { _ndOk(res, { ok: false, pendente: 'LLM não configurado' }); } catch (e) { _ndErr(res, e); } });
+
+// [#13 convite] PAGINA PUBLICA DO CONVITE + agendamento. Espelha o fluxo publico do evento
+// (/e/:slug + /e-api/.../inscrever). Link de teste = PUBLIC_BASE_URL + /c/:id — o Ezequias
+// clica e abre no navegador, igual /w/ (webinario) e /v/ (VSL). SOMENTE ADITIVO.
+const convGet = (id: string): any => db.prepare(`SELECT * FROM convites WHERE id=?`).get(String(id)) as any;
+function convHorarios(c: any): { valor: string; rotulo: string }[] {
+  const DIAS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+  try {
+    if (c.destino === 'webinario') return [{ valor: 'webinario:' + (c.webinarioId || ''), rotulo: 'Assistir agora (sala automática)' }];
+    const js = db.prepare(`SELECT * FROM disponibilidade_janelas WHERE (?='' OR projeto=?) AND (ativo=1 OR ativo IS NULL) ORDER BY dia_semana, hora`).all(String(c.projeto || ''), String(c.projeto || '')) as any[];
+    return js.slice(0, 8).map((j: any) => ({
+      valor: 'janela:' + j.id,
+      rotulo: (DIAS[j.dia_semana] ?? '?') + ' ' + (j.hora || '') + (j.tipo === 'grupo' && j.vagas ? ' · ' + j.vagas + ' vagas' : ''),
+    }));
+  } catch { return []; }
+}
+app.get('/c/:id', (req: any, res: any) => {
+  const c = convGet(String(req.params.id));
+  if (!c) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Convite nao encontrado</h1>');
+  const cor = c.cor || '#22c55e';
+  const ehQuiz = c.tipo === 'quiz';
+  const horarios = convHorarios(c);
+  const base = String(PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const vsl = c.videoVslId ? ('<div style="margin:0 0 14px"><iframe src="' + base + '/v/' + esc(c.videoVslId) + '" style="width:100%;aspect-ratio:16/9;border:0;border-radius:10px" allow="autoplay; fullscreen" allowfullscreen></iframe></div>') : '';
+  const img = (!c.videoVslId && c.imagem) ? ('<img src="' + esc(c.imagem) + '" alt="" style="width:100%;border-radius:10px;margin:0 0 14px">') : '';
+  const quizBloco = ehQuiz
+    ? '<label>Há quanto tempo você toca?</label><select name="nivel"><option value="">— escolha —</option><option>Nunca toquei</option><option>Iniciante</option><option>Já toco um pouco</option><option>Toco na igreja</option></select>'
+    : '';
+  const opcoes = horarios.length
+    ? '<label>Escolha seu horário</label><select name="horario" required><option value="">— escolha —</option>' + horarios.map((h, i) => '<option value="' + esc(h.valor) + '"' + (i === 0 ? ' selected' : '') + '>' + esc(h.rotulo) + '</option>').join('') + '</select>'
+    : '<p class="hint">' + (c.destino === 'aula_vivo' ? 'Os horários aparecem aqui quando houver janelas abertas na Disponibilidade (#6).' : 'Sala automática — você recebe o acesso ao confirmar.') + '</p>';
+  res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(c.nome || 'Seu convite') + '</title>'
+    + '<style>body{margin:0;font:16px/1.5 system-ui,Segoe UI,Arial;background:#0e1116;color:#e6e6e6;display:flex;justify-content:center;padding:28px 16px}.card{width:100%;max-width:520px;background:#161b22;border:1px solid #2a313c;border-radius:14px;overflow:hidden}.top{height:6px;background:' + esc(cor) + '}.in{padding:22px}h1{font-size:22px;margin:0 0 6px}.sub{color:#9aa3b2;margin:0 0 16px;font-size:14px}label{display:block;margin:14px 0 5px;font-weight:600;font-size:14px}input,select{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:9px;border:1px solid #2a313c;background:#0e1116;color:#e6e6e6;font-size:15px}.hint{color:#9aa3b2;font-size:13px;margin:10px 0}button{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:' + esc(cor) + ';color:#07210f;font-weight:700;font-size:16px;cursor:pointer}#ok{display:none;margin-top:16px;padding:12px;border-radius:9px;background:#0f2e1b;border:1px solid #1db95455}</style></head><body><div class="card"><div class="top"></div><div class="in">'
+    + img + vsl
+    + '<h1>Você ganhou uma aula! 🎉</h1><p class="sub">' + (ehQuiz ? 'Responda rapidinho pra gente preparar sua aula e garanta seu horário:' : 'Confirme seus dados pra garantir sua vaga:') + '</p>'
+    + '<form id="frm">' + quizBloco
+    + '<label>Nome</label><input name="nome" required>'
+    + '<label>WhatsApp</label><input name="telefone" type="tel" required>'
+    + '<label>E-mail</label><input name="email" type="email">'
+    + opcoes
+    + '<button type="submit">Confirmar minha vaga</button></form><div id="ok">✅ Vaga confirmada! Você vai receber a confirmação no WhatsApp/e-mail.</div></div></div>'
+    + '<script>document.getElementById("frm").onsubmit=async(e)=>{e.preventDefault();const d={};new FormData(e.target).forEach((v,k)=>d[k]=v);const r=await fetch("/c-api/' + c.id + '/agendar",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});if(r.ok){e.target.style.display="none";document.getElementById("ok").style.display="block";}};</script></body></html>');
+});
+app.post('/c-api/:id/agendar', (req: any, res: any) => {
+  try {
+    const c = convGet(String(req.params.id)); if (!c) return res.status(404).json({ ok: false });
+    const dados = (req.body && typeof req.body === 'object') ? req.body : {};
+    const tel = String(dados.telefone || dados.whatsapp || dados.celular || '').replace(/\D/g, '');
+    const nome = dados.nome || '';
+    const email = dados.email || '';
+    const agendou = dados.horario ? 1 : 0;
+    let contatoId: string | null = null;
+    if (tel && tel.length >= 10) {
+      contatoId = upsertContato(String(c.projeto || ''), tel, nome, email, 'convite');
+      const tag = 'convite-agendado' + (c.projeto ? '-' + c.projeto : '');
+      if (contatoId) aplicarTag(String(c.projeto || ''), contatoId, tag);
+      if (contatoId) rodarAutomacoes(String(c.projeto || ''), 'tag_adicionada', { contatoId, tag, telefone: tel, nome }).catch(() => {});
+    }
+    db.prepare(`INSERT INTO convite_respostas(id,convite_id,etapa,dados,agendou,compareceu,ts) VALUES(?,?,?,?,?,?,?)`)
+      .run(randomUUID(), c.id, 'agendou', JSON.stringify(dados), agendou, 0, agora());
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
 
 // ---------- #4/#10 Academy ----------
 app.get('/academy/resumo', (_req: any, res: any) => {
