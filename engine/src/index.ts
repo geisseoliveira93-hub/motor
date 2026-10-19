@@ -1620,6 +1620,14 @@ try { db.exec(`ALTER TABLE email_dominios ADD COLUMN smtp_seg TEXT`); } catch { 
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN erro TEXT`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN tentativas INTEGER DEFAULT 0`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN enviado_em TEXT`); } catch { /* existe */ }
+// [email-warmup] remetente escolhivel + aquecimento
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN apelido TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN ativo INTEGER DEFAULT 1`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN padrao INTEGER DEFAULT 0`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN warmup_on INTEGER DEFAULT 0`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN warmup_inicio TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN warmup_max INTEGER DEFAULT 200`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN dominio_id TEXT`); } catch { /* existe */ }
 
 // [email] enviador SMTP self-contido (net/tls do Node, sem dependencia nova). Suporta
 // TLS implicito (465) e STARTTLS (587), AUTH LOGIN. Usado pelo worker da fila e pelo teste.
@@ -1676,15 +1684,43 @@ async function _smtpEnviar(dom: any, para: string, assunto: string, html: string
   conn.send(corpo); r = await conn.wait(); if (r.code !== 250) throw new Error('envio recusado: ' + r.text);
   try { conn.send('QUIT'); } catch { /* */ } try { sock.end(); } catch { /* */ }
 }
+// [email-warmup] limite de envios de HOJE do remetente (aquecimento gradual). Sem aquecimento = sem limite.
+function _emailCapHoje(dom: any): number {
+  if (!dom || !Number(dom.warmup_on)) return Number.MAX_SAFE_INTEGER;
+  const ini = String(dom.warmup_inicio || '').trim();
+  if (!ini) return 20;
+  const base = Date.parse(ini.length <= 10 ? ini + 'T00:00:00-03:00' : ini);
+  if (!base) return 20;
+  const dias = Math.max(0, Math.floor((Date.now() - base) / 86400000));
+  return Math.min(Number(dom.warmup_max) || 200, 20 + dias * 30); // dia0=20, +30/dia
+}
+function _emailEnviadosHoje(dominioId: string): number {
+  try {
+    const nowBRT = new Date(Date.now() - 3 * 3600000);
+    const diaBRT = `${nowBRT.getUTCFullYear()}-${String(nowBRT.getUTCMonth() + 1).padStart(2, '0')}-${String(nowBRT.getUTCDate()).padStart(2, '0')}`;
+    const limiteUtc = new Date(Date.parse(diaBRT + 'T00:00:00-03:00')).toISOString();
+    const r = db.prepare(`SELECT COUNT(*) n FROM email_fila WHERE dominio_id=? AND status='enviado' AND enviado_em>=?`).get(dominioId, limiteUtc) as any;
+    return (r && r.n) || 0;
+  } catch { return 0; }
+}
+// escolhe o remetente de um item: o escolhido (dominio_id) -> o PADRAO do projeto -> o mais recente
+function _emailDomDoItem(m: any): any {
+  const okSmtp = `smtp_host IS NOT NULL AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>''`;
+  if (m && m.dominio_id) { const d = db.prepare(`SELECT * FROM email_dominios WHERE id=? AND ${okSmtp}`).get(String(m.dominio_id)) as any; if (d) return d; }
+  const pad = db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND padrao=1 AND ${okSmtp} ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+  if (pad) return pad;
+  return db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND ${okSmtp} ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+}
 async function _tickEmail(): Promise<void> {
   try {
     const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' ORDER BY criado_em ASC LIMIT 5`).all() as any[];
     for (const m of rows) {
-      const dom = db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND smtp_host IS NOT NULL AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+      const dom = _emailDomDoItem(m);
       if (!dom) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando SMTP do projeto', m.id); } catch { /* */ } continue; }
+      if (Number(dom.warmup_on) && _emailEnviadosHoje(String(dom.id)) >= _emailCapHoje(dom)) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando aquecimento (limite diario do remetente atingido)', m.id); } catch { /* */ } continue; }
       try {
         await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''));
-        db.prepare(`UPDATE email_fila SET status='enviado', enviado_em=?, erro=NULL WHERE id=?`).run(agora(), m.id);
+        db.prepare(`UPDATE email_fila SET status='enviado', enviado_em=?, erro=NULL, dominio_id=? WHERE id=?`).run(agora(), String(dom.id), m.id);
       } catch (e: any) {
         const t = (Number(m.tentativas) || 0) + 1; const st = t >= 5 ? 'erro' : 'pendente';
         db.prepare(`UPDATE email_fila SET status=?, tentativas=?, erro=? WHERE id=?`).run(st, t, String(e?.message || e), m.id);
@@ -1704,7 +1740,7 @@ app.post('/email/template', (req, res) => {
   res.json({ ok: true, id });
 });
 app.post('/email/template/remover', (req, res) => { db.prepare(`DELETE FROM email_templates WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
-app.get('/email/dominios', (req, res) => { const projeto = String(req.query.projeto || ''); const rows = (db.prepare(`SELECT * FROM email_dominios WHERE projeto=? ORDER BY dominio ASC`).all(projeto) as any[]).map((d) => { const tem_senha = !!(d.smtp_senha && String(d.smtp_senha).length); delete d.smtp_senha; d.tem_senha = tem_senha; return d; }); res.json({ ok: true, dominios: rows }); });
+app.get('/email/dominios', (req, res) => { const projeto = String(req.query.projeto || ''); const rows = (db.prepare(`SELECT * FROM email_dominios WHERE projeto=? ORDER BY dominio ASC`).all(projeto) as any[]).map((d) => { const tem_senha = !!(d.smtp_senha && String(d.smtp_senha).length); delete d.smtp_senha; d.tem_senha = tem_senha; d.capHoje = Number(d.warmup_on) ? _emailCapHoje(d) : null; d.enviadosHoje = _emailEnviadosHoje(String(d.id)); d.diaWarmup = (Number(d.warmup_on) && d.warmup_inicio) ? (Math.max(0, Math.floor((Date.now() - Date.parse(String(d.warmup_inicio).length <= 10 ? d.warmup_inicio + 'T00:00:00-03:00' : d.warmup_inicio)) / 86400000)) + 1) : 0; return d; }); res.json({ ok: true, dominios: rows }); });
 app.post('/email/dominio', (req, res) => {
   const b = req.body || {}; const id = String(b.id || randomUUID());
   const seg = String(b.smtp_seg || '').trim();
@@ -1717,6 +1753,24 @@ app.post('/email/dominio', (req, res) => {
     db.prepare(`INSERT INTO email_dominios(id,projeto,dominio,smtp_host,smtp_porta,smtp_usuario,remetente,smtp_seg,smtp_senha,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), seg, senhaCif, agora());
   }
   res.json({ ok: true, id });
+});
+// [email-warmup] config do remetente: apelido, ativo, PADRAO do projeto, aquecimento on/off + limite alvo
+app.post('/email/dominio/config', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || ''); if (!id) return res.json({ ok: false, erro: 'sem id' });
+    const dom = db.prepare(`SELECT projeto, warmup_inicio FROM email_dominios WHERE id=?`).get(id) as any;
+    if (!dom) return res.json({ ok: false, erro: 'nao_encontrado' });
+    if (b.apelido !== undefined) db.prepare(`UPDATE email_dominios SET apelido=? WHERE id=?`).run(String(b.apelido || ''), id);
+    if (b.ativo !== undefined) db.prepare(`UPDATE email_dominios SET ativo=? WHERE id=?`).run(b.ativo ? 1 : 0, id);
+    if (b.warmup_max !== undefined) db.prepare(`UPDATE email_dominios SET warmup_max=? WHERE id=?`).run(Number(b.warmup_max) || 200, id);
+    if (b.warmup_on !== undefined) {
+      const won = b.warmup_on ? 1 : 0;
+      const ini = won ? (dom.warmup_inicio || agora()) : dom.warmup_inicio || null; // comeca a contar quando liga
+      db.prepare(`UPDATE email_dominios SET warmup_on=?, warmup_inicio=? WHERE id=?`).run(won, ini, id);
+    }
+    if (b.padrao) { db.prepare(`UPDATE email_dominios SET padrao=0 WHERE projeto=?`).run(String(dom.projeto || '')); db.prepare(`UPDATE email_dominios SET padrao=1 WHERE id=?`).run(id); }
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 // [email] teste de envio: valida o SMTP mandando um e-mail de verdade
 app.post('/email/teste', async (req, res) => {
@@ -1738,7 +1792,7 @@ app.post('/email/enviar', (req, res) => {
   const b = req.body || {};
   let assunto = String(b.assunto || ''); let html = String(b.html || '');
   if (b.templateId) { const t = db.prepare(`SELECT * FROM email_templates WHERE id=?`).get(String(b.templateId)) as any; if (t) { assunto = assunto || t.assunto; html = html || t.html; } }
-  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), String(b.projeto || ''), String(b.para || ''), assunto, html, 'pendente', agora());
+  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id) VALUES(?,?,?,?,?,?,?,?)`).run(randomUUID(), String(b.projeto || ''), String(b.para || ''), assunto, html, 'pendente', agora(), b.dominio_id ? String(b.dominio_id) : null);
   res.json({ ok: true, enfileirado: true, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
 });
 
@@ -4110,8 +4164,13 @@ function _proximoTimerAbsoluto(d: any, baseMs: number): number | null {
     const mm = Number(hhmm.split(':')[1]) || 0;
     const BRT = -3; // Brasil (sem horário de verão). hh:mm BRT -> UTC = hh - BRT (= hh+3).
     if (dataEsp) {
-      const p = dataEsp.split('-').map(Number);
-      return Date.UTC(p[0], (p[1] || 1) - 1, p[2] || 1, hh - BRT, mm);
+      // [fix-timer] data_especifica pode vir "YYYY-MM-DD" ou "YYYY-MM-DDTHH:MM" (datetime-local).
+      const mEsp = dataEsp.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+      if (!mEsp) return null;
+      const yEsp = Number(mEsp[1]); const moEsp = Number(mEsp[2]) - 1; const daEsp = Number(mEsp[3]);
+      const hEsp = mEsp[4] != null ? Number(mEsp[4]) : hh; // hora do proprio datetime; senao o iniciar
+      const miEsp = mEsp[5] != null ? Number(mEsp[5]) : mm;
+      return Date.UTC(yEsp, moEsp, daEsp, hEsp - BRT, miEsp);
     }
     const mapDia: any = { dom: 0, seg: 1, ter: 2, qua: 3, qui: 4, sex: 5, sab: 6 };
     const alvo = new Set<number>();
