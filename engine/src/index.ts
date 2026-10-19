@@ -19,6 +19,8 @@
 import express from 'express';
 import Database from 'better-sqlite3';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import net from 'node:net';
+import tls from 'node:tls';
 import fs from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process'; // etapa21: rclone (OneDrive); etapa33: spawn p/ ffmpeg (lives)
 
@@ -1592,7 +1594,88 @@ app.post('/pixel', (req, res) => {
 });
 app.post('/pixel/remover', (req, res) => { db.prepare(`DELETE FROM pixels WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
 
-// ---- E-MAIL: templates, dominios (SMTP) e fila (envio real liga no fim) ----
+// ---- E-MAIL: templates, dominios (SMTP) e fila (ENVIO REAL ligado) ----
+// [email] colunas add-only: senha SMTP criptografada + seguranca + controle da fila
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN smtp_senha TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_dominios ADD COLUMN smtp_seg TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN erro TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN tentativas INTEGER DEFAULT 0`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN enviado_em TEXT`); } catch { /* existe */ }
+
+// [email] enviador SMTP self-contido (net/tls do Node, sem dependencia nova). Suporta
+// TLS implicito (465) e STARTTLS (587), AUTH LOGIN. Usado pelo worker da fila e pelo teste.
+function _mimeEnc(s: string): string { s = String(s || ''); return /^[\x00-\x7F]*$/.test(s) ? s : '=?UTF-8?B?' + Buffer.from(s, 'utf8').toString('base64') + '?='; }
+function _smtpConn(sock: any): { wait: () => Promise<any>; send: (l: string) => void } {
+  let buffer = ''; let resolver: any = null; let rejecter: any = null;
+  const settleErr = (e: any) => { const rj = rejecter; resolver = null; rejecter = null; if (rj) rj(e instanceof Error ? e : new Error(String(e))); };
+  sock.on('data', (d: any) => {
+    buffer += d.toString('utf8');
+    const lines = buffer.split(/\r?\n/).filter((x: string) => x.length);
+    const last = lines[lines.length - 1] || '';
+    if (/^\d{3} /.test(last)) { const r = { code: Number(last.slice(0, 3)), text: buffer.trim() }; buffer = ''; const fn = resolver; resolver = null; rejecter = null; if (fn) fn(r); }
+  });
+  sock.on('error', (e: any) => settleErr(e));
+  sock.on('close', () => settleErr(new Error('conexao SMTP fechada')));
+  return { wait: () => new Promise((res, rej) => { resolver = res; rejecter = rej; }), send: (l: string) => { try { sock.write(l + '\r\n'); } catch (e) { settleErr(e); } } };
+}
+async function _smtpEnviar(dom: any, para: string, assunto: string, html: string): Promise<void> {
+  const host = String(dom.smtp_host || '').trim();
+  const port = Number(dom.smtp_porta) || 587;
+  const user = String(dom.smtp_usuario || '').trim();
+  const pass = decifra(String(dom.smtp_senha || ''));
+  if (!host || !user || !pass) throw new Error('SMTP incompleto (host/usuario/senha)');
+  let fromAddr = user; let fromName = 'Melodias e Riffs';
+  const rem = String(dom.remetente || '').trim();
+  if (rem) { const m = rem.match(/<([^>]+)>/); if (m) { fromAddr = m[1]; const nm = rem.replace(/<[^>]+>/, '').trim().replace(/^"|"$/g, '').trim(); if (nm) fromName = nm; } else if (rem.includes('@')) { fromAddr = rem; } }
+  const implicito = port === 465 || String(dom.smtp_seg || '') === 'tls';
+  let sock: any = implicito ? tls.connect({ host, port, servername: host, rejectUnauthorized: false }) : net.connect({ host, port });
+  sock.setTimeout(20000, () => { try { sock.destroy(new Error('timeout SMTP')); } catch { /* */ } });
+  await new Promise<void>((res, rej) => { sock.once(implicito ? 'secureConnect' : 'connect', () => res()); sock.once('error', rej); });
+  let conn = _smtpConn(sock); let r = await conn.wait(); if (r.code !== 220) throw new Error('greeting: ' + r.text);
+  conn.send('EHLO melodiaseriffs.com.br'); r = await conn.wait();
+  if (!implicito) {
+    conn.send('STARTTLS'); r = await conn.wait(); if (r.code !== 220) throw new Error('STARTTLS: ' + r.text);
+    sock = tls.connect({ socket: sock, servername: host, rejectUnauthorized: false });
+    await new Promise<void>((res, rej) => { sock.once('secureConnect', () => res()); sock.once('error', rej); });
+    conn = _smtpConn(sock); conn.send('EHLO melodiaseriffs.com.br'); r = await conn.wait();
+  }
+  conn.send('AUTH LOGIN'); r = await conn.wait(); if (r.code !== 334) throw new Error('AUTH: ' + r.text);
+  conn.send(Buffer.from(user, 'utf8').toString('base64')); r = await conn.wait(); if (r.code !== 334) throw new Error('usuario: ' + r.text);
+  conn.send(Buffer.from(pass, 'utf8').toString('base64')); r = await conn.wait(); if (r.code !== 235) throw new Error('login falhou (usuario/senha): ' + r.text);
+  conn.send('MAIL FROM:<' + fromAddr + '>'); r = await conn.wait(); if (r.code !== 250) throw new Error('MAIL FROM: ' + r.text);
+  conn.send('RCPT TO:<' + para + '>'); r = await conn.wait(); if (r.code !== 250 && r.code !== 251) throw new Error('RCPT TO: ' + r.text);
+  conn.send('DATA'); r = await conn.wait(); if (r.code !== 354) throw new Error('DATA: ' + r.text);
+  const corpo = [
+    'From: ' + _mimeEnc(fromName) + ' <' + fromAddr + '>',
+    'To: ' + para,
+    'Subject: ' + _mimeEnc(assunto),
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '', String(html || '').replace(/\r?\n/g, '\r\n').replace(/^\./gm, '..'), '.'
+  ].join('\r\n');
+  conn.send(corpo); r = await conn.wait(); if (r.code !== 250) throw new Error('envio recusado: ' + r.text);
+  try { conn.send('QUIT'); } catch { /* */ } try { sock.end(); } catch { /* */ }
+}
+async function _tickEmail(): Promise<void> {
+  try {
+    const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' ORDER BY criado_em ASC LIMIT 5`).all() as any[];
+    for (const m of rows) {
+      const dom = db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND smtp_host IS NOT NULL AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+      if (!dom) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando SMTP do projeto', m.id); } catch { /* */ } continue; }
+      try {
+        await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''));
+        db.prepare(`UPDATE email_fila SET status='enviado', enviado_em=?, erro=NULL WHERE id=?`).run(agora(), m.id);
+      } catch (e: any) {
+        const t = (Number(m.tentativas) || 0) + 1; const st = t >= 5 ? 'erro' : 'pendente';
+        db.prepare(`UPDATE email_fila SET status=?, tentativas=?, erro=? WHERE id=?`).run(st, t, String(e?.message || e), m.id);
+      }
+    }
+  } catch { /* best-effort */ }
+}
+setInterval(() => { void _tickEmail(); }, 20000);
+console.log('[email] enviador SMTP + worker da fila carregados');
+
 app.get('/email/templates', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, templates: db.prepare(`SELECT * FROM email_templates WHERE projeto=? ORDER BY nome ASC`).all(projeto) }); });
 app.post('/email/template', (req, res) => {
   const b = req.body || {}; const id = String(b.id || randomUUID());
@@ -1602,13 +1685,33 @@ app.post('/email/template', (req, res) => {
   res.json({ ok: true, id });
 });
 app.post('/email/template/remover', (req, res) => { db.prepare(`DELETE FROM email_templates WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
-app.get('/email/dominios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, dominios: db.prepare(`SELECT * FROM email_dominios WHERE projeto=? ORDER BY dominio ASC`).all(projeto) }); });
+app.get('/email/dominios', (req, res) => { const projeto = String(req.query.projeto || ''); const rows = (db.prepare(`SELECT * FROM email_dominios WHERE projeto=? ORDER BY dominio ASC`).all(projeto) as any[]).map((d) => { const tem_senha = !!(d.smtp_senha && String(d.smtp_senha).length); delete d.smtp_senha; d.tem_senha = tem_senha; return d; }); res.json({ ok: true, dominios: rows }); });
 app.post('/email/dominio', (req, res) => {
   const b = req.body || {}; const id = String(b.id || randomUUID());
+  const seg = String(b.smtp_seg || '').trim();
+  const senhaCif = (b.smtp_senha && String(b.smtp_senha).trim()) ? cifra(String(b.smtp_senha)) : null; // só grava se veio senha nova
   const existe = db.prepare(`SELECT id FROM email_dominios WHERE id=?`).get(id);
-  if (existe) db.prepare(`UPDATE email_dominios SET dominio=?, smtp_host=?, smtp_porta=?, smtp_usuario=?, remetente=? WHERE id=?`).run(String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), id);
-  else db.prepare(`INSERT INTO email_dominios(id,projeto,dominio,smtp_host,smtp_porta,smtp_usuario,remetente,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), agora());
+  if (existe) {
+    if (senhaCif) db.prepare(`UPDATE email_dominios SET dominio=?, smtp_host=?, smtp_porta=?, smtp_usuario=?, remetente=?, smtp_seg=?, smtp_senha=? WHERE id=?`).run(String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), seg, senhaCif, id);
+    else db.prepare(`UPDATE email_dominios SET dominio=?, smtp_host=?, smtp_porta=?, smtp_usuario=?, remetente=?, smtp_seg=? WHERE id=?`).run(String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), seg, id);
+  } else {
+    db.prepare(`INSERT INTO email_dominios(id,projeto,dominio,smtp_host,smtp_porta,smtp_usuario,remetente,smtp_seg,smtp_senha,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), String(b.dominio || ''), String(b.smtp_host || ''), Number(b.smtp_porta || 587), String(b.smtp_usuario || ''), String(b.remetente || ''), seg, senhaCif, agora());
+  }
   res.json({ ok: true, id });
+});
+// [email] teste de envio: valida o SMTP mandando um e-mail de verdade
+app.post('/email/teste', async (req, res) => {
+  try {
+    const b = req.body || {}; const projeto = String(b.projeto || ''); const para = String(b.para || '').trim();
+    if (!para) return res.json({ ok: false, erro: 'Informe o e-mail de destino do teste.' });
+    const dom = b.dominioId
+      ? db.prepare(`SELECT * FROM email_dominios WHERE id=?`).get(String(b.dominioId)) as any
+      : db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND smtp_host<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto) as any;
+    if (!dom) return res.json({ ok: false, erro: 'Nenhum domínio SMTP configurado.' });
+    if (!dom.smtp_senha) return res.json({ ok: false, erro: 'Senha SMTP não configurada.' });
+    await _smtpEnviar(dom, para, 'Teste de e-mail — Melodias e Riffs ✅', '<div style="font:16px/1.5 system-ui,Arial;color:#111"><h2>Funcionou! ✅</h2><p>Seu SMTP está configurado certinho. Já dá pra enviar as confirmações por e-mail.</p></div>');
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 app.post('/email/dominio/remover', (req, res) => { db.prepare(`DELETE FROM email_dominios WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
 app.get('/email/fila', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, fila: db.prepare(`SELECT * FROM email_fila WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
@@ -1754,6 +1857,28 @@ function _agenteDevResponder(projeto: string, contatoId: string): boolean {
   if (pubFlag('agente_tag_gate', '1') !== '1') return true; // gate desligado => comportamento antigo (responde a todos)
   return _contatoTemTagGatilho(projeto, contatoId);
 }
+// [#2-guard] Tags que marcam ALUNO (regra do prompt: nunca qualificar/atender quem já é aluno). Confere SÓ no projeto atual.
+const _ALUNO_TAG_PADROES = ['grupo-de-alunos', 'black-alunos', 'alunos-desafio-hc', 'desafio-hc-alunos'];
+function _contatoEhAluno(projeto: string, contatoId: string): boolean {
+  try {
+    const tags = db.prepare(`SELECT t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.contato_id=? AND t.projeto=?`).all(contatoId, projeto) as any[];
+    for (const row of tags) {
+      const n = String(row?.nome || '').toLowerCase().trim();
+      if (!n) continue;
+      if (n === 'alunos' || n === 'aluno' || n.startsWith('aluno-') || /^t\d+-aluno/.test(n) || _ALUNO_TAG_PADROES.some((p) => n.includes(p))) return true;
+    }
+  } catch { /* best-effort */ }
+  return false;
+}
+// [#2-guard] É um dos NOSSOS próprios números conectados? (evita o agente engajar a si mesmo = eco/loop entre instâncias)
+function _ehNumeroNosso(telefone: string): boolean {
+  try {
+    const t = String(telefone || '').replace(/\D/g, '');
+    if (!t) return false;
+    const rows = db.prepare(`SELECT telefone FROM numeros`).all() as any[];
+    return rows.some((r) => String(r?.telefone || '').replace(/\D/g, '') === t);
+  } catch { return false; }
+}
 
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----
 app.post('/webhook/evolution', (req, res) => {
@@ -1771,7 +1896,7 @@ app.post('/webhook/evolution', (req, res) => {
         catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         if (!ehGrupo) rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
-        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && _agenteDevResponder(projeto, cid)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila */ }
+        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && _agenteDevResponder(projeto, cid) && !_contatoEhAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila; [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -2109,6 +2234,17 @@ setInterval(tickFila, 8000 + Math.floor(Math.random() * 7000));
 const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://api.openai.com/v1';
 const LLM_API_KEY = process.env.LLM_API_KEY || '';
 const LLM_MODEL_PADRAO = process.env.LLM_MODEL || 'gpt-4o-mini';
+// [#2 provedor trocável] Provedor efetivo: usa CONFIG.llmProvider (base_url/chave cifrada/modelo) se setado, senão o .env.
+function _llmEfetivo(): { baseUrl: string; apiKey: string; modeloPadrao: string } {
+  const p = (CONFIG as any).llmProvider || {};
+  let key = LLM_API_KEY;
+  if (p.apiKeyEnc) { try { key = decifra(p.apiKeyEnc) || LLM_API_KEY; } catch { key = LLM_API_KEY; } }
+  return {
+    baseUrl: (p.baseUrl && String(p.baseUrl).trim()) || LLM_BASE_URL,
+    apiKey: key,
+    modeloPadrao: (p.modelo && String(p.modelo).trim()) || LLM_MODEL_PADRAO,
+  };
+}
 const AGENTE_MAX_TOOL_LOOPS = Number(process.env.AGENTE_MAX_TOOL_LOOPS || 6);
 
 db.exec(`
@@ -2358,12 +2494,13 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
 
 // --------- Chamada ao LLM (API compativel com OpenAI chat/completions) ---------
 async function _chamarLLM(messages: any[], modelo: string, temperatura: number, tools: any[]): Promise<any> {
-  if (!LLM_API_KEY) return { content: '', _semChave: true };
-  const body: any = { model: modelo || LLM_MODEL_PADRAO, messages, temperature: (temperatura == null ? 0.7 : temperatura) };
+  const _prov = _llmEfetivo();
+  if (!_prov.apiKey) return { content: '', _semChave: true };
+  const body: any = { model: modelo || _prov.modeloPadrao, messages, temperature: (temperatura == null ? 0.7 : temperatura) };
   if (tools && tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
-  const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+  const res = await fetch(`${_prov.baseUrl}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_API_KEY}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${_prov.apiKey}` },
     body: JSON.stringify(body),
   });
   const txt = await res.text();
@@ -2419,7 +2556,7 @@ async function processarMensagemAgente(projeto: string, telefone: string, texto:
       if (conteudo) {
         historico.push({ role: 'assistant', content: conteudo });
         respostasEnviadas.push(conteudo);
-        if (!teste) { try { await enviarTexto(projeto as any, telefone, conteudo); } catch (e) { console.log('[agente] enviarTexto falhou', e); } }
+        if (!teste && !(opts && opts.naoEnviar)) { try { await enviarTexto(projeto as any, telefone, conteudo, (opts && opts.instancia) ? String(opts.instancia) : undefined); } catch (e) { console.log('[agente] enviarTexto falhou', e); } }
       }
       break; // sem tool_calls => fim do turno
     }
@@ -2477,6 +2614,27 @@ app.post('/agente/testar', async (req, res) => {
   const telefone = String(b.telefone || ('teste-' + projeto));
   const r = await processarMensagemAgente(projeto, telefone, String(b.texto || ''), 'Teste', undefined, { teste: true });
   res.json(r);
+});
+// [#2 IG] Recebe uma mensagem de Instagram (do PC2 por navegador, OU via API oficial no futuro),
+// roda o agente e DEVOLVE a resposta (naoEnviar) pra quem chamou entregar no Direct.
+// Conversa identificada por 'ig:'+ident. PULA o gate por tag (quem responde a nossa DM fria é lead-alvo);
+// mantém o guard de aluno quando o contato já é conhecido.
+app.post('/agente/ig', async (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '');
+  const ident = String(b.ident || b.igUser || b.usuario || '').trim();
+  const texto = String(b.texto || '');
+  if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
+  if (!ident) return res.status(400).json({ ok: false, erro: 'ident_obrigatorio' });
+  if (!((CONFIG as any).agentesHabilitados || {})[projeto]) return res.json({ ok: true, respostas: [], motivo: 'canal desligado' });
+  const idKey = 'ig:' + ident;
+  let cid: string | undefined;
+  try { cid = upsertContato(projeto, idKey, b.nome); } catch { cid = undefined; }
+  if (cid && _contatoEhAluno(projeto, cid)) return res.json({ ok: true, respostas: [], motivo: 'ja e aluno' });
+  try {
+    const r = await processarMensagemAgente(projeto, idKey, texto, b.nome, cid, { naoEnviar: true, canal: 'ig' });
+    res.json({ ok: true, respostas: (r && (r as any).respostas) || [], status: (r && (r as any).status) || 'ativo', motivo: (r && (r as any).motivo) || undefined });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
 
@@ -3371,6 +3529,38 @@ app.post('/motor2/flag', (req, res) => {
   const on = (b.on === true || b.on === '1' || b.on === 1 || b.on === 'on');
   setPubFlag(flag, on ? '1' : '0');
   res.json({ ok: true, flag, valor: pubFlag(flag, flag === 'agente_tag_gate' ? '1' : '0') === '1' });
+});
+// [#2 provedor trocável] Config do provedor de IA (base_url + chave + modelo). A CHAVE é guardada CIFRADA e nunca é devolvida.
+app.get('/motor2/llm', (_req, res) => {
+  const p = (CONFIG as any).llmProvider || {};
+  const prov = _llmEfetivo();
+  res.json({ ok: true, baseUrl: p.baseUrl || '', modelo: p.modelo || '', temChaveCustom: !!p.apiKeyEnc, usandoEnv: !p.apiKeyEnc && !!LLM_API_KEY, baseUrlEfetivo: prov.baseUrl, modeloPadraoEfetivo: prov.modeloPadrao });
+});
+app.post('/motor2/llm', (req, res) => {
+  const b = req.body || {};
+  if (!(CONFIG as any).llmProvider) (CONFIG as any).llmProvider = {};
+  const p = (CONFIG as any).llmProvider;
+  if (b.baseUrl !== undefined) p.baseUrl = String(b.baseUrl || '').trim();
+  if (b.modelo !== undefined) p.modelo = String(b.modelo || '').trim();
+  if (b.limparChave === true) { delete p.apiKeyEnc; }
+  else if (b.apiKey && String(b.apiKey).trim()) { try { p.apiKeyEnc = cifra(String(b.apiKey).trim()); } catch (e: any) { return res.status(500).json({ ok: false, erro: 'falha ao cifrar: ' + String(e?.message || e) }); } }
+  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  res.json({ ok: true, baseUrl: p.baseUrl || '', modelo: p.modelo || '', temChaveCustom: !!p.apiKeyEnc });
+});
+// [#2 seletor de canal] Canal de Instagram por instrumento: 'off' | 'navegador' | 'api'. (WhatsApp é sempre via Evolution.)
+app.get('/motor2/canais', (_req, res) => {
+  res.json({ ok: true, canalIg: (CONFIG as any).canalIg || {} });
+});
+app.post('/motor2/canal-ig', (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '');
+  const modo = String(b.modo || 'off');
+  if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
+  if (!['off', 'navegador', 'api'].includes(modo)) return res.status(400).json({ ok: false, erro: 'modo_invalido' });
+  if (!(CONFIG as any).canalIg) (CONFIG as any).canalIg = {};
+  (CONFIG as any).canalIg[projeto] = modo;
+  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  res.json({ ok: true, canalIg: (CONFIG as any).canalIg });
 });
 
 app.get('/gcal/connect', (_req, res) => {
@@ -7347,17 +7537,37 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   const wbBase = (): string => String(PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const wbGet = (slugOrId: string): any => db.prepare(`SELECT * FROM webinarios WHERE slug=? OR id=?`).get(String(slugOrId), String(slugOrId)) as any;
 
+  // [sim] AUDIÊNCIA SIMULADA por webinário (contador + comentários programados)
+  db.exec(`CREATE TABLE IF NOT EXISTS webinario_sim (
+    slug TEXT PRIMARY KEY, ativo INTEGER DEFAULT 0, cfg_json TEXT DEFAULT '{}', coment_json TEXT DEFAULT '[]', atualizado_em TEXT
+  )`);
+  const simGet = (slug: string): any => {
+    const row = db.prepare(`SELECT * FROM webinario_sim WHERE slug=?`).get(String(slug)) as any;
+    if (!row || !row.ativo) return null;
+    let cfg: any = {}; let coment: any[] = [];
+    try { cfg = JSON.parse(row.cfg_json || '{}'); } catch { cfg = {}; }
+    try { coment = JSON.parse(row.coment_json || '[]'); } catch { coment = []; }
+    return { cfg, comentarios: coment };
+  };
+
   // config pública (o que a sala precisa; sem nada sensível)
   function wbConfigPublico(wb: any): any {
     let ofertas: any[] = []; try { ofertas = JSON.parse(wb.ofertas_json || '[]'); } catch { ofertas = []; }
     let videoUrl = '';
     if (Number(wb.modo) === 1) videoUrl = String(wb.video_tipo) === 'url' ? String(wb.video_ref || '') : '';
+    const s = simGet(wb.slug);
+    const sim = s ? {
+      vMin: Number(s.cfg.vMin) || 0, vMax: Number(s.cfg.vMax) || 0,
+      vInicial: Number(s.cfg.vInicial) || Number(s.cfg.vMin) || 0,
+      variacao: Number(s.cfg.variacao) || 2, intervalo: Number(s.cfg.intervalo) || 6,
+      comentarios: (s.comentarios || []).map((c: any) => ({ t: Number(c.tempoSeg) || 0, nome: String(c.nome || 'Participante'), texto: String(c.texto || '') })).filter((c: any) => c.texto)
+    } : null;
     return {
       slug: wb.slug, nome: wb.nome || 'Webinário', modo: Number(wb.modo) || 2,
       youtube_url: wb.youtube_url || '', video_url: videoUrl,
       mascara: !!wb.mascara, chat_real: !!wb.chat_real, chat_ia: !!wb.chat_ia,
       contador: !!wb.contador, acumulado: !!wb.acumulado, popups: !!wb.popups, autoridade: !!wb.autoridade,
-      ofertas
+      ofertas, sim
     };
   }
 
@@ -7463,6 +7673,62 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
+  // [sim] CONFIG da audiência simulada por webinário (app, x-api-key)
+  app.get('/webinarios/:slug/simulacao', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).json({ ok: false });
+      const row = db.prepare(`SELECT * FROM webinario_sim WHERE slug=?`).get(wb.slug) as any;
+      let cfg: any = {}; let coment: any[] = [];
+      if (row) { try { cfg = JSON.parse(row.cfg_json || '{}'); } catch { cfg = {}; } try { coment = JSON.parse(row.coment_json || '[]'); } catch { coment = []; } }
+      res.json({ ok: true, ativo: !!(row && row.ativo), cfg, comentarios: coment });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/webinarios/:slug/simulacao', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).json({ ok: false });
+      const b = req.body || {}; const bc = b.cfg || {};
+      const cfg = {
+        vMin: Math.max(0, Math.round(Number(bc.vMin) || 0)),
+        vMax: Math.max(0, Math.round(Number(bc.vMax) || 0)),
+        vInicial: Math.max(0, Math.round(Number(bc.vInicial) || 0)),
+        variacao: Math.max(0, Math.min(500, Math.round(Number(bc.variacao) || 2))),
+        intervalo: Math.max(2, Math.min(120, Math.round(Number(bc.intervalo) || 6)))
+      };
+      const coment = (Array.isArray(b.comentarios) ? b.comentarios : []).slice(0, 5000).map((c: any, i: number) => ({
+        tempoSeg: Math.max(0, Math.min(86400, Math.round(Number(c?.tempoSeg) || 0))),
+        nome: String(c?.nome || ('Participante ' + (i + 1))).trim().slice(0, 80),
+        texto: String(c?.texto || '').trim().slice(0, 400)
+      })).filter((c: any) => c.texto);
+      db.prepare(`INSERT INTO webinario_sim(slug,ativo,cfg_json,coment_json,atualizado_em) VALUES(?,?,?,?,?)
+        ON CONFLICT(slug) DO UPDATE SET ativo=excluded.ativo,cfg_json=excluded.cfg_json,coment_json=excluded.coment_json,atualizado_em=excluded.atualizado_em`)
+        .run(wb.slug, b.ativo ? 1 : 0, JSON.stringify(cfg), JSON.stringify(coment), agora());
+      res.json({ ok: true, total: coment.length });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  // [sim] IA gera comentários a partir do tema do webinário (não salva; o app salva depois)
+  app.post('/webinarios/:slug/simulacao/ia', async (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).json({ ok: false });
+      if (!LLM_API_KEY) return res.json({ ok: false, erro: 'IA sem chave (LLM_API_KEY) no motor.' });
+      const b = req.body || {};
+      const qtd = Math.max(5, Math.min(80, Math.round(Number(b.qtd) || 25)));
+      const tema = String(b.tema || wb.nome || 'aula de música gospel').slice(0, 240);
+      const dur = Math.max(60, Math.min(14400, Math.round(Number(b.duracaoSeg) || 1500)));
+      const sys = 'Você gera comentários de chat de um webinário AO VIVO de uma escola de música gospel (Melodias e Riffs), em português do Brasil. Os comentários são de ALUNOS/participantes: curtos (3 a 12 palavras), naturais e variados (saudações, elogios, dúvidas, cidades do Brasil, empolgação, emojis ocasionais). Não repita nomes. Responda SOMENTE um array JSON valido, sem texto fora dele, no formato [{"nome":"Primeiro Nome","texto":"...","tempoSeg": N}], com ' + qtd + ' itens, com tempoSeg distribuidos de 0 a ' + dur + ' em ordem crescente.';
+      const r = await _chamarLLM([{ role: 'system', content: sys }, { role: 'user', content: 'Tema da aula: ' + tema }], String(b.modelo || ''), 0.9, []);
+      let txt = String(r?.content || '').trim();
+      const ini = txt.indexOf('['); const fim = txt.lastIndexOf(']');
+      if (ini >= 0 && fim > ini) txt = txt.slice(ini, fim + 1);
+      let arr: any[] = []; try { arr = JSON.parse(txt); } catch { arr = []; }
+      const coment = (Array.isArray(arr) ? arr : []).slice(0, qtd).map((c: any, i: number) => ({
+        tempoSeg: Math.max(0, Math.round(Number(c?.tempoSeg) || Math.round(i * dur / qtd))),
+        nome: String(c?.nome || ('Participante ' + (i + 1))).trim().slice(0, 80),
+        texto: String(c?.texto || '').trim().slice(0, 400)
+      })).filter((c: any) => c.texto);
+      if (!coment.length) return res.json({ ok: false, erro: 'A IA não retornou comentários válidos. Tente de novo.' });
+      res.json({ ok: true, comentarios: coment });
+    } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+  });
   // vendas REAIS recentes (pros popups) — da tabela transacoes, só primeiro nome
   app.get('/w-api/:slug/vendas', (req: any, res: any) => {
     try {
@@ -7494,7 +7760,11 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   var vid=document.getElementById('vid'); var videoEl=null;
   function ytId(u){ u=String(u||''); var keys=['v=','youtu.be/','embed/','live/','shorts/']; for(var i=0;i<keys.length;i++){ var k=keys[i]; var p=u.indexOf(k); if(p>=0){ var rest=u.slice(p+k.length); var id=''; for(var j=0;j<rest.length;j++){ var ch=rest[j]; if((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch==='_'||ch==='-'){ id+=ch; } else { break; } } if(id.length>=6){ return id; } } } return ''; }
   if(cfg.modo===1 && cfg.video_url){
-    videoEl=document.createElement('video'); videoEl.src=cfg.video_url; videoEl.controls=true; videoEl.playsInline=true; videoEl.autoplay=true; vid.appendChild(videoEl);
+    videoEl=document.createElement('video'); videoEl.src=cfg.video_url; videoEl.controls=true; videoEl.playsInline=true; videoEl.autoplay=true;
+    videoEl.controlsList='nodownload noplaybackrate noremoteplayback'; videoEl.setAttribute('controlsList','nodownload noplaybackrate noremoteplayback');
+    videoEl.disablePictureInPicture=true; videoEl.setAttribute('disablePictureInPicture',''); videoEl.disableRemotePlayback=true;
+    videoEl.oncontextmenu=function(){return false;};
+    vid.appendChild(videoEl);
   } else {
     var yid=ytId(cfg.youtube_url);
     if(yid){
@@ -7507,21 +7777,36 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   var t0=Date.now();
   function elapsed(){ return Math.floor((Date.now()-t0)/1000); }
   function pct(){ if(videoEl && videoEl.duration){ return Math.min(100, Math.floor(videoEl.currentTime/videoEl.duration*100)); } return Math.min(100, Math.floor(elapsed()/36)); }
+  // [sim] contador simulado (por webinario) — some se cfg.sim for null
+  var simOn=!!cfg.sim; var simV=simOn?(Number(cfg.sim.vInicial)||Number(cfg.sim.vMin)||0):0; var realOnline=0;
+  function atualizaOnline(){ if(!cfg.contador){return;} var o=document.getElementById('online'); if(!o){return;} o.textContent=(simOn?Math.max(realOnline,simV):realOnline); }
+  if(simOn){ var vmin=Number(cfg.sim.vMin)||0, vmax=Number(cfg.sim.vMax)||Math.max(simV,vmin), varx=Math.max(0,Number(cfg.sim.variacao)||2), itv=Math.max(2,Number(cfg.sim.intervalo)||6);
+    setInterval(function(){ var dd=Math.round((Math.random()*2-1)*varx); simV=Math.max(vmin,Math.min(vmax,simV+dd)); atualizaOnline(); }, itv*1000); atualizaOnline(); }
   function ping(){
     fetch('/w-api/'+slug+'/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessao:sessao,lead:lead,pct:pct()})})
       .then(function(r){return r.json();}).then(function(d){ if(!d||!d.ok){return;}
-        if(cfg.contador){ var o=document.getElementById('online'); if(o){o.textContent=d.online;} }
-        if(cfg.acumulado){ var ab=document.getElementById('acbox'); var ac=document.getElementById('acum'); if(ab){ab.style.display='inline-flex';} if(ac){ac.textContent=d.acumulado;} }
+        realOnline=Number(d.online)||0; atualizaOnline();
+        if(cfg.acumulado){ var ab=document.getElementById('acbox'); var ac=document.getElementById('acum'); if(ab){ab.style.display='inline-flex';} if(ac){ac.textContent=(simOn?Math.max(Number(d.acumulado)||0,Math.round(simV*1.8)):d.acumulado);} }
       }).catch(function(){});
   }
   ping(); setInterval(ping, 10000);
   var chat=document.getElementById('chat');
-  function renderChat(ms){ if(!chat){return;} chat.innerHTML='';
-    ms.forEach(function(m){ var d=document.createElement('div'); d.className='msg'+(m.origem==='host'?' host':m.origem==='ia'?' ia':'');
-      var b=document.createElement('b'); b.textContent=(m.nome||'Visitante')+': '; var s=document.createElement('span'); s.className='t'; s.textContent=m.texto||'';
-      d.appendChild(b); d.appendChild(s); chat.appendChild(d); }); chat.scrollTop=chat.scrollHeight; }
+  var simComs=(simOn && cfg.sim.comentarios)?cfg.sim.comentarios:[];
+  var ultServer=[];
+  function _mkmsg(m){ var d=document.createElement('div'); d.className='msg'+(m.origem==='host'?' host':m.origem==='ia'?' ia':''); var b=document.createElement('b'); b.textContent=(m.nome||'Visitante')+': '; var s=document.createElement('span'); s.className='t'; s.textContent=m.texto||''; d.appendChild(b); d.appendChild(s); return d; }
+  function desenhar(){ if(!chat){return;} var lista=[]; var i;
+    for(i=0;i<ultServer.length;i++){ var m=ultServer[i]; var ts=Date.parse(m.criado_em); if(isNaN(ts)){ts=t0+i;} lista.push({nome:m.nome,texto:m.texto,origem:m.origem,_ts:ts}); }
+    var e=elapsed();
+    for(i=0;i<simComs.length;i++){ var c=simComs[i]; if(e>=(Number(c.t)||0)){ lista.push({nome:c.nome,texto:c.texto,origem:'sim',_ts:t0+(Number(c.t)||0)*1000+i}); } }
+    lista.sort(function(a,b){ return a._ts-b._ts; });
+    var perto=(chat.scrollTop+chat.clientHeight)>=(chat.scrollHeight-48);
+    chat.innerHTML=''; for(i=0;i<lista.length;i++){ chat.appendChild(_mkmsg(lista[i])); }
+    if(perto){ chat.scrollTop=chat.scrollHeight; }
+  }
+  function renderChat(ms){ ultServer=ms||[]; desenhar(); }
   function loadChat(){ fetch('/w-api/'+slug+'/chat').then(function(r){return r.json();}).then(function(d){ if(d&&d.ok){renderChat(d.mensagens||[]);} }).catch(function(){}); }
   if(cfg.chat_real){ loadChat(); setInterval(loadChat, 3000); } else { var cbx=document.getElementById('cbox'); if(cbx){cbx.style.display='none';} }
+  if(simOn){ desenhar(); setInterval(desenhar, 1500); }
   var ci=document.getElementById('ci'), cbtn=document.getElementById('cb');
   function askName(){ var n=''; try{ n=localStorage.getItem('wb_nome'); }catch(e){} if(!n){ n=prompt('Seu nome pro chat:')||'Visitante'; try{localStorage.setItem('wb_nome',n);}catch(e){} } return n; }
   function send(){ var tx=(ci.value||'').trim(); if(!tx){return;} ci.value='';
@@ -7532,15 +7817,17 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   function loadVendas(){ if(!cfg.popups){return;} fetch('/w-api/'+slug+'/vendas').then(function(r){return r.json();}).then(function(d){ if(!d||!d.ok||!d.vendas||!d.vendas.length){return;} var v=d.vendas[vIdx%d.vendas.length]; vIdx++; showPop(v.nome+' acabou de garantir'+(v.produto?(': '+v.produto):'')+' ✅'); }).catch(function(){}); }
   if(cfg.popups){ setTimeout(loadVendas, 15000); setInterval(loadVendas, 30000); }
   var ofertas=(cfg.ofertas||[]).map(function(o){ o._shown=false; return o; });
-  function mostrarOferta(o){ var tipo=o.tipo||'banner';
+  function hideReabrir(){ var rb=document.getElementById('reofebtn'); if(rb){ rb.style.display='none'; } }
+  function showReabrir(o){ var rb=document.getElementById('reofebtn'); if(!rb){ rb=document.createElement('button'); rb.id='reofebtn'; rb.className='reofe'; document.body.appendChild(rb); } rb.textContent='🎁 Ver oferta'; rb.onclick=function(){ mostrarOferta(o); }; rb.style.display='inline-block'; }
+  function mostrarOferta(o){ var tipo=o.tipo||'banner'; hideReabrir();
     if(tipo==='popup'){ var m=document.createElement('div'); m.className='modal'; var b=document.createElement('div'); b.className='b';
-      var x=document.createElement('span'); x.textContent='✕'; x.style.position='absolute'; x.style.top='10px'; x.style.right='14px'; x.style.cursor='pointer'; x.onclick=function(){ if(m.parentNode){m.parentNode.removeChild(m);} };
+      var x=document.createElement('span'); x.textContent='✕'; x.style.position='absolute'; x.style.top='10px'; x.style.right='14px'; x.style.cursor='pointer'; x.onclick=function(){ if(m.parentNode){m.parentNode.removeChild(m);} showReabrir(o); };
       var h=document.createElement('div'); h.style.fontSize='17px'; h.style.fontWeight='700'; h.textContent=o.titulo||'Oferta especial';
       var p=document.createElement('div'); p.style.color='#9aa3b2'; p.style.margin='8px 0 14px'; p.textContent=o.conteudo||'';
       var a=document.createElement('a'); a.href=o.url||'#'; a.target='_blank'; a.textContent=o.botao||'Quero garantir'; a.style.display='inline-block'; a.style.background='#7c6cf0'; a.style.color='#fff'; a.style.fontWeight='700'; a.style.textDecoration='none'; a.style.padding='11px 22px'; a.style.borderRadius='999px';
       b.appendChild(x); b.appendChild(h); b.appendChild(p); b.appendChild(a); m.appendChild(b); document.body.appendChild(m);
     } else { var off=document.getElementById('offer'); if(!off){return;} var ban=document.createElement('div'); ban.className='banner'; ban.style.position='relative';
-      var x2=document.createElement('span'); x2.className='x'; x2.textContent='✕'; x2.onclick=function(){ if(ban.parentNode){ban.parentNode.removeChild(ban);} };
+      var x2=document.createElement('span'); x2.className='x'; x2.textContent='✕'; x2.onclick=function(){ if(ban.parentNode){ban.parentNode.removeChild(ban);} showReabrir(o); };
       var h2=document.createElement('div'); h2.style.fontSize='16px'; h2.style.fontWeight='700'; h2.style.color='#fff'; h2.textContent=o.titulo||'Oferta';
       var p2=document.createElement('div'); p2.style.color='#eee'; p2.style.fontSize='13px'; p2.textContent=o.conteudo||'';
       ban.appendChild(x2); ban.appendChild(h2); ban.appendChild(p2);
@@ -7558,7 +7845,12 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       + ':root{--bg:#0f1117;--card:#171a22;--bd:#262a36;--fg:#f2f4f8;--mut:#9aa3b2;--ac:#7c6cf0;--ok:#3fb27f}'
       + '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}'
       + '.wrap{max-width:1180px;margin:0 auto;padding:14px;display:grid;grid-template-columns:1fr 340px;gap:14px}'
-      + '@media(max-width:860px){.wrap{grid-template-columns:1fr}}'
+      + '@media(max-width:860px){html,body{height:100%;overflow:hidden}'
+      + '.wrap{height:100vh;height:100dvh;max-width:none;padding:8px;gap:8px;display:flex;flex-direction:column;min-height:0}'
+      + '.wrap>div:first-child{display:flex;flex-direction:column;min-height:0;flex:0 0 auto}'
+      + '.vid{aspect-ratio:16/9}'
+      + '.side{flex:1 1 auto;height:auto;min-height:0}'
+      + '.offer{margin:8px 0 0}.offer:empty{display:none}.banner{padding:12px}}'
       + '.vid{position:relative;background:#000;border-radius:14px;overflow:hidden;aspect-ratio:16/9}'
       + '.vid iframe,.vid video{position:absolute;inset:0;width:100%;height:100%;border:0}'
       + '.mask{position:absolute;inset:0;z-index:5}'
@@ -7575,12 +7867,21 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       + '.cbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--bd);border-radius:9px;color:var(--fg);padding:9px 10px;font-size:13px}'
       + '.cbox button{background:var(--ac);border:0;color:#fff;border-radius:9px;padding:9px 13px;font-weight:600;cursor:pointer}'
       + '.pop{position:fixed;left:14px;bottom:14px;background:var(--card);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:11px;padding:11px 14px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.4);z-index:40;max-width:300px}'
+      + '.reofe{position:fixed;right:14px;bottom:14px;z-index:46;background:var(--ac);color:#fff;border:0;border-radius:999px;padding:12px 18px;font-weight:700;font-size:14px;box-shadow:0 10px 30px rgba(124,108,240,.5);cursor:pointer;animation:pulse 1.8s infinite}'
+      + '@media(max-width:860px){.reofe{bottom:64px;right:10px;padding:10px 15px;font-size:13px}}'
       + '.offer{margin-top:12px}.banner{background:linear-gradient(135deg,#4a3fb0,#7e6cf0);border-radius:12px;padding:16px;text-align:center}'
       + '.banner a{display:inline-block;margin-top:8px;background:#fff;color:#2a2550;font-weight:700;text-decoration:none;padding:10px 20px;border-radius:999px}'
       + '.banner .x{position:absolute;top:8px;right:12px;color:#fff;cursor:pointer;font-weight:700}'
       + '.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:grid;place-items:center;z-index:50;padding:16px}'
       + '.modal .b{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:22px;max-width:420px;text-align:center;position:relative}'
       + '.auth{font-size:12px;color:var(--mut);margin-top:10px;text-align:center}'
+      // [sala-ajuste] celular DEITADO (paisagem): chat SEMPRE do lado, vídeo preenche a altura
+      + '@media(orientation:landscape) and (max-height:600px){'
+      + '.wrap{flex-direction:row}'
+      + '.wrap>div:first-child{flex:1 1 auto}'
+      + '.vid{aspect-ratio:auto;flex:1;min-height:0}'
+      + '.side{flex:0 0 300px;max-width:46%;height:auto;min-height:0}'
+      + '.top{margin-bottom:6px}.auth{display:none}}'
       + '</style></head><body>'
       + '<div class="wrap"><div><div class="top">'
       + '<div class="badge"><span class="dot"></span><span id="online">—</span> assistindo agora</div>'
@@ -8073,6 +8374,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS convites (
 db.exec(`CREATE TABLE IF NOT EXISTS convite_respostas (
   id TEXT PRIMARY KEY, convite_id TEXT, etapa TEXT, dados TEXT, agendou INTEGER DEFAULT 0, compareceu INTEGER DEFAULT 0, ts TEXT
 )`);
+// [#13 B] colunas add-only: tag configurável do agendado + texto da mensagem de confirmação
+try { db.exec(`ALTER TABLE convites ADD COLUMN tag TEXT`); } catch { /* coluna já existe */ }
+try { db.exec(`ALTER TABLE convites ADD COLUMN msg_confirmacao TEXT`); } catch { /* coluna já existe */ }
 db.exec(`CREATE TABLE IF NOT EXISTS academy_cursos (
   id TEXT PRIMARY KEY, nome TEXT, descricao TEXT, produto TEXT, publicado INTEGER DEFAULT 0, modulos INTEGER DEFAULT 0, aulas INTEGER DEFAULT 0, criado_em TEXT
 )`);
@@ -8562,10 +8866,10 @@ app.get('/convites', (req: any, res: any) => {
 app.post('/convite', (req: any, res: any) => {
   try {
     const b = req.body || {}; const id = b.id || randomUUID();
-    db.prepare(`INSERT OR REPLACE INTO convites (id,projeto,nome,produto,tipo,destino,webinarioId,imagem,videoVslId,cor,ia,pos,criado_em)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT criado_em FROM convites WHERE id=?),?))`)
+    db.prepare(`INSERT OR REPLACE INTO convites (id,projeto,nome,produto,tipo,destino,webinarioId,imagem,videoVslId,cor,ia,pos,tag,msg_confirmacao,criado_em)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT criado_em FROM convites WHERE id=?),?))`)
       .run(id, b.projeto, b.nome, b.produto, b.tipo, b.destino, b.webinarioId || null, b.imagem || null, b.videoVslId || null, b.cor || null,
-           JSON.stringify(b.ia || {}), JSON.stringify(b.pos || {}), id, agora());
+           JSON.stringify(b.ia || {}), JSON.stringify(b.pos || {}), (b.tag || null), (b.msg_confirmacao || null), id, agora());
     _ndOk(res, { id, link: String(PUBLIC_BASE_URL || '').replace(/\/+$/, '') + '/c/' + id });
   } catch (e) { _ndErr(res, e); }
 });
@@ -8640,9 +8944,24 @@ app.post('/c-api/:id/agendar', (req: any, res: any) => {
     let contatoId: string | null = null;
     if (tel && tel.length >= 10) {
       contatoId = upsertContato(String(c.projeto || ''), tel, nome, email, 'convite');
-      const tag = 'convite-agendado' + (c.projeto ? '-' + c.projeto : '');
+      const tag = String(c.tag || '').trim() || ('convite-agendado' + (c.projeto ? '-' + c.projeto : ''));
       if (contatoId) aplicarTag(String(c.projeto || ''), contatoId, tag);
       if (contatoId) rodarAutomacoes(String(c.projeto || ''), 'tag_adicionada', { contatoId, tag, telefone: tel, nome }).catch(() => {});
+    }
+    // [#13 B] confirmação direta conforme o convite pediu (pos.whatsapp envia na hora; pos.email enfileira)
+    let pos: any = {}; try { pos = JSON.parse(c.pos || '{}'); } catch { pos = {}; }
+    const primeiroNome = String(nome || '').trim().split(/\s+/)[0] || '';
+    const msgConf = String(c.msg_confirmacao || '').trim()
+      || ('Oi ' + (primeiroNome || 'tudo bem') + '! ✅ Sua vaga na aula está confirmada. Em breve te envio os detalhes por aqui. Qualquer dúvida, é só responder. 🎹');
+    if (pos.whatsapp && tel && tel.length >= 10) {
+      enviarTexto(String(c.projeto || '') as Projeto, tel, msgConf).catch(() => {});
+    }
+    if (pos.email && email) {
+      try {
+        const html = '<div style="font:16px/1.5 system-ui,Arial;color:#111"><h2>Vaga confirmada! 🎉</h2><p>' + esc(msgConf) + '</p></div>';
+        db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em) VALUES(?,?,?,?,?,?,?)`)
+          .run(randomUUID(), String(c.projeto || ''), String(email), 'Sua vaga está confirmada 🎉', html, 'pendente', agora());
+      } catch { /* fila best-effort (sai quando o SMTP do domínio estiver ligado) */ }
     }
     db.prepare(`INSERT INTO convite_respostas(id,convite_id,etapa,dados,agendou,compareceu,ts) VALUES(?,?,?,?,?,?,?)`)
       .run(randomUUID(), c.id, 'agendou', JSON.stringify(dados), agendou, 0, agora());
