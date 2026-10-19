@@ -218,6 +218,9 @@ for (const alter of [
   `ALTER TABLE paginas ADD COLUMN blocos TEXT`,
   `ALTER TABLE paginas ADD COLUMN pasta TEXT`,
   `ALTER TABLE paginas ADD COLUMN idioma TEXT DEFAULT 'pt'`,
+  `ALTER TABLE paginas ADD COLUMN seo_titulo TEXT`,
+  `ALTER TABLE paginas ADD COLUMN seo_descricao TEXT`,
+  `ALTER TABLE paginas ADD COLUMN seo_imagem TEXT`,
   `ALTER TABLE formularios ADD COLUMN passos TEXT`,
   `ALTER TABLE formularios ADD COLUMN tema TEXT`,
   `ALTER TABLE formularios ADD COLUMN acessos INTEGER DEFAULT 0`,
@@ -1517,9 +1520,11 @@ app.post('/pagina', (req, res) => {
     if (existe) db.prepare(`UPDATE paginas SET slug=?, titulo=?, html=?, publicada=?, atualizado_em=? WHERE id=?`).run(slug, String(b.titulo || ''), String(b.html || ''), b.publicada ? 1 : 0, agora(), id);
     else db.prepare(`INSERT INTO paginas(id,projeto,slug,titulo,html,publicada,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, String(b.projeto || ''), slug, String(b.titulo || ''), String(b.html || ''), b.publicada ? 1 : 0, agora(), agora());
   } catch (e: any) { return res.status(400).json({ erro: 'slug_duplicado_ou_invalido', detalhe: String(e?.message || e) }); }
+  try { if (b.seo_titulo !== undefined || b.seo_descricao !== undefined || b.seo_imagem !== undefined) db.prepare(`UPDATE paginas SET seo_titulo=?, seo_descricao=?, seo_imagem=? WHERE id=?`).run(String(b.seo_titulo || ''), String(b.seo_descricao || ''), String(b.seo_imagem || ''), id); } catch { /* seo best-effort */ }
   res.json({ ok: true, id, slug, url: (PUBLIC_BASE_URL || '') + '/p/' + slug });
 });
 app.post('/pagina/remover', (req, res) => { db.prepare(`DELETE FROM paginas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+app.get('/config/base', (_req, res) => { res.json({ ok: true, base: PUBLIC_BASE_URL || '' }); });
 // [pagina-ia] Edita o HTML da página por instrução em português (usa o provedor de IA do motor).
 // Recebe { html, instrucao } e devolve { ok, html } com o HTML completo já alterado.
 app.post('/pagina/ia', async (req, res) => {
@@ -1540,10 +1545,21 @@ app.post('/pagina/ia', async (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
 });
 // publico: serve a pagina publicada
+// [pagina-render] embrulha o HTML (fragmento) num documento com Tailwind + SEO. Se ja for doc completo, nao mexe.
+function _wrapPagina(html: string, p: any): string {
+  const h = String(html || '');
+  if (/<html[\s>]/i.test(h) || /<!doctype/i.test(h)) return h;
+  const e = (x: any) => String(x == null ? '' : x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as any)[c]);
+  const t = e((p && (p.seo_titulo || p.titulo)) || 'Pagina');
+  const d = e((p && p.seo_descricao) || '');
+  const img = e((p && p.seo_imagem) || '');
+  const og = (d || img) ? `<meta property="og:title" content="${t}"><meta property="og:type" content="website">${d ? `<meta property="og:description" content="${d}">` : ''}${img ? `<meta property="og:image" content="${img}">` : ''}<meta name="twitter:card" content="summary_large_image">` : '';
+  return `<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${t}</title>${d ? `<meta name="description" content="${d}">` : ''}${og}<script src="https://cdn.tailwindcss.com"></script><style>*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif}img{max-width:100%}</style></head><body>${h}</body></html>`;
+}
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
-  res.type('html').send(String(p.html || ''));
+  res.type('html').send(_wrapPagina(String(p.html || ''), p));
 });
 
 // ---- FORMULARIOS / QUIZ (servidos pelo motor; resposta salva + cria contato + tag) ----
@@ -4198,7 +4214,7 @@ function _gruposPorTags(tags: string[]): any[] {
   const ts = (tags || []).map((t) => String(t).trim()).filter(Boolean);
   if (!ts.length) return [];
   const ph = ts.map(() => '?').join(',');
-  const ids = db.prepare(`SELECT grupo_id FROM grupo_tags WHERE tag IN (${ph}) GROUP BY grupo_id HAVING COUNT(DISTINCT tag)=?`).all(...ts, ts.length) as any[];
+  const ids = db.prepare(`SELECT DISTINCT grupo_id FROM grupo_tags WHERE tag IN (${ph})`).all(...ts) as any[]; // [tag-ou] grupo com QUALQUER uma das tags (OU)
   if (!ids.length) return [];
   const ph2 = ids.map(() => '?').join(',');
   return db.prepare(`SELECT id, projeto, instancia, nome FROM grupos_wpp WHERE id IN (${ph2})`).all(...ids.map((r) => r.grupo_id)) as any[];
