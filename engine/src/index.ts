@@ -41,7 +41,7 @@ const CADEMI_TOKEN = process.env.CADEMI_TOKEN || '';
 // Depois de terminar a migração, pôr IMPORTAR_ATIVO=false no .env pra desligar a porta de entrada.
 const IMPORTAR_ATIVO = (process.env.IMPORTAR_ATIVO || 'true') !== 'false';
 
-const PROJETOS = ['baixo', 'violao', 'teclado'] as const;
+const PROJETOS = ['baixo', 'violao', 'teclado', 'comunidade'] as const;
 type Projeto = (typeof PROJETOS)[number];
 const ehProjeto = (x: any): x is Projeto => PROJETOS.includes(x);
 
@@ -1520,6 +1520,25 @@ app.post('/pagina', (req, res) => {
   res.json({ ok: true, id, slug, url: (PUBLIC_BASE_URL || '') + '/p/' + slug });
 });
 app.post('/pagina/remover', (req, res) => { db.prepare(`DELETE FROM paginas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// [pagina-ia] Edita o HTML da página por instrução em português (usa o provedor de IA do motor).
+// Recebe { html, instrucao } e devolve { ok, html } com o HTML completo já alterado.
+app.post('/pagina/ia', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const html = String(b.html || '');
+    const instrucao = String(b.instrucao || '').trim();
+    const contexto = String(b.contexto || '').trim(); // opcional: dados extras (ex.: texto de um print que o Ezequias colou)
+    if (!instrucao && !contexto) return res.json({ ok: false, erro: 'instrucao_vazia' });
+    const sys = 'Você é um editor de páginas HTML de alta conversão (estilo landing page). Recebe o HTML atual e uma instrução em português e devolve APENAS o HTML completo já alterado — sem explicação, sem comentário, sem markdown e sem cercas de código (nada de ```html). Preserve tudo que não foi pedido para mudar: mantenha os formulários, os links de /f/ e /p/, os scripts e os estilos existentes. Se for pedido para criar algo novo, use HTML/CSS inline coerente com o que já existe. Responda somente com o HTML final.';
+    const user = `HTML atual:\n\n${html || '(vazio — crie a página do zero conforme a instrução)'}\n\n---\n${contexto ? 'Dados/contexto fornecidos:\n' + contexto + '\n\n---\n' : ''}Instrução: ${instrucao}\n\nDevolva o HTML completo alterado.`;
+    const msg = await _chamarLLM([{ role: 'system', content: sys }, { role: 'user', content: user }], '', 0.2, []);
+    if (msg && (msg as any)._semChave) return res.json({ ok: false, erro: 'LLM sem chave (configure o provedor de IA)' });
+    let out = String((msg && msg.content) || '').trim();
+    out = out.replace(/^```(?:html)?\s*/i, '').replace(/\s*```$/i, '').trim(); // tira cercas se vierem
+    if (!out) return res.json({ ok: false, erro: 'ia_devolveu_vazio' });
+    res.json({ ok: true, html: out });
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 // publico: serve a pagina publicada
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
@@ -1896,7 +1915,7 @@ app.post('/webhook/evolution', (req, res) => {
         catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         if (!ehGrupo) rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
-        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && _agenteDevResponder(projeto, cid) && !_contatoEhAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila; [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
+        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && (_agenteDevResponder(projeto, cid) || _temAgenteAtribuido(cid)) && !_contatoEhAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila (ou agente atribuído manual/handoff); [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -2281,6 +2300,12 @@ CREATE TABLE IF NOT EXISTS agente_logs (
   conteudo TEXT,
   criado_em TEXT
 );
+CREATE TABLE IF NOT EXISTS contato_agente (
+  contato_id TEXT PRIMARY KEY,
+  agente_id TEXT,
+  origem TEXT,
+  atualizado_em TEXT
+);
 `);
 
 // Metadados por instrumento (grade real, link do grupo gratis, sala, corte de idade).
@@ -2308,11 +2333,16 @@ const AGENTE_SEED: any = {
     sala: '',
     corteIdade: 24,
   },
+  // [comunidade] Porteiro genérico: só descobre o instrumento e direciona pro agente dele (não tem funil próprio).
+  comunidade: {
+    nome: 'Comunidade (porteiro)',
+    corteIdade: 24,
+  },
 };
 
 // Garante CONFIG.agentesHabilitados (padrao: tudo desligado) sem apagar config existente.
 if (!(CONFIG as any).agentesHabilitados) {
-  (CONFIG as any).agentesHabilitados = { baixo: false, violao: false, teclado: false };
+  (CONFIG as any).agentesHabilitados = { baixo: false, violao: false, teclado: false, comunidade: false };
 }
 
 // Semeia 1 agente por projeto (so se ainda nao existir). Prompt vem vazio; e carregado
@@ -2342,6 +2372,45 @@ try { const _mig = db.prepare(`UPDATE agentes_ia SET modelo='gpt-4o-mini', atual
 
 function agenteDoProjeto(projeto: string): any {
   return db.prepare(`SELECT * FROM agentes_ia WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 1`).get(projeto) as any;
+}
+
+// [multi-agente] tags do contato (minúsculas) no projeto.
+function _tagsDoContato(projeto: string, contatoId: string): string[] {
+  try {
+    const rows = db.prepare(`SELECT t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.contato_id=? AND t.projeto=?`).all(contatoId, projeto) as any[];
+    return rows.map((r) => String(r?.nome || '').toLowerCase()).filter(Boolean);
+  } catch { return []; }
+}
+// [multi-agente] O contato tem algum agente atribuído (manual em Atendimentos ou handoff anterior)?
+function _temAgenteAtribuido(contatoId: string): boolean {
+  try { return !!db.prepare(`SELECT 1 FROM contato_agente WHERE contato_id=?`).get(contatoId); } catch { return false; }
+}
+// [multi-agente] Resolve QUAL agente atende: (1) override desta chamada (handoff); (2) agente atribuído ao
+// contato (atribuição manual em Atendimentos ou handoff anterior, se ainda ativo); (3) roteamento por TAG
+// dentro do projeto (agente ativo com config.tagsGatilho que casa, por config.prioridade asc — menor = antes).
+// Se nada casar, retorna null => o chamador cai no agenteDoProjeto (comportamento atual).
+function _resolverAgente(projeto: string, contatoId?: string, opts?: any): any {
+  if (opts && opts.agenteOverride) return opts.agenteOverride;
+  if (contatoId) {
+    try {
+      const at = db.prepare(`SELECT agente_id FROM contato_agente WHERE contato_id=?`).get(contatoId) as any;
+      if (at && at.agente_id) {
+        const a = db.prepare(`SELECT * FROM agentes_ia WHERE id=?`).get(at.agente_id) as any;
+        if (a && a.ativo) return a;
+      }
+    } catch { /* best-effort */ }
+    try {
+      const tags = _tagsDoContato(projeto, contatoId);
+      if (tags.length) {
+        const cands = (db.prepare(`SELECT * FROM agentes_ia WHERE projeto=? AND ativo=1`).all(projeto) as any[])
+          .map((a) => { let c: any = {}; try { c = JSON.parse(a.config || '{}'); } catch { c = {}; } const tg = (Array.isArray(c.tagsGatilho) ? c.tagsGatilho : []).map((x: any) => String(x || '').toLowerCase()).filter(Boolean); const pr = Number(c.prioridade == null ? 100 : c.prioridade); return { a, tg, pr }; })
+          .filter((x) => x.tg.length && x.tg.some((t: string) => tags.some((ct) => ct.includes(t))))
+          .sort((x, y) => x.pr - y.pr);
+        if (cands.length) return cands[0].a;
+      }
+    } catch { /* best-effort */ }
+  }
+  return null;
 }
 
 // --------- Agenda: calcula horarios livres a partir da grade + eventos ---------
@@ -2432,8 +2501,8 @@ function _slotsLivresV2(projeto: string, periodo: string, limite = 10): any[] {
 }
 
 // --------- Ferramentas (function-calling) que o agente pode chamar ---------
-function _toolsDef(): any[] {
-  return [
+function _toolsDef(projeto?: string): any[] {
+  const base: any[] = [
     { type: 'function', function: { name: 'listar_horarios_livres', description: 'Lista horarios livres reais da agenda do professor no periodo pedido. Use SEMPRE antes de oferecer horario; nunca invente horario.', parameters: { type: 'object', properties: { periodo: { type: 'string', enum: ['manha', 'tarde', 'noite'] } }, required: ['periodo'] } } },
     { type: 'function', function: { name: 'salvar_whatsapp', description: 'Grava o numero de WhatsApp da pessoa no cadastro (so digitos, comecando com 55 e DDD).', parameters: { type: 'object', properties: { telefone: { type: 'string' } }, required: ['telefone'] } } },
     { type: 'function', function: { name: 'marcar_agendamento', description: 'Cria o compromisso na agenda. Use o iso exato de um horario que a ferramenta de horarios retornou como livre.', parameters: { type: 'object', properties: { inicio_iso: { type: 'string' }, nome: { type: 'string' }, observacao: { type: 'string' } }, required: ['inicio_iso', 'nome'] } } },
@@ -2441,6 +2510,11 @@ function _toolsDef(): any[] {
     { type: 'function', function: { name: 'adicionar_tag', description: 'Marca o lead com uma tag (ex: sdr-instagram).', parameters: { type: 'object', properties: { tag: { type: 'string' } }, required: ['tag'] } } },
     { type: 'function', function: { name: 'transferir_fila', description: 'Transfere a conversa pra fila humana (o professor assume). O agente para de responder esse lead depois disso.', parameters: { type: 'object', properties: { motivo: { type: 'string' } }, required: ['motivo'] } } },
   ];
+  // [comunidade] só o porteiro ganha a ferramenta de direcionar pro instrumento (os agentes de instrumento não precisam).
+  if (projeto === 'comunidade') {
+    base.push({ type: 'function', function: { name: 'direcionar_instrumento', description: 'Use SOMENTE quando descobrir qual instrumento a pessoa toca ou quer aprender. Direciona a conversa pro agente daquele instrumento, que assume a qualificacao do ponto em que esta. instrumento: violao, teclado ou baixo.', parameters: { type: 'object', properties: { instrumento: { type: 'string', enum: ['violao', 'teclado', 'baixo'] } }, required: ['instrumento'] } } });
+  }
+  return base;
 }
 
 async function _execTool(projeto: string, conversa: any, nomeFerr: string, args: any): Promise<any> {
@@ -2486,6 +2560,16 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       if (conversa.contato_id) { try { aplicarTag(projeto, conversa.contato_id, 'fila-humana'); } catch { /* best-effort */ } }
       return { ok: true, transferido: true };
     }
+    if (nomeFerr === 'direcionar_instrumento') {
+      const inst = String(args.instrumento || '').toLowerCase();
+      if (!['violao', 'teclado', 'baixo'].includes(inst)) return { ok: false, erro: 'instrumento_invalido' };
+      const alvo = agenteDoProjeto(inst);
+      if (!alvo) return { ok: false, erro: 'sem_agente_' + inst };
+      if (conversa.contato_id) {
+        try { db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(conversa.contato_id, alvo.id, 'comunidade', agora()); } catch { /* best-effort */ }
+      }
+      return { ok: true, direcionado: true, instrumento: inst, agenteId: alvo.id };
+    }
   } catch (e: any) {
     return { ok: false, erro: String(e && e.message || e) };
   }
@@ -2514,15 +2598,16 @@ async function _chamarLLM(messages: any[], modelo: string, temperatura: number, 
 // opts.teste=true: nao envia pelo WhatsApp, devolve as respostas num array (pro Chat de teste).
 async function processarMensagemAgente(projeto: string, telefone: string, texto: string, nome?: string, contatoId?: string, opts?: any): Promise<any> {
   const teste = !!(opts && opts.teste);
-  const agente = agenteDoProjeto(projeto);
+  const agente = _resolverAgente(projeto, contatoId, opts) || agenteDoProjeto(projeto);
   if (!agente || !agente.ativo || !String(agente.prompt || '').trim()) {
     return { ok: false, motivo: 'sem agente ativo/ prompt' };
   }
   let conversa = db.prepare(`SELECT * FROM agente_conversas WHERE agente_id=? AND telefone=?`).get(agente.id, telefone) as any;
   if (!conversa) {
     const id = randomUUID();
+    const histIni = (opts && opts._contextoInicial) ? JSON.stringify([{ role: 'user', content: String(opts._contextoInicial) }]) : '[]';
     db.prepare(`INSERT INTO agente_conversas(id,agente_id,projeto,telefone,contato_id,status,estado,historico,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, agente.id, projeto, telefone, contatoId || null, 'ativo', '{}', '[]', agora(), agora());
+      .run(id, agente.id, projeto, telefone, contatoId || null, 'ativo', '{}', histIni, agora(), agora());
     conversa = db.prepare(`SELECT * FROM agente_conversas WHERE id=?`).get(id) as any;
   }
   if (conversa.status !== 'ativo') return { ok: false, motivo: 'conversa nao-ativa (' + conversa.status + ')' };
@@ -2531,7 +2616,7 @@ async function processarMensagemAgente(projeto: string, telefone: string, texto:
   try { historico = JSON.parse(conversa.historico || '[]'); } catch { historico = []; }
   historico.push({ role: 'user', content: texto });
 
-  const tools = agente.tools_on ? _toolsDef() : [];
+  const tools = agente.tools_on ? _toolsDef(projeto) : [];
   const respostasEnviadas: string[] = [];
   try {
     for (let loop = 0; loop < AGENTE_MAX_TOOL_LOOPS; loop++) {
@@ -2548,6 +2633,17 @@ async function processarMensagemAgente(projeto: string, telefone: string, texto:
           historico.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(resultado) });
           // se transferiu, recarrega status
           if (tc.function.name === 'transferir_fila') conversa = db.prepare(`SELECT * FROM agente_conversas WHERE id=?`).get(conversa.id) as any;
+          // [comunidade] handoff: porteiro identificou o instrumento -> o agente do instrumento ASSUME e responde AGORA
+          if (tc.function.name === 'direcionar_instrumento' && resultado && (resultado as any).direcionado) {
+            try { db.prepare(`UPDATE agente_conversas SET historico=?, atualizado_em=? WHERE id=?`).run(JSON.stringify(historico).slice(0, 200000), agora(), conversa.id); } catch { /* best-effort */ }
+            const _prof = Number((opts && opts._profundidade) || 0);
+            const _alvoProj = String((resultado as any).instrumento || '');
+            const _alvoAgente = agenteDoProjeto(_alvoProj);
+            if (_prof < 2 && _alvoAgente) {
+              const _ctx = `(contexto interno: lead chegou pela Comunidade e ja identificamos que toca/aprende ${_alvoProj}. Continue a qualificacao de ${_alvoProj} daqui, sem perguntar o instrumento de novo.)`;
+              return await processarMensagemAgente(_alvoProj, telefone, texto, nome, contatoId, Object.assign({}, opts, { agenteOverride: _alvoAgente, _contextoInicial: _ctx, _profundidade: _prof + 1 }));
+            }
+          }
         }
         continue; // volta pro LLM com os resultados das ferramentas
       }
@@ -2615,6 +2711,12 @@ app.post('/agente/testar', async (req, res) => {
   const r = await processarMensagemAgente(projeto, telefone, String(b.texto || ''), 'Teste', undefined, { teste: true });
   res.json(r);
 });
+// [#2 IG] Canal de Instagram ligado para o projeto? (navegador ou api). INDEPENDENTE do WhatsApp:
+// o /agente/ig passa a depender SO deste canal, nao do agentesHabilitados (que controla o WhatsApp).
+function _canalIgLigado(projeto: string): boolean {
+  const m = String(((CONFIG as any).canalIg || {})[projeto] || 'off');
+  return m === 'navegador' || m === 'api';
+}
 // [#2 IG] Recebe uma mensagem de Instagram (do PC2 por navegador, OU via API oficial no futuro),
 // roda o agente e DEVOLVE a resposta (naoEnviar) pra quem chamou entregar no Direct.
 // Conversa identificada por 'ig:'+ident. PULA o gate por tag (quem responde a nossa DM fria é lead-alvo);
@@ -2626,7 +2728,7 @@ app.post('/agente/ig', async (req, res) => {
   const texto = String(b.texto || '');
   if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
   if (!ident) return res.status(400).json({ ok: false, erro: 'ident_obrigatorio' });
-  if (!((CONFIG as any).agentesHabilitados || {})[projeto]) return res.json({ ok: true, respostas: [], motivo: 'canal desligado' });
+  if (!_canalIgLigado(projeto)) return res.json({ ok: true, respostas: [], motivo: 'canal ig desligado' });
   const idKey = 'ig:' + ident;
   let cid: string | undefined;
   try { cid = upsertContato(projeto, idKey, b.nome); } catch { cid = undefined; }
@@ -2637,6 +2739,31 @@ app.post('/agente/ig', async (req, res) => {
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
+
+// [multi-agente] Atribuir manualmente um agente a um contato (direcionar atendimento na tela de Atendimentos).
+// Vale pra WhatsApp e Instagram; o agente escolhido ASSUME e responde a partir da proxima mensagem do lead.
+// agenteId vazio = limpa a atribuicao (volta ao roteamento automatico por tag / padrao).
+app.get('/atendimento/agente-atual', (req, res) => {
+  const contatoId = String(req.query.contatoId || req.query.contato_id || '');
+  if (!contatoId) return res.status(400).json({ ok: false, erro: 'contato_obrigatorio' });
+  const at = db.prepare(`SELECT agente_id, origem, atualizado_em FROM contato_agente WHERE contato_id=?`).get(contatoId) as any;
+  if (!at) return res.json({ ok: true, agente: null });
+  const a = db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE id=?`).get(at.agente_id) as any;
+  res.json({ ok: true, agente: a || null, origem: at.origem });
+});
+app.post('/atendimento/atribuir-agente', (req, res) => {
+  const b = req.body || {};
+  const contatoId = String(b.contatoId || b.contato_id || '');
+  const agenteId = String(b.agenteId || b.agente_id || '');
+  if (!contatoId) return res.status(400).json({ ok: false, erro: 'contato_obrigatorio' });
+  if (!agenteId) { try { db.prepare(`DELETE FROM contato_agente WHERE contato_id=?`).run(contatoId); } catch { /* best-effort */ } return res.json({ ok: true, limpo: true }); }
+  const a = db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE id=?`).get(agenteId) as any;
+  if (!a) return res.status(400).json({ ok: false, erro: 'agente_inexistente' });
+  try { db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(contatoId, agenteId, 'manual', agora()); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+  // reativa a conversa mais recente desse contato (se estava em humano/encerrada) pro agente assumir
+  try { const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(contatoId) as any; if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id); } catch { /* best-effort */ }
+  res.json({ ok: true, agente: { id: a.id, projeto: a.projeto, nome: a.nome } });
+});
 
 // ============================================================================
 // ETAPA 15 — Central de Atendimento (API unificada de atendimento).
@@ -2845,6 +2972,27 @@ app.post('/disparo/grupo/instrumento', (req, res) => {
   const b = req.body || {};
   db.prepare(`UPDATE grupos_wpp SET inst_manual=? WHERE id=?`).run(String(b.inst || ''), String(b.id || ''));
   res.json({ ok: true });
+});
+
+// [grupo-link] Tenta pegar o LINK de convite de um grupo (pra identificar/abrir). Precisa que o número seja ADMIN
+// do grupo; se não for, o Evolution recusa — e aí o motivo já volta explicado (mesma causa do erro ao mudar nome/foto).
+app.get('/disparo/grupo/link', async (req, res) => {
+  try {
+    const jid = String((req.query as any).jid || (req.query as any).id || '').trim();
+    if (!jid) return res.json({ ok: false, erro: 'jid_obrigatorio' });
+    let instancia = String((req.query as any).instancia || '').trim();
+    if (!instancia) { const g = db.prepare(`SELECT instancia FROM grupos_wpp WHERE id=?`).get(jid) as any; instancia = String((g && g.instancia) || ''); }
+    if (!instancia) return res.json({ ok: false, erro: 'instancia_nao_encontrada' });
+    try {
+      const r: any = await evo(`/group/inviteCode/${instancia}?groupJid=${encodeURIComponent(jid)}`, 'GET');
+      const code = (r && (r.inviteCode || r.code)) || '';
+      const url = (r && r.inviteUrl) || (code ? 'https://chat.whatsapp.com/' + code : '');
+      if (!url) return res.json({ ok: false, erro: 'sem_link', detalhe: r });
+      return res.json({ ok: true, link: url, jid, instancia });
+    } catch (e: any) {
+      return res.json({ ok: false, erro: 'evolution_recusou', detalhe: String((e && e.message) || e), dica: 'Quase sempre é porque esse número não é ADMIN do grupo.' });
+    }
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
 });
 
 app.get('/disparo/tags', (req, res) => {
@@ -3950,6 +4098,42 @@ function _msUnidade(u: string): number {
   if (s.startsWith('hor')) return 3600 * 1000;
   return 86400 * 1000; // dias (padrão)
 }
+// [timer-agenda] Timer com AGENDA ABSOLUTA (dia da semana + horário, ou data específica), em horário de Brasília (UTC-3).
+// Retorna o instante (ms UTC) da PRÓXIMA ocorrência a partir de baseMs, ou null se o timer for do tipo "esperar X" (relativo).
+function _proximoTimerAbsoluto(d: any, baseMs: number): number | null {
+  try {
+    const dataEsp = String((d && d.data_especifica) || '').trim();
+    const temDias = !!(d && d.dias_on) && d.dias && Object.values(d.dias).some(Boolean);
+    if (!dataEsp && !temDias) return null; // sem agenda absoluta => comportamento relativo
+    const hhmm = String((d && d.iniciar) || '').trim() || '00:00';
+    const hh = Number(hhmm.split(':')[0]) || 0;
+    const mm = Number(hhmm.split(':')[1]) || 0;
+    const BRT = -3; // Brasil (sem horário de verão). hh:mm BRT -> UTC = hh - BRT (= hh+3).
+    if (dataEsp) {
+      const p = dataEsp.split('-').map(Number);
+      return Date.UTC(p[0], (p[1] || 1) - 1, p[2] || 1, hh - BRT, mm);
+    }
+    const mapDia: any = { dom: 0, seg: 1, ter: 2, qua: 3, qui: 4, sex: 5, sab: 6 };
+    const alvo = new Set<number>();
+    for (const k of Object.keys(d.dias || {})) if (d.dias[k] && mapDia[k] != null) alvo.add(mapDia[k]);
+    if (!alvo.size) return null;
+    const nowBRT = new Date(baseMs + BRT * 3600000); // ler com getUTC* dá o relógio de Brasília
+    for (let i = 0; i < 14; i++) {
+      const cand = new Date(Date.UTC(nowBRT.getUTCFullYear(), nowBRT.getUTCMonth(), nowBRT.getUTCDate() + i));
+      if (!alvo.has(cand.getUTCDay())) continue;
+      const ms = Date.UTC(cand.getUTCFullYear(), cand.getUTCMonth(), cand.getUTCDate(), hh - BRT, mm);
+      if (ms > baseMs + 1000) return ms;
+    }
+    return null;
+  } catch { return null; }
+}
+// [timer-agenda] O fluxo é recorrente (agenda semanal por dia da semana, sem data fixa)? Usado pra re-armar toda semana.
+function _fluxoRecorrente(fluxoJson: string): boolean {
+  try {
+    const f = JSON.parse(fluxoJson || '{}'); const ns = Array.isArray(f.nodes) ? f.nodes : [];
+    return ns.some((n: any) => { const d = (n && (n.data || n.d)) || {}; return _tipoNo(n) === 'timer' && !!d.dias_on && d.dias && Object.values(d.dias).some(Boolean) && !String(d.data_especifica || '').trim() && String(d.aba || '') !== 'espera'; });
+  } catch { return false; }
+}
 // resolve os grupos-alvo: precisam ter TODAS as tags listadas
 function _gruposPorTags(tags: string[]): any[] {
   const ts = (tags || []).map((t) => String(t).trim()).filter(Boolean);
@@ -4004,7 +4188,11 @@ function _compilarFluxoIndividual(camp: any, simular = false): { grupos: number;
       guard++; if (visto[atual]) break; visto[atual] = 1;
       const n = byId[atual]; if (!n) break;
       const t = _tipoNo(n); const d = _dataDoNo(n);
-      if (t === 'timer') { const val = Math.max(0, Number(d.valor ?? 1)); offset += val * _msUnidade(d.unidade || 'Dias'); }
+      if (t === 'timer') {
+        const abs = _proximoTimerAbsoluto(d, base);
+        if (abs != null) offset = Math.max(0, abs - base); // agenda absoluta (dia+hora BRT)
+        else { const val = Math.max(0, Number(d.valor ?? 1)); offset += val * _msUnidade(d.unidade || 'Dias'); } // esperar X
+      }
       else if (t === 'whatsapp') {
         const blocos = _resolverBlocosOd(d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
         contatos.forEach((c: any, ci: number) => {
@@ -4065,8 +4253,9 @@ function _compilarFluxo(camp: any, simular = false): { grupos: number; mensagens
       const n = byId[atual]; if (!n) break;
       const t = _tipoNo(n); const d = _dataDoNo(n);
       if (t === 'timer') {
-        const val = Math.max(0, Number(d.valor ?? 1));
-        offset += val * _msUnidade(d.unidade || 'Dias');
+        const abs = _proximoTimerAbsoluto(d, base);
+        if (abs != null) offset = Math.max(0, abs - base); // [timer-agenda] agenda absoluta (dia da semana + horário BRT, ou data específica)
+        else { const val = Math.max(0, Number(d.valor ?? 1)); offset += val * _msUnidade(d.unidade || 'Dias'); } // esperar X min/horas/dias
       } else if (t === 'whatsapp') {
         const blocos = _resolverBlocosOd(d.blocos || []).filter((b: any) => (b.tipo === 'texto' ? String(b.texto || '').trim() : String(b.url || '').trim()));
         gruposUso.forEach((g: any, gi: number) => {
@@ -4116,6 +4305,22 @@ app.post('/fluxo/campanha/ativar', (req, res) => {
     res.json({ ok: true, ativo: 1, agendados: r.mensagens, grupos: r.grupos, ate: r.ate, erros: r.erros });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+
+// [timer-agenda] RE-ARMA fluxos recorrentes (agenda semanal): quando não resta envio pendente da campanha
+// ativa, recompila pra agendar a PRÓXIMA ocorrência (ex.: toda segunda 11:00). Roda a cada 5 min.
+setInterval(() => {
+  try {
+    const camps = db.prepare(`SELECT id, tipo, fluxo_json FROM fluxo_campanhas WHERE ativo=1`).all() as any[];
+    for (const c of camps) {
+      try {
+        if (!_fluxoRecorrente(c.fluxo_json)) continue;
+        const pend = db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE campanha_id=? AND status IN ('camp_pend','cmp_multi')`).get(c.id) as any;
+        if ((pend && pend.n) > 0) continue; // ainda tem envio agendado -> não mexe
+        _compilarFluxo(c, false); // agenda a próxima ocorrência
+      } catch { /* best-effort por campanha */ }
+    }
+  } catch { /* best-effort */ }
+}, 300000);
 
 // status de execução de uma campanha (quantos pendentes/enviados/falhou)
 app.get('/fluxo/campanha/:id/status', (req, res) => {
