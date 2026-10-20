@@ -1742,10 +1742,49 @@ function _wrapPagina(html: string, p: any): string {
   const og = (d || img) ? `<meta property="og:title" content="${t}"><meta property="og:type" content="website">${d ? `<meta property="og:description" content="${d}">` : ''}${img ? `<meta property="og:image" content="${img}">` : ''}<meta name="twitter:card" content="summary_large_image">` : '';
   return `<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${t}</title>${d ? `<meta name="description" content="${d}">` : ''}${og}<script src="https://cdn.tailwindcss.com"></script><style>*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif}img{max-width:100%}</style></head><body>${h}</body></html>`;
 }
+// ============================================================================
+// [TRACK FUNIL] Injeta rastreio de FUNIL em toda pagina publicada (/p/:slug) e
+//   formularios (/f/:id), roteando pro pixel do PROJETO da pagina. ADITIVO e
+//   IDEMPOTENTE (window.__mrPg). Dispara: PageView (via snippet), ViewContent e
+//   InitiateCheckout (links de checkout detectados), Lead (envio de formulario)
+//   e eventos explicitos via marcador data-mr-evento. Se a pagina ja tem o
+//   integrador do importador (mr-integra), NAO recarrega o snippet nem re-liga
+//   formularios/marcadores (so acrescenta ViewContent + InitiateCheckout).
+// ============================================================================
+const _TRACK_PAGINA_JS = `(function(){
+  if(window.__mrPg) return; window.__mrPg=1;
+  var base=__BASE__, proj=__PROJ__;
+  var temIntegra=!!document.getElementById('mr-integra');
+  if(!temIntegra && !document.querySelector('script[src*="/track/snippet.js"]')){ try{ var s=document.createElement('script'); s.src=base+'/track/snippet.js?projeto='+encodeURIComponent(proj); document.head.appendChild(s); }catch(e){} }
+  function track(ev,p){ p=p||{}; var n=0; (function go(){ try{ if(window.mrTrack){ window.mrTrack(ev,p); return; } }catch(e){} if(n++<60) setTimeout(go,100); })(); }
+  function run(){
+    try{
+      if(!temIntegra){
+        var evs=document.querySelectorAll('[data-mr-evento]'); for(var i=0;i<evs.length;i++){ (function(el){ el.addEventListener('click',function(){ track(el.getAttribute('data-mr-evento')||'Lead',{}); }); })(evs[i]); }
+        var fms=document.querySelectorAll('form'); for(var j=0;j<fms.length;j++){ (function(f){ if(f.getAttribute('data-mr-form')!=null) return; f.addEventListener('submit',function(){ track('Lead',{content_name:document.title||''}); }); })(fms[j]); }
+      }
+      var CK=/(guru|lastlink|hotmart|kiwify|eduzz|monetizze|cakto|payt|kirvano|checkout|pay\\.|carrinho|comprar|assinar|inscrever)/i;
+      var temCk=false; var as=document.querySelectorAll('a[href]');
+      for(var k=0;k<as.length;k++){ (function(a){ var h=a.getAttribute('href')||''; if(CK.test(h)){ temCk=true; if(a.getAttribute('data-mr-evento')==null) a.addEventListener('click',function(){ track('InitiateCheckout',{content_name:document.title||''}); }); } })(as[k]); }
+      if(temCk) track('ViewContent',{content_name:document.title||''});
+    }catch(e){}
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',run); else run();
+})();`;
+function _injetarTrackPagina(html: string, projeto: any): string {
+  const h = String(html || '');
+  if (/window\.__mrPg/.test(h)) return h;
+  const base = PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br';
+  const js = _TRACK_PAGINA_JS.replace('__BASE__', JSON.stringify(base)).replace('__PROJ__', JSON.stringify(String(projeto || 'teclado')));
+  const sc = '<scr' + 'ipt>' + js + '</scr' + 'ipt>';
+  if (/<\/body>/i.test(h)) return h.replace(/<\/body>/i, sc + '</body>');
+  return h + sc;
+}
+
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
-  res.type('html').send(_wrapPagina(String(p.html || ''), p));
+  res.type('html').send(_injetarTrackPagina(_wrapPagina(String(p.html || ''), p), p.projeto));
 });
 
 // ============================================================================
