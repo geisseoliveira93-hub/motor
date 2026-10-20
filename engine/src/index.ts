@@ -9712,13 +9712,31 @@ app.get('/paginas/captacao', (_req: any, res: any) => {
 app.get('/capi/diagnostico', (req: any, res: any) => {
   try {
     const projeto = String(req.query.projeto || '');
-    let eventos: any = { recebidos: 0, enviados: 0, erro: 0, por_tipo: [] };
+    const dias = Math.max(1, Math.min(365, Number(req.query.dias || 7)));
+    const desde = new Date(Date.now() - dias * 864e5).toISOString();
+    let cfg: any = null;
+    try { cfg = db.prepare(`SELECT meta_pixel_id, ga4_mid, dominio, ativo, (meta_token_enc IS NOT NULL) AS temMetaToken, (ga4_secret_enc IS NOT NULL) AS temGa4Secret FROM track_config WHERE projeto=?`).get(projeto); } catch { /* */ }
+    const on = cfg && cfg.ativo ? 1 : 0;
+    const conexoes: any[] = [];
+    if (cfg) {
+      conexoes.push({ nome: 'Meta Pixel', status: (cfg.meta_pixel_id && on) ? 'verde' : (cfg.meta_pixel_id ? 'amarelo' : 'cinza'), detalhe: cfg.meta_pixel_id ? String(cfg.meta_pixel_id) : 'nao configurado' });
+      conexoes.push({ nome: 'CAPI (Conversions API)', status: (cfg.temMetaToken && on) ? 'verde' : (cfg.temMetaToken ? 'amarelo' : 'cinza'), detalhe: cfg.temMetaToken ? 'token salvo' : 'sem token' });
+      conexoes.push({ nome: 'Google GA4', status: (cfg.ga4_mid && cfg.temGa4Secret && on) ? 'verde' : (cfg.ga4_mid ? 'amarelo' : 'cinza'), detalhe: cfg.ga4_mid ? String(cfg.ga4_mid) : 'nao configurado' });
+      if (cfg.dominio) conexoes.push({ nome: 'Dominio', status: 'verde', detalhe: String(cfg.dominio) });
+    } else {
+      conexoes.push({ nome: 'Rastreio', status: 'cinza', detalhe: 'projeto sem configuracao (aba Pixels > Rastreamento avancado)' });
+    }
+    const eventos: any = { recebidos: 0, enviados: 0, erro: 0, por_tipo: [] };
     try {
-      const r = db.prepare(`SELECT COUNT(*) n FROM capi_eventos`).get() as any;
-      eventos.recebidos = r ? r.n : 0; eventos.enviados = eventos.recebidos;
-    } catch { /* tabela capi_eventos pode não existir ainda */ }
+      const px = cfg && cfg.meta_pixel_id ? String(cfg.meta_pixel_id) : '';
+      const params: any = { desde }; let w = '';
+      if (px) { w = ' AND pixel_id=@px'; params.px = px; }
+      const b = db.prepare(`SELECT COUNT(*) n, SUM(status='ok') ok, SUM(status='erro') er FROM capi_eventos WHERE ts>=@desde${w}`).get(params) as any;
+      eventos.recebidos = (b && b.n) || 0; eventos.enviados = (b && b.ok) || 0; eventos.erro = (b && b.er) || 0;
+      eventos.por_tipo = db.prepare(`SELECT evento tipo, COUNT(*) n, SUM(status='ok') ok, SUM(status='erro') erro FROM capi_eventos WHERE ts>=@desde${w} GROUP BY evento ORDER BY n DESC`).all(params);
+    } catch { /* capi_eventos pode nao existir */ }
     const alertas = db.prepare(`SELECT push,email,telegram FROM capi_alertas WHERE projeto=?`).get(projeto) || { push: 1, email: 1, telegram: 1 };
-    _ndOk(res, { conexoes: [], eventos, emq_por_produto: [], alertas });
+    _ndOk(res, { conexoes, eventos, emq_por_produto: [], alertas, periodo_dias: dias, ativo: !!on });
   } catch (e) { _ndErr(res, e); }
 });
 app.post('/capi/alertas', (req: any, res: any) => {
@@ -9726,6 +9744,48 @@ app.post('/capi/alertas', (req: any, res: any) => {
     const b = req.body || {};
     db.prepare(`INSERT OR REPLACE INTO capi_alertas (projeto,push,email,telegram) VALUES (?,?,?,?)`).run(b.projeto || '', b.push ? 1 : 0, b.email ? 1 : 0, b.telegram ? 1 : 0);
     _ndOk(res, { salvo: true });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// [#5 painel] resumo de SAUDE do rastreio por projeto + periodo (ok/erro, vendas, ultimos)
+app.get('/track/resumo', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const dias = Math.max(1, Math.min(365, Number(req.query.dias || 7)));
+    const desde = new Date(Date.now() - dias * 864e5).toISOString();
+    let cfg: any = null;
+    try { cfg = db.prepare(`SELECT meta_pixel_id, ga4_mid, ativo FROM track_config WHERE projeto=?`).get(projeto); } catch { /* */ }
+    const px = cfg && cfg.meta_pixel_id ? String(cfg.meta_pixel_id) : '';
+    const params: any = { desde }; let w = '';
+    if (px) { w = ' AND pixel_id=@px'; params.px = px; }
+    let recebidos = 0, ok = 0, erro = 0, ult = ''; let vendasN = 0, vendasTotal = 0; let ultimos: any[] = [];
+    try {
+      const b = db.prepare(`SELECT COUNT(*) n, SUM(status='ok') ok, SUM(status='erro') er, MAX(ts) ult FROM capi_eventos WHERE ts>=@desde${w}`).get(params) as any;
+      recebidos = (b && b.n) || 0; ok = (b && b.ok) || 0; erro = (b && b.er) || 0; ult = (b && b.ult) || '';
+      const v = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(valor_centavos),0) c FROM capi_eventos WHERE ts>=@desde AND evento='Purchase' AND status='ok'${w}`).get(params) as any;
+      vendasN = (v && v.n) || 0; vendasTotal = ((v && v.c) || 0) / 100;
+      ultimos = (db.prepare(`SELECT evento, fonte, pagina, produto, status, valor_centavos FROM capi_eventos WHERE ts>=@desde${w} ORDER BY ts DESC LIMIT 15`).all(params) as any[]).map((r) => ({ evento: r.evento, destino: r.fonte || r.pagina || r.produto || '', status: r.status, valor: r.valor_centavos ? (r.valor_centavos / 100) : null }));
+    } catch { /* */ }
+    const saude = recebidos ? Math.round((ok / recebidos) * 100) : 0;
+    _ndOk(res, { ativo: !!(cfg && cfg.ativo), pixel_id: px, ga4_mid: (cfg && cfg.ga4_mid) || '', recebidos, enviadosOk: ok, erro, saude, ultimo_evento: ult, vendas: { n: vendasN, total: vendasTotal }, ultimos, emFila: 0, dias });
+  } catch (e) { _ndErr(res, e); }
+});
+// [#5 painel] atribuicao por pagina/fonte (proxy de campanha ate termos UTM): leads x vendas x R$
+app.get('/track/atribuicao', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const dias = Math.max(1, Math.min(365, Number(req.query.dias || 7)));
+    const desde = new Date(Date.now() - dias * 864e5).toISOString();
+    let cfg: any = null;
+    try { cfg = db.prepare(`SELECT meta_pixel_id FROM track_config WHERE projeto=?`).get(projeto); } catch { /* */ }
+    const px = cfg && cfg.meta_pixel_id ? String(cfg.meta_pixel_id) : '';
+    const params: any = { desde }; let w = '';
+    if (px) { w = ' AND pixel_id=@px'; params.px = px; }
+    let linhas: any[] = [];
+    try {
+      linhas = (db.prepare(`SELECT COALESCE(NULLIF(pagina,''), NULLIF(produto,''), '(direto)') campanha, COALESCE(NULLIF(fonte,''), '-') fonte, SUM(evento='Lead') leads, SUM(evento='Purchase' AND status='ok') vendas, COALESCE(SUM(CASE WHEN evento='Purchase' AND status='ok' THEN valor_centavos ELSE 0 END),0) centavos FROM capi_eventos WHERE ts>=@desde${w} GROUP BY campanha, fonte ORDER BY vendas DESC, leads DESC LIMIT 50`).all(params) as any[]).map((r) => ({ campanha: r.campanha, fonte: r.fonte, leads: r.leads || 0, vendas: r.vendas || 0, total: ((r.centavos || 0)) / 100 }));
+    } catch { /* */ }
+    _ndOk(res, { linhas });
   } catch (e) { _ndErr(res, e); }
 });
 
