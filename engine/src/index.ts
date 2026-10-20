@@ -681,6 +681,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/e-api/')) return next();  // [evento] API publica do evento (inscricao)
   if (req.path.startsWith('/c/')) return next();      // [#13 convite] pagina publica do convite (o aluno ve e agenda)
   if (req.path.startsWith('/c-api/')) return next();  // [#13 convite] API publica do convite (agendamento, sem x-api-key)
+  if (req.path === '/mcp' || req.path.startsWith('/mcp/')) return next(); // [MCP] endpoint remoto: auth propria (MCP_API_KEY)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -697,6 +698,95 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, projetos: PROJETOS, hora: agora() }));
+
+// ============================================================================
+// [MCP] Endpoint MCP remoto (Streamable HTTP) — comandar a NUVEM de qualquer
+//   sessao do Claude (PC1/PC2/PC3/celular), sem .bat e sem PC ligado. ADITIVO.
+//   Auth propria (MCP_API_KEY), NAO usa a ENGINE_API_KEY. Chave no .env do motor.
+//   A chave vem no header Authorization: Bearer <chave> / x-mcp-key, OU no
+//   caminho /mcp/<chave> (se o conector so aceitar URL). Ferramenta: motor_call.
+//   Acoes perigosas (apagar/publicar/disparar/gasto/live) exigem confirmar:true.
+// ============================================================================
+function _mcpChaveEsperada(): string {
+  const env = String(process.env.MCP_API_KEY || '').trim();
+  if (env) return env;
+  try { return String(fs.readFileSync('/data/mcp-api-key.txt', 'utf8') || '').trim(); } catch { return ''; }
+}
+function _mcpChaveDoReq(req: any): string {
+  const auth = String(req.header('authorization') || '');
+  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+  const xk = String(req.header('x-mcp-key') || '');
+  if (xk) return xk;
+  if (req.params && req.params.key) return String(req.params.key);
+  return '';
+}
+const _MCP_TOOLS = [{
+  name: 'motor_call',
+  description: 'Chama qualquer endpoint do motor (nuvem) do Melodias e Riffs. Use pra LER e CONSTRUIR na nuvem: paginas (/pagina), agentes, calendario, canais (/motor2/canais), stats, etc. Exemplos: criar pagina = {metodo:"POST", caminho:"/pagina", body:{...}}; ler canais = {metodo:"GET", caminho:"/motor2/canais"}. Acoes perigosas (apagar/publicar/disparar/gasto de anuncio/por live no ar) SO executam com confirmar:true.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      metodo: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], description: 'Metodo HTTP' },
+      caminho: { type: 'string', description: 'Caminho do endpoint, comecando com / (ex.: /pagina)' },
+      body: { type: 'object', description: 'Corpo JSON para POST/PUT/PATCH (opcional)' },
+      confirmar: { type: 'boolean', description: 'true para executar acoes perigosas (apagar/publicar/disparar/gasto/live)' }
+    },
+    required: ['metodo', 'caminho']
+  }
+}];
+async function _mcpMotorCall(args: any): Promise<any> {
+  const metodo = String((args && args.metodo) || 'GET').toUpperCase();
+  let caminho = String((args && args.caminho) || '');
+  if (!caminho.startsWith('/')) caminho = '/' + caminho;
+  const confirmar = (args && args.confirmar) === true;
+  const perigoso = metodo !== 'GET' && /(remover|delete|apagar|excluir|publicar|postar|disparar|enviar|cancelar|gasto|anuncio|trafego|habilitar|lives\/(agendar|testar|preparar|iniciar))/i.test(caminho);
+  if (perigoso && !confirmar) {
+    return { __erro: true, confirmacao_necessaria: true, aviso: 'Acao potencialmente perigosa: ' + metodo + ' ' + caminho + '. Reenvie com confirmar:true para executar.' };
+  }
+  const init: any = { method: metodo, headers: { 'x-api-key': ENGINE_API_KEY } };
+  if (metodo !== 'GET' && metodo !== 'HEAD') { init.headers['content-type'] = 'application/json'; init.body = JSON.stringify((args && args.body) || {}); }
+  try {
+    const r = await fetch('http://127.0.0.1:' + PORT + caminho, init);
+    const txt = await r.text();
+    let dados: any; try { dados = JSON.parse(txt); } catch { dados = txt; }
+    console.log('[mcp] ' + metodo + ' ' + caminho + ' -> ' + r.status);
+    return { status: r.status, ok: r.ok, dados };
+  } catch (e: any) {
+    return { __erro: true, erro: String((e && e.message) || e) };
+  }
+}
+async function _mcpHandler(req: any, res: any): Promise<void> {
+  const _chaveEsp = _mcpChaveEsperada();
+  if (!_chaveEsp) { res.status(503).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'MCP nao configurado (defina MCP_API_KEY no .env OU /data/mcp-api-key.txt)' } }); return; }
+  if (_mcpChaveDoReq(req) !== _chaveEsp) { res.status(401).json({ jsonrpc: '2.0', id: (req.body && req.body.id) || null, error: { code: -32001, message: 'nao_autorizado' } }); return; }
+  const msg: any = req.body || {};
+  const id = (msg.id !== undefined) ? msg.id : null;
+  const method = String(msg.method || '');
+  try {
+    if (method === 'initialize') {
+      res.json({ jsonrpc: '2.0', id, result: { protocolVersion: (msg.params && msg.params.protocolVersion) || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'editor-video-motor', version: '1.0.0' } } });
+      return;
+    }
+    if (method.startsWith('notifications/')) { res.status(202).end(); return; }
+    if (method === 'ping') { res.json({ jsonrpc: '2.0', id, result: {} }); return; }
+    if (method === 'tools/list') { res.json({ jsonrpc: '2.0', id, result: { tools: _MCP_TOOLS } }); return; }
+    if (method === 'tools/call') {
+      const p: any = msg.params || {};
+      if (String(p.name || '') !== 'motor_call') { res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'tool_desconhecida: ' + p.name }], isError: true } }); return; }
+      const out = await _mcpMotorCall(p.arguments || {});
+      res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(out) }], isError: !!(out && out.__erro) } });
+      return;
+    }
+    res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'metodo_nao_suportado: ' + method } });
+  } catch (e: any) {
+    res.json({ jsonrpc: '2.0', id, error: { code: -32603, message: String((e && e.message) || e) } });
+  }
+}
+app.post('/mcp', _mcpHandler);
+app.post('/mcp/:key', _mcpHandler);
+app.get('/mcp', (_req: any, res: any) => res.status(405).set('Allow', 'POST').json({ erro: 'use_post' }));
+app.get('/mcp/:key', (_req: any, res: any) => res.status(405).set('Allow', 'POST').json({ erro: 'use_post' }));
+// ============================================================================
 
 // ---- Números (conectar por QR / status / registrar existente / sincronizar) ----
 app.post('/numbers/connect', async (req, res) => {
@@ -1560,6 +1650,99 @@ app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
   res.type('html').send(_wrapPagina(String(p.html || ''), p));
+});
+
+// ============================================================================
+// [IMPORTADOR] POST /pagina/importar — traz uma pagina montada no desktop/cloud
+//   PRA DENTRO do sistema, 100% fiel, ja integrada: rastreio (pixel/CAPI via
+//   /track), player de VSL (metricas) e formularios (lead+tag+automacao+Lead).
+//   A integracao entra por UM <script> injetado (wiring no navegador) — NAO mexe
+//   no visual. Marcadores no HTML (voce poe ao montar a pagina aqui comigo):
+//     video:  <div data-mr-vsl="oferta"></div>             -> vira player de VSL
+//     form:   <form data-mr-form="principal"> ... </form>   -> salva lead no sistema
+//     evento: <button data-mr-evento="Lead"> ...            -> dispara evento rastreado
+//   Body JSON:
+//     { projeto, slug?, titulo?, html, publicada?(=true), rastreio?(=true),
+//       seo?:{titulo,descricao,imagem},
+//       vsl?:[ { chave, id? | criar:{nome,fonte,ref,oferta_segundos,formato,barra,dominios,marcadagua} } ],
+//       forms?:[ { chave, id? | titulo?,tag?,redirecionar?,campos?:[{rotulo,chave,tipo,obrigatorio}] } ] }
+// ============================================================================
+const _MR_INTEGRA_JS = `(function(){
+  var el=document.getElementById('mr-integra'); if(!el) return;
+  var cfg={}; try{cfg=JSON.parse(el.getAttribute('data-cfg')||'{}');}catch(e){return;}
+  var base=cfg.base||'';
+  if(cfg.rastreio){ try{ var s=document.createElement('script'); s.src=base+'/track/snippet.js?projeto='+encodeURIComponent(cfg.projeto||''); document.head.appendChild(s); }catch(e){} }
+  function track(ev,p){ p=p||{}; var n=0; (function go(){ try{ if(window.mrTrack){ window.mrTrack(ev,p); return; } }catch(e){} if(n++<50) setTimeout(go,120); })(); }
+  function run(){
+    var vsl=cfg.vsl||{}; Object.keys(vsl).forEach(function(k){ var id=vsl[k]; var ns=document.querySelectorAll('[data-mr-vsl="'+k+'"]'); for(var i=0;i<ns.length;i++){ (function(box){ try{ box.innerHTML=''; var sc=document.createElement('script'); sc.src=base+'/v/'+id+'.js'; box.appendChild(sc); }catch(e){} })(ns[i]); } });
+    var evs=document.querySelectorAll('[data-mr-evento]'); for(var j=0;j<evs.length;j++){ (function(bt){ bt.addEventListener('click',function(){ track(bt.getAttribute('data-mr-evento')||'Lead',{}); }); })(evs[j]); }
+    var forms=cfg.forms||{}; Object.keys(forms).forEach(function(k){ var fm=forms[k]; var fs2=document.querySelectorAll('form[data-mr-form="'+k+'"]'); for(var i=0;i<fs2.length;i++){ (function(f){ f.addEventListener('submit',function(e){ e.preventDefault(); var d={}; new FormData(f).forEach(function(v,n){ d[n]=v; }); fetch(base+'/f/'+fm.id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(function(r){ return r.json().catch(function(){return {};}); }).then(function(){ track('Lead',{content_name:(cfg.projeto||'')}); var red=fm.redirecionar||f.getAttribute('data-mr-redir')||''; if(red){ setTimeout(function(){ location.href=red; },800); } else { var ok=f.getAttribute('data-mr-ok'); if(ok){ var e2=document.querySelector(ok); if(e2) e2.style.display=''; } f.style.display='none'; } }).catch(function(){}); }); })(fs2[i]); } });
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',run); else run();
+})();`;
+app.post('/pagina/importar', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    let html = String(b.html || '');
+    if (!html.trim()) return res.status(400).json({ ok: false, erro: 'html_vazio' });
+    const projeto = String(b.projeto || 'teclado');
+    const base = PUBLIC_BASE_URL || '';
+    let slug = String(b.slug || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-|-$/g, '');
+    let id = String(b.id || '').trim();
+    if (!id && slug) { const ex = db.prepare(`SELECT id FROM paginas WHERE slug=?`).get(slug) as any; if (ex && ex.id) id = String(ex.id); }
+    if (!id) id = randomUUID();
+    if (!slug) slug = id.slice(0, 8);
+
+    // 1) VSLs: cria (criar:{...}) ou linka (id) -> mapa chave->id
+    const vslMap: any = {}; const vslOut: any[] = [];
+    if (Array.isArray(b.vsl)) for (const v of b.vsl) {
+      const chave = String((v && v.chave) || '').trim(); if (!chave) continue;
+      let vid = String((v && v.id) || '').trim();
+      if (!vid && v && v.criar) {
+        vid = randomUUID(); const c = v.criar || {};
+        try {
+          db.prepare(`INSERT OR REPLACE INTO vsl_videos (id,projeto,nome,fonte,ref,oferta_segundos,barra,dominios,marcadagua,formato,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT criado_em FROM vsl_videos WHERE id=?),?))`)
+            .run(vid, projeto, String(c.nome || 'VSL'), String(c.fonte || 'youtube'), String(c.ref || ''), (c.oferta_segundos != null ? (Number(c.oferta_segundos) || 0) : 0), String(c.barra || 'inteligente'), String(c.dominios || ''), (c.marcadagua ? 1 : 0), String(c.formato || '16:9'), vid, agora());
+        } catch { /* best-effort */ }
+      }
+      if (vid) { vslMap[chave] = vid; vslOut.push({ chave, id: vid, player: base + '/v/' + vid }); }
+    }
+
+    // 2) Formularios: cria ou linka -> mapa chave->{id,redirecionar}
+    const formMap: any = {}; const formOut: any[] = [];
+    if (Array.isArray(b.forms)) for (const f of b.forms) {
+      const chave = String((f && f.chave) || '').trim(); if (!chave) continue;
+      let fid = String((f && f.id) || '').trim();
+      if (!fid) {
+        fid = randomUUID();
+        try {
+          const campos = JSON.stringify(Array.isArray(f.campos) ? f.campos : []);
+          db.prepare(`INSERT INTO formularios(id,projeto,titulo,campos,tag,redirecionar,criado_em) VALUES(?,?,?,?,?,?,?)`)
+            .run(fid, projeto, String(f.titulo || b.titulo || 'Formulario'), campos, String(f.tag || ''), String(f.redirecionar || ''), agora());
+        } catch { /* best-effort */ }
+      }
+      formMap[chave] = { id: fid, redirecionar: String((f && f.redirecionar) || '') };
+      formOut.push({ chave, id: fid, url: base + '/f/' + fid });
+    }
+
+    // 3) Script integrador (wiring no navegador; nao altera o visual)
+    const rastreio = b.rastreio !== false;
+    const cfg = { base, projeto, rastreio, vsl: vslMap, forms: formMap };
+    const cfgAttr = JSON.stringify(cfg).replace(/</g, '\\u003c').replace(/'/g, '&#39;');
+    const loader = '<script id="mr-integra" data-cfg=\'' + cfgAttr + '\'>' + _MR_INTEGRA_JS + '</scr' + 'ipt>';
+    if (/<\/body>/i.test(html)) html = html.replace(/<\/body>/i, loader + '</body>'); else html = html + loader;
+
+    // 4) Salva/publica (reusa tabela paginas)
+    const publicada = b.publicada === false ? 0 : 1;
+    const existe = db.prepare(`SELECT id FROM paginas WHERE id=?`).get(id);
+    try {
+      if (existe) db.prepare(`UPDATE paginas SET slug=?, titulo=?, html=?, publicada=?, atualizado_em=? WHERE id=?`).run(slug, String(b.titulo || ''), html, publicada, agora(), id);
+      else db.prepare(`INSERT INTO paginas(id,projeto,slug,titulo,html,publicada,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`).run(id, projeto, slug, String(b.titulo || ''), html, publicada, agora(), agora());
+    } catch (e: any) { return res.status(400).json({ ok: false, erro: 'slug_duplicado_ou_invalido', detalhe: String((e && e.message) || e) }); }
+    try { if (b.seo) db.prepare(`UPDATE paginas SET seo_titulo=?, seo_descricao=?, seo_imagem=? WHERE id=?`).run(String(b.seo.titulo || ''), String(b.seo.descricao || ''), String(b.seo.imagem || ''), id); } catch { /* seo best-effort */ }
+
+    res.json({ ok: true, id, slug, url: base + '/p/' + slug, publicada: !!publicada, rastreio, vsl: vslOut, forms: formOut });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
 });
 
 // ---- FORMULARIOS / QUIZ (servidos pelo motor; resposta salva + cria contato + tag) ----
@@ -7429,6 +7612,25 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       const destinos = Array.isArray(b.destinos) ? b.destinos : [];
       if (!destinos.length) return res.status(400).json({ ok: false, erro: 'destinos_obrigatorio' });
       if (!b.fonte_ref) return res.status(400).json({ ok: false, erro: 'fonte_ref_obrigatorio' });
+      // [live-valida-video] trava: a FONTE da live tem que ser VIDEO, nunca imagem.
+      //   (bug 20/10: a live do Teclado pegou o .jpg da capa no lugar do .mp4 e encerrou na hora.)
+      {
+        const _ft = String(b.fonte_tipo || 'onedrive');
+        const _fr = String(b.fonte_ref || '');
+        const _ehArquivo = ['onedrive', 'arquivo', 'local', 'od', 'rclone'].includes(_ft);
+        if (_ehArquivo) {
+          const _ext = (_fr.split('?')[0].split('#')[0].split('.').pop() || '').toLowerCase();
+          const _VIDEO = ['mp4', 'mov', 'mkv', 'avi', 'webm', 'flv', 'm4v', 'mpg', 'mpeg', 'wmv', 'ts', 'm2ts', '3gp'];
+          const _IMG = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tif', 'tiff', 'svg'];
+          if (_IMG.includes(_ext)) {
+            const _sug = _fr.replace(/\.[^.]+$/, '.mp4');
+            return res.status(400).json({ ok: false, erro: 'fonte_e_imagem', mensagem: `O arquivo escolhido como VIDEO da live e uma imagem (.${_ext}), nao um video. Selecione o video (ex.: ${_sug}). A imagem deve ir so no campo de CAPA.` });
+          }
+          if (_ext && !_VIDEO.includes(_ext)) {
+            return res.status(400).json({ ok: false, erro: 'fonte_nao_video', mensagem: `O arquivo escolhido como VIDEO da live (.${_ext}) nao e um formato de video reconhecido. Use um arquivo de video (mp4, mov, mkv, webm, ...).` });
+          }
+        }
+      }
       const id = String(b.id || randomUUID());
       const priv = ['private', 'unlisted', 'public'].includes(String(b.privacidade)) ? String(b.privacidade) : 'private';
       db.prepare(`INSERT INTO fila_lives(id,projeto,titulo,descricao,fonte_tipo,fonte_ref,capa_ref,tipo,qualidade,privacidade,destinos_json,data_agendada,status,broadcasts_json,em_loop,criado_em,atualizado_em)
