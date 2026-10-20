@@ -622,6 +622,7 @@ function preencheNome(tpl: string, nome?: string, opts?: OpcoesNome): string {
 // ----------------------- API HTTP -----------------------
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' })); // [MCP OAuth] parse form-urlencoded (token/authorize)
 // aceita CSV cru no corpo (pra importação em massa de leads da SellFlux)
 app.use(express.text({ type: ['text/csv', 'application/csv', 'text/plain'], limit: '120mb' }));
 
@@ -682,6 +683,8 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/c/')) return next();      // [#13 convite] pagina publica do convite (o aluno ve e agenda)
   if (req.path.startsWith('/c-api/')) return next();  // [#13 convite] API publica do convite (agendamento, sem x-api-key)
   if (req.path === '/mcp' || req.path.startsWith('/mcp/')) return next(); // [MCP] endpoint remoto: auth propria (MCP_API_KEY)
+  if (req.path.startsWith('/.well-known/oauth')) return next(); // [MCP OAuth] metadata de descoberta
+  if (req.path.startsWith('/oauth/')) return next(); // [MCP OAuth] authorize/token/register (gate pela MCP_API_KEY)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -758,7 +761,7 @@ async function _mcpMotorCall(args: any): Promise<any> {
 async function _mcpHandler(req: any, res: any): Promise<void> {
   const _chaveEsp = _mcpChaveEsperada();
   if (!_chaveEsp) { res.status(503).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: 'MCP nao configurado (defina MCP_API_KEY no .env OU /data/mcp-api-key.txt)' } }); return; }
-  if (_mcpChaveDoReq(req) !== _chaveEsp) { res.status(401).json({ jsonrpc: '2.0', id: (req.body && req.body.id) || null, error: { code: -32001, message: 'nao_autorizado' } }); return; }
+  if (_mcpChaveDoReq(req) !== _chaveEsp) { res.status(401).set('WWW-Authenticate', 'Bearer resource_metadata="' + (PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br') + '/.well-known/oauth-protected-resource"').json({ jsonrpc: '2.0', id: (req.body && req.body.id) || null, error: { code: -32001, message: 'nao_autorizado' } }); return; }
   const msg: any = req.body || {};
   const id = (msg.id !== undefined) ? msg.id : null;
   const method = String(msg.method || '');
@@ -786,6 +789,99 @@ app.post('/mcp', _mcpHandler);
 app.post('/mcp/:key', _mcpHandler);
 app.get('/mcp', (_req: any, res: any) => res.status(405).set('Allow', 'POST').json({ erro: 'use_post' }));
 app.get('/mcp/:key', (_req: any, res: any) => res.status(405).set('Allow', 'POST').json({ erro: 'use_post' }));
+// ============================================================================
+// [MCP OAuth] OAuth 2.1 minimo pro conector do Claude (que e OAuth-first).
+//   O "login" e a propria MCP_API_KEY: o usuario cola a chave na tela /oauth/authorize.
+//   Fluxo: descoberta (.well-known) -> registro dinamico (/oauth/register) ->
+//   /oauth/authorize (form com a chave) -> /oauth/token (PKCE S256) -> Bearer = a chave.
+//   Tudo ADITIVO. Rotas ja liberadas no bypass de auth (/.well-known/oauth*, /oauth/*).
+// ============================================================================
+const _mcpBaseUrl = (): string => (PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br');
+const _mcpB64url = (b: Buffer): string => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const _mcpOauthCodes = new Map<string, { challenge: string; redirect: string; exp: number }>();
+function _mcpLimpaCodes(): void { const n = Date.now(); for (const [k, v] of _mcpOauthCodes) { if (v.exp < n) _mcpOauthCodes.delete(k); } }
+
+function _mcpPRM(_req: any, res: any): void { res.json({ resource: _mcpBaseUrl() + '/mcp', authorization_servers: [_mcpBaseUrl()] }); }
+app.get('/.well-known/oauth-protected-resource', _mcpPRM);
+app.get('/.well-known/oauth-protected-resource/mcp', _mcpPRM);
+app.get('/.well-known/oauth-protected-resource/mcp/:key', _mcpPRM);
+
+function _mcpASM(_req: any, res: any): void {
+  res.json({
+    issuer: _mcpBaseUrl(),
+    authorization_endpoint: _mcpBaseUrl() + '/oauth/authorize',
+    token_endpoint: _mcpBaseUrl() + '/oauth/token',
+    registration_endpoint: _mcpBaseUrl() + '/oauth/register',
+    scopes_supported: ['mcp'],
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none']
+  });
+}
+app.get('/.well-known/oauth-authorization-server', _mcpASM);
+app.get('/.well-known/oauth-authorization-server/mcp', _mcpASM);
+
+app.post('/oauth/register', (req: any, res: any) => {
+  const b = req.body || {};
+  res.status(201).json({
+    client_id: 'mr-' + _mcpB64url(randomBytes(12)),
+    token_endpoint_auth_method: 'none',
+    redirect_uris: Array.isArray(b.redirect_uris) ? b.redirect_uris : [],
+    grant_types: ['authorization_code'],
+    response_types: ['code']
+  });
+});
+
+app.get('/oauth/authorize', (req: any, res: any) => {
+  const q = req.query || {};
+  const campos = ['client_id', 'redirect_uri', 'state', 'code_challenge', 'code_challenge_method', 'scope', 'resource', 'response_type'];
+  const hidden = campos.map((c) => '<input type="hidden" name="' + c + '" value="' + esc(String(q[c] || '')) + '">').join('');
+  res.type('html').send('<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conectar Motor Nuvem</title></head>'
+    + '<body style="font-family:system-ui;max-width:420px;margin:60px auto;padding:0 20px;color:#111">'
+    + '<h2>Conectar ao Motor Nuvem</h2><p>Cole a <b>chave do MCP</b> para autorizar este computador.</p>'
+    + '<form method="POST" action="/oauth/authorize">' + hidden
+    + '<input name="mcp_key" type="password" placeholder="Chave do MCP" autofocus style="width:100%;box-sizing:border-box;padding:12px;font-size:16px;border:1px solid #ccc;border-radius:8px">'
+    + '<button type="submit" style="width:100%;margin-top:12px;padding:12px;font-size:16px;border:0;border-radius:8px;background:#1db954;color:#fff;font-weight:600;cursor:pointer">Autorizar</button>'
+    + '</form></body></html>');
+});
+
+app.post('/oauth/authorize', (req: any, res: any) => {
+  const b = req.body || {};
+  const chaveEsp = _mcpChaveEsperada();
+  if (!chaveEsp || String(b.mcp_key || '').trim() !== chaveEsp) {
+    res.status(401).type('html').send('<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;max-width:420px;margin:60px auto;padding:0 20px"><p>Chave incorreta. <a href="javascript:history.back()">Voltar</a></p></body>');
+    return;
+  }
+  const redirect = String(b.redirect_uri || '');
+  if (!redirect) { res.status(400).json({ erro: 'sem_redirect_uri' }); return; }
+  _mcpLimpaCodes();
+  const code = _mcpB64url(randomBytes(24));
+  _mcpOauthCodes.set(code, { challenge: String(b.code_challenge || ''), redirect, exp: Date.now() + 5 * 60 * 1000 });
+  try {
+    const u = new URL(redirect);
+    u.searchParams.set('code', code);
+    if (b.state) u.searchParams.set('state', String(b.state));
+    res.redirect(302, u.toString());
+  } catch { res.status(400).json({ erro: 'redirect_invalido' }); }
+});
+
+app.post('/oauth/token', (req: any, res: any) => {
+  const b = req.body || {};
+  const code = String(b.code || '');
+  const rec = _mcpOauthCodes.get(code);
+  if (!rec || rec.exp < Date.now()) { res.status(400).json({ error: 'invalid_grant' }); return; }
+  if (rec.challenge) {
+    const ver = String(b.code_verifier || '');
+    const calc = _mcpB64url(createHash('sha256').update(ver).digest());
+    if (calc !== rec.challenge) { res.status(400).json({ error: 'invalid_grant', error_description: 'pkce' }); return; }
+  }
+  if (b.redirect_uri && String(b.redirect_uri) !== rec.redirect) { res.status(400).json({ error: 'invalid_grant', error_description: 'redirect' }); return; }
+  _mcpOauthCodes.delete(code);
+  res.json({ access_token: _mcpChaveEsperada(), token_type: 'Bearer', expires_in: 31536000, scope: 'mcp' });
+});
+// ============================================================================
+
 // ============================================================================
 
 // ---- Números (conectar por QR / status / registrar existente / sincronizar) ----
