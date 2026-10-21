@@ -637,6 +637,16 @@ app.use((_req, res, next) => {
   next();
 });
 
+// [VSL] O player /v/:id precisa ser embutido via <iframe> nas paginas de vendas (proprias e externas).
+// Por isso liberamos o framing SO nessas rotas (o player tem trava de dominio propria pra abuso).
+app.use((req, res, next) => {
+  if (req.path === '/v' || req.path.indexOf('/v/') === 0) {
+    res.removeHeader('X-Frame-Options');
+    res.setHeader('Content-Security-Policy', 'frame-ancestors *');
+  }
+  next();
+});
+
 // ---- Segurança: liga/desliga a porta de entrada da importação ----
 // Quando IMPORTAR_ATIVO=false, a página e o envio de importação respondem 403.
 app.use((req, res, next) => {
@@ -685,6 +695,7 @@ app.use((req, res, next) => {
   if (req.path === '/mcp' || req.path.startsWith('/mcp/')) return next(); // [MCP] endpoint remoto: auth propria (MCP_API_KEY)
   if (req.path.startsWith('/.well-known/oauth')) return next(); // [MCP OAuth] metadata de descoberta
   if (req.path.startsWith('/oauth/')) return next(); // [MCP OAuth] authorize/token/register (gate pela MCP_API_KEY)
+  if (req.path === '/area' || req.path.startsWith('/area/')) return next(); // [B] area de membros (auth propria por cookie)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -1781,10 +1792,43 @@ function _injetarTrackPagina(html: string, projeto: any): string {
   return h + sc;
 }
 
+// ============================================================================
+// [BANNER LGPD] #5(4) Aviso de cookies/privacidade — INFORMATIVO e NAO-BLOQUEANTE.
+//   Nao condiciona nem atrasa o rastreio (o _TRACK_PAGINA_JS roda normal). So
+//   informa o uso de cookies/medicao e lembra a aceitacao (localStorage). ADITIVO
+//   e IDEMPOTENTE (window.__mrLgpd). Injetado em /p/:slug depois do rastreio.
+// ============================================================================
+const _BANNER_LGPD_JS = `(function(){
+  if(window.__mrLgpd) return; window.__mrLgpd=1;
+  try{ if(localStorage.getItem('_mr_lgpd_ok')==='1') return; }catch(e){}
+  function mk(){
+    if(document.getElementById('_mr-lgpd')) return;
+    var b=document.createElement('div'); b.id='_mr-lgpd';
+    b.setAttribute('role','dialog'); b.setAttribute('aria-label','Aviso de cookies e privacidade');
+    b.style.cssText='position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483600;max-width:860px;margin:0 auto;background:#0f172a;color:#f8fafc;font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:16px 18px;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.35);display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between';
+    var t=document.createElement('div'); t.style.cssText='flex:1 1 340px;min-width:0';
+    t.innerHTML='Usamos cookies e tecnologias de medicao para melhorar sua experiencia e entender os resultados das nossas paginas. Ao continuar navegando, voce concorda com o uso. <a href="__PRIV__" style="color:#93c5fd;text-decoration:underline;white-space:nowrap">Saiba mais</a>.';
+    var btn=document.createElement('button'); btn.type='button'; btn.textContent='Aceitar';
+    btn.style.cssText='flex:0 0 auto;background:#22c55e;color:#052e16;border:0;border-radius:10px;padding:11px 26px;font-weight:700;font-size:14px;cursor:pointer';
+    btn.addEventListener('click',function(){ try{localStorage.setItem('_mr_lgpd_ok','1');}catch(e){} var n=document.getElementById('_mr-lgpd'); if(n&&n.parentNode) n.parentNode.removeChild(n); });
+    b.appendChild(t); b.appendChild(btn); document.body.appendChild(b);
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',mk); else mk();
+})();`;
+function _injetarBannerLgpd(html: string): string {
+  const h = String(html || '');
+  if (/__mrLgpd/.test(h)) return h;
+  const priv = '/p/politica-de-privacidade';
+  const js = _BANNER_LGPD_JS.replace('__PRIV__', priv);
+  const sc = '<scr' + 'ipt>' + js + '</scr' + 'ipt>';
+  if (/<\/body>/i.test(h)) return h.replace(/<\/body>/i, sc + '</body>');
+  return h + sc;
+}
+
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
-  res.type('html').send(_injetarTrackPagina(_wrapPagina(String(p.html || ''), p), p.projeto));
+  res.type('html').send(_injetarBannerLgpd(_injetarTrackPagina(_wrapPagina(String(p.html || ''), p), p.projeto)));
 });
 
 // ============================================================================
@@ -2424,6 +2468,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         }).catch(() => {});
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
+    if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       if (categoria === 'aprovado') {
@@ -2711,14 +2756,14 @@ const AGENTE_SEED: any = {
     nome: 'SDR Teclado',
     grade: { dias: [1, 4], horas: ['11:00', '15:00', '20:00'], duracaoMin: 60, antecedenciaH: 2 },
     grupo: 'https://chat.whatsapp.com/C1VYxajhCJiCt1EFVuWjmY',
-    sala: '',
+    sala: 'https://meet.google.com/rpw-wdwu-cby',
     corteIdade: 24,
   },
   violao: {
     nome: 'SDR Violao',
     grade: { dias: [1, 4], horas: ['14:00', '19:00'], duracaoMin: 60, antecedenciaH: 3 },
     grupo: '',
-    sala: '',
+    sala: 'https://meet.google.com/rpw-wdwu-cby',
     corteIdade: 24,
   },
   // [comunidade] Porteiro genérico: só descobre o instrumento e direciona pro agente dele (não tem funil próprio).
@@ -2930,7 +2975,7 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
         try { _gcalIaId = await _gcalCriarEvento({ tipo: 'ia', refId: id, titulo: 'Sessao ' + projeto + ' - ' + String(args.nome || conversa.telefone), inicio, fim, descricao: String(args.observacao || '') }); }
         catch (e: any) { _gcalIaAviso = 'google_falhou: ' + String(e && e.message || e); }
       } else if (pubFlag('gcal_ativo') === '1') { _gcalIaAviso = 'fonte_ia_desligada'; }
-      return { ok: true, id, inicio, fim, sala: seed.sala || '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
+      return { ok: true, id, inicio, fim, sala: seed.sala || '', sala_instrucao: seed.sala ? ('IMPORTANTE: envie este link da sala fixa pro aluno na confirmacao, exatamente assim: ' + seed.sala + ' . Ignore qualquer outro link de meet que apareca.') : '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
     }
     if (nomeFerr === 'registrar_card_crm') {
       const id = randomUUID();
@@ -8168,6 +8213,47 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   };
 
   // config pública (o que a sala precisa; sem nada sensível)
+  // [evergreen] AGENDA do webinário (horários programados) — tabela separada, não mexe no webinarios
+  db.exec(`CREATE TABLE IF NOT EXISTS webinario_agenda (
+    slug TEXT PRIMARY KEY, tipo TEXT DEFAULT 'aberto', intervalo INTEGER DEFAULT 15, janela INTEGER DEFAULT 5,
+    horarios_json TEXT DEFAULT '[]', duracao_seg INTEGER DEFAULT 0, atualizado_em TEXT
+  )`);
+  const wbAgendaGet = (slug: string): any => db.prepare(`SELECT * FROM webinario_agenda WHERE slug=?`).get(String(slug)) as any;
+  function wbProximaSessao(wb: any, nowMs: number): any {
+    const row = wbAgendaGet(wb.slug);
+    const tipo = row ? String(row.tipo || 'aberto') : 'aberto';
+    const dur = row ? Math.max(0, Math.round(Number(row.duracao_seg) || 0)) : 0;
+    if (tipo === 'aberto' || dur <= 0) return { tipo: 'aberto', estado: 'ao_vivo', inicio_ms: nowMs, fim_ms: 0, duracao: dur };
+    const durMs = dur * 1000;
+    if (tipo === 'jit') {
+      const I = Math.max(1, Math.round(Number(row.intervalo) || 15));
+      const J = Math.max(0, Math.round(Number(row.janela) || 5));
+      const slotMs = I * 60000;
+      const last = Math.floor(nowMs / slotMs) * slotMs;
+      const since = nowMs - last;
+      if (since < Math.min(J * 60000, durMs)) return { tipo, estado: 'ao_vivo', inicio_ms: last, fim_ms: last + durMs, duracao: dur };
+      const next = last + slotMs;
+      return { tipo, estado: 'antes', inicio_ms: next, fim_ms: next + durMs, duracao: dur };
+    }
+    if (tipo === 'diario') {
+      let horarios: any[] = []; try { horarios = JSON.parse(row.horarios_json || '[]'); } catch { horarios = []; }
+      const BRT = -3 * 3600000;
+      const cand: number[] = [];
+      for (let d = 0; d <= 1; d++) {
+        const bl = new Date(nowMs + d * 86400000 + BRT);
+        for (const hhmm of horarios) {
+          const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm).trim()); if (!m) continue;
+          const startMs = Date.UTC(bl.getUTCFullYear(), bl.getUTCMonth(), bl.getUTCDate(), Number(m[1]), Number(m[2]), 0) - BRT;
+          cand.push(startMs);
+        }
+      }
+      cand.sort((a, b) => a - b);
+      for (const st of cand) { if (nowMs >= st && nowMs < st + durMs) return { tipo, estado: 'ao_vivo', inicio_ms: st, fim_ms: st + durMs, duracao: dur }; }
+      for (const st of cand) { if (st > nowMs) return { tipo, estado: 'antes', inicio_ms: st, fim_ms: st + durMs, duracao: dur }; }
+      return { tipo, estado: 'antes', inicio_ms: nowMs + durMs, fim_ms: 0, duracao: dur };
+    }
+    return { tipo: 'aberto', estado: 'ao_vivo', inicio_ms: nowMs, fim_ms: 0, duracao: dur };
+  }
   function wbConfigPublico(wb: any): any {
     let ofertas: any[] = []; try { ofertas = JSON.parse(wb.ofertas_json || '[]'); } catch { ofertas = []; }
     let videoUrl = '';
@@ -8184,7 +8270,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       youtube_url: wb.youtube_url || '', video_url: videoUrl,
       mascara: !!wb.mascara, chat_real: !!wb.chat_real, chat_ia: !!wb.chat_ia,
       contador: !!wb.contador, acumulado: !!wb.acumulado, popups: !!wb.popups, autoridade: !!wb.autoridade,
-      ofertas, sim
+      ofertas, sim, agenda: wbProximaSessao(wb, Date.now()), server_now: Date.now()
     };
   }
 
@@ -8252,7 +8338,10 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   app.get('/w-api/:slug/chat', (req: any, res: any) => {
     try {
       const slug = String(req.params.slug);
-      const rows = db.prepare(`SELECT id,nome,texto,origem,criado_em FROM webinario_chat WHERE slug=? ORDER BY criado_em DESC LIMIT 60`).all(slug) as any[];
+      const desde = String((req.query && req.query.desde) || '');
+      const rows = (desde
+        ? db.prepare(`SELECT id,nome,texto,origem,criado_em FROM webinario_chat WHERE slug=? AND criado_em>=? ORDER BY criado_em DESC LIMIT 60`).all(slug, desde)
+        : db.prepare(`SELECT id,nome,texto,origem,criado_em FROM webinario_chat WHERE slug=? ORDER BY criado_em DESC LIMIT 60`).all(slug)) as any[];
       res.json({ ok: true, mensagens: rows.reverse() });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
@@ -8346,6 +8435,33 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       res.json({ ok: true, comentarios: coment });
     } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
   });
+  // [evergreen] CONFIG da agenda do webinário (app, x-api-key)
+  app.get('/webinarios/:slug/agenda', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).json({ ok: false });
+      const row = wbAgendaGet(wb.slug);
+      let horarios: any[] = []; try { horarios = JSON.parse((row && row.horarios_json) || '[]'); } catch { horarios = []; }
+      res.json({ ok: true, agenda: {
+        tipo: (row && row.tipo) || 'aberto', intervalo: (row && Number(row.intervalo)) || 15, janela: (row && Number(row.janela)) || 5,
+        horarios, duracao_seg: (row && Number(row.duracao_seg)) || 0
+      }, exemplo: wbProximaSessao(wb, Date.now()) });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/webinarios/:slug/agenda', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).json({ ok: false });
+      const b = req.body || {};
+      const tipo = ['aberto', 'jit', 'diario'].includes(String(b.tipo)) ? String(b.tipo) : 'aberto';
+      const intervalo = Math.max(1, Math.min(240, Math.round(Number(b.intervalo) || 15)));
+      const janela = Math.max(0, Math.min(120, Math.round(Number(b.janela) || 5)));
+      const duracao = Math.max(0, Math.min(86400, Math.round(Number(b.duracao_seg) || 0)));
+      const horarios = (Array.isArray(b.horarios) ? b.horarios : []).map((h: any) => String(h || '').trim()).filter((h: string) => /^\d{1,2}:\d{2}$/.test(h)).slice(0, 24);
+      db.prepare(`INSERT INTO webinario_agenda(slug,tipo,intervalo,janela,horarios_json,duracao_seg,atualizado_em) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(slug) DO UPDATE SET tipo=excluded.tipo,intervalo=excluded.intervalo,janela=excluded.janela,horarios_json=excluded.horarios_json,duracao_seg=excluded.duracao_seg,atualizado_em=excluded.atualizado_em`)
+        .run(wb.slug, tipo, intervalo, janela, JSON.stringify(horarios), duracao, agora());
+      res.json({ ok: true, exemplo: wbProximaSessao(wb, Date.now()) });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
   // vendas REAIS recentes (pros popups) — da tabela transacoes, só primeiro nome
   app.get('/w-api/:slug/vendas', (req: any, res: any) => {
     try {
@@ -8374,25 +8490,38 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   var cfg=CFG, slug=SLUG;
   var sessao='s-'+Math.random().toString(36).slice(2)+Date.now().toString(36);
   var lead=''; try{ lead=new URLSearchParams(location.search).get('lead')||''; }catch(e){}
+  var AG=cfg.agenda||{tipo:'aberto',estado:'ao_vivo',inicio_ms:Date.now(),fim_ms:0,duracao:0};
+  var EVG=!!(AG.tipo&&AG.tipo!=='aberto');
+  var _skew=(Number(cfg.server_now)||Date.now())-Date.now();
+  function snow(){ return Date.now()+_skew; }
+  var SS=Number(AG.inicio_ms)||Date.now(); var SF=Number(AG.fim_ms)||0;
+  function fase(){ if(!EVG){ return 'vivo'; } var n=snow(); if(n<SS){ return 'antes'; } if(SF&&n>=SF){ return 'depois'; } return 'vivo'; }
+  function fmtHMS(ms){ if(ms<0){ms=0;} var s=Math.floor(ms/1000); var h=Math.floor(s/3600); var m=Math.floor((s%3600)/60); var ss=s%60; function z(x){return (x<10?'0':'')+x;} return (h>0?(z(h)+':'):'')+z(m)+':'+z(ss); }
+  var _gateEl=null;
+  function gate(html,btn,onbtn){ var v=document.getElementById('vid'); if(!v){return;} if(!_gateEl){ _gateEl=document.createElement('div'); _gateEl.className='gate'; v.appendChild(_gateEl); } _gateEl.innerHTML=''; var d=document.createElement('div'); d.className='gi'; d.innerHTML=html; _gateEl.appendChild(d); if(btn){ var b=document.createElement('button'); b.className='gbtn'; b.textContent=btn; b.onclick=onbtn; _gateEl.appendChild(b); } _gateEl.style.display='flex'; }
+  function gateOff(){ if(_gateEl){ _gateEl.style.display='none'; _gateEl.innerHTML=''; } }
   var vid=document.getElementById('vid'); var videoEl=null;
   function ytId(u){ u=String(u||''); var keys=['v=','youtu.be/','embed/','live/','shorts/']; for(var i=0;i<keys.length;i++){ var k=keys[i]; var p=u.indexOf(k); if(p>=0){ var rest=u.slice(p+k.length); var id=''; for(var j=0;j<rest.length;j++){ var ch=rest[j]; if((ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch==='_'||ch==='-'){ id+=ch; } else { break; } } if(id.length>=6){ return id; } } } return ''; }
-  if(cfg.modo===1 && cfg.video_url){
+  function montarPlayer(){ if(cfg.modo===1 && cfg.video_url){
     videoEl=document.createElement('video'); videoEl.src=cfg.video_url; videoEl.controls=true; videoEl.playsInline=true; videoEl.autoplay=true;
     videoEl.controlsList='nodownload noplaybackrate noremoteplayback'; videoEl.setAttribute('controlsList','nodownload noplaybackrate noremoteplayback');
     videoEl.disablePictureInPicture=true; videoEl.setAttribute('disablePictureInPicture',''); videoEl.disableRemotePlayback=true;
     videoEl.oncontextmenu=function(){return false;};
     vid.appendChild(videoEl);
+    if(EVG){ videoEl.addEventListener('loadedmetadata',function(){ try{ var pp=Math.max(0,(snow()-SS)/1000); if(videoEl.duration&&pp<videoEl.duration){ videoEl.currentTime=pp; } }catch(e){} }); videoEl.addEventListener('seeking',function(){ try{ var mx=Math.max(0,(snow()-SS)/1000); if(videoEl.currentTime>mx+2){ videoEl.currentTime=mx; } }catch(e){} }); }
   } else {
     var yid=ytId(cfg.youtube_url);
     if(yid){
-      var ifr=document.createElement('iframe'); ifr.src='https://www.youtube.com/embed/'+yid+'?autoplay=1&rel=0&modestbranding=1&playsinline=1';
+      var ifr=document.createElement('iframe'); ifr.src='https://www.youtube.com/embed/'+yid+'?autoplay=1&rel=0&modestbranding=1&playsinline=1'+(EVG?('&start='+Math.max(0,Math.floor((snow()-SS)/1000))):'');
       ifr.allow='autoplay; encrypted-media; picture-in-picture'; ifr.allowFullscreen=true; vid.appendChild(ifr);
       if(cfg.modo===2 && cfg.mascara){ var mk=document.createElement('div'); mk.className='mask'; vid.appendChild(mk); }
     } else { vid.innerHTML='<div style="position:absolute;inset:0;display:grid;place-items:center;color:#9aa3b2">Configure o vídeo do webinário.</div>'; }
   }
+  }
+  if(fase()!=='antes'){ montarPlayer(); }
   if(cfg.autoridade){ var au=document.getElementById('auth'); if(au){ au.style.display='block'; } }
-  var t0=Date.now();
-  function elapsed(){ return Math.floor((Date.now()-t0)/1000); }
+  var t0=EVG?SS:Date.now();
+  function elapsed(){ return Math.max(0,Math.floor((snow()-t0)/1000)); }
   function pct(){ if(videoEl && videoEl.duration){ return Math.min(100, Math.floor(videoEl.currentTime/videoEl.duration*100)); } return Math.min(100, Math.floor(elapsed()/36)); }
   // [sim] contador simulado (por webinario) — some se cfg.sim for null
   var simOn=!!cfg.sim; var simV=simOn?(Number(cfg.sim.vInicial)||Number(cfg.sim.vMin)||0):0; var realOnline=0;
@@ -8421,14 +8550,23 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
     if(perto){ chat.scrollTop=chat.scrollHeight; }
   }
   function renderChat(ms){ ultServer=ms||[]; desenhar(); }
-  function loadChat(){ fetch('/w-api/'+slug+'/chat').then(function(r){return r.json();}).then(function(d){ if(d&&d.ok){renderChat(d.mensagens||[]);} }).catch(function(){}); }
-  if(cfg.chat_real){ loadChat(); setInterval(loadChat, 3000); } else { var cbx=document.getElementById('cbox'); if(cbx){cbx.style.display='none';} }
+  function loadChat(){ fetch('/w-api/'+slug+'/chat'+(EVG?('?desde='+encodeURIComponent(new Date(SS).toISOString())):'')).then(function(r){return r.json();}).then(function(d){ if(d&&d.ok){renderChat(d.mensagens||[]);} }).catch(function(){}); }
+  if(cfg.chat_real){ loadChat(); setInterval(loadChat, 3000); } else { var cbx=document.getElementById('cbox'); if(cbx){cbx.style.display='none';} var cnm=document.getElementById('cn'); if(cnm){cnm.style.display='none';} }
   if(simOn){ desenhar(); setInterval(desenhar, 1500); }
   var ci=document.getElementById('ci'), cbtn=document.getElementById('cb');
-  function askName(){ var n=''; try{ n=localStorage.getItem('wb_nome'); }catch(e){} if(!n){ n=prompt('Seu nome pro chat:')||'Visitante'; try{localStorage.setItem('wb_nome',n);}catch(e){} } return n; }
+  function askName(){ var el=document.getElementById('cn'); var n=(el&&el.value||'').trim(); if(!n){ try{ n=localStorage.getItem('wb_nome')||''; }catch(e){} } n=(n||'Visitante').slice(0,40); try{ localStorage.setItem('wb_nome',n); }catch(e){} return n; }
+  (function(){ var el=document.getElementById('cn'); if(el){ try{ var sv=localStorage.getItem('wb_nome'); if(sv){ el.value=sv; } }catch(e){} } })();
   function send(){ var tx=(ci.value||'').trim(); if(!tx){return;} ci.value='';
     fetch('/w-api/'+slug+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nome:askName(),texto:tx,sessao:sessao})}).then(function(){ setTimeout(loadChat,400); }).catch(function(){}); }
   if(cbtn){cbtn.onclick=send;} if(ci){ci.addEventListener('keydown',function(e){ if(e.key==='Enter'){send();} });}
+  if(EVG){
+    function tickEvg(){ var f=fase();
+      if(f==='antes'){ gate('<div class="gt">A sessao comeca em</div><div class="gc">'+fmtHMS(SS-snow())+'</div><div class="gs">Fique nesta pagina - comeca automaticamente.</div>'); if(snow()>=SS){ location.reload(); } }
+      else if(f==='depois'){ gate('<div class="gt">Esta sessao encerrou</div><div class="gs">Entre na proxima sessao pra assistir do inicio.</div>','Entrar na proxima sessao',function(){ location.reload(); }); }
+      else { gateOff(); }
+    }
+    tickEvg(); setInterval(tickEvg,1000);
+  }
   var vIdx=0;
   function showPop(txt){ var p=document.createElement('div'); p.className='pop'; p.textContent=txt; document.body.appendChild(p); setTimeout(function(){ if(p&&p.parentNode){p.parentNode.removeChild(p);} }, 7000); }
   function loadVendas(){ if(!cfg.popups){return;} fetch('/w-api/'+slug+'/vendas').then(function(r){return r.json();}).then(function(d){ if(!d||!d.ok||!d.vendas||!d.vendas.length){return;} var v=d.vendas[vIdx%d.vendas.length]; vIdx++; showPop(v.nome+' acabou de garantir'+(v.produto?(': '+v.produto):'')+' ✅'); }).catch(function(){}); }
@@ -8469,6 +8607,8 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       + '.side{flex:1 1 auto;height:auto;min-height:0}'
       + '.offer{margin:8px 0 0}.offer:empty{display:none}.banner{padding:12px}}'
       + '.vid{position:relative;background:#000;border-radius:14px;overflow:hidden;aspect-ratio:16/9}'
+      + '.gate{position:absolute;inset:0;background:rgba(10,12,18,.93);display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:18px;z-index:25}'
+      + '.gate .gi{max-width:440px}.gate .gt{font-size:15px;color:var(--mut)}.gate .gc{font-size:46px;font-weight:800;margin:6px 0;letter-spacing:1px}.gate .gs{font-size:13px;color:var(--mut);margin-top:8px}.gbtn{margin-top:16px;background:var(--ac);color:#fff;border:0;border-radius:999px;padding:12px 24px;font-weight:700;font-size:15px;cursor:pointer}'
       + '.vid iframe,.vid video{position:absolute;inset:0;width:100%;height:100%;border:0}'
       + '.mask{position:absolute;inset:0;z-index:5}'
       + '.top{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}'
@@ -8483,6 +8623,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       + '.cbox{display:flex;gap:6px;padding:10px;border-top:1px solid var(--bd)}'
       + '.cbox input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--bd);border-radius:9px;color:var(--fg);padding:9px 10px;font-size:13px}'
       + '.cbox button{background:var(--ac);border:0;color:#fff;border-radius:9px;padding:9px 13px;font-weight:600;cursor:pointer}'
+      + '.cname{margin:0 10px 0;background:var(--bg);border:1px solid var(--bd);border-radius:9px;color:var(--fg);padding:8px 10px;font-size:13px}'
       + '.pop{position:fixed;left:14px;bottom:14px;background:var(--card);border:1px solid var(--bd);border-left:3px solid var(--ok);border-radius:11px;padding:11px 14px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.4);z-index:40;max-width:300px}'
       + '.reofe{position:fixed;right:14px;bottom:14px;z-index:46;background:var(--ac);color:#fff;border:0;border-radius:999px;padding:12px 18px;font-weight:700;font-size:14px;box-shadow:0 10px 30px rgba(124,108,240,.5);cursor:pointer;animation:pulse 1.8s infinite}'
       + '@media(max-width:860px){.reofe{bottom:64px;right:10px;padding:10px 15px;font-size:13px}}'
@@ -8508,7 +8649,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       + '<div class="offer" id="offer"></div>'
       + '<div class="auth" id="auth" style="display:none">+3.200 músicos já passaram pela escola · depoimentos reais</div>'
       + '</div><div class="side"><h3>💬 Chat ao vivo</h3><div class="chat" id="chat"></div>'
-      + '<div class="cbox" id="cbox"><input id="ci" maxlength="400" placeholder="Escreva no chat..."><button id="cb">Enviar</button></div></div></div>'
+      + '<input id="cn" class="cname" maxlength="40" placeholder="Seu nome (pra aparecer no chat)"><div class="cbox" id="cbox"><input id="ci" maxlength="400" placeholder="Escreva no chat..."><button id="cb">Enviar</button></div></div></div>'
       + '<script>var CFG=' + cfgJson + ';var SLUG=' + JSON.stringify(slug) + ';</script>'
       + '<script>' + WB_ROOM_JS + '</script></body></html>';
   }
@@ -9967,5 +10108,1381 @@ app.post('/editor/limpar-audio', _editorAcao);
   });
 }
 // ===================== FIM DO LOTE A =====================
+
+// ===================================================================================
+// LOTE B — ACADEMY: ÁREA DE MEMBROS (clone fiel da Cademí) + BACKEND COMPLETO.
+// ADITIVO. Inserido antes do app.listen. Reaproveita: db, app, agora(), randomUUID,
+// esc(), _ndOk/_ndErr/_ndJson, createHash, PUBLIC_BASE_URL, pubFlag/setPubFlag.
+// Área do aluno é PÚBLICA (exempta de x-api-key) e tem auth PRÓPRIA por cookie de sessão.
+// Admin usa x-api-key como o resto do /academy/*. Nada aqui apaga/altera dados existentes.
+// Fases cobertas: 0 (modelo de dados), 1 (área do aluno), 2 (jornada+dúvidas+ranking), 3 (admin).
+// ===================================================================================
+
+// ---------- [B.0] Schema novo (add-only) ----------
+db.exec(`CREATE TABLE IF NOT EXISTS academy_vitrines (
+  id TEXT PRIMARY KEY, nome TEXT, ordem INTEGER DEFAULT 0, listada INTEGER DEFAULT 1, cor TEXT, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_acesso (
+  id TEXT PRIMARY KEY, aluno_id TEXT, alvo_tipo TEXT, alvo_id TEXT, validade TEXT, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_sessoes (
+  token TEXT PRIMARY KEY, aluno_id TEXT, dispositivo TEXT, criado_em TEXT, expira_em TEXT, ultimo_uso TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_progresso (
+  aluno_id TEXT, aula_id TEXT, curso_id TEXT, visto INTEGER DEFAULT 0, pct INTEGER DEFAULT 0,
+  pos_seg INTEGER DEFAULT 0, atualizado_em TEXT, PRIMARY KEY(aluno_id, aula_id)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_logs (
+  id TEXT PRIMARY KEY, aluno_id TEXT, tipo TEXT, detalhe TEXT, ts TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_perguntas (
+  id TEXT PRIMARY KEY, aluno_id TEXT, aula_id TEXT, curso_id TEXT, texto TEXT,
+  status TEXT DEFAULT 'pendente', resposta TEXT, resposta_publica INTEGER DEFAULT 0,
+  fixada INTEGER DEFAULT 0, anexos TEXT, criado_em TEXT, respondido_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_comentarios (
+  id TEXT PRIMARY KEY, aluno_id TEXT, aula_id TEXT, texto TEXT, aprovado INTEGER DEFAULT 0, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_pontos (
+  id TEXT PRIMARY KEY, aluno_id TEXT, acao TEXT, pontos INTEGER, ref TEXT, ts TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_gamificacao (
+  id INTEGER PRIMARY KEY, exibir INTEGER DEFAULT 0, perfil TEXT DEFAULT 'equilibrado', regras TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_banners (
+  id TEXT PRIMARY KEY, nome TEXT, imagem TEXT, link TEXT, status TEXT DEFAULT 'rascunho', ordem INTEGER DEFAULT 0, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_tags ( id TEXT PRIMARY KEY, nome TEXT, cor TEXT )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_aluno_tags ( aluno_id TEXT, tag_id TEXT, PRIMARY KEY(aluno_id, tag_id) )`);
+
+// add-only em tabelas já existentes
+const _acAlter = (sql: string) => { try { db.exec(sql); } catch { /* coluna já existe */ } };
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN vitrine_id TEXT`);
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN capa TEXT`);
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN subtitulo TEXT`);
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN ordem INTEGER`);
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN checkout_url TEXT`);
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN duvida_modo TEXT`);   // professor | ia | off
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN tipo TEXT`);           // video | material
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN descricao TEXT`);
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN duracao_seg INTEGER`);
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN anexos TEXT`);         // json [{nome,url,tamanho}]
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN curso_id TEXT`);       // desnormalizado p/ consulta rápida
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_hash TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN token_login TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN avatar TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN telefone TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN cpf TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN endereco TEXT`);  // json
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN pontos INTEGER`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN dias_consecutivos INTEGER`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN ultimo_dia TEXT`);
+// semente da config de gamificação (perfil Equilibrado) se vazia
+try {
+  const g = db.prepare(`SELECT id FROM academy_gamificacao WHERE id=1`).get();
+  if (!g) {
+    const regras = { comentario: 5, duvida: 5, iniciou: 2, concluiu_aula: 10, pct50: 10, pct75: 15, pct90: 20, prova: 30, concluiu_curso: 50, certificado: 25 };
+    db.prepare(`INSERT INTO academy_gamificacao (id,exibir,perfil,regras) VALUES (1,0,'equilibrado',?)`).run(JSON.stringify(regras));
+  }
+} catch { /* ok */ }
+
+// ---------- [B.1] Helpers de auth / aluno ----------
+const AC_SALT = pubFlag('academy_salt', '') || (() => { const s = randomUUID(); try { setPubFlag('academy_salt', s); } catch {} return s; })();
+const _acHash = (senha: string): string => createHash('sha256').update(String(senha || '') + ':' + AC_SALT).digest('hex');
+const _acToken = (): string => (randomUUID() + randomUUID()).replace(/-/g, '');
+const _acCookie = (req: any, nome: string): string => {
+  const raw = String(req.headers.cookie || '');
+  const m = raw.match(new RegExp('(?:^|; )' + nome + '=([^;]+)'));
+  return m ? decodeURIComponent(m[1]) : '';
+};
+const _acSetSession = (res: any, alunoId: string, req: any) => {
+  const token = _acToken();
+  const exp = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString(); // 1 ano = login persistente
+  db.prepare(`INSERT INTO academy_sessoes (token,aluno_id,dispositivo,criado_em,expira_em,ultimo_uso) VALUES (?,?,?,?,?,?)`)
+    .run(token, alunoId, String((req && req.headers && req.headers['user-agent']) || '').slice(0, 120), agora(), exp, agora());
+  res.setHeader('Set-Cookie', 'ac_sess=' + token + '; Path=/area; Max-Age=31536000; HttpOnly; SameSite=Lax');
+  return token;
+};
+const _acAluno = (req: any): any => {
+  const token = _acCookie(req, 'ac_sess');
+  if (!token) return null;
+  const s = db.prepare(`SELECT * FROM academy_sessoes WHERE token=?`).get(token) as any;
+  if (!s) return null;
+  if (s.expira_em && s.expira_em < agora()) return null;
+  const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(s.aluno_id) as any;
+  if (!al) return null;
+  try { db.prepare(`UPDATE academy_sessoes SET ultimo_uso=? WHERE token=?`).run(agora(), token); } catch {}
+  return al;
+};
+const _acLog = (alunoId: string, tipo: string, detalhe = '') => {
+  try { db.prepare(`INSERT INTO academy_logs (id,aluno_id,tipo,detalhe,ts) VALUES (?,?,?,?,?)`).run(randomUUID(), alunoId, tipo, detalhe, agora()); } catch {}
+};
+const _acMarcarAcesso = (al: any) => {
+  try {
+    const hoje = new Date().toISOString().slice(0, 10);
+    const ont = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
+    let dias = Number(al.dias_consecutivos || 0);
+    if (al.ultimo_dia === hoje) { /* já contou hoje */ }
+    else if (al.ultimo_dia === ont) dias += 1;
+    else dias = 1;
+    db.prepare(`UPDATE academy_matriculas SET ultimo_acesso=?, ultimo_dia=?, dias_consecutivos=? WHERE id=?`).run(agora(), hoje, dias, al.id);
+  } catch {}
+};
+const _acPontuar = (alunoId: string, acao: string, ref = '') => {
+  try {
+    const g = db.prepare(`SELECT regras FROM academy_gamificacao WHERE id=1`).get() as any;
+    const regras = _ndJson(g && g.regras, {});
+    const pts = Number(regras[acao] || 0);
+    if (pts <= 0) return;
+    // evita pontuar 2x a mesma (acao,ref) por aluno
+    const ja = db.prepare(`SELECT 1 FROM academy_pontos WHERE aluno_id=? AND acao=? AND ref=?`).get(alunoId, acao, ref);
+    if (ja) return;
+    db.prepare(`INSERT INTO academy_pontos (id,aluno_id,acao,pontos,ref,ts) VALUES (?,?,?,?,?,?)`).run(randomUUID(), alunoId, acao, pts, ref, agora());
+    const tot = (db.prepare(`SELECT COALESCE(SUM(pontos),0) n FROM academy_pontos WHERE aluno_id=?`).get(alunoId) as any).n;
+    db.prepare(`UPDATE academy_matriculas SET pontos=? WHERE id=?`).run(tot, alunoId);
+  } catch {}
+};
+// acesso do aluno: tem acesso ao curso se há linha em academy_acesso (curso direto OU a vitrine do curso), válida
+const _acValida = (validade: string): boolean => {
+  if (!validade || validade === 'vitalicio') return true;
+  try { return validade >= new Date().toISOString().slice(0, 10); } catch { return false; }
+};
+const _acCursosDoAluno = (alunoId: string): Set<string> => {
+  const ok = new Set<string>();
+  try {
+    const acc = db.prepare(`SELECT alvo_tipo,alvo_id,validade FROM academy_acesso WHERE aluno_id=?`).all(alunoId) as any[];
+    const cursos = db.prepare(`SELECT id,vitrine_id FROM academy_cursos`).all() as any[];
+    for (const a of acc) {
+      if (!_acValida(a.validade)) continue;
+      if (a.alvo_tipo === 'curso') ok.add(a.alvo_id);
+      if (a.alvo_tipo === 'vitrine') for (const c of cursos) if (c.vitrine_id === a.alvo_id) ok.add(c.id);
+    }
+  } catch {}
+  return ok;
+};
+
+// ---------- [B.2] Tema / layout da área do aluno (M|R dark) ----------
+const _acCSS = `
+*{box-sizing:border-box}html,body{margin:0}
+body{background:#0a0a0c;color:#ececf0;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+.top{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:22px;height:58px;padding:0 20px;background:#0c0c10;border-bottom:1px solid #1c1c24}
+.top .logo{font-weight:800;letter-spacing:.06em;color:#e7c86a;font-size:20px}
+.top nav{display:flex;gap:18px;font-size:14px;color:#cfcfd8}
+.top nav a.on,.top nav a:hover{color:#fff}
+.top .sp{flex:1}
+.top .ic{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;color:#cfcfd8;cursor:pointer}
+.av{width:34px;height:34px;border-radius:50%;background:#2a2a36;display:grid;place-items:center;font-weight:700;color:#e7c86a;cursor:pointer;position:relative}
+.menu{position:absolute;right:0;top:44px;background:#15151c;border:1px solid #26262f;border-radius:12px;min-width:210px;padding:6px;display:none;box-shadow:0 18px 40px #000a}
+.menu.open{display:block}
+.menu a{display:block;padding:9px 12px;border-radius:8px;font-size:14px;color:#dcdce4}
+.menu a:hover{background:#20202a}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px 60px}
+.hero{position:relative;height:300px;border-radius:0;overflow:hidden;margin-bottom:10px}
+.hero .bg{position:absolute;inset:0;background-size:cover;background-position:center;filter:brightness(.55)}
+.hero .ov{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 clamp(20px,6vw,70px);max-width:720px}
+.hero h1{font-size:clamp(22px,4vw,34px);margin:.1em 0}
+.hero p{color:#d7d7df;max-width:48ch}
+.shelf{margin:26px 0}
+.shelf h2{font-size:15px;color:#bdbdc8;font-weight:600;margin:0 0 12px}
+.rail{display:flex;gap:14px;overflow-x:auto;padding-bottom:6px;scrollbar-width:thin}
+.card{flex:0 0 172px;width:172px}
+.card .pz{position:relative;width:172px;height:244px;border-radius:10px;overflow:hidden;background:#17171f;border:1px solid #23232c}
+.card .pz img{width:100%;height:100%;object-fit:cover;display:block}
+.card .pz .lock{position:absolute;inset:0;display:grid;place-items:center;background:#000000a8;font-size:30px}
+.card .pz .pb{position:absolute;left:0;right:0;bottom:0;height:4px;background:#ffffff22}
+.card .pz .pb i{display:block;height:100%;background:#e7c86a}
+.card .nm{font-size:13px;color:#cfcfd8;margin-top:7px;line-height:1.35}
+.btn{display:inline-block;border:0;border-radius:9px;padding:11px 18px;font-weight:700;font-size:14px;cursor:pointer}
+.btn-l{background:#fff;color:#111}
+.btn-g{background:#e7c86a;color:#201a08}
+.btn-ghost{background:#1c1c24;color:#ececf0;border:1px solid #2a2a34}
+.coverhero{position:relative;min-height:320px;display:flex;align-items:flex-end;border-radius:14px;overflow:hidden;margin:18px 0}
+.coverhero .bg{position:absolute;inset:0;background-size:cover;background-position:center;filter:brightness(.5)}
+.coverhero .in{position:relative;padding:28px;max-width:640px}
+.coverhero h1{font-size:clamp(22px,3.5vw,32px);margin:.1em 0}
+.coverhero .meta{color:#c6c6d0;font-size:14px;margin-bottom:14px}
+.layoutaula{display:grid;grid-template-columns:1fr 340px;gap:22px;align-items:start}
+.player{width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid #1c1c24}
+.player iframe{width:100%;height:100%;border:0;display:block}
+.aulahead{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:16px 0}
+.aulahead h1{font-size:20px;margin:0;flex:1 1 260px}
+.pill{display:inline-flex;align-items:center;gap:6px;background:#1c1c24;border:1px solid #2a2a34;border-radius:999px;padding:8px 13px;font-size:13px;color:#dcdce4;cursor:pointer}
+.pill.on{background:#143d27;border-color:#1e7a46;color:#9ff0c0}
+.anexo{display:flex;align-items:center;gap:12px;background:#15151c;border:1px solid #23232c;border-radius:10px;padding:12px 14px;margin:8px 0}
+.tree{background:#13131a;border:1px solid #23232c;border-radius:12px;overflow:hidden}
+.tree .mod{padding:13px 15px;border-bottom:1px solid #20202a;font-weight:600;font-size:14px}
+.tree .au{display:flex;gap:10px;align-items:center;padding:10px 15px 10px 18px;border-bottom:1px solid #1a1a22;font-size:13.3px;color:#cfcfd8}
+.tree .au.on{background:#1a1a22;color:#fff}
+.tree .au .dot{width:16px;height:16px;border-radius:50%;border:2px solid #44444f;flex:none}
+.tree .au .dot.done{background:#2ecc71;border-color:#2ecc71}
+.tree .au .dot.half{background:conic-gradient(#e7c86a 50%,#44444f 0)}
+.card2{background:#13131a;border:1px solid #23232c;border-radius:12px;padding:18px}
+.fld{width:100%;background:#0e0e14;border:1px solid #2a2a34;border-radius:9px;padding:11px 13px;color:#ececf0;font-size:14px}
+label{display:block;font-size:12.5px;color:#aeaeba;margin:12px 0 5px}
+.rank{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid #1c1c24}
+.rank .pos{width:26px;text-align:center;font-weight:800;color:#e7c86a}
+.rank .pt{margin-left:auto;font-weight:700}
+.fab{position:fixed;right:18px;bottom:18px;background:#e7c86a;color:#201a08;border:0;border-radius:999px;padding:12px 18px;font-weight:700;cursor:pointer;box-shadow:0 10px 30px #0008}
+.modal{position:fixed;inset:0;background:#000a;display:none;z-index:60;align-items:center;justify-content:center;padding:18px}
+.modal.open{display:flex}
+.modal .bx{background:#15151c;border:1px solid #26262f;border-radius:14px;max-width:480px;width:100%;padding:22px}
+@media(max-width:820px){.layoutaula{grid-template-columns:1fr}.top nav{display:none}}
+html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big .card .nm{font-size:15px}html.ac-big .btn,html.ac-big .pill{font-size:16px}html.ac-big .tree .au{font-size:15px}html.ac-big h1{font-size:clamp(24px,5vw,36px)}
+.adov{position:absolute;inset:0;background:#000;display:flex;flex-direction:column;z-index:5}.adov iframe{flex:1;width:100%;border:0}.adbar{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0c0c10;border-top:1px solid #1c1c24;font-size:13px;color:#cfcfd8}.adcta{position:absolute;top:12px;right:12px;background:#e7c86a;color:#201a08;padding:8px 14px;border-radius:8px;font-weight:700;font-size:13px}.adfx{position:absolute;left:0;right:0;bottom:0;z-index:6;display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0c0c10e8;border-top:1px solid #e7c86a;font-size:13px}.dmark{position:absolute;right:10px;top:10px;z-index:4;color:#ffffff40;font-size:11px;pointer-events:none;text-shadow:0 1px 2px #0008}.card.locked .nm{color:#8a8a96}.lock .unlock{display:block;font-size:11px;color:#e7c86a;margin-top:4px;font-weight:700}.cattile{flex:0 0 200px;height:96px;border-radius:12px;background:linear-gradient(135deg,#1b1b24,#23232e);border:1px solid #2a2a34;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#e7c86a;text-align:center;padding:0 12px}.cattile:hover{border-color:#e7c86a}.popov{position:fixed;inset:0;z-index:70;background:#000b;display:flex;align-items:center;justify-content:center;padding:18px}.pop{position:relative;background:#15151c;border:1px solid #26262f;border-radius:14px;padding:16px;width:100%}.popx{position:absolute;top:8px;right:8px;width:34px;height:34px;border-radius:50%;border:0;background:#0009;color:#fff;font-size:16px;cursor:pointer;z-index:2}.metp{display:none;position:fixed;right:18px;bottom:120px;z-index:50;background:#15151c;border:1px solid #26262f;border-radius:12px;padding:14px;width:240px;box-shadow:0 12px 30px #0008}
+`;
+const _acTop = (al: any, aba = ''): string => {
+  const ini = esc(String(al && al.nome || 'A').trim().charAt(0).toUpperCase() || 'A');
+  const impers = ''; // (admin "entrar como aluno" poderia injetar "voltar"); mantido simples
+  return `<div class="top"><a class="logo" href="/area">M|R</a>
+    <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
+    <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a></nav>
+    <div class="sp"></div>
+    <div class="ic" title="Aumentar a letra" style="font-weight:800;width:auto;padding:0 10px;border:1px solid #2a2a34" onclick="acBig()">A+</div>
+    <div class="av" onclick="var m=document.getElementById('mn');m.classList.toggle('open')">${ini}
+      <div class="menu" id="mn">${impers}
+        <a href="/area/perfil">Perfil</a>
+        <a href="/area/ranking">Ranking</a>
+        <a href="/area/favoritos">Favoritas</a>
+        <a href="/area/duvidas">Dúvidas</a>
+        <a href="/area/comentarios">Comentários</a>
+        <a href="/area/faq">FAQ</a>
+        <a href="/area/logout">Sair</a>
+      </div>
+    </div></div>`;
+};
+const _acPage = (al: any, titulo: string, corpo: string, aba = '', extraHead = ''): string =>
+  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+  + '<title>' + esc(titulo) + ' — Melodias e Riffs</title><link rel="manifest" href="/area/manifest.webmanifest"><meta name="theme-color" content="#0a0a0c"><style>' + _acCSS + '</style>' + extraHead + '<script>function acBig(){try{var h=document.documentElement;h.classList.toggle("ac-big");localStorage.setItem("ac_big",h.classList.contains("ac-big")?"1":"0");}catch(e){}}try{if(localStorage.getItem("ac_big")==="1")document.documentElement.classList.add("ac-big");}catch(e){}if("serviceWorker" in navigator){navigator.serviceWorker.register("/area/sw.js").catch(function(){});}</script></head><body>'
+  + _acTop(al, aba) + corpo + '</body></html>';
+
+// ---------- [B.3] Login / magic link / logout ----------
+const _acLoginHtml = (erro = ''): string =>
+  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — Melodias e Riffs</title><style>' + _acCSS
+  + 'body{display:flex;align-items:center;justify-content:center;min-height:100vh}.bx{background:#13131a;border:1px solid #23232c;border-radius:16px;padding:30px;max-width:380px;width:100%}.lg{font-weight:800;color:#e7c86a;font-size:26px;letter-spacing:.06em;text-align:center;margin-bottom:6px}.sub{color:#aeaeba;text-align:center;margin-bottom:18px;font-size:14px}.er{background:#3a1620;border:1px solid #7a2238;color:#ffb3c0;border-radius:8px;padding:9px 12px;font-size:13px;margin-bottom:10px}</style></head><body>'
+  + '<form class="bx" method="post" action="/area/login"><div class="lg">M|R</div><div class="sub">Área do aluno</div>'
+  + (erro ? '<div class="er">' + esc(erro) + '</div>' : '')
+  + '<label>E-mail</label><input class="fld" name="email" type="email" required autofocus>'
+  + '<label>Senha</label><input class="fld" name="senha" type="password" required>'
+  + '<button class="btn btn-g" style="width:100%;margin-top:18px" type="submit">Entrar</button>'
+  + '<p style="color:#8a8a96;font-size:12.5px;text-align:center;margin-top:16px">Recebeu um link de acesso? É só clicar nele que você entra direto.</p>'
+  + '</form></body></html>';
+
+app.get('/area/login', (req: any, res: any) => {
+  if (_acAluno(req)) return res.redirect('/area');
+  res.type('html').send(_acLoginHtml(String(req.query.erro || '')));
+});
+app.post('/area/login', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const email = String(b.email || '').trim().toLowerCase();
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+    if (!al || !al.senha_hash || al.senha_hash !== _acHash(String(b.senha || ''))) {
+      return res.type('html').send(_acLoginHtml('E-mail ou senha incorretos.'));
+    }
+    _acSetSession(res, al.id, req);
+    _acMarcarAcesso(al); _acLog(al.id, 'login', 'senha');
+    res.redirect('/area');
+  } catch (e) { res.type('html').send(_acLoginHtml('Erro ao entrar. Tente de novo.')); }
+});
+// magic link: /area/entrar/:token  -> loga e fica conectado
+app.get('/area/entrar/:token', (req: any, res: any) => {
+  try {
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE token_login=?`).get(String(req.params.token)) as any;
+    if (!al) return res.redirect('/area/login?erro=' + encodeURIComponent('Link inválido ou expirado.'));
+    _acSetSession(res, al.id, req);
+    _acMarcarAcesso(al);
+    const primeiro = !al.senha_hash;
+    _acLog(al.id, primeiro ? 'primeiro_acesso' : 'login', 'magiclink');
+    res.redirect('/area');
+  } catch (e) { res.redirect('/area/login'); }
+});
+app.get('/area/logout', (req: any, res: any) => {
+  try { const t = _acCookie(req, 'ac_sess'); if (t) db.prepare(`DELETE FROM academy_sessoes WHERE token=?`).run(t); } catch {}
+  res.setHeader('Set-Cookie', 'ac_sess=; Path=/area; Max-Age=0');
+  res.redirect('/area/login');
+});
+
+// ---------- [B.4] HOME do aluno (banner + prateleiras por vitrine) ----------
+app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
+  const al = _acAluno(req);
+  if (!al) return res.redirect('/area/login');
+  _acMarcarAcesso(al);
+  try {
+    const meus = _acCursosDoAluno(al.id);
+    const banner = db.prepare(`SELECT * FROM academy_banners WHERE status='publicado' AND (tipo IS NULL OR tipo='' OR tipo='hero') ORDER BY ordem LIMIT 1`).get() as any;
+    const vitrines = db.prepare(`SELECT * FROM academy_vitrines ORDER BY ordem, nome`).all() as any[];
+    const cursos = db.prepare(`SELECT * FROM academy_cursos ORDER BY ordem, criado_em`).all() as any[];
+    // progresso p/ barra do card
+    const prog = db.prepare(`SELECT curso_id, AVG(pct) p FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id) as any[];
+    const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
+
+    let hero = '';
+    if (banner) {
+      hero = `<div class="hero"><div class="bg" style="background-image:url('${esc(banner.imagem || '')}')"></div>
+        <div class="ov"><h1>${esc(banner.nome || '')}</h1>${banner.link ? `<div style="margin-top:14px"><a class="btn btn-g" href="${esc(banner.link)}" target="_blank">Saber mais</a></div>` : ''}</div></div>`;
+    }
+    const cardHtml = (c: any): string => _acCardCurso(c, meus, pmap);
+    const emAndamento = cursos.filter((c) => meus.has(c.id) && (pmap[c.id] || 0) > 0 && (pmap[c.id] || 0) < 100);
+    const cats: string[] = []; for (const v of vitrines) { const ct = String(v.categoria || '').trim(); if (ct && !cats.includes(ct)) cats.push(ct); }
+    let shelves = '';
+    if (emAndamento.length) shelves += `<div class="shelf"><h2>Continuar assistindo</h2><div class="rail">${emAndamento.map(cardHtml).join('')}</div></div>`;
+    const novos = cursos.filter((c) => c.criado_em && c.criado_em >= new Date(Date.now() - 30 * 864e5).toISOString());
+    if (novos.length) shelves += `<div class="shelf"><h2>✨ Novidades</h2><div class="rail">${novos.map(cardHtml).join('')}</div></div>`;
+    const _catMeta = _acCatMeta();
+    if (cats.length) shelves += `<div class="shelf"><h2>Categorias</h2><div class="rail">` + cats.map((ct) => _acCatTile(ct, _catMeta)).join('') + `</div></div>`;
+    for (const v of vitrines) {
+      if (cats.length && String(v.categoria || '').trim()) continue; // categorizadas vão pra página da categoria
+      const doV = cursos.filter((c) => c.vitrine_id === v.id);
+      if (!doV.length) continue;
+      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map(cardHtml).join('')}</div></div>`;
+    }
+    const semVit = cursos.filter((c) => !c.vitrine_id);
+    if (semVit.length) shelves += `<div class="shelf"><h2>Cursos</h2><div class="rail">${semVit.map(cardHtml).join('')}</div></div>`;
+    if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Seus cursos aparecerão aqui.</div>`;
+    const corpo = hero + `<div class="wrap">` + shelves + `</div>` + _acPopupHtml(al);
+    res.type('html').send(_acPage(al, 'Início', corpo, 'home'));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// ---------- [B.5] PÁGINA DO CURSO ----------
+app.get('/area/curso/:id', (req: any, res: any) => {
+  const al = _acAluno(req);
+  if (!al) return res.redirect('/area/login');
+  try {
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(String(req.params.id)) as any;
+    if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
+    if (!_acCursosDoAluno(al.id).has(curso.id)) {
+      return res.type('html').send(_acPage(al, curso.nome || 'Curso',
+        `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">Você ainda não tem acesso a este curso.${curso.checkout_url ? `<br><br><a class="btn btn-g" href="${esc(curso.checkout_url)}" target="_blank">Quero este curso</a>` : ''}</div></div>`));
+    }
+    const mods = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(curso.id) as any[];
+    const aulas = db.prepare(`SELECT * FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?) ORDER BY ordem`).all(curso.id, curso.id) as any[];
+    const prog = db.prepare(`SELECT aula_id,visto FROM academy_progresso WHERE aluno_id=? AND curso_id=?`).all(al.id, curso.id) as any[];
+    const vistos = new Set(prog.filter((p) => p.visto).map((p) => p.aula_id));
+    const nAulas = aulas.length;
+    const nFeitas = aulas.filter((a) => vistos.has(a.id)).length;
+    // "continuar de onde parei": 1a aula não vista (ou a 1a)
+    const prox = aulas.find((a) => !vistos.has(a.id)) || aulas[0];
+    const modCards = mods.map((m) => {
+      const aus = aulas.filter((a) => a.modulo_id === m.id);
+      return `<div class="card2" style="margin:10px 0"><div style="font-weight:700">${esc(m.nome || '')}</div><div style="color:#8a8a96;font-size:13px;margin-top:3px">${aus.length} aula${aus.length === 1 ? '' : 's'}</div></div>`;
+    }).join('');
+    const corpo = `<div class="wrap">
+      <div class="coverhero"><div class="bg" style="background-image:url('${esc(curso.capa || '')}')"></div>
+        <div class="in"><div class="meta">${mods.length} módulos · ${nAulas} aulas · ${nFeitas}/${nAulas} concluídas${_acTempoCursoHtml(al.id, curso.id)}</div>
+        <h1>${esc(curso.nome || '')}</h1>
+        ${prox ? `<a class="btn btn-l" href="/area/aula/${prox.id}">${nFeitas ? 'Continuar de onde parei' : 'Começar'}</a>` : ''}</div></div>
+      ${nAulas > 0 && nFeitas >= nAulas ? `<div class="card2" style="border:1px solid #e7c86a;margin-bottom:14px;display:flex;align-items:center;gap:12px"><span style="font-size:24px">\u{1F3C6}</span><div style="flex:1">Você concluiu este curso!</div><a class="btn btn-g" href="/area/certificado/${curso.id}">Ver certificado</a></div>` : ''}
+      <h2 style="font-size:15px;color:#bdbdc8">Módulos</h2>${modCards || '<div class="card2">Conteúdo em breve.</div>'}
+      ${(function(){try{var pv=db.prepare(`SELECT * FROM academy_provas WHERE curso_id=? ORDER BY criado_em`).all(curso.id);if(!pv.length)return '';return '<h2 style="font-size:15px;color:#bdbdc8;margin-top:18px">Provas</h2>'+pv.map(function(p){return `<a class="card2" style="display:flex;align-items:center;gap:10px;margin:8px 0" href="/area/prova/${p.id}">📝 <b>${esc(p.titulo||'Prova')}</b><span style="margin-left:auto;color:#8a8a96;font-size:12px">nota mín ${p.nota_minima}%</span></a>`;}).join('');}catch(e){return '';}})()}
+      </div>`;
+    _acLog(al.id, 'abriu_curso', curso.id);
+    res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// ---------- [B.6] PÁGINA DA AULA (player + visto + anterior/próximo + árvore + dúvida) ----------
+const _acPlayerHtml = (aula: any, curso: any, pos: number): string => {
+  const fonte = String(aula.video_fonte || 'youtube');
+  const ref = String(aula.video_ref || '');
+  if (fonte === 'vsl' && ref) {
+    return `<div class="player"><iframe src="${PUBLIC_BASE_URL}/v/${esc(ref)}" allow="autoplay; fullscreen" allowfullscreen></iframe></div>`;
+  }
+  // YouTube protegido (nocookie, sem relacionados, branding mínimo, origem travada)
+  const yid = ref.replace(/^https?:\/\/(www\.)?(youtu\.be\/|youtube\.com\/(watch\?v=|embed\/))?/, '').split(/[?&]/)[0];
+  const org = encodeURIComponent(PUBLIC_BASE_URL || '');
+  const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
+  return `<div class="player"><iframe src="https://www.youtube-nocookie.com/embed/${esc(yid)}?rel=0&modestbranding=1&playsinline=1&origin=${org}${start}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe></div>`;
+};
+app.get('/area/aula/:id', (req: any, res: any) => {
+  const al = _acAluno(req);
+  if (!al) return res.redirect('/area/login');
+  try {
+    const aula = db.prepare(`SELECT * FROM academy_aulas WHERE id=?`).get(String(req.params.id)) as any;
+    if (!aula) return res.status(404).type('html').send('Aula não encontrada.');
+    const mod = db.prepare(`SELECT * FROM academy_modulos WHERE id=?`).get(aula.modulo_id) as any;
+    const cursoId = aula.curso_id || (mod && mod.curso_id);
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(cursoId) as any;
+    if (!curso || !_acCursosDoAluno(al.id).has(curso.id)) return res.status(403).type('html').send('Sem acesso.');
+    const _lib = _acAulaLiberada(al, aula, curso);
+    if (!_lib.ok) return res.type('html').send(_acPage(al, aula.nome || 'Aula', `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">🔒 Esta aula ainda não foi liberada.<br>Libera em <b>${_lib.quando ? new Date(_lib.quando).toLocaleDateString('pt-BR') : ''}</b>.<br><br><a class="btn btn-ghost" href="/area/curso/${curso.id}">Voltar ao curso</a></div></div>`));
+
+    const mods = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(curso.id) as any[];
+    const aulas = db.prepare(`SELECT * FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?) ORDER BY ordem`).all(curso.id, curso.id) as any[];
+    const prog = db.prepare(`SELECT aula_id,visto,pos_seg FROM academy_progresso WHERE aluno_id=? AND curso_id=?`).all(al.id, curso.id) as any[];
+    const vmap: any = {}; for (const p of prog) vmap[p.aula_id] = p;
+    const idx = aulas.findIndex((a) => a.id === aula.id);
+    const ant = idx > 0 ? aulas[idx - 1] : null;
+    const prox = idx >= 0 && idx < aulas.length - 1 ? aulas[idx + 1] : null;
+    const visto = !!(vmap[aula.id] && vmap[aula.id].visto);
+    const isFav = !!db.prepare(`SELECT 1 FROM academy_favoritos WHERE aluno_id=? AND aula_id=?`).get(al.id, aula.id);
+    const pos = (vmap[aula.id] && vmap[aula.id].pos_seg) || 0;
+
+    // registra "iniciou" + progresso base
+    db.prepare(`INSERT INTO academy_progresso (aluno_id,aula_id,curso_id,visto,pct,pos_seg,atualizado_em) VALUES (?,?,?,COALESCE((SELECT visto FROM academy_progresso WHERE aluno_id=? AND aula_id=?),0),COALESCE((SELECT pct FROM academy_progresso WHERE aluno_id=? AND aula_id=?),0),COALESCE((SELECT pos_seg FROM academy_progresso WHERE aluno_id=? AND aula_id=?),0),?)
+      ON CONFLICT(aluno_id,aula_id) DO UPDATE SET atualizado_em=excluded.atualizado_em`)
+      .run(al.id, aula.id, curso.id, al.id, aula.id, al.id, aula.id, al.id, aula.id, agora());
+    _acPontuar(al.id, 'iniciou', aula.id);
+    _acLog(al.id, 'abriu_aula', aula.id);
+
+    // corpo da aula
+    const tipo = aula.tipo || (aula.video_ref ? 'video' : 'material');
+    let miolo = '';
+    if (tipo === 'video') miolo = _acPlayerComAnuncios(aula, curso, pos, al);
+    const anexos = _ndJson(aula.anexos, []) as any[];
+    const anexosHtml = anexos.length ? anexos.map((x: any) => `<a class="anexo" href="${esc(x.url || '#')}" target="_blank">📎 <span>${esc(x.nome || 'Arquivo')}</span>${x.tamanho ? `<span style="margin-left:auto;color:#8a8a96;font-size:12px">${esc(x.tamanho)}</span>` : ''}</a>`).join('') : '';
+    const desc = aula.descricao ? `<div class="card2" style="margin:14px 0;color:#d2d2dc">${esc(aula.descricao)}</div>` : '';
+    const _coms = db.prepare(`SELECT c.*, m.nome FROM academy_comentarios c LEFT JOIN academy_matriculas m ON m.id=c.aluno_id WHERE c.aula_id=? AND c.aprovado=1 ORDER BY c.criado_em DESC LIMIT 50`).all(aula.id) as any[];
+    const comentariosHtml = `<div class="card2" style="margin-top:16px"><div style="font-weight:700;margin-bottom:8px">Comentários</div>`
+      + `<textarea id="ctx" class="fld" rows="2" placeholder="Escreva um comentário..."></textarea>`
+      + `<div style="margin-top:8px"><button class="btn btn-ghost" onclick="acComentar('${aula.id}')">Comentar</button><span id="cok" style="display:none;color:#9ff0c0;margin-left:10px">✅ Enviado (em análise)</span></div>`
+      + (_coms.length ? _coms.map((c:any)=>`<div style="border-top:1px solid #1c1c24;padding:10px 0;font-size:13.5px"><b>${esc(c.nome||'Aluno')}</b><div style="color:#cfcfd8;margin-top:3px">${esc(c.texto||'')}</div></div>`).join('') : `<div style="color:#8a8a96;font-size:13px;margin-top:10px">Seja o primeiro a comentar.</div>`)
+      + `</div>`;
+
+    const tree = mods.map((m) => {
+      const aus = aulas.filter((a) => a.modulo_id === m.id);
+      const lis = aus.map((a) => {
+        const p = vmap[a.id];
+        const cls = p && p.visto ? 'done' : (p && p.pos_seg ? 'half' : '');
+        const _l = _acAulaLiberada(al, a, curso);
+        if (!_l.ok) return `<div class="au" style="opacity:.55"><span class="dot"></span><span>🔒 ${esc(a.nome || '')}</span></div>`;
+        return `<a class="au ${a.id === aula.id ? 'on' : ''}" href="/area/aula/${a.id}"><span class="dot ${cls}"></span><span>${esc(a.nome || '')}</span></a>`;
+      }).join('');
+      return `<div class="mod">${esc(m.nome || '')}</div>${lis}`;
+    }).join('');
+
+    const dmodo = curso.duvida_modo || 'professor';
+    const fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
+    const modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
+      <h3 style="margin:0 0 10px">Sua dúvida nesta aula</h3>
+      <textarea id="qtx" class="fld" rows="4" placeholder="Escreva sua dúvida..."></textarea>
+      <div style="display:flex;gap:10px;margin-top:14px"><button class="btn btn-ghost" onclick="document.getElementById('md').classList.remove('open')">Cancelar</button>
+      <button class="btn btn-g" onclick="acEnviarDuvida('${aula.id}','${curso.id}')">Enviar</button></div>
+      <div id="qok" style="display:none;color:#9ff0c0;margin-top:12px">✅ Dúvida enviada! O professor vai responder.</div>
+    </div></div>`;
+
+    const corpo = `<div class="wrap"><div style="color:#8a8a96;font-size:13px;margin:16px 0 4px"><a href="/area/curso/${curso.id}">${esc(curso.nome || '')}</a></div>
+      <div class="layoutaula">
+        <div>${miolo}
+          <div class="aulahead"><h1>${esc(aula.nome || '')}</h1>
+            <span class="pill ${isFav ? 'on' : ''}" id="fvpill" onclick="acFav('${aula.id}')">${isFav ? '★ Favorita' : '☆ Favoritar'}</span>
+            <span class="pill ${visto ? 'on' : ''}" id="vpill" onclick="acVisto('${aula.id}','${curso.id}')">${visto ? '✓ Concluída' : 'Marcar como vista'}</span>
+            ${ant ? `<a class="pill" href="/area/aula/${ant.id}">← Anterior</a>` : ''}
+            ${prox ? `<a class="pill" href="/area/aula/${prox.id}">Próximo →</a>` : ''}
+          </div>${desc}${anexosHtml}${comentariosHtml}
+        </div>
+        <div class="tree">${tree}</div>
+      </div></div>${fab}${modal}${_acMetronomo()}
+      <script>
+      async function acVisto(aula,curso){var p=document.getElementById('vpill');var on=p.classList.contains('on');
+        await fetch('/area/api/visto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:aula,curso:curso,visto:!on})});
+        if(on){p.classList.remove('on');p.textContent='Marcar como vista';}else{p.classList.add('on');p.textContent='✓ Concluída';}}
+      async function acEnviarDuvida(aula,curso){var t=document.getElementById('qtx').value.trim();if(!t)return;
+        await fetch('/area/api/pergunta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:aula,curso:curso,texto:t})});
+        document.getElementById('qtx').style.display='none';document.getElementById('qok').style.display='block';}
+      async function acComentar(aula){var t=document.getElementById('ctx').value.trim();if(!t)return;await fetch('/area/api/comentario',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:aula,texto:t})});document.getElementById('ctx').value='';document.getElementById('cok').style.display='inline';}
+      async function acFav(aula){var r=await fetch('/area/api/favoritar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:aula})});var j=await r.json();var p=document.getElementById('fvpill');if(p){if(j.fav){p.classList.add('on');p.textContent='★ Favorita';}else{p.classList.remove('on');p.textContent='☆ Favoritar';}}}
+      // heartbeat de progresso simples (posição estimada por tempo na página)
+      var _acS=0;setInterval(function(){_acS+=15;fetch('/area/api/progresso',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:'${aula.id}',curso:'${curso.id}',pos:_acS})});},15000);
+      </script>`;
+    res.type('html').send(_acPage(al, aula.nome || 'Aula', corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// ---------- [B.7] APIs do aluno (progresso / visto / pergunta / comentário / perfil / senha) ----------
+app.post('/area/api/visto', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {}; const visto = b.visto ? 1 : 0;
+    db.prepare(`INSERT INTO academy_progresso (aluno_id,aula_id,curso_id,visto,pct,pos_seg,atualizado_em) VALUES (?,?,?,?,?,0,?)
+      ON CONFLICT(aluno_id,aula_id) DO UPDATE SET visto=excluded.visto, pct=MAX(pct,excluded.pct), atualizado_em=excluded.atualizado_em`)
+      .run(al.id, b.aula, b.curso, visto, visto ? 100 : 0, agora());
+    if (visto) { _acPontuar(al.id, 'concluiu_aula', b.aula); _acLog(al.id, 'concluiu_aula', b.aula); _acChecaConclusaoCurso(al.id, b.curso); }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+app.post('/area/api/progresso', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {}; const pos = Number(b.pos || 0);
+    db.prepare(`INSERT INTO academy_progresso (aluno_id,aula_id,curso_id,visto,pct,pos_seg,atualizado_em) VALUES (?,?,?,0,0,?,?)
+      ON CONFLICT(aluno_id,aula_id) DO UPDATE SET pos_seg=MAX(pos_seg,excluded.pos_seg), atualizado_em=excluded.atualizado_em`)
+      .run(al.id, b.aula, b.curso, pos, agora());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+app.post('/area/api/pergunta', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {}; const id = randomUUID();
+    db.prepare(`INSERT INTO academy_perguntas (id,aluno_id,aula_id,curso_id,texto,status,criado_em) VALUES (?,?,?,?,?,'pendente',?)`)
+      .run(id, al.id, b.aula, b.curso, String(b.texto || '').slice(0, 2000), agora());
+    _acPontuar(al.id, 'duvida', id); _acLog(al.id, 'enviou_duvida', b.aula);
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+app.post('/area/api/comentario', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {}; const id = randomUUID();
+    db.prepare(`INSERT INTO academy_comentarios (id,aluno_id,aula_id,texto,aprovado,criado_em) VALUES (?,?,?,?,0,?)`).run(id, al.id, b.aula, String(b.texto || '').slice(0, 2000), agora());
+    _acPontuar(al.id, 'comentario', b.aula); _acLog(al.id, 'comentou', b.aula);
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+const _acChecaConclusaoCurso = (alunoId: string, cursoId: string) => {
+  try {
+    const tot = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(cursoId, cursoId) as any).n;
+    if (!tot) return;
+    const feitas = (db.prepare(`SELECT COUNT(*) n FROM academy_progresso WHERE aluno_id=? AND curso_id=? AND visto=1`).get(alunoId, cursoId) as any).n;
+    if (feitas >= tot) { _acPontuar(alunoId, 'concluiu_curso', cursoId); _acLog(alunoId, 'concluiu_curso', cursoId); }
+  } catch {}
+};
+
+// perfil do aluno
+app.get('/area/perfil', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const end = _ndJson(al.endereco, {}) as any;
+  const corpo = `<div class="wrap"><div style="display:grid;grid-template-columns:200px 1fr;gap:24px;margin-top:24px" class="perfilgrid">
+    <div class="card2"><div style="font-weight:700;margin-bottom:10px">Minha conta</div>
+      <a href="/area/perfil" style="display:block;padding:8px 0;color:#e7c86a">Perfil</a>
+      <a href="/area/duvidas" style="display:block;padding:8px 0">Dúvidas</a>
+      <a href="/area/comentarios" style="display:block;padding:8px 0">Comentários</a>
+      <a href="/area/faq" style="display:block;padding:8px 0">FAQ</a></div>
+    <div><div class="card2"><h3 style="margin:0 0 14px">Perfil</h3>
+      <label>Nome</label><input id="pf_nome" class="fld" value="${esc(al.nome || '')}">
+      <label>E-mail</label><input class="fld" value="${esc(al.email || '')}" disabled style="opacity:.6">
+      <label>Celular</label><input id="pf_tel" class="fld" value="${esc(al.telefone || '')}">
+      <label>CPF/CNPJ</label><input id="pf_cpf" class="fld" value="${esc(al.cpf || '')}">
+      <h3 style="margin:20px 0 10px">Meu endereço</h3>
+      <label>CEP</label><input id="pf_cep" class="fld" value="${esc(end.cep || '')}">
+      <label>Endereço</label><input id="pf_end" class="fld" value="${esc(end.rua || '')}">
+      <label>Cidade / Estado</label><input id="pf_cid" class="fld" value="${esc(end.cidade || '')}">
+      <button class="btn btn-g" style="margin-top:16px" onclick="acSalvarPerfil()">Salvar</button>
+      <span id="pf_ok" style="display:none;color:#9ff0c0;margin-left:10px">✅ Salvo</span></div>
+    <div class="card2" style="margin-top:16px"><h3 style="margin:0 0 10px">Alterar senha</h3>
+      <label>Nova senha</label><input id="pf_s1" class="fld" type="password">
+      <button class="btn btn-ghost" style="margin-top:14px" onclick="acTrocarSenha()">Trocar senha</button>
+      <span id="pf_sok" style="display:none;color:#9ff0c0;margin-left:10px">✅ Senha alterada</span></div>
+    </div></div>
+    <script>
+    async function acSalvarPerfil(){await fetch('/area/api/perfil',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nome:pf_nome.value,telefone:pf_tel.value,cpf:pf_cpf.value,endereco:{cep:pf_cep.value,rua:pf_end.value,cidade:pf_cid.value}})});pf_ok.style.display='inline';}
+    async function acTrocarSenha(){var s=pf_s1.value;if(s.length<4){alert('Senha muito curta');return;}await fetch('/area/api/senha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha:s})});pf_s1.value='';pf_sok.style.display='inline';}
+    </script>`;
+  res.type('html').send(_acPage(al, 'Perfil', corpo));
+});
+app.post('/area/api/perfil', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try { const b = req.body || {}; db.prepare(`UPDATE academy_matriculas SET nome=?, telefone=?, cpf=?, endereco=? WHERE id=?`).run(String(b.nome || al.nome), String(b.telefone || ''), String(b.cpf || ''), JSON.stringify(b.endereco || {}), al.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+});
+app.post('/area/api/senha', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try { db.prepare(`UPDATE academy_matriculas SET senha_hash=? WHERE id=?`).run(_acHash(String((req.body || {}).senha || '')), al.id); _acLog(al.id, 'trocou_senha', ''); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// minhas dúvidas / comentários / FAQ
+app.get('/area/duvidas', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const rows = db.prepare(`SELECT p.*, a.nome aula_nome FROM academy_perguntas p LEFT JOIN academy_aulas a ON a.id=p.aula_id WHERE p.aluno_id=? ORDER BY p.criado_em DESC`).all(al.id) as any[];
+  const lista = rows.length ? rows.map((r) => `<div class="card2" style="margin:10px 0"><div style="font-size:12px;color:#8a8a96">${esc(r.aula_nome || '')} · ${r.status === 'respondida' ? 'Respondida' : 'Pendente'}</div><div style="margin:6px 0">${esc(r.texto || '')}</div>${r.resposta ? `<div style="background:#13201a;border:1px solid #1e7a46;border-radius:8px;padding:10px;margin-top:6px"><b style="color:#9ff0c0">Resposta do professor:</b><br>${esc(r.resposta)}</div>` : ''}</div>`).join('') : '<div class="card2">Você ainda não enviou dúvidas.</div>';
+  res.type('html').send(_acPage(al, 'Minhas dúvidas', `<div class="wrap"><h2 style="font-size:18px">Minhas dúvidas</h2>${lista}</div>`));
+});
+app.get('/area/comentarios', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const rows = db.prepare(`SELECT c.*, a.nome aula_nome FROM academy_comentarios c LEFT JOIN academy_aulas a ON a.id=c.aula_id WHERE c.aluno_id=? ORDER BY c.criado_em DESC`).all(al.id) as any[];
+  const lista = rows.length ? rows.map((r) => `<div class="card2" style="margin:10px 0"><div style="font-size:12px;color:#8a8a96">${esc(r.aula_nome || '')} · ${r.aprovado ? 'Publicado' : 'Em análise'}</div><div style="margin:6px 0">${esc(r.texto || '')}</div></div>`).join('') : '<div class="card2">Nenhum comentário ainda.</div>';
+  res.type('html').send(_acPage(al, 'Comentários', `<div class="wrap"><h2 style="font-size:18px">Meus comentários</h2>${lista}</div>`));
+});
+app.get('/area/faq', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const faq = _ndJson(pubFlag('academy_faq', ''), []) as any[];
+  const lista = faq.length ? faq.map((f: any) => `<div class="card2" style="margin:10px 0"><div style="font-weight:700">${esc(f.p || '')}</div><div style="color:#cfcfd8;margin-top:6px">${esc(f.r || '')}</div></div>`).join('') : '<div class="card2">Em breve.</div>';
+  res.type('html').send(_acPage(al, 'FAQ', `<div class="wrap"><h2 style="font-size:18px">Perguntas frequentes</h2>${lista}</div>`));
+});
+
+// ===================================================================================
+// [B.8] ADMIN API (x-api-key) — vitrines, módulos, aulas, banners, tags, acesso,
+//        dossiê, perguntas, gamificação, relatórios, matrícula/importação.
+// ===================================================================================
+// Vitrines
+app.get('/academy/vitrines', (_req: any, res: any) => { try { _ndOk(res, { vitrines: db.prepare(`SELECT * FROM academy_vitrines ORDER BY ordem, nome`).all() }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/vitrine', (req: any, res: any) => {
+  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_vitrines SET nome=?, ordem=?, listada=?, cor=?, categoria=? WHERE id=?`).run(b.nome, b.ordem || 0, b.listada ? 1 : 0, b.cor || '', b.categoria || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_vitrines (id,nome,ordem,listada,cor,criado_em,categoria) VALUES (?,?,?,?,?,?,?)`).run(id, b.nome, b.ordem || 0, b.listada ? 1 : 1, b.cor || '', agora(), b.categoria || ''); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/vitrine/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_vitrines WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+// Módulos
+app.post('/academy/modulo', (req: any, res: any) => {
+  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_modulos SET nome=?, ordem=? WHERE id=?`).run(b.nome, b.ordem || 0, b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_modulos (id,curso_id,nome,ordem) VALUES (?,?,?,?)`).run(id, b.curso_id, b.nome, b.ordem || 0); _acRecount(b.curso_id); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/modulo/remover', (req: any, res: any) => { try { const b = req.body || {}; db.prepare(`DELETE FROM academy_modulos WHERE id=?`).run(b.id); if (b.curso_id) _acRecount(b.curso_id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+// Aulas
+app.post('/academy/aula', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.id) { db.prepare(`UPDATE academy_aulas SET nome=?, tipo=?, video_fonte=?, video_ref=?, descricao=?, anexos=?, ordem=?, libera_dias=?, libera_em=? WHERE id=?`).run(b.nome, b.tipo || 'video', b.video_fonte || 'youtube', b.video_ref || '', b.descricao || '', JSON.stringify(b.anexos || []), b.ordem || 0, Number(b.libera_dias || 0), b.libera_em || '', b.id); return _ndOk(res, { id: b.id }); }
+    const id = randomUUID();
+    db.prepare(`INSERT INTO academy_aulas (id,modulo_id,curso_id,nome,tipo,video_fonte,video_ref,descricao,anexos,ordem,libera_dias,libera_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, b.modulo_id, b.curso_id, b.nome, b.tipo || 'video', b.video_fonte || 'youtube', b.video_ref || '', b.descricao || '', JSON.stringify(b.anexos || []), b.ordem || 0, Number(b.libera_dias || 0), b.libera_em || '');
+    if (b.curso_id) _acRecount(b.curso_id); _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/aula/remover', (req: any, res: any) => { try { const b = req.body || {}; db.prepare(`DELETE FROM academy_aulas WHERE id=?`).run(b.id); if (b.curso_id) _acRecount(b.curso_id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+const _acRecount = (cursoId: string) => {
+  try {
+    const nm = (db.prepare(`SELECT COUNT(*) n FROM academy_modulos WHERE curso_id=?`).get(cursoId) as any).n;
+    const na = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(cursoId, cursoId) as any).n;
+    db.prepare(`UPDATE academy_cursos SET modulos=?, aulas=? WHERE id=?`).run(nm, na, cursoId);
+  } catch {}
+};
+// detalhe do curso (admin): módulos + aulas
+app.get('/academy/curso/:id', (req: any, res: any) => {
+  try {
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(req.params.id) as any;
+    const modulos = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(req.params.id) as any[];
+    const aulas = db.prepare(`SELECT * FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?) ORDER BY ordem`).all(req.params.id, req.params.id);
+    _ndOk(res, { curso, modulos, aulas });
+  } catch (e) { _ndErr(res, e); }
+});
+// atualizar campos extras do curso (vitrine, capa, checkout, dúvida_modo)
+app.post('/academy/curso/meta', (req: any, res: any) => {
+  try { const b = req.body || {}; db.prepare(`UPDATE academy_cursos SET vitrine_id=?, capa=?, subtitulo=?, ordem=?, checkout_url=?, duvida_modo=? WHERE id=?`).run(b.vitrine_id || '', b.capa || '', b.subtitulo || '', b.ordem || 0, b.checkout_url || '', b.duvida_modo || 'professor', b.id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); }
+});
+// Banners
+app.get('/academy/banners', (_req: any, res: any) => { try { _ndOk(res, { banners: db.prepare(`SELECT * FROM academy_banners ORDER BY ordem, criado_em`).all() }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/banner', (req: any, res: any) => {
+  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_banners SET nome=?, imagem=?, link=?, status=?, ordem=?, tipo=?, tamanho=?, freq=?, alvo_publico=?, alvo_tag=?, produto_alvo=? WHERE id=?`).run(b.nome, b.imagem || '', b.link || '', b.status || 'rascunho', b.ordem || 0, b.tipo || 'hero', b.tamanho || 'm', b.freq || 'day', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_banners (id,nome,imagem,link,status,ordem,criado_em,tipo,tamanho,freq,alvo_publico,alvo_tag,produto_alvo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, b.nome, b.imagem || '', b.link || '', b.status || 'rascunho', b.ordem || 0, agora(), b.tipo || 'hero', b.tamanho || 'm', b.freq || 'day', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || ''); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/banner/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_banners WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+// Tags
+app.get('/academy/tags', (_req: any, res: any) => { try { _ndOk(res, { tags: db.prepare(`SELECT * FROM academy_tags ORDER BY nome`).all() }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/tag', (req: any, res: any) => { try { const b = req.body || {}; const id = b.id || randomUUID(); db.prepare(`INSERT OR REPLACE INTO academy_tags (id,nome,cor) VALUES (?,?,?)`).run(id, b.nome, b.cor || ''); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/aluno/tag', (req: any, res: any) => { try { const b = req.body || {}; if (b.remover) db.prepare(`DELETE FROM academy_aluno_tags WHERE aluno_id=? AND tag_id=?`).run(b.aluno_id, b.tag_id); else db.prepare(`INSERT OR IGNORE INTO academy_aluno_tags (aluno_id,tag_id) VALUES (?,?)`).run(b.aluno_id, b.tag_id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); } });
+// Acesso / entitlement
+app.post('/academy/acesso', (req: any, res: any) => {
+  try { const b = req.body || {}; const id = randomUUID(); db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(id, b.aluno_id, b.alvo_tipo || 'curso', b.alvo_id, b.validade || 'vitalicio', agora()); _acLog(b.aluno_id, 'acesso_concedido', (b.alvo_tipo || 'curso') + ':' + b.alvo_id); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/acesso/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_acesso WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+// Dossiê do aluno (admin)
+app.get('/academy/aluno/:id', (req: any, res: any) => {
+  try {
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(req.params.id) as any;
+    if (!al) return _ndErr(res, 'aluno não encontrado');
+    if (al.endereco) al.endereco = _ndJson(al.endereco, {});
+    const acessos = db.prepare(`SELECT * FROM academy_acesso WHERE aluno_id=?`).all(al.id);
+    const pontuacoes = db.prepare(`SELECT acao, SUM(pontos) pontos, COUNT(*) n FROM academy_pontos WHERE aluno_id=? GROUP BY acao`).all(al.id);
+    const logs = db.prepare(`SELECT tipo,detalhe,ts FROM academy_logs WHERE aluno_id=? ORDER BY ts DESC LIMIT 60`).all(al.id);
+    const perguntas = db.prepare(`SELECT * FROM academy_perguntas WHERE aluno_id=? ORDER BY criado_em DESC`).all(al.id);
+    const progresso = db.prepare(`SELECT curso_id, COUNT(*) aulas, SUM(visto) vistas, AVG(pct) pct FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id);
+    const tags = db.prepare(`SELECT t.* FROM academy_tags t JOIN academy_aluno_tags at ON at.tag_id=t.id WHERE at.aluno_id=?`).all(al.id);
+    const magic = al.token_login ? ((PUBLIC_BASE_URL || '') + '/area/entrar/' + al.token_login) : '';
+    _ndOk(res, { aluno: al, acessos, pontuacoes, logs, perguntas, progresso, tags, magic_link: magic });
+  } catch (e) { _ndErr(res, e); }
+});
+// admin: definir/gerar senha do aluno
+app.post('/academy/aluno/senha', (req: any, res: any) => {
+  try { const b = req.body || {}; const senha = String(b.senha || Math.random().toString(36).slice(2, 10)); db.prepare(`UPDATE academy_matriculas SET senha_hash=? WHERE id=?`).run(_acHash(senha), b.id); _ndOk(res, { senha }); } catch (e) { _ndErr(res, e); }
+});
+// admin: gerar/retornar magic link do aluno
+app.post('/academy/aluno/magiclink', (req: any, res: any) => {
+  try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: (PUBLIC_BASE_URL || '') + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
+});
+// admin: criar/matricular aluno (e conceder acesso opcional)
+app.post('/academy/matricular', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const email = String(b.email || '').trim().toLowerCase();
+    let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+    let id = al && al.id;
+    if (!al) { id = randomUUID(); const tok = _acToken(); db.prepare(`INSERT INTO academy_matriculas (id,nome,email,token_login,ativo,criado_em) VALUES (?,?,?,?,1,?)`).run(id, b.nome || '', email, tok, agora()); }
+    if (b.alvo_id) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, b.alvo_tipo || 'curso', b.alvo_id, b.validade || 'vitalicio', agora());
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+// Perguntas (admin) — fila + responder (só ao aluno / na aula)
+app.get('/academy/perguntas', (req: any, res: any) => {
+  try {
+    const status = String(req.query.status || '');
+    const rows = db.prepare(`SELECT p.*, m.nome aluno_nome, m.email aluno_email, a.nome aula_nome, c.nome curso_nome
+      FROM academy_perguntas p LEFT JOIN academy_matriculas m ON m.id=p.aluno_id LEFT JOIN academy_aulas a ON a.id=p.aula_id LEFT JOIN academy_cursos c ON c.id=p.curso_id
+      WHERE (?='' OR p.status=?) ORDER BY p.fixada DESC, p.criado_em DESC`).all(status, status);
+    _ndOk(res, { perguntas: rows });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/pergunta/responder', (req: any, res: any) => {
+  try { const b = req.body || {}; db.prepare(`UPDATE academy_perguntas SET resposta=?, resposta_publica=?, status='respondida', respondido_em=? WHERE id=?`).run(String(b.resposta || ''), b.publica ? 1 : 0, agora(), b.id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/pergunta/acao', (req: any, res: any) => {
+  try { const b = req.body || {}; if (b.fixar !== undefined) db.prepare(`UPDATE academy_perguntas SET fixada=? WHERE id=?`).run(b.fixar ? 1 : 0, b.id); if (b.excluir) db.prepare(`DELETE FROM academy_perguntas WHERE id=?`).run(b.id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); }
+});
+// Comentários (admin) — aprovar
+app.get('/academy/comentarios', (req: any, res: any) => { try { const rows = db.prepare(`SELECT c.*, m.nome aluno_nome, a.nome aula_nome FROM academy_comentarios c LEFT JOIN academy_matriculas m ON m.id=c.aluno_id LEFT JOIN academy_aulas a ON a.id=c.aula_id ORDER BY c.criado_em DESC`).all(); _ndOk(res, { comentarios: rows }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/comentario/acao', (req: any, res: any) => { try { const b = req.body || {}; if (b.aprovar !== undefined) db.prepare(`UPDATE academy_comentarios SET aprovado=? WHERE id=?`).run(b.aprovar ? 1 : 0, b.id); if (b.excluir) db.prepare(`DELETE FROM academy_comentarios WHERE id=?`).run(b.id); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); } });
+// Gamificação
+app.get('/academy/gamificacao', (_req: any, res: any) => { try { const g = db.prepare(`SELECT * FROM academy_gamificacao WHERE id=1`).get() as any; if (g) g.regras = _ndJson(g.regras, {}); _ndOk(res, g || {}); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/gamificacao', (req: any, res: any) => { try { const b = req.body || {}; db.prepare(`INSERT OR REPLACE INTO academy_gamificacao (id,exibir,perfil,regras) VALUES (1,?,?,?)`).run(b.exibir ? 1 : 0, b.perfil || 'personalizado', JSON.stringify(b.regras || {})); _ndOk(res, { salvo: true }); } catch (e) { _ndErr(res, e); } });
+// Ranking (admin + usado no aluno)
+app.get('/academy/ranking', (_req: any, res: any) => { try { const rows = db.prepare(`SELECT id,nome,COALESCE(pontos,0) pontos FROM academy_matriculas ORDER BY COALESCE(pontos,0) DESC LIMIT 50`).all(); _ndOk(res, { ranking: rows }); } catch (e) { _ndErr(res, e); } });
+// Relatório de engajamento
+app.get('/academy/relatorios/engajamento', (_req: any, res: any) => {
+  try {
+    const total = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas`).get() as any).n;
+    const ativos7 = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso >= datetime('now','-7 day')`).get() as any).n;
+    const inat15 = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso < datetime('now','-15 day')`).get() as any).n;
+    const nunca = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso IS NULL OR ultimo_acesso=''`).get() as any).n;
+    _ndOk(res, { total, ativos7, inat15, nunca });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- [B.1] Ranking do aluno + IMPORTAÇÃO (migração) ----------
+app.get('/area/ranking', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  try {
+    const g = db.prepare(`SELECT exibir FROM academy_gamificacao WHERE id=1`).get() as any;
+    const top = db.prepare(`SELECT id,nome,COALESCE(pontos,0) pontos FROM academy_matriculas ORDER BY COALESCE(pontos,0) DESC LIMIT 50`).all() as any[];
+    const minha = top.findIndex((r) => r.id === al.id);
+    const linhas = top.map((r, i) => `<div class="rank"><span class="pos">${i + 1}</span><span>${esc(r.nome || 'Aluno')}${r.id === al.id ? ' <b style="color:#e7c86a">(você)</b>' : ''}</span><span class="pt">${Number(r.pontos || 0).toLocaleString('pt-BR')}</span></div>`).join('');
+    const corpo = `<div class="wrap"><h2 style="font-size:20px;margin-top:20px">🏆 Ranking</h2>
+      <div class="card2" style="margin:8px 0 16px">Você tem <b style="color:#e7c86a">${Number(al.pontos || 0).toLocaleString('pt-BR')} pontos</b>${minha >= 0 ? ` · posição <b>${minha + 1}º</b>` : ''}.</div>
+      ${(g && g.exibir) ? linhas : '<div class="card2">O ranking está desativado no momento.</div>'}</div>`;
+    res.type('html').send(_acPage(al, 'Ranking', corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// Importação de ALUNOS (migração Cademí): CSV com colunas nome,email,tags,acesso,validade
+// acesso = id(s) de curso separados por ; | validade = vitalicio | 1ano | 6meses | YYYY-MM-DD
+app.post('/academy/importar/alunos', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const linhas: any[] = Array.isArray(b.linhas) ? b.linhas : [];
+    let novos = 0, atualizados = 0, acessos = 0;
+    const valMap = (v: string): string => {
+      v = String(v || 'vitalicio').trim().toLowerCase();
+      if (v === '1ano' || v === '1 ano') { const d = new Date(); d.setFullYear(d.getFullYear() + 1); return d.toISOString().slice(0, 10); }
+      if (v === '6meses' || v === '6 meses') { const d = new Date(); d.setMonth(d.getMonth() + 6); return d.toISOString().slice(0, 10); }
+      return v || 'vitalicio';
+    };
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
+        let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        let id = al && al.id;
+        if (!al) { id = randomUUID(); const tok = _acToken(); db.prepare(`INSERT INTO academy_matriculas (id,nome,email,token_login,ativo,criado_em) VALUES (?,?,?,?,1,?)`).run(id, String(r.nome || ''), email, tok, agora()); novos++; }
+        else { if (r.nome) db.prepare(`UPDATE academy_matriculas SET nome=? WHERE id=?`).run(String(r.nome), id); atualizados++; }
+        // tags
+        for (const tg of String(r.tags || '').split(/[;,]/).map((x: string) => x.trim()).filter(Boolean)) {
+          let tag = db.prepare(`SELECT id FROM academy_tags WHERE lower(nome)=?`).get(tg.toLowerCase()) as any;
+          if (!tag) { const tid = randomUUID(); db.prepare(`INSERT INTO academy_tags (id,nome,cor) VALUES (?,?,'')`).run(tid, tg); tag = { id: tid }; }
+          db.prepare(`INSERT OR IGNORE INTO academy_aluno_tags (aluno_id,tag_id) VALUES (?,?)`).run(id, tag.id);
+        }
+        // acessos
+        const val = valMap(r.validade);
+        for (const cid of String(r.acesso || '').split(/[;]/).map((x: string) => x.trim()).filter(Boolean)) {
+          db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', cid, val, agora()); acessos++;
+        }
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { novos, atualizados, acessos, total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// Importação de CONTEÚDO (vitrine + curso + módulos + aulas) em um JSON só
+app.post('/academy/importar/conteudo', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    let vitrineId = b.vitrine_id;
+    if (!vitrineId && b.vitrine_nome) { vitrineId = randomUUID(); db.prepare(`INSERT INTO academy_vitrines (id,nome,ordem,listada,criado_em) VALUES (?,?,?,1,?)`).run(vitrineId, String(b.vitrine_nome), 0, agora()); }
+    const cursoId = randomUUID();
+    db.prepare(`INSERT INTO academy_cursos (id,nome,descricao,vitrine_id,capa,checkout_url,duvida_modo,publicado,criado_em) VALUES (?,?,?,?,?,?,?,1,?)`)
+      .run(cursoId, String(b.nome || 'Curso'), String(b.descricao || ''), vitrineId || '', String(b.capa || ''), String(b.checkout_url || ''), String(b.duvida_modo || 'professor'), agora());
+    let ordM = 0;
+    for (const m of (Array.isArray(b.modulos) ? b.modulos : [])) {
+      const mid = randomUUID();
+      db.prepare(`INSERT INTO academy_modulos (id,curso_id,nome,ordem) VALUES (?,?,?,?)`).run(mid, cursoId, String(m.nome || 'Módulo'), ordM++);
+      let ordA = 0;
+      for (const a of (Array.isArray(m.aulas) ? m.aulas : [])) {
+        db.prepare(`INSERT INTO academy_aulas (id,modulo_id,curso_id,nome,tipo,video_fonte,video_ref,descricao,anexos,ordem) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+          .run(randomUUID(), mid, cursoId, String(a.nome || 'Aula'), String(a.tipo || (a.video_ref ? 'video' : 'material')), String(a.video_fonte || 'youtube'), String(a.video_ref || ''), String(a.descricao || ''), JSON.stringify(a.anexos || []), ordA++);
+      }
+    }
+    _acRecount(cursoId);
+    _ndOk(res, { curso_id: cursoId, vitrine_id: vitrineId });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- [B.2] Etapa 4: certificado, FAQ admin, dashboard admin, PWA ----------
+// anúncio de CONCLUSÃO de curso (mostrado ao concluir / no certificado)
+const _acAdConclusao = (al: any, curso: any): any => {
+  try {
+    const meus = _acCursosDoAluno(al.id);
+    const hoje = new Date().toISOString().slice(0, 10);
+    const ads = db.prepare(`SELECT * FROM academy_anuncios WHERE ativo=1 AND posicao='conclusao' ORDER BY RANDOM()`).all() as any[];
+    for (const ad of ads) {
+      const t = ad.escopo_tipo || 'todos';
+      if (t === 'curso' && !(_ndJson(ad.escopo_ids, []) as string[]).includes(curso.id)) continue;
+      if (t === 'vitrine' && !(_ndJson(ad.escopo_ids, []) as string[]).includes(curso.vitrine_id)) continue;
+      if (ad.inicio && hoje < String(ad.inicio).slice(0, 10)) continue;
+      if (ad.fim && hoje > String(ad.fim).slice(0, 10)) continue;
+      if (ad.produto_alvo && meus.has(ad.produto_alvo)) continue;
+      return ad;
+    }
+  } catch { /* ok */ }
+  return null;
+};
+// Certificado do aluno (quando concluiu o curso)
+app.get('/area/certificado/:cursoId', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  try {
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(String(req.params.cursoId)) as any;
+    if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
+    const tot = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(curso.id, curso.id) as any).n;
+    const feitas = (db.prepare(`SELECT COUNT(*) n FROM academy_progresso WHERE aluno_id=? AND curso_id=? AND visto=1`).get(al.id, curso.id) as any).n;
+    if (!tot || feitas < tot) return res.type('html').send(_acPage(al, 'Certificado', `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">Conclua todas as aulas de <b>${esc(curso.nome || '')}</b> para emitir o certificado.<br><br><a class="btn btn-g" href="/area/curso/${curso.id}">Voltar ao curso</a></div></div>`));
+    _acPontuar(al.id, 'certificado', curso.id); _acLog(al.id, 'certificado', curso.id);
+    const hoje = new Date().toLocaleDateString('pt-BR');
+    const corpo = `<div class="wrap"><div style="max-width:820px;margin:30px auto;background:linear-gradient(135deg,#14140f,#1c1a12);border:2px solid #e7c86a;border-radius:16px;padding:48px;text-align:center">
+      <div style="color:#e7c86a;font-weight:800;letter-spacing:.2em;font-size:14px">MELODIAS E RIFFS</div>
+      <div style="font-size:13px;color:#aa9b6a;margin-bottom:24px">A Escola do Músico Cristão</div>
+      <div style="font-size:15px;color:#cfcfd8">Certificamos que</div>
+      <div style="font-size:30px;font-weight:800;margin:10px 0">${esc(al.nome || 'Aluno')}</div>
+      <div style="font-size:15px;color:#cfcfd8">concluiu o curso</div>
+      <div style="font-size:22px;font-weight:700;color:#e7c86a;margin:10px 0">${esc(curso.nome || '')}</div>
+      <div style="color:#8a8a96;font-size:13px;margin-top:20px">${esc(hoje)} · Prof. Ezequias</div>
+      </div>
+      ${(function(){var ad=_acAdConclusao(al,curso);return ad?`<div class="card2" style="max-width:820px;margin:16px auto;border:1px solid #e7c86a;display:flex;align-items:center;gap:12px"><span style="font-size:22px">🎁</span><div style="flex:1">${esc(ad.cta_texto||ad.nome||"Oferta especial pra você")}</div>${ad.cta_link?`<a class="btn btn-g" href="${esc(ad.cta_link)}" target="_blank">Ver ›</a>`:""}</div>`:"";})()}
+      <div style="text-align:center"><button class="btn btn-ghost" onclick="window.print()">Imprimir / Salvar PDF</button></div></div>`;
+    res.type('html').send(_acPage(al, 'Certificado', corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// FAQ (admin): editar as perguntas frequentes do aluno
+app.get('/academy/faq', (_req: any, res: any) => { try { _ndOk(res, { faq: _ndJson(pubFlag('academy_faq', ''), []) }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/faq', (req: any, res: any) => { try { setPubFlag('academy_faq', JSON.stringify((req.body || {}).faq || [])); _ndOk(res, { salvo: true }); } catch (e) { _ndErr(res, e); } });
+
+// Dashboard admin (clone do "Início" da Cademí): cards + filas "precisa de atenção" + acessos + ranking + atividade
+app.get('/academy/dashboard', (_req: any, res: any) => {
+  try {
+    const n = (sql: string, ...p: any[]) => (db.prepare(sql).get(...p) as any).n;
+    const alunos = n(`SELECT COUNT(*) n FROM academy_matriculas`);
+    const ativos7 = n(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso >= datetime('now','-7 day')`);
+    const novos_mes = n(`SELECT COUNT(*) n FROM academy_matriculas WHERE criado_em >= date('now','start of month')`);
+    const acessos_hoje = n(`SELECT COUNT(*) n FROM academy_matriculas WHERE substr(ultimo_acesso,1,10)=date('now')`);
+    const filas = {
+      duvidas_pendentes: n(`SELECT COUNT(*) n FROM academy_perguntas WHERE status='pendente'`),
+      comentarios_aprovar: n(`SELECT COUNT(*) n FROM academy_comentarios WHERE aprovado=0`),
+      nunca_acessaram: n(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso IS NULL OR ultimo_acesso=''`),
+      produtos_sem_capa: n(`SELECT COUNT(*) n FROM academy_cursos WHERE capa IS NULL OR capa=''`),
+    };
+    const acessos30 = {
+      hoje: n(`SELECT COUNT(*) n FROM academy_matriculas WHERE substr(ultimo_acesso,1,10)=date('now')`),
+      d2a7: n(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso < date('now') AND ultimo_acesso >= datetime('now','-7 day')`),
+      d8a30: n(`SELECT COUNT(*) n FROM academy_matriculas WHERE ultimo_acesso < datetime('now','-7 day') AND ultimo_acesso >= datetime('now','-30 day')`),
+    };
+    const ranking = db.prepare(`SELECT id,nome,COALESCE(pontos,0) pontos FROM academy_matriculas ORDER BY COALESCE(pontos,0) DESC LIMIT 5`).all();
+    const atividade = db.prepare(`SELECT l.tipo,l.detalhe,l.ts,m.nome FROM academy_logs l LEFT JOIN academy_matriculas m ON m.id=l.aluno_id ORDER BY l.ts DESC LIMIT 10`).all();
+    _ndOk(res, { alunos, ativos7, novos_mes, acessos_hoje, filas, acessos30, ranking, atividade });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// PWA: manifest + service worker da área do aluno (instalar como app no celular)
+app.get('/area/manifest.webmanifest', (_req: any, res: any) => {
+  res.type('application/manifest+json').send(JSON.stringify({
+    name: 'Melodias e Riffs', short_name: 'M|R', start_url: '/area', scope: '/area',
+    display: 'standalone', background_color: '#0a0a0c', theme_color: '#0a0a0c',
+    icons: [{ src: (PUBLIC_BASE_URL || '') + '/area/icon.png', sizes: '512x512', type: 'image/png' }],
+  }));
+});
+app.get('/area/sw.js', (_req: any, res: any) => {
+  res.type('application/javascript').send("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',function(){});");
+});
+
+// ---------- [B.4] ANÚNCIOS NA AULA (pré-roll / pós-roll) — p/ lançamentos (Black Friday) ----------
+// Toca um vídeo de propaganda ANTES ou DEPOIS da aula. Escolhe escopo (todos/vitrine/curso/aulas),
+// posição (pre/post) e LIMITE de exibições por aluno (ex.: aparece nas 2 primeiras aulas, depois não).
+db.exec(`CREATE TABLE IF NOT EXISTS academy_anuncios (
+  id TEXT PRIMARY KEY, nome TEXT, video_fonte TEXT, video_ref TEXT, posicao TEXT,
+  escopo_tipo TEXT, escopo_ids TEXT, max_exibicoes INTEGER DEFAULT 2, pular_apos_seg INTEGER DEFAULT 5,
+  cta_texto TEXT, cta_link TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_anuncio_views (
+  aluno_id TEXT, anuncio_id TEXT, aula_id TEXT, ts TEXT, PRIMARY KEY(aluno_id, anuncio_id, aula_id)
+)`);
+
+// [B.5] colunas novas dos anúncios (agendamento, público-alvo, formato, limite, cliques)
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN inicio TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN fim TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN alvo_publico TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN alvo_tag TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN produto_alvo TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN formato TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN modo_limite TEXT`);
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN cliques INTEGER`);
+
+// decide se um anúncio se aplica a esta aula (escopo)
+const _acAdAplica = (ad: any, aula: any, curso: any): boolean => {
+  const t = ad.escopo_tipo || 'todos';
+  if (t === 'todos') return true;
+  const ids = _ndJson(ad.escopo_ids, []) as string[];
+  if (t === 'curso') return ids.includes(curso.id);
+  if (t === 'vitrine') return ids.includes(curso.vitrine_id);
+  if (t === 'aulas') return ids.includes(aula.id);
+  return false;
+};
+// regras completas de elegibilidade (escopo + agendamento + público + produto já comprado + limite)
+const _acAdElegivel = (ad: any, al: any, aula: any, curso: any, meus: Set<string>): boolean => {
+  if (!_acAdAplica(ad, aula, curso)) return false;
+  const hoje = new Date().toISOString().slice(0, 10);
+  if (ad.inicio && hoje < String(ad.inicio).slice(0, 10)) return false;         // ainda não começou
+  if (ad.fim && hoje > String(ad.fim).slice(0, 10)) return false;               // já acabou
+  if (ad.produto_alvo && meus.has(ad.produto_alvo)) return false;               // não anuncia p/ quem já tem
+  const pub = ad.alvo_publico || 'todos';
+  if (pub === 'nao_compradores' && ad.produto_alvo && meus.has(ad.produto_alvo)) return false;
+  if (pub === 'inativos') { const lim = new Date(Date.now() - 15 * 864e5).toISOString(); if (al.ultimo_acesso && al.ultimo_acesso >= lim) return false; }
+  if (pub === 'tag' && ad.alvo_tag) { const has = db.prepare(`SELECT 1 FROM academy_aluno_tags at JOIN academy_tags t ON t.id=at.tag_id WHERE at.aluno_id=? AND lower(t.nome)=lower(?)`).get(al.id, ad.alvo_tag); if (!has) return false; }
+  // limite
+  const nestaAula = db.prepare(`SELECT 1 FROM academy_anuncio_views WHERE aluno_id=? AND anuncio_id=? AND aula_id=?`).get(al.id, ad.id, aula.id);
+  if (nestaAula) return true; // já mostrou nesta aula; pode re-renderizar sem contar a mais
+  if ((ad.modo_limite || 'por_aula') === 'por_dia') {
+    const hojeViews = (db.prepare(`SELECT COUNT(*) n FROM academy_anuncio_views WHERE aluno_id=? AND anuncio_id=? AND substr(ts,1,10)=date('now')`).get(al.id, ad.id) as any).n;
+    if (hojeViews >= Number(ad.max_exibicoes || 2)) return false;
+  } else {
+    const vistos = (db.prepare(`SELECT COUNT(*) n FROM academy_anuncio_views WHERE aluno_id=? AND anuncio_id=?`).get(al.id, ad.id) as any).n;
+    if (vistos >= Number(ad.max_exibicoes || 2)) return false;
+  }
+  return true;
+};
+const _acAdsElegiveis = (al: any, aula: any, curso: any): { pre: any; post: any; faixa: any; mid: any } => {
+  let pre = null, post = null, faixa = null, mid = null;
+  try {
+    const meus = _acCursosDoAluno(al.id);
+    const ads = db.prepare(`SELECT * FROM academy_anuncios WHERE ativo=1 ORDER BY RANDOM()`).all() as any[]; // RANDOM = rotação A/B
+    for (const ad of ads) {
+      if ((ad.posicao || 'pre') === 'conclusao') continue; // conclusão é mostrado ao concluir o curso, não no player
+      if (!_acAdElegivel(ad, al, aula, curso, meus)) continue;
+      if ((ad.formato || 'video') === 'faixa') { if (!faixa) faixa = ad; continue; }
+      if ((ad.posicao || 'pre') === 'pre' && !pre) pre = ad;
+      if ((ad.posicao || 'pre') === 'post' && !post) post = ad;
+      if ((ad.posicao || 'pre') === 'mid' && !mid) mid = ad;
+    }
+  } catch { /* ok */ }
+  return { pre, post, faixa, mid };
+};
+const _acAdSrc = (ad: any, autoplay: boolean): string => {
+  const ref = String(ad.video_ref || '');
+  if ((ad.video_fonte || 'youtube') === 'vsl' && ref) return (PUBLIC_BASE_URL || '') + '/v/' + ref;
+  const yid = ref.replace(/^https?:\/\/(www\.)?(youtu\.be\/|youtube\.com\/(watch\?v=|embed\/))?/, '').split(/[?&]/)[0];
+  return 'https://www.youtube-nocookie.com/embed/' + yid + '?rel=0&modestbranding=1&playsinline=1' + (autoplay ? '&autoplay=1' : '');
+};
+const _acPlayerComAnuncios = (aula: any, curso: any, pos: number, al: any): string => {
+  const { pre, post, faixa, mid } = _acAdsElegiveis(al, aula, curso);
+  let _dm = ''; try { const _cfg = db.prepare(`SELECT marcadagua FROM academy_config WHERE id=1`).get() as any; if (!_cfg || _cfg.marcadagua) _dm = `<div class="dmark">${esc(al.nome || '')} · ${esc(al.email || '')}</div>`; } catch { /* ok */ }
+  const fonte = String(aula.video_fonte || 'youtube');
+  const ref = String(aula.video_ref || '');
+  let lessonSrc = ''; let ehYt = false;
+  if (fonte === 'vsl' && ref) { lessonSrc = (PUBLIC_BASE_URL || '') + '/v/' + ref; }
+  else {
+    ehYt = true;
+    const yid = ref.replace(/^https?:\/\/(www\.)?(youtu\.be\/|youtube\.com\/(watch\?v=|embed\/))?/, '').split(/[?&]/)[0];
+    const org = encodeURIComponent(PUBLIC_BASE_URL || '');
+    const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
+    lessonSrc = 'https://www.youtube-nocookie.com/embed/' + yid + '?rel=0&modestbranding=1&playsinline=1&enablejsapi=1&origin=' + org + start;
+  }
+  const btnPre = pre && pre.cta_link ? (esc(pre.cta_texto || 'Saber mais') + ' ›') : 'Continuar para a aula ›';
+  const preOverlay = pre ? `<div class="adov" id="pread">
+      <iframe src="${_acAdSrc(pre, true)}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>
+      <div class="adbar"><span id="adcount">Anúncio</span>${pre.fim ? '<span id="adcd" style="color:#e7c86a"></span>' : ''}
+        <button class="btn btn-g" id="adskip" style="display:none" onclick="acFechaPre()">${btnPre}</button></div>
+      ${pre.cta_link ? `<a class="adcta" href="${esc(pre.cta_link)}" target="_blank" onclick="acAdClick('${pre.id}')">${esc(pre.cta_texto || 'Ver oferta')}</a>` : ''}
+    </div>` : '';
+  const postOverlay = post ? `<div class="adov" id="postad" style="display:none">
+      <iframe id="postfr" src="" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>
+      <div class="adbar"><span>Antes de sair…</span><button class="btn btn-ghost" onclick="acFechaPost()">Fechar ✕</button>
+        ${post.cta_link ? `<a class="btn btn-g" href="${esc(post.cta_link)}" target="_blank" onclick="acAdClick('${post.id}')">${esc(post.cta_texto || 'Ver oferta')} ›</a>` : ''}</div>
+    </div>` : '';
+  const faixaBar = faixa ? `<div class="adfx" id="adfx">
+      <span style="flex:1">${esc(faixa.cta_texto || faixa.nome || 'Oferta especial')}${faixa.fim ? ' · <b id="fxcd" style="color:#e7c86a"></b>' : ''}</span>
+      ${faixa.cta_link ? `<a class="btn btn-g" href="${esc(faixa.cta_link)}" target="_blank" onclick="acAdClick('${faixa.id}')">Ver ›</a>` : ''}
+      <button class="btn btn-ghost" onclick="var e=document.getElementById('adfx');if(e)e.style.display='none'">✕</button></div>` : '';
+  const midOverlay = mid ? `<div class="adov" id="midad" style="display:none">
+      <iframe id="midfr" src="" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>
+      <div class="adbar"><span>Uma mensagem rápida…</span><button class="btn btn-ghost" onclick="acFechaMid()">Continuar a aula ›</button>
+        ${mid.cta_link ? `<a class="btn btn-g" href="${esc(mid.cta_link)}" target="_blank" onclick="acAdClick('${mid.id}')">${esc(mid.cta_texto || 'Ver oferta')} ›</a>` : ''}</div>
+    </div>` : '';
+  const lessonIframe = `<iframe id="lessonfr" ${pre ? 'data-src' : 'src'}="${lessonSrc}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>`;
+  const fimPre = pre && pre.fim ? JSON.stringify(String(pre.fim)) : 'null';
+  const fimFx = faixa && faixa.fim ? JSON.stringify(String(faixa.fim)) : 'null';
+  const script = `<script>
+    var _preId=${pre ? "'" + pre.id + "'" : 'null'}, _postId=${post ? "'" + post.id + "'" : 'null'}, _faixaId=${faixa ? "'" + faixa.id + "'" : 'null'}, _postSrc=${post ? JSON.stringify(_acAdSrc(post, true)) : 'null'}, _ehYt=${ehYt ? 'true' : 'false'}, _pularApos=${pre ? Number(pre.pular_apos_seg || 5) : 0}, _fimPre=${fimPre}, _fimFx=${fimFx};
+    var _midId=${mid ? "'" + mid.id + "'" : 'null'}, _midSrc=${mid ? JSON.stringify(_acAdSrc(mid, true)) : 'null'}, _midSeg=${mid ? Number(mid.mid_seg || 60) : 0}, _midDone=false;
+    function acAdVisto(id){try{fetch('/area/api/anuncio-visto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anuncio:id,aula:'${aula.id}'})});}catch(e){}}
+    function acAdClick(id){try{fetch('/area/api/anuncio-click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anuncio:id})});}catch(e){}}
+    function acCd(elId,fim){var el=document.getElementById(elId);if(!el||!fim)return;function tick(){var d=new Date(fim)-new Date();if(d<=0){el.textContent='Encerrado';return;}var h=Math.floor(d/3.6e6),m=Math.floor(d%3.6e6/6e4),s=Math.floor(d%6e4/1e3);el.textContent='Acaba em '+(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(s<10?'0':'')+s;}tick();setInterval(tick,1000);}
+    function acFechaPre(){var o=document.getElementById('pread');if(o)o.style.display='none';var fr=document.getElementById('lessonfr');if(fr&&fr.getAttribute('data-src'))fr.src=fr.getAttribute('data-src');acIniciaYt();}
+    function acFechaPost(){var o=document.getElementById('postad');if(o)o.style.display='none';var f=document.getElementById('postfr');if(f)f.src='';}
+    function acMostraPost(){if(!_postId)return;var o=document.getElementById('postad');var f=document.getElementById('postfr');if(o&&f){f.src=_postSrc;o.style.display='flex';acAdVisto(_postId);}}
+    if(_preId){acAdVisto(_preId);var sk=document.getElementById('adskip'),c=document.getElementById('adcount'),n=_pularApos;acCd('adcd',_fimPre);
+      if(n<=0){if(sk)sk.style.display='inline-block';}else{var t=setInterval(function(){n--;if(c)c.textContent='Anúncio · '+n+'s';if(n<=0){clearInterval(t);if(sk)sk.style.display='inline-block';if(c)c.textContent='Anúncio';}},1000);}}
+    if(_faixaId){acAdVisto(_faixaId);acCd('fxcd',_fimFx);}
+    var _ytP=null;
+    function acIniciaYt(){ if(!_ehYt||!_postId||_ytP) return;
+      if(!window.YT||!window.YT.Player){var tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);window.onYouTubeIframeAPIReady=acIniciaYt;return;}
+      try{_ytP=new YT.Player('lessonfr',{events:{onStateChange:function(e){if(e.data===YT.PlayerState.ENDED)acMostraPost();}}});}catch(e){}
+      if(_midId){setInterval(function(){try{if(_midDone||!_ytP||!_ytP.getCurrentTime)return;if(_ytP.getCurrentTime()>=_midSeg){_midDone=true;_ytP.pauseVideo();var o=document.getElementById('midad'),f=document.getElementById('midfr');if(o&&f){f.src=_midSrc;o.style.display='flex';acAdVisto(_midId);}}}catch(e){}},1000);}}
+    function acFechaMid(){var o=document.getElementById('midad'),f=document.getElementById('midfr');if(o)o.style.display='none';if(f)f.src='';try{if(_ytP&&_ytP.playVideo)_ytP.playVideo();}catch(e){}}
+    if(!_preId){acIniciaYt();}
+  </script>`;
+  return `<div class="player" style="position:relative">${lessonIframe}${_dm}${preOverlay}${postOverlay}${midOverlay}${faixaBar}</div>${script}`;
+};
+
+// registra que o aluno viu um anúncio (controla o limite de exibições)
+app.post('/area/api/anuncio-visto', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try { const b = req.body || {}; db.prepare(`INSERT OR IGNORE INTO academy_anuncio_views (aluno_id,anuncio_id,aula_id,ts) VALUES (?,?,?,?)`).run(al.id, b.anuncio, b.aula, agora()); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+});
+app.post('/area/api/anuncio-click', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try { db.prepare(`UPDATE academy_anuncios SET cliques=COALESCE(cliques,0)+1 WHERE id=?`).run((req.body || {}).anuncio); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// ADMIN: CRUD de anúncios
+app.get('/academy/anuncios', (_req: any, res: any) => { try { _ndOk(res, { anuncios: db.prepare(`SELECT * FROM academy_anuncios ORDER BY criado_em DESC`).all() }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/anuncio', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.id) { db.prepare(`UPDATE academy_anuncios SET nome=?, video_fonte=?, video_ref=?, posicao=?, escopo_tipo=?, escopo_ids=?, max_exibicoes=?, pular_apos_seg=?, cta_texto=?, cta_link=?, ativo=?, inicio=?, fim=?, alvo_publico=?, alvo_tag=?, produto_alvo=?, formato=?, modo_limite=?, mid_seg=? WHERE id=?`)
+      .run(b.nome, b.video_fonte || 'youtube', b.video_ref || '', b.posicao || 'pre', b.escopo_tipo || 'todos', JSON.stringify(b.escopo_ids || []), Number(b.max_exibicoes || 2), Number(b.pular_apos_seg || 5), b.cta_texto || '', b.cta_link || '', b.ativo ? 1 : 0, b.inicio || '', b.fim || '', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || '', b.formato || 'video', b.modo_limite || 'por_aula', Number(b.mid_seg || 60), b.id); return _ndOk(res, { id: b.id }); }
+    const id = randomUUID();
+    db.prepare(`INSERT INTO academy_anuncios (id,nome,video_fonte,video_ref,posicao,escopo_tipo,escopo_ids,max_exibicoes,pular_apos_seg,cta_texto,cta_link,ativo,criado_em,inicio,fim,alvo_publico,alvo_tag,produto_alvo,formato,modo_limite,cliques,mid_seg) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`)
+      .run(id, b.nome, b.video_fonte || 'youtube', b.video_ref || '', b.posicao || 'pre', b.escopo_tipo || 'todos', JSON.stringify(b.escopo_ids || []), Number(b.max_exibicoes || 2), Number(b.pular_apos_seg || 5), b.cta_texto || '', b.cta_link || '', b.ativo ? 1 : 1, agora(), b.inicio || '', b.fim || '', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || '', b.formato || 'video', b.modo_limite || 'por_aula', Number(b.mid_seg || 60));
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/anuncio/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_anuncios WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+app.get('/academy/anuncio/:id/stats', (req: any, res: any) => { try { const v = (db.prepare(`SELECT COUNT(*) n FROM academy_anuncio_views WHERE anuncio_id=?`).get(req.params.id) as any).n; const alunos = (db.prepare(`SELECT COUNT(DISTINCT aluno_id) n FROM academy_anuncio_views WHERE anuncio_id=?`).get(req.params.id) as any).n; const cl = (db.prepare(`SELECT COALESCE(cliques,0) n FROM academy_anuncios WHERE id=?`).get(req.params.id) as any); const cliques = cl ? cl.n : 0; const ctr = v > 0 ? Math.round((cliques / v) * 1000) / 10 : 0; _ndOk(res, { exibicoes: v, alunos, cliques, ctr }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- [B.6] Favoritar + Conteúdo programado (drip) + Marca d'água + Upload de arquivo ----------
+db.exec(`CREATE TABLE IF NOT EXISTS academy_favoritos ( aluno_id TEXT, aula_id TEXT, ts TEXT, PRIMARY KEY(aluno_id, aula_id) )`);
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN libera_dias INTEGER`);   // libera X dias após a matrícula
+_acAlter(`ALTER TABLE academy_aulas ADD COLUMN libera_em TEXT`);        // ou numa data fixa
+_acAlter(`ALTER TABLE academy_anuncios ADD COLUMN mid_seg INTEGER`);    // [mid-roll] segundo em que aparece
+
+// data de matrícula do aluno no curso (1º acesso concedido ao curso/vitrine; senão, cadastro)
+const _acMatriculaData = (alunoId: string, curso: any): string => {
+  try {
+    const ids = [curso.id]; if (curso.vitrine_id) ids.push(curso.vitrine_id);
+    const ph = ids.map(() => '?').join(',');
+    const r = db.prepare(`SELECT MIN(criado_em) d FROM academy_acesso WHERE aluno_id=? AND alvo_id IN (${ph})`).get(alunoId, ...ids) as any;
+    if (r && r.d) return r.d;
+    const m = db.prepare(`SELECT criado_em d FROM academy_matriculas WHERE id=?`).get(alunoId) as any;
+    return (m && m.d) || agora();
+  } catch { return agora(); }
+};
+const _acAulaLiberada = (al: any, aula: any, curso: any): { ok: boolean; quando?: Date } => {
+  const dias = Number(aula.libera_dias || 0); const em = aula.libera_em;
+  let quando: Date | null = null;
+  if (dias > 0) { const base = new Date(_acMatriculaData(al.id, curso)); base.setDate(base.getDate() + dias); quando = base; }
+  if (em) { const d = new Date(em); if (!quando || d > quando) quando = d; }
+  if (!quando) return { ok: true };
+  return { ok: new Date() >= quando, quando };
+};
+
+// favoritar aula (toggle)
+app.post('/area/api/favoritar', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {};
+    const ja = db.prepare(`SELECT 1 FROM academy_favoritos WHERE aluno_id=? AND aula_id=?`).get(al.id, b.aula);
+    if (ja) { db.prepare(`DELETE FROM academy_favoritos WHERE aluno_id=? AND aula_id=?`).run(al.id, b.aula); res.json({ ok: true, fav: false }); }
+    else { db.prepare(`INSERT OR IGNORE INTO academy_favoritos (aluno_id,aula_id,ts) VALUES (?,?,?)`).run(al.id, b.aula, agora()); res.json({ ok: true, fav: true }); }
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+// página "Minhas favoritas"
+app.get('/area/favoritos', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const rows = db.prepare(`SELECT a.id,a.nome,a.curso_id,c.nome curso_nome FROM academy_favoritos f JOIN academy_aulas a ON a.id=f.aula_id LEFT JOIN academy_cursos c ON c.id=a.curso_id WHERE f.aluno_id=? ORDER BY f.ts DESC`).all(al.id) as any[];
+  const lista = rows.length ? rows.map((r) => `<a class="card2" style="display:block;margin:8px 0" href="/area/aula/${r.id}">⭐ <b>${esc(r.nome || '')}</b><div style="font-size:12px;color:#8a8a96">${esc(r.curso_nome || '')}</div></a>`).join('') : '<div class="card2">Você ainda não favoritou aulas. Toque em ☆ Favoritar numa aula.</div>';
+  res.type('html').send(_acPage(al, 'Minhas favoritas', `<div class="wrap"><h2 style="font-size:18px">⭐ Minhas favoritas</h2>${lista}</div>`));
+});
+
+// UPLOAD de arquivo (admin): recebe base64 (dataURL) e salva em /data/media/academy, serve em /media/academy
+app.post('/academy/upload', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const data = String(b.data || '');
+    const m = data.match(/^data:([^;]+);base64,(.*)$/);
+    if (!m) return _ndErr(res, 'formato inválido (envie dataURL base64)');
+    const mime = m[1]; const buf = Buffer.from(m[2], 'base64');
+    const ext = (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5);
+    const dir = MEDIA_DIR + '/academy';
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
+    const nome = randomUUID() + '.' + ext;
+    fs.writeFileSync(dir + '/' + nome, buf);
+    _ndOk(res, { url: (PUBLIC_BASE_URL || '') + '/media/academy/' + nome });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// ---------- [B.8] PROVAS / QUIZ ----------
+db.exec(`CREATE TABLE IF NOT EXISTS academy_provas ( id TEXT PRIMARY KEY, curso_id TEXT, modulo_id TEXT, titulo TEXT, nota_minima INTEGER DEFAULT 60, criado_em TEXT )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_prova_questoes ( id TEXT PRIMARY KEY, prova_id TEXT, pergunta TEXT, opcoes TEXT, correta INTEGER, ordem INTEGER )`);
+db.exec(`CREATE TABLE IF NOT EXISTS academy_prova_resultados ( id TEXT PRIMARY KEY, aluno_id TEXT, prova_id TEXT, nota INTEGER, aprovado INTEGER, respostas TEXT, ts TEXT )`);
+
+// ADMIN: provas
+app.get('/academy/provas', (req: any, res: any) => { try { const curso = String(req.query.curso || ''); const provas = db.prepare(`SELECT * FROM academy_provas WHERE (?='' OR curso_id=?) ORDER BY criado_em DESC`).all(curso, curso); _ndOk(res, { provas }); } catch (e) { _ndErr(res, e); } });
+app.get('/academy/prova/:id', (req: any, res: any) => { try { const prova = db.prepare(`SELECT * FROM academy_provas WHERE id=?`).get(req.params.id); const questoes = (db.prepare(`SELECT * FROM academy_prova_questoes WHERE prova_id=? ORDER BY ordem`).all(req.params.id) as any[]).map((q) => ({ ...q, opcoes: _ndJson(q.opcoes, []) })); _ndOk(res, { prova, questoes }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/prova', (req: any, res: any) => { try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_provas SET titulo=?, curso_id=?, modulo_id=?, nota_minima=? WHERE id=?`).run(b.titulo, b.curso_id || '', b.modulo_id || '', Number(b.nota_minima || 60), b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_provas (id,curso_id,modulo_id,titulo,nota_minima,criado_em) VALUES (?,?,?,?,?,?)`).run(id, b.curso_id || '', b.modulo_id || '', b.titulo, Number(b.nota_minima || 60), agora()); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/prova/remover', (req: any, res: any) => { try { const id = (req.body || {}).id; db.prepare(`DELETE FROM academy_provas WHERE id=?`).run(id); db.prepare(`DELETE FROM academy_prova_questoes WHERE prova_id=?`).run(id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/prova/questao', (req: any, res: any) => { try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_prova_questoes SET pergunta=?, opcoes=?, correta=?, ordem=? WHERE id=?`).run(b.pergunta, JSON.stringify(b.opcoes || []), Number(b.correta || 0), Number(b.ordem || 0), b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_prova_questoes (id,prova_id,pergunta,opcoes,correta,ordem) VALUES (?,?,?,?,?,?)`).run(id, b.prova_id, b.pergunta, JSON.stringify(b.opcoes || []), Number(b.correta || 0), Number(b.ordem || 0)); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/prova/questao/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_prova_questoes WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+
+// ALUNO: fazer a prova
+app.get('/area/prova/:id', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  try {
+    const prova = db.prepare(`SELECT * FROM academy_provas WHERE id=?`).get(req.params.id) as any;
+    if (!prova) return res.status(404).type('html').send('Prova não encontrada.');
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(prova.curso_id) as any;
+    if (!curso || !_acCursosDoAluno(al.id).has(curso.id)) return res.status(403).type('html').send('Sem acesso.');
+    const questoes = (db.prepare(`SELECT * FROM academy_prova_questoes WHERE prova_id=? ORDER BY ordem`).all(prova.id) as any[]).map((q) => ({ ...q, opcoes: _ndJson(q.opcoes, []) }));
+    const ult = db.prepare(`SELECT * FROM academy_prova_resultados WHERE aluno_id=? AND prova_id=? ORDER BY ts DESC LIMIT 1`).get(al.id, prova.id) as any;
+    const qsHtml = questoes.map((q, i) => `<div class="card2" style="margin:10px 0"><div style="font-weight:600;margin-bottom:8px">${i + 1}. ${esc(q.pergunta || '')}</div>${(q.opcoes as any[]).map((op: string, j: number) => `<label style="display:block;padding:6px 0;cursor:pointer"><input type="radio" name="q_${q.id}" value="${j}"> ${esc(op)}</label>`).join('')}</div>`).join('');
+    const corpo = `<div class="wrap"><h2 style="font-size:20px;margin-top:20px">📝 ${esc(prova.titulo || 'Prova')}</h2>
+      <div style="color:#8a8a96;font-size:13px;margin-bottom:10px">Nota mínima para aprovar: ${prova.nota_minima}%${ult ? ` · última nota: <b style="color:${ult.aprovado ? '#9ff0c0' : '#ffb3c0'}">${ult.nota}%</b>` : ''}</div>
+      <form id="pf">${qsHtml || '<div class="card2">Prova sem questões ainda.</div>'}</form>
+      <button class="btn btn-g" onclick="acEnviarProva('${prova.id}')">Enviar respostas</button>
+      <div id="pres" style="display:none" class="card2" style="margin-top:14px"></div>
+      <script>
+      async function acEnviarProva(id){var resp={};document.querySelectorAll('#pf input[type=radio]:checked').forEach(function(el){resp[el.name.slice(2)]=Number(el.value);});
+        var r=await fetch('/area/api/prova',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prova:id,respostas:resp})});var j=await r.json();
+        var box=document.getElementById('pres');box.style.display='block';box.innerHTML=j.aprovado?('<b style="color:#9ff0c0">✅ Aprovado! Nota '+j.nota+'%</b>'):('<b style="color:#ffb3c0">Nota '+j.nota+'%. Tente de novo.</b>');}
+      </script></div>`;
+    res.type('html').send(_acPage(al, prova.titulo || 'Prova', corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+app.post('/area/api/prova', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.status(401).json({ ok: false });
+  try {
+    const b = req.body || {}; const resp = b.respostas || {};
+    const prova = db.prepare(`SELECT * FROM academy_provas WHERE id=?`).get(b.prova) as any;
+    const questoes = db.prepare(`SELECT id,correta FROM academy_prova_questoes WHERE prova_id=?`).all(b.prova) as any[];
+    if (!prova || !questoes.length) return res.json({ ok: false });
+    let certos = 0; for (const q of questoes) { if (Number(resp[q.id]) === Number(q.correta)) certos++; }
+    const nota = Math.round((certos / questoes.length) * 100);
+    const aprovado = nota >= Number(prova.nota_minima || 60) ? 1 : 0;
+    db.prepare(`INSERT INTO academy_prova_resultados (id,aluno_id,prova_id,nota,aprovado,respostas,ts) VALUES (?,?,?,?,?,?,?)`).run(randomUUID(), al.id, b.prova, nota, aprovado, JSON.stringify(resp), agora());
+    if (aprovado) { _acPontuar(al.id, 'prova', b.prova); _acLog(al.id, 'prova_aprovada', b.prova); }
+    res.json({ ok: true, nota, aprovado: !!aprovado });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// ---------- [B.9] Layout inteligente: categorias + pop-up na tela + clareza tem/não-tem + metrônomo ----------
+_acAlter(`ALTER TABLE academy_vitrines ADD COLUMN categoria TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN tipo TEXT`);       // hero | popup
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN tamanho TEXT`);    // p | m | g | full
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN freq TEXT`);       // once | day | always
+
+// card de curso (destacado se tem; escuro + cadeado "Desbloquear" se não tem)
+const _acCardCurso = (c: any, meus: Set<string>, pmap: any): string => {
+  const tem = meus.has(c.id);
+  const capa = c.capa || '';
+  const pct = pmap[c.id] || 0;
+  const img = capa ? `<img src="${esc(capa)}" alt="">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:12px">${esc(c.nome || '')}</div>`;
+  const inner = `<div class="pz"${tem ? '' : ' style="filter:grayscale(.6) brightness(.5)"'}>${img}`
+    + (tem ? (pct > 0 ? `<div class="pb"><i style="width:${pct}%"></i></div>` : '') : `<div class="lock">🔒<span class="unlock">Desbloquear</span></div>`)
+    + `</div><div class="nm">${esc(c.nome || '')}</div>`;
+  const href = tem ? ('/area/curso/' + c.id) : (c.checkout_url ? esc(c.checkout_url) : '#');
+  const tgt = tem ? '' : ' target="_blank"';
+  return `<a class="card${tem ? '' : ' locked'}" href="${href}"${tgt}>${inner}</a>`;
+};
+// pop-up/banner na tela (X pra fechar; tamanhos p/m/g/full; frequência once/day/always)
+const _acPopupHtml = (al?: any): string => {
+  try {
+    const cands = db.prepare(`SELECT * FROM academy_banners WHERE status='publicado' AND tipo='popup' ORDER BY ordem`).all() as any[];
+    let p: any = null;
+    const meus = al ? _acCursosDoAluno(al.id) : new Set<string>();
+    for (const cand of cands) { if (!al || _acPublicoOk(al, cand.alvo_publico, cand.alvo_tag, cand.produto_alvo, meus)) { p = cand; break; } }
+    if (!p) return '';
+    const szmap: any = { p: '340px', m: '520px', g: '780px', full: '96vw' };
+    const sz = szmap[p.tamanho || 'm'] || '520px';
+    const full = (p.tamanho === 'full');
+    const inner = `<div class="pop" style="max-width:${sz}${full ? ';width:96vw;height:92vh;overflow:auto' : ''}">`
+      + `<button class="popx" onclick="acFechaPop()">✕</button>`
+      + (p.imagem ? `<img src="${esc(p.imagem)}" style="width:100%;border-radius:10px;display:block">` : '')
+      + (p.nome ? `<div style="font-weight:700;font-size:18px;margin:10px 4px">${esc(p.nome)}</div>` : '')
+      + (p.link ? `<a class="btn btn-g" href="${esc(p.link)}" target="_blank" style="display:inline-block;margin:6px 4px">Saber mais</a>` : '')
+      + `</div>`;
+    const freq = p.freq || 'day';
+    return `<div class="popov" id="popov" style="display:none">${inner}</div>`
+      + `<script>(function(){var k='acpop_${p.id}',f='${freq}';try{var last=localStorage.getItem(k),today=new Date().toISOString().slice(0,10);if(f==='once'&&last)return;if(f==='day'&&last===today)return;}catch(e){}`
+      + `setTimeout(function(){var o=document.getElementById('popov');if(o)o.style.display='flex';},1200);`
+      + `window.acFechaPop=function(){var o=document.getElementById('popov');if(o)o.style.display='none';try{localStorage.setItem('acpop_${p.id}',new Date().toISOString().slice(0,10));}catch(e){}};})();</script>`;
+  } catch { return ''; }
+};
+// metrônomo (ferramenta na aula)
+const _acMetronomo = (): string => `<button class="fab" style="right:18px;bottom:72px;background:#1c1c24;color:#e7c86a;border:1px solid #2a2a34" onclick="var e=document.getElementById('metp');e.style.display=e.style.display==='block'?'none':'block'">🎵 Metrônomo</button>
+  <div class="metp" id="metp"><div style="font-weight:700;margin-bottom:8px">Metrônomo</div>
+    <div style="display:flex;align-items:center;gap:8px"><input id="metb" type="range" min="40" max="220" value="90" oninput="document.getElementById('metv').textContent=this.value" style="flex:1"><b id="metv" style="min-width:34px;text-align:right">90</b><span style="color:#8a8a96">BPM</span></div>
+    <button class="btn btn-g" style="margin-top:10px;width:100%" id="metbtn" onclick="acMet()">Iniciar</button></div>
+  <script>var _met=null;function acMet(){var b=document.getElementById('metbtn');if(_met){clearInterval(_met);_met=null;b.textContent='Iniciar';return;}var bpm=Number(document.getElementById('metb').value)||90;var AC=window.AudioContext||window.webkitAudioContext;var ac=new AC();function clk(){var o=ac.createOscillator(),g=ac.createGain();o.frequency.value=1000;o.connect(g);g.connect(ac.destination);g.gain.setValueAtTime(0.001,ac.currentTime);g.gain.exponentialRampToValueAtTime(0.5,ac.currentTime+0.001);g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+0.05);o.start();o.stop(ac.currentTime+0.06);}clk();_met=setInterval(clk,60000/bpm);b.textContent='Parar';}</script>`;
+
+// página da categoria (abre só os cursos daquele instrumento/categoria)
+app.get('/area/categoria/:cat', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  try {
+    const cat = decodeURIComponent(String(req.params.cat));
+    const meus = _acCursosDoAluno(al.id);
+    const vitrines = db.prepare(`SELECT * FROM academy_vitrines WHERE categoria=? ORDER BY ordem, nome`).all(cat) as any[];
+    const cursos = db.prepare(`SELECT * FROM academy_cursos ORDER BY ordem, criado_em`).all() as any[];
+    const prog = db.prepare(`SELECT curso_id, AVG(pct) p FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id) as any[];
+    const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
+    let shelves = '';
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap)).join('')}</div></div>`; }
+    if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
+    const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
+    res.type('html').send(_acPage(al, cat, corpo));
+  } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
+});
+
+// ADMIN: listar categorias (distintas) p/ ajudar a organizar
+app.get('/academy/categorias', (_req: any, res: any) => { try { const rows = (db.prepare(`SELECT DISTINCT categoria FROM academy_vitrines WHERE categoria IS NOT NULL AND categoria<>'' ORDER BY categoria`).all() as any[]).map((r) => r.categoria); _ndOk(res, { categorias: rows }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- [B.10] Capa de categoria + "Novidades" + pop-up segmentado ----------
+db.exec(`CREATE TABLE IF NOT EXISTS academy_categorias ( nome TEXT PRIMARY KEY, imagem TEXT, ordem INTEGER DEFAULT 0 )`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN alvo_publico TEXT`);  // todos | nao_compradores | inativos | tag
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN alvo_tag TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN produto_alvo TEXT`);
+
+// público-alvo bate? (reusado por pop-up segmentado)
+const _acPublicoOk = (al: any, alvo_publico: string, alvo_tag: string, produto_alvo: string, meus: Set<string>): boolean => {
+  if (produto_alvo && meus.has(produto_alvo)) return false;
+  const pub = alvo_publico || 'todos';
+  if (pub === 'nao_compradores' && produto_alvo && meus.has(produto_alvo)) return false;
+  if (pub === 'inativos') { const lim = new Date(Date.now() - 15 * 864e5).toISOString(); if (al.ultimo_acesso && al.ultimo_acesso >= lim) return false; }
+  if (pub === 'tag' && alvo_tag) { const has = db.prepare(`SELECT 1 FROM academy_aluno_tags at JOIN academy_tags t ON t.id=at.tag_id WHERE at.aluno_id=? AND lower(t.nome)=lower(?)`).get(al.id, alvo_tag); if (!has) return false; }
+  return true;
+};
+// imagem/ordem por categoria
+const _acCatMeta = (): any => { const m: any = {}; try { for (const r of db.prepare(`SELECT * FROM academy_categorias`).all() as any[]) m[r.nome] = r; } catch { /* ok */ } return m; };
+// tile de categoria (com imagem se houver)
+const _acCatTile = (ct: string, meta: any): string => {
+  const im = meta[ct] && meta[ct].imagem;
+  if (im) return `<a class="cattile" style="background-image:linear-gradient(0deg,#000a,#0003),url('${esc(im)}');background-size:cover;background-position:center" href="/area/categoria/${encodeURIComponent(ct)}"><span style="text-shadow:0 1px 3px #000">${esc(ct)}</span></a>`;
+  return `<a class="cattile" href="/area/categoria/${encodeURIComponent(ct)}">${esc(ct)}</a>`;
+};
+// ADMIN: salvar imagem/ordem de uma categoria
+app.post('/academy/categoria', (req: any, res: any) => { try { const b = req.body || {}; db.prepare(`INSERT INTO academy_categorias (nome,imagem,ordem) VALUES (?,?,?) ON CONFLICT(nome) DO UPDATE SET imagem=excluded.imagem, ordem=excluded.ordem`).run(b.nome, b.imagem || '', Number(b.ordem || 0)); _ndOk(res, { ok: true }); } catch (e) { _ndErr(res, e); } });
+
+// ---------- [B.11] ENTREGA AUTOMÁTICA NA VENDA (webhook compra → matrícula na Academy) ----------
+db.exec(`CREATE TABLE IF NOT EXISTS academy_produto_curso ( id TEXT PRIMARY KEY, match TEXT, curso_id TEXT, validade TEXT, criado_em TEXT )`);
+const _acValidadeMap = (v: string): string => {
+  v = String(v || 'vitalicio').trim().toLowerCase();
+  if (v === '1ano' || v === '1 ano') { const d = new Date(); d.setFullYear(d.getFullYear() + 1); return d.toISOString().slice(0, 10); }
+  if (v === '6meses' || v === '6 meses') { const d = new Date(); d.setMonth(d.getMonth() + 6); return d.toISOString().slice(0, 10); }
+  return (v === 'vitalicio' || v === 'vitalício') ? 'vitalicio' : v;
+};
+// matricula o comprador na Academy conforme o mapa produto→curso (add-only, best-effort)
+const _acMatricularPorVenda = (v: any): void => {
+  try {
+    const pid = String(v.produtoId || '').toLowerCase().trim();
+    const pnome = String(v.produtoNome || '').toLowerCase().trim();
+    const email = String(v.email || '').trim().toLowerCase();
+    if (!email) return;
+    const maps = db.prepare(`SELECT * FROM academy_produto_curso`).all() as any[];
+    const matched = maps.filter((m) => { const k = String(m.match || '').toLowerCase().trim(); return k && (k === pid || k === pnome || (pnome && pnome.indexOf(k) >= 0)); });
+    if (!matched.length) return;
+    let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+    let id = al && al.id;
+    if (!al) { id = randomUUID(); const tok = _acToken(); db.prepare(`INSERT INTO academy_matriculas (id,nome,email,token_login,ativo,criado_em) VALUES (?,?,?,?,1,?)`).run(id, v.nome || '', email, tok, agora()); }
+    for (const m of matched) {
+      const val = _acValidadeMap(m.validade);
+      const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, m.curso_id);
+      if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', m.curso_id, val, agora());
+      _acLog(id, 'matricula_venda', m.curso_id);
+    }
+  } catch { /* best-effort: nunca quebra a entrega */ }
+};
+// ADMIN: mapa produto→curso
+app.get('/academy/mapa', (_req: any, res: any) => { try { const mapa = db.prepare(`SELECT mc.*, c.nome curso_nome FROM academy_produto_curso mc LEFT JOIN academy_cursos c ON c.id=mc.curso_id ORDER BY mc.criado_em DESC`).all(); _ndOk(res, { mapa }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/mapa', (req: any, res: any) => { try { const b = req.body || {}; const id = b.id || randomUUID(); db.prepare(`INSERT OR REPLACE INTO academy_produto_curso (id,match,curso_id,validade,criado_em) VALUES (?,?,?,?,?)`).run(id, String(b.match || '').trim(), b.curso_id, b.validade || 'vitalicio', agora()); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/mapa/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_produto_curso WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+
+// ===================== FIM DO LOTE B =====================
+
+// ---------- [B.12] MIGRAÇÃO DE ALUNOS v2 — acesso com INÍCIO + validade por curso + TEMPO RESTANTE ----------
+// ADITIVO. Só adiciona coluna/rotas/helpers; não altera nada existente. Reaproveita db, app, agora(),
+// randomUUID, _ndOk/_ndErr, _acToken, _acValida.
+try { db.exec(`ALTER TABLE academy_acesso ADD COLUMN inicio TEXT`); } catch { /* coluna já existe */ }
+
+// Calcula o tempo de acesso (total/restante em dias) de um registro de academy_acesso.
+const _acTempoAcesso = (ac: any): any => {
+  try {
+    const val = String((ac && ac.validade) || '');
+    if (!val || val.toLowerCase() === 'vitalicio') return { vitalicio: true, texto: 'Vitalício' };
+    const exp = new Date(val + 'T23:59:59'); if (isNaN(exp.getTime())) return { vitalicio: true, texto: 'Vitalício' };
+    const ini = ac.inicio ? new Date(String(ac.inicio) + 'T00:00:00') : null;
+    const dia = 86400000;
+    const restante = Math.ceil((exp.getTime() - Date.now()) / dia);
+    const total = ini ? Math.round((exp.getTime() - ini.getTime()) / dia) : null;
+    const expirado = restante < 0;
+    const brExp = val.split('-').reverse().join('/');
+    const texto = expirado ? ('Expirado em ' + brExp)
+      : (total ? (restante + ' de ' + total + ' dias') : (restante + ' dias restantes'));
+    return { vitalicio: false, inicio: ac.inicio || null, expira: val, total_dias: total, restante_dias: restante, expirado, texto };
+  } catch { return { vitalicio: true, texto: '' }; }
+};
+// HTML curtinho do tempo de acesso de um curso pra um aluno (usado na página do curso do aluno).
+const _acTempoCursoHtml = (alunoId: string, cursoId: string): string => {
+  try {
+    const a = db.prepare(`SELECT * FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=? ORDER BY validade DESC`).get(alunoId, cursoId) as any;
+    if (!a) return '';
+    const t = _acTempoAcesso(a);
+    if (t.vitalicio) return ' · <span style="color:#7ddc8f">acesso vitalício</span>';
+    if (t.expirado) return ' · <span style="color:#e06b6b">acesso expirado</span>';
+    return ' · <span style="color:#e7c86a">' + t.restante_dias + ' dias de acesso restantes</span>';
+  } catch { return ''; }
+};
+
+// Importação de ALUNOS v2 — aceita acessos por curso com INÍCIO + VALIDADE (data) individuais por curso.
+// body: { linhas: [ { nome, email, tags, acessos:[ {curso_id, inicio:'YYYY-MM-DD', validade:'YYYY-MM-DD'|'vitalicio'} ] } ] }
+app.post('/academy/importar/alunos2', (req: any, res: any) => {
+  try {
+    const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
+    let novos = 0, atualizados = 0, acessos = 0, tags = 0;
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
+        let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        let id = al && al.id;
+        if (!al) { id = randomUUID(); const tok = _acToken(); db.prepare(`INSERT INTO academy_matriculas (id,nome,email,token_login,ativo,criado_em) VALUES (?,?,?,?,1,?)`).run(id, String(r.nome || ''), email, tok, agora()); novos++; }
+        else { if (r.nome && !al.nome) db.prepare(`UPDATE academy_matriculas SET nome=? WHERE id=?`).run(String(r.nome), id); atualizados++; }
+        for (const tg of String(r.tags || '').split(/[;,]/).map((x: string) => x.trim()).filter(Boolean)) {
+          let tag = db.prepare(`SELECT id FROM academy_tags WHERE lower(nome)=?`).get(tg.toLowerCase()) as any;
+          if (!tag) { const tid = randomUUID(); db.prepare(`INSERT INTO academy_tags (id,nome,cor) VALUES (?,?,'')`).run(tid, tg); tag = { id: tid }; }
+          db.prepare(`INSERT OR IGNORE INTO academy_aluno_tags (aluno_id,tag_id) VALUES (?,?)`).run(id, tag.id); tags++;
+        }
+        for (const ac of (Array.isArray(r.acessos) ? r.acessos : [])) {
+          const cid = String((ac && ac.curso_id) || ''); if (!cid) continue;
+          const val = String((ac && ac.validade) || 'vitalicio');
+          const ini = String((ac && ac.inicio) || '');
+          const ex = db.prepare(`SELECT id FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, cid) as any;
+          if (ex) db.prepare(`UPDATE academy_acesso SET validade=?, inicio=? WHERE id=?`).run(val, ini, ex.id);
+          else db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,inicio,criado_em) VALUES (?,?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', cid, val, ini, agora());
+          acessos++;
+        }
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { novos, atualizados, acessos, tags, total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// Admin: acessos de um aluno COM tempo restante calculado (entrada + total + restante).
+app.get('/academy/aluno/:id/acessos', (req: any, res: any) => {
+  try {
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(String(req.params.id)) as any;
+    if (!al) return _ndErr(res, 'aluno nao encontrado');
+    const accs = db.prepare(`SELECT a.*, c.nome curso_nome FROM academy_acesso a LEFT JOIN academy_cursos c ON c.id=a.alvo_id WHERE a.aluno_id=? AND a.alvo_tipo='curso'`).all(al.id) as any[];
+    const out = accs.map((a) => ({ curso_id: a.alvo_id, curso_nome: a.curso_nome || a.alvo_id, inicio: a.inicio || null, validade: a.validade, tempo: _acTempoAcesso(a) }));
+    _ndOk(res, { aluno: { id: al.id, nome: al.nome, email: al.email }, acessos: out });
+  } catch (e) { _ndErr(res, e); }
+});
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
