@@ -5885,6 +5885,34 @@ function _contaNos(fluxoJson: string): number {
   try { const o = JSON.parse(fluxoJson || '{}'); return Array.isArray(o.nodes) ? o.nodes.length : 0; } catch { return 0; }
 }
 
+app.post('/crm/contatos/acao-massa', (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || '');
+    const acao = String(b.acao || '');
+    const valor = String(b.valor || '');
+    const alvo = b.alvo || {};
+    if (!valor) return res.json({ ok: false, erro: 'valor_obrigatorio' });
+    let ids: string[] = [];
+    if (Array.isArray(alvo.ids) && alvo.ids.length) ids = alvo.ids.map((x: any) => String(x));
+    else if (alvo.tag) {
+      ids = (db.prepare(`SELECT c.id FROM contatos c JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id WHERE t.nome=? AND (?='' OR c.projeto=?)`).all(String(alvo.tag), projeto, projeto) as any[]).map((r) => String(r.id));
+    }
+    if (!ids.length) return res.json({ ok: false, erro: 'sem_alvo' });
+    let afetados = 0;
+    if (acao === 'add_tag') {
+      for (const cid of ids) { aplicarTag(projeto, cid, valor); const ct = db.prepare(`SELECT telefone, nome FROM contatos WHERE id=?`).get(cid) as any; rodarAutomacoes(projeto, 'tag_adicionada', { contatoId: cid, tag: valor, telefone: ct?.telefone, nome: ct?.nome }).catch(() => {}); afetados++; }
+    } else if (acao === 'remove_tag') {
+      const t = db.prepare(`SELECT id FROM tags WHERE projeto=? AND nome=?`).get(projeto, valor) as any;
+      if (t) for (const cid of ids) { db.prepare(`DELETE FROM contato_tags WHERE contato_id=? AND tag_id=?`).run(cid, t.id); afetados++; }
+    } else if (acao === 'add_fluxo') {
+      return res.json({ ok: false, erro: 'add_fluxo_indisponivel', msg: 'Entrada direta em fluxo ainda nao disponivel; use Adicionar tag com a tag de entrada do fluxo.' });
+    } else {
+      return res.json({ ok: false, erro: 'acao_invalida' });
+    }
+    res.json({ ok: true, afetados, total: afetados });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
 app.get('/fluxo/campanhas', (req, res) => {
   try {
     const tipo = String((req.query as any).tipo || '');
@@ -11743,6 +11771,7 @@ _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN pontos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN dias_consecutivos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN ultimo_dia TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN email_sumido_em TEXT`); // [aluno-sumido] ultimo e-mail de reengajamento
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN termo_aceite TEXT`); // [termo] quando o aluno aceitou o termo de compromisso
 // semente da config de gamificação (perfil Equilibrado) se vazia
 try {
   const g = db.prepare(`SELECT id FROM academy_gamificacao WHERE id=1`).get();
@@ -11999,10 +12028,32 @@ function _acHomeJS(): string {
     var h=document.getElementById('heroC');if(h){var sl=h.querySelectorAll('.hslide'),dt=h.querySelectorAll('.hdot'),c=0,itv=(Number(h.getAttribute('data-itv'))||6)*1000;function go(i){sl[c].classList.remove('on');if(dt[c])dt[c].classList.remove('on');c=i;sl[c].classList.add('on');if(dt[c])dt[c].classList.add('on');}dt.forEach(function(d,i){d.addEventListener('click',function(){go(i);});});if(sl.length>1)setInterval(function(){go((c+1)%sl.length);},itv);}
   })();</script>`;
 }
+function _acTermoPendente(al: any): boolean {
+  try {
+    const cfg = db.prepare(`SELECT exigir_termo, termo FROM academy_config WHERE id=1`).get() as any;
+    if (!cfg || !Number(cfg.exigir_termo)) return false;
+    if (!String(cfg.termo || '').trim()) return false; // sem texto de termo = nao bloqueia (seguro)
+    return !al || !al.termo_aceite;
+  } catch { return false; }
+}
+app.get('/area/termo', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  const cfg = db.prepare(`SELECT termo FROM academy_config WHERE id=1`).get() as any;
+  const termo = String((cfg && cfg.termo) || '').trim();
+  if (!termo || al.termo_aceite) return res.redirect('/area');
+  const html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Termo \u2014 Melodias e Riffs</title><style>' + _acCSS + 'body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.bx{background:#13131a;border:1px solid #23232c;border-radius:16px;padding:28px;max-width:640px;width:100%}.lg{font-weight:800;color:#e7c86a;font-size:22px;text-align:center;margin-bottom:6px}.sub{color:#aeaeba;text-align:center;margin-bottom:18px;font-size:14px}.termo{max-height:50vh;overflow:auto;background:#0e0e14;border:1px solid #23232c;border-radius:10px;padding:16px;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#dcdce4;margin-bottom:16px}</style></head><body><div class="bx"><div class="lg">Termo de compromisso</div><div class="sub">Pra continuar na \u00e1rea de aluno, leia e aceite:</div><div class="termo">' + esc(termo) + '</div><form method="post" action="/area/api/aceitar-termo"><label style="display:flex;gap:8px;align-items:flex-start;font-size:14px;color:#dcdce4;margin-bottom:14px;cursor:pointer"><input type="checkbox" required style="margin-top:3px"> Li e aceito o termo acima.</label><button class="btn btn-g" type="submit" style="width:100%">Aceitar e continuar</button></form></div></body></html>';
+  res.type('html').send(html);
+});
+app.post('/area/api/aceitar-termo', (req: any, res: any) => {
+  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
+  try { db.prepare(`UPDATE academy_matriculas SET termo_aceite=? WHERE id=?`).run(agora(), al.id); _acLog(al.id, 'aceitou_termo', ''); } catch { /* */ }
+  res.redirect('/area');
+});
 app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   _acMarcarAcesso(al);
+  if (_acTermoPendente(al)) return res.redirect('/area/termo');
   try {
     const meus = _acCursosDoAluno(al.id);
     // [banner v3 23/10] carrossel: TODOS os banners hero publicados que o aluno QUALIFICA (segmentado por _acPublicoOk), com intervalo configurável (pub_kv academy_banner_intervalo).
@@ -12055,6 +12106,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
 app.get('/area/curso/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
+  if (_acTermoPendente(al)) return res.redirect('/area/termo');
   try {
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(String(req.params.id)) as any;
     if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
@@ -12105,6 +12157,7 @@ app.get('/area/aula/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   try {
+    if (_acTermoPendente(al)) return res.redirect('/area/termo');
     const aula = db.prepare(`SELECT * FROM academy_aulas WHERE id=?`).get(String(req.params.id)) as any;
     if (!aula) return res.status(404).type('html').send('Aula não encontrada.');
     const mod = db.prepare(`SELECT * FROM academy_modulos WHERE id=?`).get(aula.modulo_id) as any;
