@@ -2900,6 +2900,103 @@ app.post('/email/lembrete/config', (req, res) => {
   res.json({ ok: true, assunto: String((CONFIG as any).emailLembreteAssunto || '') });
 });
 
+// ============================================================================
+// [email-relatorio] RELATORIO SEMANAL por e-mail pro dono (Ezequias).
+// Reaproveita os dados do painel (/painel/trafego/dados via localhost). Nasce DESLIGADO
+// (email_relatorio_ativo!='1'). Dia/hora/destinatario configuraveis. Tambem da pra mandar na hora.
+// ============================================================================
+async function _emailRelatorioGerar(dias: number): Promise<{ assunto: string; html: string } | null> {
+  try {
+    const token = String((CONFIG as any).painelTrafegoToken || '');
+    if (!token) return null;
+    const rr = await fetch('http://localhost:' + PORT + '/painel/trafego/dados?k=' + encodeURIComponent(token) + '&dias=' + dias);
+    const j: any = await rr.json();
+    if (!j || !j.ok) return null;
+    const brl = (n: any): string => 'R$ ' + (Number(n) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const x2 = (n: any): string => (Number(n) || 0).toFixed(2).replace('.', ',');
+    const cor = (n: any): string => (Number(n) >= 0 ? '#1a9e5f' : '#c0392b');
+    const t = j.total || {};
+    let linhas = '';
+    for (const p of (j.produtos || [])) {
+      linhas += '<tr><td style="padding:8px 10px;border-bottom:1px solid #eee">' + String(p.produto || '') + '</td>'
+        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + brl(p.gasto) + '</td>'
+        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + (p.vendas || 0) + '</td>'
+        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + brl(p.fat) + '</td>'
+        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + x2(p.roas) + 'x</td>'
+        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right;color:' + cor(p.lucro) + ';font-weight:700">' + brl(p.lucro) + '</td></tr>';
+    }
+    const link = (PUBLIC_BASE_URL || '') + '/painel/trafego?k=' + token;
+    const assunto = 'Seu resumo de trafego — Melodias e Riffs (' + String(j.de || '') + ' a ' + String(j.ate || '') + ')';
+    const html = '<div style="font:15px/1.6 system-ui,Arial;color:#141a21;max-width:640px">'
+      + '<h2 style="margin:0 0 4px">\u{1F4CA} Resumo de trafego</h2>'
+      + '<p style="color:#667;margin:0 0 16px">Periodo: ' + String(j.de || '') + ' a ' + String(j.ate || '') + '</p>'
+      + '<table style="width:100%;border-collapse:collapse;margin-bottom:14px">'
+      + '<tr><td style="padding:6px 0">Faturamento</td><td style="padding:6px 0;text-align:right;font-weight:700">' + brl(t.fat) + '</td></tr>'
+      + '<tr><td style="padding:6px 0">Vendas</td><td style="padding:6px 0;text-align:right;font-weight:700">' + (t.vendas || 0) + '</td></tr>'
+      + '<tr><td style="padding:6px 0">Investido em anuncios</td><td style="padding:6px 0;text-align:right;font-weight:700">' + brl(t.gasto) + '</td></tr>'
+      + '<tr><td style="padding:6px 0">ROAS</td><td style="padding:6px 0;text-align:right;font-weight:700">' + x2(t.roas) + 'x</td></tr>'
+      + '<tr><td style="padding:6px 0;border-top:2px solid #141a21">Lucro liquido</td><td style="padding:6px 0;text-align:right;font-weight:800;border-top:2px solid #141a21;color:' + cor(t.lucro) + '">' + brl(t.lucro) + '</td></tr>'
+      + '</table>'
+      + '<h3 style="margin:18px 0 8px">Por produto</h3>'
+      + '<table style="width:100%;border-collapse:collapse;font-size:13px">'
+      + '<thead><tr style="color:#889;text-align:left"><th style="padding:8px 10px;border-bottom:2px solid #eee">Produto</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Investido</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Vendas</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Fat.</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">ROAS</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Lucro</th></tr></thead>'
+      + '<tbody>' + linhas + '</tbody></table>'
+      + '<p style="margin:18px 0 0"><a href="' + link + '" style="color:#3b82f6">Abrir o painel completo &rarr;</a></p>'
+      + '</div>';
+    return { assunto, html };
+  } catch { return null; }
+}
+async function _emailRelatorioEnviar(dias?: number): Promise<boolean> {
+  const d = (Number(dias) > 0) ? Number(dias) : (Number((CONFIG as any).emailRelatorioDias) || 7);
+  const para = String((CONFIG as any).emailRelatorioPara || 'geisseoliveira.93@gmail.com').trim();
+  if (!para || !para.includes('@')) return false;
+  const rep = await _emailRelatorioGerar(d);
+  if (!rep) return false;
+  try {
+    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), 'teclado', para, rep.assunto, rep.html, 'pendente', agora(), null, null);
+    return true;
+  } catch { return false; }
+}
+let _relTicking = false;
+async function _tickEmailRelatorio(): Promise<void> {
+  if (_relTicking) return; _relTicking = true;
+  try {
+    if (pubFlag('email_relatorio_ativo','0') !== '1') return;
+    const nowBRT = new Date(Date.now() - 3 * 3600000);
+    const dia = nowBRT.getUTCDay();
+    const hora = nowBRT.getUTCHours();
+    const diaCfg = Number((CONFIG as any).emailRelatorioDia); const diaAlvo = isFinite(diaCfg) ? diaCfg : 1;
+    const horaCfg = Number((CONFIG as any).emailRelatorioHora); const horaAlvo = isFinite(horaCfg) ? horaCfg : 8;
+    if (dia !== diaAlvo || hora < horaAlvo) return;
+    const hojeStr = `${nowBRT.getUTCFullYear()}-${String(nowBRT.getUTCMonth()+1).padStart(2,'0')}-${String(nowBRT.getUTCDate()).padStart(2,'0')}`;
+    if (pubFlag('email_relatorio_ultimo','') === hojeStr) return;
+    const ok = await _emailRelatorioEnviar();
+    if (ok) setPubFlag('email_relatorio_ultimo', hojeStr);
+  } catch { /* best-effort */ } finally { _relTicking = false; }
+}
+setInterval(() => { _tickEmailRelatorio().catch(() => {}); }, 15 * 60000);
+app.get('/email/relatorio', (_req, res) => {
+  res.json({ ok: true, ativo: pubFlag('email_relatorio_ativo','0')==='1',
+    para: String((CONFIG as any).emailRelatorioPara || 'geisseoliveira.93@gmail.com'),
+    dia: isFinite(Number((CONFIG as any).emailRelatorioDia)) ? Number((CONFIG as any).emailRelatorioDia) : 1,
+    hora: isFinite(Number((CONFIG as any).emailRelatorioHora)) ? Number((CONFIG as any).emailRelatorioHora) : 8,
+    dias: Number((CONFIG as any).emailRelatorioDias) || 7 });
+});
+app.post('/email/relatorio/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_relatorio_ativo', on?'1':'0'); res.json({ ok:true, ativo: pubFlag('email_relatorio_ativo','0')==='1' }); });
+app.post('/email/relatorio/config', (req, res) => {
+  const b = req.body || {};
+  if (b.para !== undefined) salvarConfigPermanente('emailRelatorioPara', String(b.para||''));
+  if (b.dia !== undefined) salvarConfigPermanente('emailRelatorioDia', Math.max(0, Math.min(6, Number(b.dia)||0)));
+  if (b.hora !== undefined) salvarConfigPermanente('emailRelatorioHora', Math.max(0, Math.min(23, Number(b.hora)||0)));
+  if (b.dias !== undefined) salvarConfigPermanente('emailRelatorioDias', Math.max(1, Math.min(90, Number(b.dias)||7)));
+  res.json({ ok:true });
+});
+app.post('/email/relatorio/enviar', async (req, res) => {
+  try { const dias = Number((req.body||{}).dias) || undefined; const ok = await _emailRelatorioEnviar(dias); res.json({ ok, enfileirado: ok }); }
+  catch (e:any) { res.json({ ok:false, erro:String(e&&e.message||e) }); }
+});
+
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
 app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
 app.post('/comentario', (req, res) => {
@@ -13417,7 +13514,13 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 };
       for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; }
       const total = enrich(tot);
-      return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista };
+      const ads = (anuncios || []).map((a: any) => {
+        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
+        const gasto = (a.gasto_centavos || 0) / 100; const fat = (a.fat_centavos || 0) / 100;
+        const taxaV = fat * tx / 100; const impV = gasto * im / 100;
+        return { produto: prod, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: a.vendas || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
+      });
+      return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista, ads };
     };
 
     // JSON (publico, protegido por ?k=)
@@ -13464,6 +13567,8 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + '@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}}'
         + '.kpi{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:12px 13px}'
         + '.kpi .l{font-size:11px;color:var(--mut);font-weight:600}.kpi .v{font-size:20px;font-weight:800;letter-spacing:-.4px;margin-top:6px;line-height:1}'
+        + '.mg{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border-radius:10px;overflow:hidden;margin-top:2px}@media(max-width:560px){.mg{grid-template-columns:1fr 1fr}}'
+        + '.mi{background:var(--card);padding:11px 12px}.mi .l{font-size:10.5px;color:var(--mut);font-weight:600}.mi .v{font-size:15.5px;font-weight:800;margin-top:4px;letter-spacing:-.2px}'
         + '.panel{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:15px 16px;margin-bottom:12px}'
         + '.panel h2{font-size:13.5px;margin:0 0 12px}'
         + '.line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px dashed var(--line)}.line:last-of-type{border-bottom:0}'
@@ -13478,6 +13583,8 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + '.foot{font-size:11px;color:var(--mut);text-align:center;margin-top:18px}'
         + '.err{background:var(--ams);border:1px solid var(--am);color:var(--am);border-radius:12px;padding:14px;font-size:13px;font-weight:600;text-align:center}'
         + '.sk{opacity:.45}'
+        + '.px{overflow-x:auto}'
+        + 'td.cmp{color:var(--mut);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
         + '</style></head><body><div class="wrap">'
         + '<div class="top"><div class="brand"><div class="logo">🎹</div><div><h1>Trafego Pago</h1><div class="sub">Melodias e Riffs · ao vivo</div></div></div>'
         + '<div class="ctl"><button class="btn2" id="qhoje">Hoje</button><button class="btn2" id="qontem">Ontem</button><select class="sel" id="dias"><option value="7">7 dias</option><option value="14" selected>14 dias</option><option value="30">30 dias</option></select><input type="date" class="sel dt" id="de"><span class="dsep">→</span><input type="date" class="sel dt" id="ate">'
@@ -13515,6 +13622,10 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + 'html+=kpi("Ticket medio",brl(p.ticket));'
         + 'html+=kpi("CPA",brl(p.cpa));'
         + 'html+="</div>";'
+        + 'var _ctr=p.impressoes>0?(p.cliques/p.impressoes*100):0;var _cpc=p.cliques>0?(p.gasto/p.cliques):0;var _cpm=p.impressoes>0?(p.gasto/p.impressoes*1000):0;var _cpl=p.leads>0?(p.gasto/p.leads):0;'
+        + 'html+="<div class=panel><h2>\u{1F4C8} Metricas de anuncio</h2><div class=mg>";'
+        + 'html+=mi("Cliques",num(p.cliques))+mi("Impressoes",num(p.impressoes))+mi("CTR",pct(_ctr))+mi("CPC",brl(_cpc))+mi("CPM",brl(_cpm))+mi("Leads",num(p.leads))+mi("CPL",brl(_cpl));'
+        + 'html+="</div></div>";'
         + 'html+="<div class=panel><h2>💰 Resultado real — o que sobra ("+esc(SEL)+")</h2>";'
         + 'html+=lin("Faturamento bruto","",brl(p.fat),false);'
         + 'html+=lin("Taxa da plataforma","LastLink · "+x(DADOS.taxaPct)+"%","− "+brl(p.taxaPlataforma),true);'
@@ -13526,9 +13637,21 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + 'html+="<div class=panel style=\\"overflow-x:auto\\"><h2>Por produto</h2><table><thead><tr><th>Produto</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Faturamento</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
         + 'for(var r=0;r<DADOS.produtos.length;r++){var q=DADOS.produtos[r];html+="<tr><td class=cre>"+esc(q.produto)+"</td><td class=n>"+brl(q.gasto)+"</td><td class=n>"+num(q.vendas)+"</td><td class=n>"+brl(q.fat)+"</td><td class=n>"+x(q.roas)+"x</td><td class=\\"n "+(q.lucro>=0?"pos":"neg")+"\\">"+brl(q.lucro)+"</td></tr>";}'
         + 'html+="</tbody></table></div>";'
-        + 'body.innerHTML=html;'
+        + 'var _ads=adsDoSel();'
+        + 'if(_ads&&_ads.length){var _camps=agrupaCamp(_ads);'
+        + 'html+="<div class=panel><h2>Por campanha ("+esc(SEL)+")</h2><div class=px><table><thead><tr><th>Campanha</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Fat.</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
+        + 'for(var ci=0;ci<_camps.length;ci++){var c=_camps[ci];html+="<tr><td class=cre>"+esc(c.campanha)+"</td><td class=n>"+brl(c.gasto)+"</td><td class=n>"+num(c.vendas)+"</td><td class=n>"+brl(c.fat)+"</td><td class=n>"+x(c.roas)+"x</td><td class=n><span class="+(c.lucro>=0?"pos":"neg")+">"+brl(c.lucro)+"</span></td></tr>";}'
+        + 'html+="</tbody></table></div></div>";'
+        + 'html+="<div class=panel><h2>Por criativo (anuncio)</h2><div class=px><table><thead><tr><th>Anuncio</th><th>Campanha</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
+        + 'var _ao=_ads.slice().sort(function(a,b){return b.gasto-a.gasto;});'
+        + 'for(var ai=0;ai<_ao.length;ai++){var d=_ao[ai];html+="<tr><td class=cre>"+esc(d.ad)+"</td><td class=cmp>"+esc(d.campanha)+"</td><td class=n>"+brl(d.gasto)+"</td><td class=n>"+num(d.vendas)+"</td><td class=n>"+x(d.roas)+"x</td><td class=n><span class="+(d.lucro>=0?"pos":"neg")+">"+brl(d.lucro)+"</span></td></tr>";}'
+        + 'html+="</tbody></table></div></div>";}'
+        + 'body.innerHTML=html;' 
         + '}'
         + 'function kpi(l,v){return "<div class=kpi><div class=l>"+esc(l)+"</div><div class=v>"+v+"</div></div>";}'
+        + 'function mi(l,v){return "<div class=mi><div class=l>"+esc(l)+"</div><div class=v>"+v+"</div></div>";}'
+        + 'function adsDoSel(){var a=(DADOS&&DADOS.ads)||[];if(SEL==="Todos")return a;var o=[];for(var i=0;i<a.length;i++){if(a[i].produto===SEL)o.push(a[i]);}return o;}'
+        + 'function agrupaCamp(ads){var m={},ord=[];for(var i=0;i<ads.length;i++){var c=ads[i].campanha;if(!m[c]){m[c]={campanha:c,gasto:0,vendas:0,fat:0,lucro:0};ord.push(c);}var g=m[c];g.gasto+=ads[i].gasto;g.vendas+=ads[i].vendas;g.fat+=ads[i].fat;g.lucro+=ads[i].lucro;}var out=[];for(var k=0;k<ord.length;k++){var gg=m[ord[k]];gg.roas=gg.gasto>0?gg.fat/gg.gasto:0;out.push(gg);}out.sort(function(a,b){return b.gasto-a.gasto;});return out;}'
         + 'function lin(tag,pc,v,minus){return "<div class=\\"line"+(minus?" minus":"")+"\\"><div><span class=tag>"+esc(tag)+"</span>"+(pc?"<span class=pct>"+esc(pc)+"</span>":"")+"</div><div class=vv>"+v+"</div></div>";}'
         + 'function carregar(){'
         + 'var dias=document.getElementById("dias").value;'
