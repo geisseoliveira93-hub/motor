@@ -3031,6 +3031,16 @@ function _emailFilaEnfileirar(projeto: string, para: string, assunto: string, ht
       .run(randomUUID(), String(projeto || ''), String(para || ''), String(assunto || ''), String(html || ''), 'pendente', agora(), (opts && opts.dominio_id) || null, anexos, (opts && opts.agendado_para) || null);
   } catch { /* best-effort */ }
 }
+// [canal-whatsapp] enfileira UMA mensagem de WhatsApp na fila_envio (mesmo worker tickFila,
+// respeita agendado_para e o ritmo anti-ban). Reaproveitado pelos fluxos, aluno-sumido e certificado.
+function _wppFilaEnfileirar(projeto: string, para: string, texto: string, opts?: { instancia?: string | null; agendado_para?: string | null }): void {
+  try {
+    const tel = String(para || '').replace(/\D/g, '');
+    if (tel.length < 8 || !String(texto || '').trim()) return;
+    db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), String(projeto || 'teclado'), tel, 0, String(texto || ''), 'texto', 'pendente', (opts && opts.instancia) || null, (opts && opts.agendado_para) || null, agora());
+  } catch { /* best-effort */ }
+}
 function _emailFluxoMatch(evento: string, produtoId?: string, produtoNome?: string): any[] {
   const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
   const id = String(produtoId || '').toLowerCase();
@@ -3039,22 +3049,33 @@ function _emailFluxoMatch(evento: string, produtoId?: string, produtoNome?: stri
     if (!f || !f.ativo || String(f.evento || '') !== evento) continue;
     const chave = String(f.chave || '').toLowerCase();
     const casa = !chave || (f.porId ? (id && id === chave) : alvo.includes(chave));
-    if (casa && (f.assunto || f.html)) out.push(f);
+    if (casa && (f.assunto || f.html || f.wtexto)) out.push(f);
   }
   return out;
 }
-async function _emailFluxoDisparar(evento: string, projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<void> {
+async function _emailFluxoDisparar(evento: string, projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string, telefone?: string): Promise<void> {
   const para = String(email || '').trim();
-  if (!para || !para.includes('@')) return;
+  const temEmail = !!para && para.includes('@');
+  const tel = String(telefone || '').replace(/\D/g, '');
+  const temWpp = tel.length >= 8;
+  if (!temEmail && !temWpp) return;
   const fluxos = _emailFluxoMatch(evento, produtoId, produtoNome);
   if (!fluxos.length) return;
   const nm = (nome || '').trim();
   for (const f of fluxos) {
-    const assunto = String(f.assunto || '').replace(/\{nome\}/g, nm);
-    const html = String(f.html || '').replace(/\{nome\}/g, nm);
     const dias = Math.max(0, Number(f.delayDias) || 0);
-    const agendado = dias > 0 ? new Date(Date.now() + dias * 86400000).toISOString() : null;
-    _emailFilaEnfileirar(String(projeto || ''), para, assunto, html, { anexos: f.anexos, agendado_para: agendado });
+    // canal e-mail
+    if (temEmail && (f.assunto || f.html)) {
+      const assunto = String(f.assunto || '').replace(/\{nome\}/g, nm);
+      const html = String(f.html || '').replace(/\{nome\}/g, nm);
+      const agendado = dias > 0 ? new Date(Date.now() + dias * 86400000).toISOString() : null;
+      _emailFilaEnfileirar(String(projeto || ''), para, assunto, html, { anexos: f.anexos, agendado_para: agendado });
+    }
+    // canal WhatsApp
+    if (temWpp && f.wtexto) {
+      const wtexto = String(f.wtexto || '').replace(/\{nome\}/g, nm);
+      _wppFilaEnfileirar(String(projeto || 'teclado'), tel, wtexto, { agendado_para: dias > 0 ? emSegundos(dias * 86400) : null });
+    }
   }
 }
 // GET: lista os fluxos. POST /email/fluxo: cria/atualiza. /remover e /ativo pra gerenciar.
@@ -3063,7 +3084,7 @@ app.post('/email/fluxo', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.id || randomUUID());
     const evento = ['nao_pago','cartao_recusado'].includes(String(b.evento || '')) ? String(b.evento || '') : 'pos_compra';
-    const item: any = { id, evento, label: String(b.label || ''), chave: String(b.chave || ''), porId: !!b.porId, delayDias: Math.max(0, Number(b.delayDias) || 0), assunto: String(b.assunto || ''), html: String(b.html || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], ativo: b.ativo === undefined ? true : !!b.ativo };
+    const item: any = { id, evento, label: String(b.label || ''), chave: String(b.chave || ''), porId: !!b.porId, delayDias: Math.max(0, Number(b.delayDias) || 0), assunto: String(b.assunto || ''), html: String(b.html || ''), wtexto: String(b.wtexto || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], ativo: b.ativo === undefined ? true : !!b.ativo };
     const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id);
     lista.push(item); salvarConfigPermanente('emailFluxos', lista);
     res.json({ ok: true, id, total: lista.length });
@@ -3413,12 +3434,12 @@ app.post('/webhook/payment/:provider', async (req, res) => {
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
     // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
     if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
-    if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+    if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
     if (categoria === 'perdido') {
       // [cartao-recusado] se a recusa foi de cartao/sem limite, dispara o fluxo 'cartao_recusado';
       // os demais nao-pagos (boleto/pix nao pago, abandono) caem em 'nao_pago'. Exclusivo: nunca os dois.
-      if (_cartaoRecusado(provider, b, p.status)) { try { await _emailFluxoDisparar('cartao_recusado', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
-      else { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+      if (_cartaoRecusado(provider, b, p.status)) { try { await _emailFluxoDisparar('cartao_recusado', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
+      else { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
     }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
@@ -12595,7 +12616,8 @@ function _acCertificadoEmail(alunoId: string, cursoId: string): void {
     if (ja) return;
     const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(alunoId) as any;
     const email = (al && al.email) ? String(al.email).trim() : '';
-    if (!email || !email.includes('@')) return;
+    const telChk = (al && al.telefone) ? String(al.telefone).replace(/\D/g, '') : '';
+    if ((!email || !email.includes('@')) && telChk.length < 8) return;
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(cursoId) as any;
     const nomeCurso = curso ? String(curso.nome || '') : '';
     const nomeAluno = String((al && al.nome) || 'Aluno');
@@ -12619,13 +12641,21 @@ function _acCertificadoEmail(alunoId: string, cursoId: string): void {
       + `<p style="margin:0 0 16px">${intro}</p>${cert}`
       + `<p style="text-align:center;margin:22px 0 0"><a href="${link}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Ver e baixar o certificado (PDF)</a></p>`
       + `<p style="color:#889;font-size:13px;text-align:center;margin:14px 0 0">Dica: na página do certificado, toque em "Imprimir / Salvar PDF".</p></div>`;
-    _emailFilaEnfileirar('teclado', email, assunto, html, {});
+    if (email && email.includes('@')) _emailFilaEnfileirar('teclado', email, assunto, html, {});
+    const tel = (al && al.telefone) ? String(al.telefone).replace(/\D/g, '') : '';
+    const wtextoCfg = String((CONFIG as any).emailCertWtexto || '').trim();
+    if (tel.length >= 8) {
+      const wmsg = (wtextoCfg
+        ? wtextoCfg.replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso)
+        : `Parab\u00e9ns, ${nomeAluno}! \u{1F3C6} Voc\u00ea concluiu o curso *${nomeCurso}*. Seu certificado est\u00e1 aqui: ${link}`);
+      _wppFilaEnfileirar('teclado', tel, wmsg, {});
+    }
     _acLog(alunoId, 'cert_email', cursoId);
   } catch { /* best-effort */ }
 }
-app.get('/email/cert', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1', assunto: String((CONFIG as any).emailCertAssunto || ''), html: String((CONFIG as any).emailCertHtml || '') }); });
+app.get('/email/cert', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1', assunto: String((CONFIG as any).emailCertAssunto || ''), html: String((CONFIG as any).emailCertHtml || ''), wtexto: String((CONFIG as any).emailCertWtexto || '') }); });
 app.post('/email/cert/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_cert_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1' }); });
-app.post('/email/cert/config', (req, res) => { const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailCertAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailCertHtml', String(b.html || '')); res.json({ ok: true }); });
+app.post('/email/cert/config', (req, res) => { const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailCertAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailCertHtml', String(b.html || '')); if (b.wtexto !== undefined) salvarConfigPermanente('emailCertWtexto', String(b.wtexto || '')); res.json({ ok: true }); });
 
 function _tickEmailSumido(): void {
   try {
@@ -12635,13 +12665,17 @@ function _tickEmailSumido(): void {
     if (pubFlag('email_sumido_ultimo','') === hojeStr) return;
     const dias = Math.max(1, Number((CONFIG as any).emailSumidoDias) || 15);
     const lim = new Date(Date.now() - dias * 86400000).toISOString();
-    const rows = db.prepare(`SELECT id,nome,email FROM academy_matriculas WHERE email IS NOT NULL AND email<>'' AND ultimo_acesso IS NOT NULL AND ultimo_acesso<>'' AND ultimo_acesso < ? AND (email_sumido_em IS NULL OR email_sumido_em < ?) LIMIT 100`).all(lim, lim) as any[];
+    const rows = db.prepare(`SELECT id,nome,email,telefone FROM academy_matriculas WHERE ((email IS NOT NULL AND email<>'') OR (telefone IS NOT NULL AND telefone<>'')) AND ultimo_acesso IS NOT NULL AND ultimo_acesso<>'' AND ultimo_acesso < ? AND (email_sumido_em IS NULL OR email_sumido_em < ?) LIMIT 100`).all(lim, lim) as any[];
     const assuntoCfg = String((CONFIG as any).emailSumidoAssunto || '').trim();
     const htmlCfg = String((CONFIG as any).emailSumidoHtml || '').trim();
+    const wtextoCfg = String((CONFIG as any).emailSumidoWtexto || '').trim();
     const base = (PUBLIC_BASE_URL || '') + '/area';
     for (const r of rows) {
-      const email = String(r.email || '').trim(); if (!email.includes('@')) continue;
+      const email = String(r.email || '').trim();
+      const tel = String(r.telefone || '').replace(/\D/g, '');
       const nm = String(r.nome || '').trim();
+      let mandou = false;
+      if (email.includes('@')) {
       const assunto = (assuntoCfg || 'Sentimos sua falta na Melodias e Riffs \u{1F3B6}').replace(/\{nome\}/g, nm);
       const corpo = htmlCfg
         ? htmlCfg.replace(/\{nome\}/g, nm).replace(/\r?\n/g, '<br>')
@@ -12649,7 +12683,10 @@ function _tickEmailSumido(): void {
       const html = `<div style="font:16px/1.6 system-ui,Arial;color:#141a21;max-width:600px;margin:0 auto">`
         + `<p style="margin:0 0 16px">${corpo}</p>`
         + `<p style="text-align:center;margin:22px 0 0"><a href="${base}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Voltar para as aulas</a></p></div>`;
-      _emailFilaEnfileirar('teclado', email, assunto, html, {});
+      _emailFilaEnfileirar('teclado', email, assunto, html, {}); mandou = true;
+      }
+      if (tel.length >= 8 && wtextoCfg) { _wppFilaEnfileirar('teclado', tel, wtextoCfg.replace(/\{nome\}/g, nm), {}); mandou = true; }
+      if (!mandou) continue;
       try { db.prepare(`UPDATE academy_matriculas SET email_sumido_em=? WHERE id=?`).run(agora(), r.id); } catch { /* */ }
       try { _acLog(r.id, 'email_sumido', ''); } catch { /* */ }
     }
@@ -12657,9 +12694,9 @@ function _tickEmailSumido(): void {
   } catch { /* best-effort */ }
 }
 setInterval(() => { try { _tickEmailSumido(); } catch { /* */ } }, 60 * 60000); // checa 1x/hora; dispara no max 1x/dia
-app.get('/email/sumido', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1', dias: Number((CONFIG as any).emailSumidoDias) || 15, assunto: String((CONFIG as any).emailSumidoAssunto || ''), html: String((CONFIG as any).emailSumidoHtml || '') }); });
+app.get('/email/sumido', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1', dias: Number((CONFIG as any).emailSumidoDias) || 15, assunto: String((CONFIG as any).emailSumidoAssunto || ''), html: String((CONFIG as any).emailSumidoHtml || ''), wtexto: String((CONFIG as any).emailSumidoWtexto || '') }); });
 app.post('/email/sumido/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_sumido_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1' }); });
-app.post('/email/sumido/config', (req, res) => { const b = req.body || {}; if (b.dias !== undefined) salvarConfigPermanente('emailSumidoDias', Math.max(1, Number(b.dias) || 15)); if (b.assunto !== undefined) salvarConfigPermanente('emailSumidoAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailSumidoHtml', String(b.html || '')); res.json({ ok: true }); });
+app.post('/email/sumido/config', (req, res) => { const b = req.body || {}; if (b.dias !== undefined) salvarConfigPermanente('emailSumidoDias', Math.max(1, Number(b.dias) || 15)); if (b.assunto !== undefined) salvarConfigPermanente('emailSumidoAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailSumidoHtml', String(b.html || '')); if (b.wtexto !== undefined) salvarConfigPermanente('emailSumidoWtexto', String(b.wtexto || '')); res.json({ ok: true }); });
 app.post('/email/sumido/enviar-agora', (_req, res) => { try { setPubFlag('email_sumido_ultimo',''); _tickEmailSumido(); res.json({ ok: true }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
 
 
