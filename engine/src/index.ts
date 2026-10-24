@@ -2866,6 +2866,40 @@ app.post('/email/entrega/flag', (req, res) => {
   res.json({ ok: true, ativo: pubFlag('email_entrega_ativo','0')==='1' });
 });
 
+// ============================================================================
+// [email-lembrete] E-mail de LEMBRETE de live/webinario, JUNTO com o WhatsApp.
+// Reusa o motor de lembretes de sessao (agenda_lembretes/tickLembretesSessao):
+// quando um lembrete dispara, se este e-mail estiver LIGADO e o contato tiver e-mail,
+// manda o mesmo lembrete tambem por e-mail. Nasce DESLIGADO (email_lembrete_ativo!='1').
+// ============================================================================
+function _emailLembreteEnviar(projeto: string, contatoId: string | null, texto: string): void {
+  try {
+    if (pubFlag('email_lembrete_ativo','0') !== '1') return;
+    if (!contatoId) return;
+    const ct = db.prepare(`SELECT email FROM contatos WHERE id=?`).get(contatoId) as any;
+    const email = (ct && ct.email) ? String(ct.email).trim() : '';
+    if (!email || !email.includes('@')) return;
+    const assunto = String((CONFIG as any).emailLembreteAssunto || 'Lembrete: sua aula ao vivo 🎹');
+    const esc = String(texto || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = '<div style="font:16px/1.6 system-ui,Arial;color:#141a21">' + esc.replace(/\r?\n/g, '<br>').replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>') + '</div>';
+    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), String(projeto || ''), email, assunto, html, 'pendente', agora(), null, null);
+  } catch { /* best-effort: nunca quebra o lembrete do WhatsApp */ }
+}
+// GET: estado do liga/desliga + assunto do e-mail de lembrete.
+app.get('/email/lembrete', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_lembrete_ativo','0')==='1', assunto: String((CONFIG as any).emailLembreteAssunto || '') }); });
+// POST: liga/desliga. body:{on:true/false}. Nasce DESLIGADO.
+app.post('/email/lembrete/flag', (req, res) => {
+  const on = ((req.body || {}).on === true || (req.body||{}).on === '1' || (req.body||{}).on === 1 || (req.body||{}).on === 'on');
+  setPubFlag('email_lembrete_ativo', on ? '1' : '0');
+  res.json({ ok: true, ativo: pubFlag('email_lembrete_ativo','0')==='1' });
+});
+// POST: define o assunto do e-mail de lembrete. body:{assunto}
+app.post('/email/lembrete/config', (req, res) => {
+  const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailLembreteAssunto', String(b.assunto || ''));
+  res.json({ ok: true, assunto: String((CONFIG as any).emailLembreteAssunto || '') });
+});
+
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
 app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
 app.post('/comentario', (req, res) => {
@@ -3665,6 +3699,7 @@ async function tickLembretesSessao(): Promise<void> {
         if (!got.changes) continue;
         try { await enviarTexto(r.projeto as any, r.telefone, r.texto, r.instancia ? String(r.instancia) : undefined); }
         catch (e: any) { db.prepare(`UPDATE agenda_lembretes SET status='erro', erro=? WHERE id=?`).run(String(e && e.message || e), r.id); }
+        try { _emailLembreteEnviar(String(r.projeto||''), r.contato_id || null, String(r.texto||'')); } catch { /* [email-lembrete] best-effort */ }
       } catch { /* best-effort por linha */ }
     }
   } catch { /* best-effort */ } finally { _lembTicking = false; }
