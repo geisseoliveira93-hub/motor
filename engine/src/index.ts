@@ -295,8 +295,11 @@ type Config = {
   // [num-escolha] Número PADRÃO de envio por projeto (nome da instância). Usado por numeroConectado
   // como preferência; se vazio/desconectado, cai no 1º conectado. Evita mandar do número errado (ex.: pessoal).
   numeroPadrao?: Partial<Record<Projeto, string>>;
+  // [+presenca] mostrar "digitando…" (texto) e "gravando áudio…" (áudio) antes de enviar no 1-a-1. Default: ligado.
+  presencaSimulada?: boolean;
 };
 const CONFIG_DEFAULT: Config = {
+  presencaSimulada: true,
   produtoProjeto: {},
   palavraChaveProjeto: [
     { contem: 'baixo', projeto: 'baixo' },
@@ -338,12 +341,35 @@ function carregarConfig(): Config {
 }
 let CONFIG = carregarConfig();
 
+// ===================== [+seguranca-camada1] CONFIG também no BANCO (sobrevive a deploy) =====================
+// Problema histórico: o deploy copiava engine/config.json POR CIMA de /data/config.json e apagava os
+// configs de produção (agentesHabilitados, agenteModoWa, canalIg, numeroPadrao, presencaSimulada...).
+// Solução definitiva: espelhar TODO o CONFIG numa tabela do /data/engine.db (que o deploy NÃO toca).
+// No boot o BANCO MANDA: mescla o snapshot do banco POR CIMA do config.json. Como todos os setters já
+// chamam salvarConfig(), basta salvarConfig() gravar também no banco — cobre tudo de uma vez. Add-only.
+try { db.exec(`CREATE TABLE IF NOT EXISTS config_runtime ( chave TEXT PRIMARY KEY, valor TEXT NOT NULL, atualizado_em TEXT NOT NULL DEFAULT (datetime('now')) )`); } catch { /* ja existe */ }
+function _configRuntimeSalvar(): void {
+  try { db.prepare(`INSERT INTO config_runtime(chave,valor,atualizado_em) VALUES('CONFIG',?,datetime('now')) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em`).run(JSON.stringify(CONFIG)); } catch { /* best-effort */ }
+}
+function _configRuntimeCarregar(): void {
+  try {
+    const r = db.prepare(`SELECT valor FROM config_runtime WHERE chave='CONFIG'`).get() as any;
+    if (r && r.valor) { const snap = JSON.parse(r.valor); CONFIG = { ...CONFIG, ...snap }; console.log('[seguranca] CONFIG mesclado do banco (sobrevive a deploy).'); }
+    else { _configRuntimeSalvar(); console.log('[seguranca] config_runtime semeado do config.json (1a vez).'); }
+  } catch (e: any) { console.log('[seguranca] erro ao carregar config_runtime (seguindo):', e?.message || e); }
+}
+_configRuntimeCarregar();
+// Convenience p/ código novo: muda UMA chave de topo do CONFIG e já persiste nos 2 lugares.
+function salvarConfigPermanente(chave: string, valor: any): void { (CONFIG as any)[chave] = valor; salvarConfig(); }
+void salvarConfigPermanente; // reservado p/ uso futuro (evita "não usado")
+
 // ----------------------- Salvar config (construtor de fluxos do app) -----------------------
 // Grava o CONFIG atual em /data/config.json (volume do engine). Usado pelos endpoints /flows
 // pro app publicar os fluxos de entrega/recuperacao sem editar o arquivo na mao.
 function salvarConfig(): void {
   fs.mkdirSync('/data', { recursive: true });
   fs.writeFileSync('/data/config.json', JSON.stringify(CONFIG, null, 2), 'utf8');
+  try { _configRuntimeSalvar(); } catch { /* best-effort */ } // [+seguranca-camada1] espelha no banco (sobrevive a deploy)
 }
 
 // ----------------------- [entrega-perm] Fluxos de entrega PERMANENTES -----------------------
@@ -723,11 +749,31 @@ function numeroConectado(projeto: Projeto): any {
   ).get(projeto);
 }
 
+// [+presenca] "digitando…" (texto) e "gravando áudio…" (áudio) antes de enviar — ritmo humano.
+// Global, LIGADO por padrão (CONFIG.presencaSimulada). SÓ no 1-a-1 (nunca em grupo) e SÓ nos envios
+// enviarTexto/enviarMidia (agentes, entrega, recuperação, lembretes) — NÃO no disparo em massa.
+function _presencaLigada(): boolean { const v = (CONFIG as any).presencaSimulada; return v === undefined ? true : !!v; }
+function _presencaMs(ref: string, modo: 'composing' | 'recording'): number {
+  if (modo === 'recording') return 2800;
+  const n = String(ref || '').length;
+  return Math.min(6000, Math.max(1400, Math.round((n / 22) * 1000))); // ~22 caracteres/seg
+}
+async function _simularPresenca(inst: string, para: string, modo: 'composing' | 'recording', ref: string): Promise<void> {
+  try {
+    if (!_presencaLigada()) return;
+    if (!inst || !para || String(para).includes('@g.us')) return; // nunca em grupo
+    const ms = _presencaMs(ref, modo);
+    try { await evo(`/chat/sendPresence/${encodeURIComponent(inst)}`, 'POST', { number: para, delay: ms, presence: modo }); } catch { /* best-effort */ }
+    await new Promise((r) => setTimeout(r, ms));
+  } catch { /* nunca quebra o envio */ }
+}
+
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
 async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string) {
   // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
   const inst = instancia || numeroConectado(projeto)?.instancia;
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
+  await _simularPresenca(inst, para, 'composing', texto); // [+presenca] "digitando…"
   return evo(`/message/sendText/${inst}`, 'POST', {
     number: para, text: texto,
   });
@@ -739,6 +785,7 @@ async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: st
   const inst = instancia || numeroConectado(projeto)?.instancia;
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
   if (!url) throw new Error('midia_sem_url');
+  await _simularPresenca(inst, para, tipo === 'audio' ? 'recording' : 'composing', legenda || ''); // [+presenca] "gravando áudio…"/"digitando…"
   if (tipo === 'audio') {
     return evo(`/message/sendWhatsAppAudio/${inst}`, 'POST', { number: para, audio: url });
   }
@@ -946,6 +993,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/capi/webhook/')) return next(); // etapa29: webhook público de venda (Hotmart/Kiwify/Guru chamam sem x-api-key)
   if (req.path === '/track/snippet.js') return next(); // [#5 rastreio] snippet do navegador (sem x-api-key)
   if (req.path === '/track/evento') return next();     // [#5 rastreio] evento do navegador (sem x-api-key)
+  if (req.path.startsWith('/obs/on_publish')) return next(); // [+obs] webhooks do nginx-rtmp (valida por token na query)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
@@ -1591,6 +1639,7 @@ app.get('/flows/motor', (_req, res) => {
       entregaProjeto: (CONFIG.entregaFluxo || {}),
       recuperacaoProjeto: (CONFIG.recuperacaoFluxo || {}),
       fixos: [fixoDed],
+      presencaSimulada: _presencaLigada(),
     });
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
@@ -2200,6 +2249,10 @@ app.post('/pagina', (req, res) => {
 });
 app.post('/pagina/remover', (req, res) => { db.prepare(`DELETE FROM paginas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
 app.get('/config/base', (_req, res) => { res.json({ ok: true, base: PUBLIC_BASE_URL || '' }); });
+
+// [+presenca] ligar/desligar o "digitando…/gravando áudio…" antes de enviar (1-a-1). Default: ligado.
+app.get('/config/presenca', (_req, res) => { res.json({ ok: true, ligado: _presencaLigada() }); });
+app.post('/config/presenca', (req, res) => { const b = req.body || {}; (CONFIG as any).presencaSimulada = (b.ligado !== false); salvarConfig(); res.json({ ok: true, ligado: _presencaLigada() }); });
 // [pagina-ia] Edita o HTML da página por instrução em português (usa o provedor de IA do motor).
 // Recebe { html, instrucao } e devolve { ok, html } com o HTML completo já alterado.
 app.post('/pagina/ia', async (req, res) => {
@@ -2507,6 +2560,7 @@ function _utmDoPayload(b: any): any {
   return o;
 }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN dominio_id TEXT`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN anexos TEXT`); } catch { /* existe */ } // [email-anexos] json [{nome,url|base64|caminho,tipo?}]
 
 // [email] enviador SMTP self-contido (net/tls do Node, sem dependencia nova). Suporta
 // TLS implicito (465) e STARTTLS (587), AUTH LOGIN. Usado pelo worker da fila e pelo teste.
@@ -2524,7 +2578,67 @@ function _smtpConn(sock: any): { wait: () => Promise<any>; send: (l: string) => 
   sock.on('close', () => settleErr(new Error('conexao SMTP fechada')));
   return { wait: () => new Promise((res, rej) => { resolver = res; rejecter = rej; }), send: (l: string) => { try { sock.write(l + '\r\n'); } catch (e) { settleErr(e); } } };
 }
-async function _smtpEnviar(dom: any, para: string, assunto: string, html: string): Promise<void> {
+// [email-anexos] MIME do e-mail. Sem anexos = text/html (identico ao de antes).
+// Com anexos = multipart/mixed (HTML + cada arquivo base64). anexo: {nome,tipo?,base64}.
+function _emailMontarMIME(fromName: string, fromAddr: string, para: string, assunto: string, html: string, anexos?: any[]): string {
+  const htmlPart = String(html || '').replace(/\r?\n/g, '\r\n').replace(/^\./gm, '..');
+  const cab = [
+    'From: ' + _mimeEnc(fromName) + ' <' + fromAddr + '>',
+    'To: ' + para,
+    'Subject: ' + _mimeEnc(assunto),
+    'MIME-Version: 1.0',
+  ];
+  const lista = Array.isArray(anexos) ? anexos.filter((a) => a && a.base64 && String(a.base64).length) : [];
+  if (!lista.length) {
+    return cab.concat(['Content-Type: text/html; charset=UTF-8', 'Content-Transfer-Encoding: 8bit', '', htmlPart, '.']).join('\r\n');
+  }
+  const bnd = 'mr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+  const partes: string[] = cab.concat([
+    'Content-Type: multipart/mixed; boundary="' + bnd + '"', '',
+    '--' + bnd, 'Content-Type: text/html; charset=UTF-8', 'Content-Transfer-Encoding: 8bit', '', htmlPart, ''
+  ]);
+  for (const a of lista) {
+    const nome = String(a.nome || 'arquivo');
+    const tipo = String(a.tipo || 'application/octet-stream');
+    const b64 = String(a.base64).replace(/\s+/g, '').replace(/.{76}/g, '$&\r\n');
+    partes.push('--' + bnd, 'Content-Type: ' + tipo + '; name="' + _mimeEnc(nome) + '"', 'Content-Transfer-Encoding: base64', 'Content-Disposition: attachment; filename="' + _mimeEnc(nome) + '"', '', b64, '');
+  }
+  partes.push('--' + bnd + '--', '.');
+  return partes.join('\r\n');
+}
+function _nomeDeUrl(u: string): string { try { const p = new URL(u).pathname.split('/').pop() || 'arquivo'; return decodeURIComponent(p) || 'arquivo'; } catch { return 'arquivo'; } }
+function _mimePorNome(n: string): string {
+  const e = String(n || '').toLowerCase().split('.').pop() || '';
+  const m: any = { pdf:'application/pdf', mp3:'audio/mpeg', m4a:'audio/mp4', wav:'audio/wav', ogg:'audio/ogg', mp4:'video/mp4', mov:'video/quicktime', jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', zip:'application/zip', doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls:'application/vnd.ms-excel', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ppt:'application/vnd.ms-powerpoint', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation', txt:'text/plain', csv:'text/csv' };
+  return m[e] || 'application/octet-stream';
+}
+async function _emailBaixarUrl(url: string): Promise<Buffer | null> {
+  try {
+    const r = await (globalThis as any).fetch(url);
+    if (!r || !r.ok) return null;
+    const ab = await r.arrayBuffer();
+    const buf = Buffer.from(ab);
+    if (buf.length > 25 * 1024 * 1024) return null; // limite 25MB (padrao de anexo de e-mail)
+    return buf;
+  } catch { return null; }
+}
+// [email-anexos] resolve cada anexo (url -> baixa; caminho -> le do disco do motor; base64 -> usa) e devolve [{nome,tipo,base64}].
+async function _emailResolverAnexos(raw: any): Promise<any[]> {
+  let arr: any[] = [];
+  try { arr = typeof raw === 'string' ? JSON.parse(raw || '[]') : (Array.isArray(raw) ? raw : []); } catch { arr = []; }
+  if (!Array.isArray(arr) || !arr.length) return [];
+  const out: any[] = [];
+  for (const a of arr) {
+    if (!a) continue;
+    try {
+      if (a.base64 && String(a.base64).length) { out.push({ nome: String(a.nome || 'arquivo'), tipo: String(a.tipo || _mimePorNome(String(a.nome || ''))), base64: String(a.base64) }); continue; }
+      if (a.caminho && String(a.caminho).length) { const p = String(a.caminho); if (fs.existsSync(p)) { const b = fs.readFileSync(p); out.push({ nome: String(a.nome || (p.split(/[\\/]/).pop() || 'arquivo')), tipo: String(a.tipo || _mimePorNome(p)), base64: b.toString('base64') }); } continue; }
+      if (a.url && String(a.url).length) { const buf = await _emailBaixarUrl(String(a.url)); if (buf) out.push({ nome: String(a.nome || _nomeDeUrl(String(a.url))), tipo: String(a.tipo || _mimePorNome(String(a.nome || a.url))), base64: buf.toString('base64') }); continue; }
+    } catch { /* pula anexo que falhar, nao derruba o e-mail */ }
+  }
+  return out;
+}
+async function _smtpEnviar(dom: any, para: string, assunto: string, html: string, anexos?: any[]): Promise<void> {
   const host = String(dom.smtp_host || '').trim();
   const port = Number(dom.smtp_porta) || 587;
   const user = String(dom.smtp_usuario || '').trim();
@@ -2551,15 +2665,7 @@ async function _smtpEnviar(dom: any, para: string, assunto: string, html: string
   conn.send('MAIL FROM:<' + fromAddr + '>'); r = await conn.wait(); if (r.code !== 250) throw new Error('MAIL FROM: ' + r.text);
   conn.send('RCPT TO:<' + para + '>'); r = await conn.wait(); if (r.code !== 250 && r.code !== 251) throw new Error('RCPT TO: ' + r.text);
   conn.send('DATA'); r = await conn.wait(); if (r.code !== 354) throw new Error('DATA: ' + r.text);
-  const corpo = [
-    'From: ' + _mimeEnc(fromName) + ' <' + fromAddr + '>',
-    'To: ' + para,
-    'Subject: ' + _mimeEnc(assunto),
-    'MIME-Version: 1.0',
-    'Content-Type: text/html; charset=UTF-8',
-    'Content-Transfer-Encoding: 8bit',
-    '', String(html || '').replace(/\r?\n/g, '\r\n').replace(/^\./gm, '..'), '.'
-  ].join('\r\n');
+  const corpo = _emailMontarMIME(fromName, fromAddr, para, assunto, html, anexos); // [email-anexos] monta text/html OU multipart/mixed
   conn.send(corpo); r = await conn.wait(); if (r.code !== 250) throw new Error('envio recusado: ' + r.text);
   try { conn.send('QUIT'); } catch { /* */ } try { sock.end(); } catch { /* */ }
 }
@@ -2598,7 +2704,8 @@ async function _tickEmail(): Promise<void> {
       if (!dom) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando SMTP do projeto', m.id); } catch { /* */ } continue; }
       if (Number(dom.warmup_on) && _emailEnviadosHoje(String(dom.id)) >= _emailCapHoje(dom)) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando aquecimento (limite diario do remetente atingido)', m.id); } catch { /* */ } continue; }
       try {
-        await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''));
+        const _anx = await _emailResolverAnexos((m as any).anexos); // [email-anexos]
+        await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''), _anx);
         db.prepare(`UPDATE email_fila SET status='enviado', enviado_em=?, erro=NULL, dominio_id=? WHERE id=?`).run(agora(), String(dom.id), m.id);
       } catch (e: any) {
         const t = (Number(m.tentativas) || 0) + 1; const st = t >= 5 ? 'erro' : 'pendente';
@@ -2671,8 +2778,33 @@ app.post('/email/enviar', (req, res) => {
   const b = req.body || {};
   let assunto = String(b.assunto || ''); let html = String(b.html || '');
   if (b.templateId) { const t = db.prepare(`SELECT * FROM email_templates WHERE id=?`).get(String(b.templateId)) as any; if (t) { assunto = assunto || t.assunto; html = html || t.html; } }
-  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id) VALUES(?,?,?,?,?,?,?,?)`).run(randomUUID(), String(b.projeto || ''), String(b.para || ''), assunto, html, 'pendente', agora(), b.dominio_id ? String(b.dominio_id) : null);
-  res.json({ ok: true, enfileirado: true, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
+  // [email-anexos+lote] 1 ou varios destinatarios (b.para string/array, ou b.lote). anexos=[{nome,url|base64|caminho,tipo?}]
+  const brutoDest = (b.lote !== undefined ? b.lote : b.para);
+  let destinatarios: string[] = [];
+  if (Array.isArray(brutoDest)) destinatarios = brutoDest.map((x: any) => String(x || '').trim());
+  else destinatarios = String(brutoDest || '').split(/[,;\n\r]+/).map((x) => x.trim());
+  destinatarios = destinatarios.filter((x) => x && x.includes('@'));
+  if (!destinatarios.length) return res.json({ ok: false, erro: 'Informe ao menos um destinatario com @.' });
+  const anexosJson = (b.anexos && Array.isArray(b.anexos) && b.anexos.length) ? JSON.stringify(b.anexos) : null;
+  const domId = b.dominio_id ? String(b.dominio_id) : null;
+  const ins = db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`);
+  const tx = db.transaction((lista: string[]) => { for (const p of lista) ins.run(randomUUID(), String(b.projeto || ''), p, assunto, html, 'pendente', agora(), domId, anexosJson); });
+  tx(destinatarios);
+  res.json({ ok: true, enfileirado: true, quantos: destinatarios.length, com_anexos: !!anexosJson, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
+});
+// [email-anexos] UPLOAD de anexo grande (arquivo do PC). Sobe os bytes crus (content-type qualquer), guarda em /data/media/email-anexos (persiste em deploy) e devolve caminho+url. Depois use no /email/enviar como {nome, caminho} (ou {nome,url}). Ideal p/ lote: sobe 1x, manda p/ muitos.
+const EMAIL_ANEXO_DIR = '/data/media/email-anexos';
+try { fs.mkdirSync(EMAIL_ANEXO_DIR, { recursive: true }); } catch { /* ok */ }
+app.post('/email/anexo/upload', express.raw({ type: () => true, limit: '200mb' }), (req: any, res: any) => {
+  try {
+    const nome = String(req.query.nome || req.headers['x-nome'] || 'arquivo').replace(/[\\/\r\n]+/g, '_');
+    const buf: Buffer = (req.body && Buffer.isBuffer(req.body)) ? req.body : Buffer.from([]);
+    if (!buf.length) return res.json({ ok: false, erro: 'arquivo vazio (envie os bytes no corpo, content-type application/octet-stream)' });
+    const safe = randomUUID().slice(0, 8) + '_' + nome;
+    fs.writeFileSync(EMAIL_ANEXO_DIR + '/' + safe, buf);
+    const url = 'https://motor.melodiaseriffs.com.br/media/email-anexos/' + encodeURIComponent(safe);
+    res.json({ ok: true, nome, caminho: EMAIL_ANEXO_DIR + '/' + safe, url, tipo: _mimePorNome(nome), tamanho: buf.length });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
@@ -4548,6 +4680,7 @@ app.post('/wa/mcp/enviar', async (req: any, res: any) => {
     if (_waEnviadosHoje() >= teto) return res.json({ ok: false, erro: `teto diário de ${teto} mensagens atingido para o MCP (ajuste em Config)` });
     const id = randomUUID();
     try {
+      await _simularPresenca(inst, tel, 'composing', texto); // [+presenca] "digitando…" (MCP 1-a-1)
       const r: any = await evo(`/message/sendText/${inst}`, 'POST', { number: tel, text: texto });
       const msgId = String(r?.key?.id || r?.id || '');
       db.prepare(`INSERT INTO wa_mcp_log(id,criado_em,instancia,telefone,texto,status,erro,msg_id) VALUES(?,?,?,?,?,?,?,?)`).run(id, agora(), inst, tel, texto, 'enviado', '', msgId);
@@ -6368,10 +6501,12 @@ function _odBaixarPub(rel: string): string {
 }
 // envia por uma INSTÂNCIA específica (não pelo projeto). Reusa evo().
 async function enviarTextoVia(instancia: string, para: string, texto: string) {
+  await _simularPresenca(instancia, para, 'composing', texto); // [+presenca] "digitando…" (pula grupo)
   return evo(`/message/sendText/${encodeURIComponent(instancia)}`, 'POST', { number: para, text: texto });
 }
 async function enviarMidiaVia(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
   if (!url) throw new Error('midia_sem_url');
+  await _simularPresenca(instancia, para, tipo === 'audio' ? 'recording' : 'composing', legenda || ''); // [+presenca]
   if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url });
   const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url };
@@ -12886,6 +13021,428 @@ app.get('/academy/audio-push/lista', (req: any, res: any) => {
     res.type('text/plain').send(rows.map((r) => r.id + ',' + r.video_ref).join('\n'));
   } catch (e: any) { res.status(500).type('text/plain').send(String((e && e.message) || e)); }
 });
+
+// ===================== [+seguranca-camada3] VIGIA DE PRODUÇÃO (monitor + auto-cura segura + alerta) =====================
+// Com a CAMADA 1 o CONFIG já sobrevive a deploy. A vigia é a rede 24/7: no boot e a cada 5min confere os
+// sinais vitais, AUTO-CURA o que é seguro (re-semeia o fluxo "dedilhados" se sumir) e AVISA no WhatsApp
+// quando algo está vermelho (número padrão offline, fila travada, fluxo sumiu). NÃO liga/desliga agente
+// sozinho (pra não brigar com mudança intencional sua). Tudo best-effort — nunca quebra o motor.
+try { db.exec(`CREATE TABLE IF NOT EXISTS log_vigia ( id TEXT PRIMARY KEY, criado_em TEXT, item TEXT, status TEXT, detalhe TEXT )`); } catch { /* ja existe */ }
+const _vigiaUltimoAlerta: Record<string, number> = {};
+function _vigiaPodeAlertar(item: string): boolean {
+  const ag = Date.now(); const ult = _vigiaUltimoAlerta[item] || 0;
+  if (ag - ult < 60 * 60 * 1000) return false; // máx 1 alerta por item por hora
+  _vigiaUltimoAlerta[item] = ag; return true;
+}
+async function _vigiaAlerta(item: string, msg: string): Promise<void> {
+  try {
+    try { db.prepare(`INSERT INTO log_vigia(id,criado_em,item,status,detalhe) VALUES(?,?,?,?,?)`).run(randomUUID(), agora(), item, 'alerta', msg); } catch { /* */ }
+    if (!_vigiaPodeAlertar(item)) return;
+    const instTeclado = ((CONFIG as any).numeroPadrao || {}).teclado || _RECUP_DED_INST;
+    await enviarTexto('teclado' as Projeto, '5516981518794', '⚠️ Motor: ' + msg, instTeclado).catch(() => { /* */ });
+  } catch { /* nunca quebra */ }
+}
+function _saudeProducao(): any {
+  const r: any = { ok: true, itens: {} };
+  try {
+    const temDed = (CONFIG.entregaFluxoProduto || []).some((f) => String(f.chave || '').toLowerCase() === 'dedilhados');
+    r.itens.entregaDedilhados = temDed ? 'ok' : 'vermelho';
+    r.itens.agentesHabilitados = (CONFIG as any).agentesHabilitados || {};
+    r.itens.canalIg = (CONFIG as any).canalIg || {};
+    const instT = ((CONFIG as any).numeroPadrao || {}).teclado || '';
+    const nT = instT ? (db.prepare(`SELECT status FROM numeros WHERE instancia=?`).get(instT) as any) : null;
+    r.itens.numeroPadraoTeclado = { instancia: instT, status: nT ? nT.status : 'nao_cadastrado' };
+    const atrasados = (db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE status IN ('pendente','camp_pend','cmp_multi','cmp_mmk') AND agendado_para < ?`).get(new Date(Date.now() - 10 * 60000).toISOString()) as any)?.n || 0;
+    r.itens.filaAtrasada = Number(atrasados);
+    r.itens.presencaSimulada = _presencaLigada();
+    r.ok = temDed && Number(atrasados) < 50;
+  } catch (e: any) { r.ok = false; r.erro = String(e?.message || e); }
+  return r;
+}
+async function vigiaProducao(): Promise<void> {
+  try {
+    const s = _saudeProducao();
+    if (s.itens && s.itens.entregaDedilhados === 'vermelho') {
+      try { seedFluxoDedilhados(); } catch { /* */ }
+      const agoraTem = (CONFIG.entregaFluxoProduto || []).some((f) => String(f.chave || '').toLowerCase() === 'dedilhados');
+      await _vigiaAlerta('entrega-dedilhados', agoraTem ? 'o fluxo de entrega "dedilhados" tinha sumido e foi RESTAURADO automaticamente.' : 'o fluxo "dedilhados" sumiu e NÃO consegui restaurar — confira no app.');
+    }
+    const nT = s.itens && s.itens.numeroPadraoTeclado;
+    if (nT && nT.instancia && nT.status !== 'conectado') {
+      await _vigiaAlerta('numero-teclado-offline', 'o número padrão do Teclado (' + nT.instancia + ') está ' + (nT.status || 'offline') + '. Reconecte pelo QR no app.');
+    }
+    if (s.itens && Number(s.itens.filaAtrasada) >= 50) {
+      await _vigiaAlerta('fila-travada', Number(s.itens.filaAtrasada) + ' mensagens estão atrasadas na fila. Pode ter número desconectado ou worker parado.');
+    }
+    try { db.prepare(`INSERT INTO log_vigia(id,criado_em,item,status,detalhe) VALUES(?,?,?,?,?)`).run(randomUUID(), agora(), 'checkup', s.ok ? 'ok' : 'atencao', JSON.stringify(s.itens || {})); } catch { /* */ }
+  } catch { /* nunca quebra */ }
+}
+app.get('/saude/producao', (_req, res) => { res.json({ ok: true, saude: _saudeProducao() }); });
+app.get('/saude/vigia-log', (req, res) => { try { const n = Math.min(200, Number(req.query.limite || 50)); res.json({ ok: true, itens: db.prepare(`SELECT * FROM log_vigia ORDER BY criado_em DESC LIMIT ?`).all(n) }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+setInterval(() => { vigiaProducao().catch(() => { /* */ }); }, 5 * 60 * 1000);
+setTimeout(() => { vigiaProducao().catch(() => { /* */ }); }, 20000); // 1º check ~20s após o boot
+
+// ===================== [+obs] AO VIVO PELO OBS — ingest RTMP (nginx-rtmp) -> multistream (stream copy) =====================
+// O OBS do Ezequias empurra 2 sinais (h/v) pro nginx-rtmp (serviço novo no docker-compose). Quando um sinal
+// começa a publicar, o nginx-rtmp chama /obs/on_publish; o motor sobe 1 ffmpeg COPY por destino marcado, do
+// ingest local pras redes (leve, tempo real). Reconecta sozinho. Prévia = HLS do nginx-rtmp. Tudo add-only.
+const OBS_PUBLIC_RTMP = process.env.OBS_PUBLIC_RTMP || 'rtmp://live.melodiaseriffs.com.br/live';
+const OBS_INGEST_BASE = process.env.OBS_INGEST_BASE || 'rtmp://rtmp:1935/live'; // nome do serviço nginx-rtmp na rede docker
+const OBS_HLS_BASE = process.env.OBS_HLS_BASE || 'https://live.melodiaseriffs.com.br/hls';
+const OBS_HOOK_TOKEN = process.env.OBS_HOOK_TOKEN || ENGINE_API_KEY || 'obs-hook';
+try { db.exec(`CREATE TABLE IF NOT EXISTS obs_sinal ( id TEXT PRIMARY KEY, stream_key TEXT, label TEXT, atualizado_em TEXT )`); } catch { /* ja existe */ }
+try { db.exec(`CREATE TABLE IF NOT EXISTS obs_rota ( id TEXT PRIMARY KEY, sinal TEXT, plataforma TEXT, instrumento TEXT, nome TEXT, rtmp_base TEXT, stream_key TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT, atualizado_em TEXT )`); } catch { /* ja existe */ }
+function _obsChaveNova(p: string): string { return 'mr-' + p + '-' + randomUUID().replace(/-/g, '').slice(0, 10); }
+function _obsSeed(): void {
+  for (const par of [['h', 'HORIZONTAL (16:9)'], ['v', 'VERTICAL (9:16)']] as [string, string][]) {
+    const ex = db.prepare(`SELECT id FROM obs_sinal WHERE id=?`).get(par[0]) as any;
+    if (!ex) db.prepare(`INSERT INTO obs_sinal(id,stream_key,label,atualizado_em) VALUES(?,?,?,?)`).run(par[0], _obsChaveNova(par[0]), par[1], agora());
+  }
+}
+_obsSeed();
+function _obsSinais(): any[] { return db.prepare(`SELECT * FROM obs_sinal ORDER BY id`).all() as any[]; }
+function _obsSinalPorKey(key: string): string | null { const r = db.prepare(`SELECT id FROM obs_sinal WHERE stream_key=?`).get(String(key)) as any; return r ? r.id : null; }
+function _obsRotas(sinal?: string): any[] { return sinal ? (db.prepare(`SELECT * FROM obs_rota WHERE sinal=? ORDER BY plataforma`).all(sinal) as any[]) : (db.prepare(`SELECT * FROM obs_rota ORDER BY sinal, plataforma`).all() as any[]); }
+function _obsDestFull(r: any): string { const base = String(r.rtmp_base || '').replace(/\/+$/, ''); const key = String(r.stream_key || ''); return base ? (base + '/' + key) : ''; }
+const _obsRelays: Map<string, Array<{ id: string; child: any; tentativas: number; vivo: boolean; dest: string }>> = new Map();
+const _obsPublicando: Record<string, { desde: string }> = {};
+function _obsFfmpegCopy(input: string, outFull: string): any {
+  // relay de um sinal JÁ codificado pelo OBS: só COPIA (sem recodificar) -> leve, tempo real.
+  const child = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-i', input, '-c', 'copy', '-f', 'flv', outFull], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let tail = ''; try { child.stderr.on('data', (d: any) => { tail = (tail + String(d)).slice(-800); }); } catch { /* */ }
+  (child as any)._tail = () => tail;
+  return child;
+}
+function _obsPararRelay(sinal: string): void {
+  const arr = _obsRelays.get(sinal) || [];
+  for (const r of arr) { r.vivo = false; try { r.child.kill('SIGKILL'); } catch { /* */ } }
+  _obsRelays.set(sinal, []);
+  delete _obsPublicando[sinal];
+}
+function _obsIniciarRelay(sinal: string): void {
+  _obsPararRelay(sinal);
+  _obsPublicando[sinal] = { desde: agora() };
+  const sk = (db.prepare(`SELECT stream_key FROM obs_sinal WHERE id=?`).get(sinal) as any)?.stream_key;
+  if (!sk) return;
+  const input = OBS_INGEST_BASE + '/' + sk;
+  const rotas = _obsRotas(sinal).filter((r: any) => Number(r.ativo) === 1 && _obsDestFull(r));
+  const arr: Array<{ id: string; child: any; tentativas: number; vivo: boolean; dest: string }> = [];
+  for (const r of rotas) {
+    const dest = _obsDestFull(r);
+    const spawnRelay = (tent: number) => {
+      const child = _obsFfmpegCopy(input, dest);
+      const item = { id: r.id, child, tentativas: tent, vivo: true, dest };
+      child.on('exit', () => {
+        if (!item.vivo || !_obsPublicando[sinal]) return; // parada intencional
+        if (tent >= 20) { _vigiaAlerta('obs-relay-' + r.id, 'o repasse do sinal ' + sinal + ' pra ' + (r.nome || r.plataforma) + ' caiu e parou de reconectar.').catch(() => { /* */ }); return; }
+        setTimeout(() => { if (_obsPublicando[sinal]) { const novo = spawnRelay(tent + 1); const idx = arr.findIndex((x) => x.id === r.id); if (idx >= 0) arr[idx] = novo; } }, 3000);
+      });
+      return item;
+    };
+    arr.push(spawnRelay(0));
+  }
+  _obsRelays.set(sinal, arr);
+}
+app.get('/obs/config', (_req, res) => {
+  const sinais = _obsSinais().map((s: any) => ({ id: s.id, label: s.label, streamKey: s.stream_key, rtmpUrl: OBS_PUBLIC_RTMP, hls: OBS_HLS_BASE + '/' + s.stream_key + '.m3u8', publicando: !!_obsPublicando[s.id] }));
+  res.json({ ok: true, ingestUrl: OBS_PUBLIC_RTMP, hlsBase: OBS_HLS_BASE, sinais, rotas: _obsRotas(), plataformas: ['youtube', 'facebook', 'instagram', 'tiktok', 'custom'], instrumentos: PROJETOS });
+});
+app.post('/obs/rota', (req, res) => {
+  try {
+    const b = req.body || {}; const sinal = String(b.sinal || ''); if (sinal !== 'h' && sinal !== 'v') return res.json({ ok: false, erro: 'sinal_invalido' });
+    const id = String(b.id || '') || randomUUID();
+    const ex = db.prepare(`SELECT id FROM obs_rota WHERE id=?`).get(id) as any;
+    if (ex) db.prepare(`UPDATE obs_rota SET sinal=?,plataforma=?,instrumento=?,nome=?,rtmp_base=?,stream_key=?,canal_id=?,ativo=?,atualizado_em=? WHERE id=?`).run(sinal, String(b.plataforma || 'custom'), String(b.instrumento || ''), String(b.nome || ''), String(b.rtmp_base || ''), String(b.stream_key || ''), String(b.canal_id || ''), b.ativo === false ? 0 : 1, agora(), id);
+    else db.prepare(`INSERT INTO obs_rota(id,sinal,plataforma,instrumento,nome,rtmp_base,stream_key,canal_id,ativo,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, sinal, String(b.plataforma || 'custom'), String(b.instrumento || ''), String(b.nome || ''), String(b.rtmp_base || ''), String(b.stream_key || ''), String(b.canal_id || ''), b.ativo === false ? 0 : 1, agora(), agora());
+    if (_obsPublicando[sinal]) _obsIniciarRelay(sinal); // aplica na hora se estiver no ar
+    res.json({ ok: true, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/obs/rota/remover', (req, res) => { try { const id = String((req.body || {}).id || ''); const r = db.prepare(`SELECT sinal FROM obs_rota WHERE id=?`).get(id) as any; db.prepare(`DELETE FROM obs_rota WHERE id=?`).run(id); if (r && _obsPublicando[r.sinal]) _obsIniciarRelay(r.sinal); res.json({ ok: true }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+app.post('/obs/sinal/regenerar', (req, res) => { try { const sinal = String((req.body || {}).sinal || ''); if (sinal !== 'h' && sinal !== 'v') return res.json({ ok: false, erro: 'sinal_invalido' }); const nk = _obsChaveNova(sinal); db.prepare(`UPDATE obs_sinal SET stream_key=?,atualizado_em=? WHERE id=?`).run(nk, agora(), sinal); res.json({ ok: true, streamKey: nk }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+app.get('/obs/status', (_req, res) => { const out: any = { ok: true, sinais: {} }; for (const s of _obsSinais()) { const arr = _obsRelays.get(s.id) || []; out.sinais[s.id] = { publicando: !!_obsPublicando[s.id], desde: _obsPublicando[s.id]?.desde || null, relays: arr.map((r: any) => ({ id: r.id, vivo: r.vivo, tentativas: r.tentativas })) }; } res.json(out); });
+app.post('/obs/parar', (req, res) => { const sinal = String((req.body || {}).sinal || ''); if (sinal) { _obsPararRelay(sinal); } else { _obsPararRelay('h'); _obsPararRelay('v'); } res.json({ ok: true }); });
+// webhooks do nginx-rtmp (sem x-api-key; valida token na query). nginx manda 'name'=chave no corpo (form).
+app.post('/obs/on_publish', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (!sinal) return res.status(404).send('chave desconhecida'); _obsIniciarRelay(sinal); console.log('[obs] on_publish sinal', sinal); return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
+app.post('/obs/on_publish_done', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (sinal) { _obsPararRelay(sinal); console.log('[obs] on_publish_done sinal', sinal); } return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
+// [+obs-comentarios] Comentários do YouTube ao vivo (ler + responder + resposta em massa). Reaproveita o OAuth das lives.
+try { db.exec(`ALTER TABLE obs_rota ADD COLUMN canal_id TEXT`); } catch { /* ja existe */ }
+const _ytLiveChatCache: Record<string, { liveChatId: string; ts: number }> = {};
+const _obsCmtBuf: Array<{ id: string; rede: string; canal_id: string; autor: string; texto: string; ts: string }> = [];
+const _obsCmtPage: Record<string, string> = {};
+const _obsCmtSeen: Set<string> = new Set();
+async function _ytFetch(token: string, url: string, init?: any): Promise<any> {
+  const r = await fetch(url, { ...(init || {}), headers: { Authorization: 'Bearer ' + token, ...(init && init.body ? { 'Content-Type': 'application/json' } : {}) } });
+  const t = await r.text(); let j: any = {}; try { j = t ? JSON.parse(t) : {}; } catch { j = { raw: t }; }
+  if (!r.ok) throw new Error('YT ' + r.status + ': ' + String((j && j.error && j.error.message) || t).slice(0, 200));
+  return j;
+}
+async function _ytLiveChatId(canalId: string, token: string): Promise<string> {
+  const c = _ytLiveChatCache[canalId]; if (c && Date.now() - c.ts < 60000) return c.liveChatId;
+  const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveBroadcasts?part=snippet&broadcastStatus=active&broadcastType=all&mine=true&maxResults=1');
+  const lc = (j && j.items && j.items[0] && j.items[0].snippet && j.items[0].snippet.liveChatId) || '';
+  _ytLiveChatCache[canalId] = { liveChatId: lc, ts: Date.now() };
+  return lc;
+}
+async function _obsPollYouTube(): Promise<void> {
+  const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
+  const vistos = new Set<string>();
+  for (const r of rotas) {
+    if (vistos.has(r.canal_id)) continue; vistos.add(r.canal_id);
+    try {
+      const token = await pbYtTokenLives(r.canal_id);
+      const lc = await _ytLiveChatId(r.canal_id, token); if (!lc) continue;
+      const pg = _obsCmtPage[lc] ? ('&pageToken=' + encodeURIComponent(_obsCmtPage[lc])) : '';
+      const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet,authorDetails&liveChatId=' + encodeURIComponent(lc) + '&maxResults=50' + pg);
+      _obsCmtPage[lc] = (j && j.nextPageToken) || _obsCmtPage[lc];
+      for (const it of ((j && j.items) || [])) {
+        const id = 'yt:' + it.id; if (_obsCmtSeen.has(id)) continue; _obsCmtSeen.add(id);
+        _obsCmtBuf.push({ id, rede: 'youtube', canal_id: r.canal_id, autor: (it.authorDetails && it.authorDetails.displayName) || '', texto: (it.snippet && it.snippet.displayMessage) || '', ts: (it.snippet && it.snippet.publishedAt) || agora() });
+      }
+    } catch { /* best-effort por canal */ }
+  }
+  if (_obsCmtBuf.length > 200) _obsCmtBuf.splice(0, _obsCmtBuf.length - 200);
+  if (_obsCmtSeen.size > 2000) _obsCmtSeen.clear();
+}
+app.get('/obs/comentarios', async (_req, res) => {
+  try { await _obsPollYouTube(); } catch { /* */ }
+  const itens = [..._obsCmtBuf].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(0, 80);
+  res.json({ ok: true, itens, redesPostar: ['youtube'], nota: 'Facebook/Instagram/TikTok: leitura/resposta em etapa futura.' });
+});
+app.post('/obs/responder', async (req, res) => {
+  try {
+    const b = req.body || {}; const texto = String(b.texto || '').trim(); if (!texto) return res.json({ ok: false, erro: 'texto_vazio' });
+    const alvo = String(b.alvo || 'todas');
+    const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
+    const canais = alvo === 'todas' ? Array.from(new Set(rotas.map((r) => r.canal_id))) : [alvo];
+    let n = 0; const erros: string[] = [];
+    for (const canalId of canais) {
+      try {
+        const token = await pbYtTokenLives(String(canalId));
+        const lc = await _ytLiveChatId(String(canalId), token); if (!lc) { erros.push(canalId + ': sem live ativa'); continue; }
+        await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet', { method: 'POST', body: JSON.stringify({ snippet: { liveChatId: lc, type: 'textMessageEvent', textMessageDetails: { messageText: texto } } }) });
+        n++;
+      } catch (e: any) { erros.push(canalId + ': ' + String(e && e.message || e).slice(0, 80)); }
+    }
+    res.json({ ok: n > 0, enviados: n, erros });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/obs/canais-youtube', (_req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, nome, projeto FROM canais_publicacao WHERE ativo=1 ORDER BY projeto, nome`).all() as any[];
+    const out = rows.filter((c) => db.prepare(`SELECT 1 FROM oauth_tokens_pub WHERE canal_id=? AND plataforma IN ('youtube_lives','youtube') LIMIT 1`).get(c.id)).map((c) => ({ canal_id: c.id, nome: c.nome, projeto: c.projeto }));
+    res.json({ ok: true, canais: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
+
+// ===================== [+painel-trafego] Painel web de Trafego (link protegido, ao vivo) =====================
+// ADITIVO. Inserido antes do app.listen. Reaproveita: app, db, CONFIG, salvarConfig, fetch, randomBytes,
+// ENGINE_API_KEY, PUBLIC_BASE_URL. NAO remove nada. Puxa os dados reais de ads do Worker
+// (DEBRIEF_BASE_URL + DEBRIEF_TOKEN no .env), agrega por PRODUTO (palavra-chave do nome da campanha)
+// e serve uma pagina SO-LEITURA em /painel/trafego?k=<token>. Todos os produtos num painel so.
+(() => {
+  try {
+    const DBF_BASE = (process.env.DEBRIEF_BASE_URL || '').replace(/\/+$/, '');
+    const DBF_TOKEN = process.env.DEBRIEF_TOKEN || '';
+    // token secreto do link: gera 1x e guarda no CONFIG (sobrevive a deploy via config_runtime)
+    try {
+      if (!(CONFIG as any).painelTrafegoToken) {
+        (CONFIG as any).painelTrafegoToken = randomBytes(18).toString('hex');
+        try { salvarConfig(); } catch { /* best-effort */ }
+      }
+    } catch { /* ignore */ }
+    const PNL_TOKEN = (): string => String((CONFIG as any).painelTrafegoToken || '');
+    const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
+    const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
+
+    const _pnlProduto = (nome: string): string => {
+      const t = String(nome || '').toLowerCase();
+      if (/dedilhad/.test(t)) return 'Dedilhados';
+      if (/teclad/.test(t)) return 'Teclado';
+      if (/baix/.test(t)) return 'Baixo';
+      if (/viol/.test(t)) return 'Violao';
+      if (/harpa|comunidade/.test(t)) return 'Harpa';
+      return 'Outros';
+    };
+
+    const _pnlDados = async (dias: number): Promise<any> => {
+      if (!DBF_BASE || !DBF_TOKEN) return { ok: false, erro: 'SEM_TOKEN' };
+      const ateD = new Date();
+      const deD = new Date(Date.now() - (dias - 1) * 86400000);
+      const fmt = (d: Date): string => d.toISOString().slice(0, 10);
+      const url = DBF_BASE + '/api/custos/ads/roas?de=' + fmt(deD) + '&ate=' + fmt(ateD);
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 20000);
+      let anuncios: any[] = [];
+      try {
+        const r = await fetch(url, { headers: { Authorization: 'Bearer ' + DBF_TOKEN }, signal: ctrl.signal });
+        if (!r.ok) return { ok: false, erro: 'WORKER_' + r.status };
+        const j: any = await r.json();
+        anuncios = (j && j.anuncios) || [];
+      } catch (e: any) {
+        return { ok: false, erro: 'FETCH_' + (e && e.message ? e.message : 'erro') };
+      } finally { clearTimeout(to); }
+
+      const porProd: Record<string, any> = {};
+      for (const a of anuncios) {
+        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
+        const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 });
+        p.gasto += (a.gasto_centavos || 0) / 100;
+        p.vendas += (a.vendas || 0);
+        p.fat += (a.fat_centavos || 0) / 100;
+        p.leads += (a.leads || 0);
+        p.cliques += (a.cliques || 0);
+        p.impressoes += (a.impressoes || 0);
+      }
+      const tx = taxaPct();
+      const im = impPct();
+      const enrich = (p: any): any => {
+        const taxaV = p.fat * tx / 100;
+        const impV = p.gasto * im / 100;
+        const lucro = p.fat - taxaV - impV - p.gasto;
+        return {
+          produto: p.produto, gasto: p.gasto, vendas: p.vendas, fat: p.fat, leads: p.leads,
+          cliques: p.cliques, impressoes: p.impressoes,
+          roas: p.gasto > 0 ? p.fat / p.gasto : 0,
+          cpa: p.vendas > 0 ? p.gasto / p.vendas : 0,
+          ticket: p.vendas > 0 ? p.fat / p.vendas : 0,
+          taxaPlataforma: taxaV, impostoMeta: impV, lucro,
+          margem: p.fat > 0 ? lucro / p.fat * 100 : 0,
+        };
+      };
+      const lista = Object.keys(porProd).map((k) => enrich(porProd[k])).sort((a, b) => b.fat - a.fat);
+      const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 };
+      for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; }
+      const total = enrich(tot);
+      return { ok: true, dias, de: fmt(deD), ate: fmt(ateD), taxaPct: tx, impostoPct: im, total, produtos: lista };
+    };
+
+    // JSON (publico, protegido por ?k=)
+    app.get('/painel/trafego/dados', async (req: any, res: any) => {
+      if (!PNL_TOKEN() || String(req.query.k || '') !== PNL_TOKEN()) return res.status(403).json({ ok: false, erro: 'acesso' });
+      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 14));
+      try { res.json(await _pnlDados(dias)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+    });
+    // token/link do painel (so admin: x-api-key)
+    app.get('/painel/token', (req: any, res: any) => {
+      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false });
+      res.json({ ok: true, token: PNL_TOKEN(), link: (PUBLIC_BASE_URL || '') + '/painel/trafego?k=' + PNL_TOKEN(), temWorker: !!(DBF_BASE && DBF_TOKEN), taxaPct: taxaPct(), impostoPct: impPct() });
+    });
+    // pagina HTML
+    app.get('/painel/trafego', (req: any, res: any) => {
+      if (!PNL_TOKEN() || String(req.query.k || '') !== PNL_TOKEN()) {
+        return res.status(403).type('html').send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;background:#0e0f14;color:#eee;padding:48px;text-align:center">Link invalido ou expirado.</body>');
+      }
+      res.type('html').send(_pnlHtml());
+    });
+
+    const _pnlHtml = (): string => {
+      return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+        + '<title>Trafego Pago — Melodias e Riffs</title>'
+        + '<style>'
+        + ':root{--bg:#0e0f14;--card:#171922;--fg:#f2f3f7;--mut:#9a9eae;--line:#262a36;--ac:#9a84ff;--acs:#241f3d;--gr:#36c892;--grs:#12271f;--rd:#ff7a6e;--rds:#2c1613;--am:#f0ad4e;--ams:#2a2112;--chip:#20232e}'
+        + '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}'
+        + '.wrap{max-width:1000px;margin:0 auto;padding:18px 16px 54px}'
+        + '.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}'
+        + '.brand{display:flex;gap:10px;align-items:center}.logo{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#9a84ff,#b58bff);display:grid;place-items:center;font-size:19px}'
+        + 'h1{font-size:17px;margin:0;letter-spacing:-.2px}.sub{font-size:12px;color:var(--mut);margin-top:2px}'
+        + '.ctl{display:flex;gap:7px;flex-wrap:wrap;align-items:center}'
+        + '.sel{background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--fg);font-size:12.5px;font-weight:600;padding:8px 10px}'
+        + '.btn{background:var(--acs);border:1px solid var(--ac);color:var(--ac);border-radius:10px;font-size:12.5px;font-weight:700;padding:8px 11px;cursor:pointer}'
+        + '.tabs{display:flex;gap:7px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px;-webkit-overflow-scrolling:touch}'
+        + '.tab{flex:none;background:var(--card);border:1px solid var(--line);color:var(--mut);border-radius:999px;font-size:12.5px;font-weight:700;padding:7px 13px;cursor:pointer;white-space:nowrap}'
+        + '.tab.on{background:var(--acs);border-color:var(--ac);color:var(--ac)}'
+        + '.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}'
+        + '@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}}'
+        + '.kpi{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:12px 13px}'
+        + '.kpi .l{font-size:11px;color:var(--mut);font-weight:600}.kpi .v{font-size:20px;font-weight:800;letter-spacing:-.4px;margin-top:6px;line-height:1}'
+        + '.panel{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:15px 16px;margin-bottom:12px}'
+        + '.panel h2{font-size:13.5px;margin:0 0 12px}'
+        + '.line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px dashed var(--line)}.line:last-of-type{border-bottom:0}'
+        + '.line .tag{font-size:13px;font-weight:600}.line .pct{font-size:10.5px;color:var(--mut);background:var(--chip);padding:2px 7px;border-radius:999px;margin-left:7px}'
+        + '.line .vv{font-size:14.5px;font-weight:800;white-space:nowrap}.minus .vv{color:var(--rd)}'
+        + '.res{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;background:var(--grs);border:1px solid var(--gr);border-radius:12px;padding:13px 14px}'
+        + '.res .l{font-size:13px;font-weight:700;color:var(--gr)}.res .big{font-size:21px;font-weight:800;color:var(--gr);line-height:1;text-align:right}.res .mar{font-size:11px;color:var(--mut);margin-top:3px}'
+        + 'table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--mut);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.3px;padding:8px 7px;border-bottom:1px solid var(--line)}'
+        + 'td{padding:9px 7px;border-bottom:1px solid var(--line)}th.n,td.n{text-align:right;white-space:nowrap}tr:last-child td{border-bottom:0}.cre{font-weight:700}'
+        + '.pos{color:var(--gr)}.neg{color:var(--rd)}'
+        + '.note{font-size:11px;color:var(--mut);background:var(--chip);border-radius:10px;padding:9px 11px;margin-top:11px;line-height:1.5}'
+        + '.foot{font-size:11px;color:var(--mut);text-align:center;margin-top:18px}'
+        + '.err{background:var(--ams);border:1px solid var(--am);color:var(--am);border-radius:12px;padding:14px;font-size:13px;font-weight:600;text-align:center}'
+        + '.sk{opacity:.45}'
+        + '</style></head><body><div class="wrap">'
+        + '<div class="top"><div class="brand"><div class="logo">🎹</div><div><h1>Trafego Pago</h1><div class="sub">Melodias e Riffs · ao vivo</div></div></div>'
+        + '<div class="ctl"><select class="sel" id="dias"><option value="7">7 dias</option><option value="14" selected>14 dias</option><option value="30">30 dias</option></select>'
+        + '<button class="btn" id="rec">Atualizar</button></div></div>'
+        + '<div class="tabs" id="tabs"></div>'
+        + '<div id="body"></div>'
+        + '<div class="foot" id="foot">Carregando…</div>'
+        + '</div><script>'
+        + '(function(){'
+        + 'var K=new URLSearchParams(location.search).get("k")||"";'
+        + 'var DADOS=null,SEL="Todos";'
+        + 'function brl(n){try{return (n||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"})}catch(e){return "R$ "+(n||0).toFixed(2)}}'
+        + 'function num(n){try{return Math.round(n||0).toLocaleString("pt-BR")}catch(e){return String(Math.round(n||0))}}'
+        + 'function x(n){return (n||0).toFixed(2).replace(".",",")}'
+        + 'function pct(n){return (n||0).toFixed(1).replace(".",",")+"%"}'
+        + 'function esc(s){return String(s==null?"":s).replace(/[&<>]/g,function(c){return c==="&"?"&amp;":c==="<"?"&lt;":"&gt;"})}'
+        + 'function achaProd(nome){if(nome==="Todos")return DADOS.total;var a=DADOS.produtos||[];for(var i=0;i<a.length;i++){if(a[i].produto===nome)return a[i]}return DADOS.total}'
+        + 'function render(){'
+        + 'var tabs=document.getElementById("tabs");var body=document.getElementById("body");'
+        + 'if(!DADOS||!DADOS.ok){'
+        + 'tabs.innerHTML="";'
+        + 'if(DADOS&&DADOS.erro==="SEM_TOKEN"){body.innerHTML="<div class=err>Falta ligar os dados do Meta no motor.<br><span style=\\"font-weight:500\\">(DEBRIEF_BASE_URL + DEBRIEF_TOKEN no .env — o Ezequias faz 1x no deploy)</span></div>";}'
+        + 'else{body.innerHTML="<div class=err>Nao consegui carregar os dados agora."+(DADOS&&DADOS.erro?"<br><span style=\\"font-weight:500\\">("+esc(DADOS.erro)+")</span>":"")+"</div>";}'
+        + 'return;}'
+        + 'var nomes=["Todos"];for(var i=0;i<DADOS.produtos.length;i++){nomes.push(DADOS.produtos[i].produto);}'
+        + 'var th="";for(var j=0;j<nomes.length;j++){th+="<div class=\\"tab"+(nomes[j]===SEL?" on":"")+"\\" data-p=\\""+esc(nomes[j])+"\\">"+esc(nomes[j])+"</div>";}tabs.innerHTML=th;'
+        + 'var tabsEls=tabs.querySelectorAll(".tab");for(var t=0;t<tabsEls.length;t++){tabsEls[t].onclick=function(){SEL=this.getAttribute("data-p");render();};}'
+        + 'var p=achaProd(SEL);'
+        + 'var html="";'
+        + 'html+="<div class=grid>";'
+        + 'html+=kpi("Faturamento",brl(p.fat));'
+        + 'html+=kpi("Vendas",num(p.vendas));'
+        + 'html+=kpi("Investido (ads)",brl(p.gasto));'
+        + 'html+=kpi("ROAS",x(p.roas)+"x");'
+        + 'html+=kpi("Ticket medio",brl(p.ticket));'
+        + 'html+=kpi("CPA",brl(p.cpa));'
+        + 'html+="</div>";'
+        + 'html+="<div class=panel><h2>💰 Resultado real — o que sobra ("+esc(SEL)+")</h2>";'
+        + 'html+=lin("Faturamento bruto","",brl(p.fat),false);'
+        + 'html+=lin("Taxa da plataforma","LastLink · "+x(DADOS.taxaPct)+"%","− "+brl(p.taxaPlataforma),true);'
+        + 'html+=lin("Imposto do Meta","sobre ads · "+x(DADOS.impostoPct)+"%","− "+brl(p.impostoMeta),true);'
+        + 'html+=lin("Investido em anuncios","Gerenciador","− "+brl(p.gasto),true);'
+        + 'html+="<div class=res><div class=l>✅ Lucro liquido</div><div><div class=big>"+brl(p.lucro)+"</div><div class=mar>Margem "+pct(p.margem)+" · "+num(p.cliques)+" cliques · "+num(p.impressoes)+" impressoes</div></div></div>";'
+        + 'html+="<div class=note>O Gerenciador mostra o gasto, mas a fatura do Meta vem com imposto por cima — por isso a gente separa, pra ver o lucro de verdade. As % de taxa/imposto se ajustam no motor.</div>";'
+        + 'html+="</div>";'
+        + 'html+="<div class=panel style=\\"overflow-x:auto\\"><h2>Por produto</h2><table><thead><tr><th>Produto</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Faturamento</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
+        + 'for(var r=0;r<DADOS.produtos.length;r++){var q=DADOS.produtos[r];html+="<tr><td class=cre>"+esc(q.produto)+"</td><td class=n>"+brl(q.gasto)+"</td><td class=n>"+num(q.vendas)+"</td><td class=n>"+brl(q.fat)+"</td><td class=n>"+x(q.roas)+"x</td><td class=\\"n "+(q.lucro>=0?"pos":"neg")+"\\">"+brl(q.lucro)+"</td></tr>";}'
+        + 'html+="</tbody></table></div>";'
+        + 'body.innerHTML=html;'
+        + '}'
+        + 'function kpi(l,v){return "<div class=kpi><div class=l>"+esc(l)+"</div><div class=v>"+v+"</div></div>";}'
+        + 'function lin(tag,pc,v,minus){return "<div class=\\"line"+(minus?" minus":"")+"\\"><div><span class=tag>"+esc(tag)+"</span>"+(pc?"<span class=pct>"+esc(pc)+"</span>":"")+"</div><div class=vv>"+v+"</div></div>";}'
+        + 'function carregar(){'
+        + 'var dias=document.getElementById("dias").value;'
+        + 'var foot=document.getElementById("foot");foot.textContent="Atualizando…";'
+        + 'fetch("/painel/trafego/dados?k="+encodeURIComponent(K)+"&dias="+dias).then(function(r){return r.json();}).then(function(j){'
+        + 'DADOS=j;render();'
+        + 'if(j&&j.ok){var h=new Date();foot.textContent="Atualizado "+h.getHours()+":"+("0"+h.getMinutes()).slice(-2)+" · periodo "+j.de+" a "+j.ate+" · atualiza sozinho a cada 60s";}else{foot.textContent="";}'
+        + '}).catch(function(){DADOS={ok:false,erro:"rede"};render();foot.textContent="";});'
+        + '}'
+        + 'document.getElementById("rec").onclick=carregar;'
+        + 'document.getElementById("dias").onchange=carregar;'
+        + 'carregar();setInterval(carregar,60000);'
+        + '})();'
+        + '</script></body></html>';
+    };
+
+    console.log('[painel-trafego] bloco carregado; worker=', (DBF_BASE && DBF_TOKEN) ? 'ok' : 'FALTA-ENV', 'token=', PNL_TOKEN() ? 'ok' : '-');
+  } catch (e: any) { console.log('[painel-trafego] erro no bloco (seguindo):', e && e.message ? e.message : e); }
+})();
+// ===================== [+painel-trafego] fim =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
