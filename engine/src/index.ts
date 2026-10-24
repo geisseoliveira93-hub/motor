@@ -13362,12 +13362,18 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       return 'Outros';
     };
 
-    const _pnlDados = async (dias: number): Promise<any> => {
+    const _pnlDados = async (dias: number, deOpt?: string, ateOpt?: string): Promise<any> => {
       if (!DBF_BASE || !DBF_TOKEN) return { ok: false, erro: 'SEM_TOKEN' };
-      const ateD = new Date();
-      const deD = new Date(Date.now() - (dias - 1) * 86400000);
       const fmt = (d: Date): string => d.toISOString().slice(0, 10);
-      const url = DBF_BASE + '/api/custos/ads/roas?de=' + fmt(deD) + '&ate=' + fmt(ateD);
+      const _rangeOk = (s: any): boolean => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
+      let deStr2 = _rangeOk(deOpt) ? String(deOpt) : '';
+      let ateStr2 = _rangeOk(ateOpt) ? String(ateOpt) : '';
+      if (deStr2 && ateStr2 && deStr2 > ateStr2) { const _t = deStr2; deStr2 = ateStr2; ateStr2 = _t; }
+      const ateD = ateStr2 ? new Date(ateStr2 + 'T12:00:00Z') : new Date();
+      const deD = deStr2 ? new Date(deStr2 + 'T12:00:00Z') : new Date(Date.now() - (dias - 1) * 86400000);
+      const deFinal = deStr2 || fmt(deD);
+      const ateFinal = ateStr2 || fmt(ateD);
+      const url = DBF_BASE + '/api/custos/ads/roas?de=' + deFinal + '&ate=' + ateFinal;
       const ctrl = new AbortController();
       const to = setTimeout(() => ctrl.abort(), 20000);
       let anuncios: any[] = [];
@@ -13411,14 +13417,16 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 };
       for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; }
       const total = enrich(tot);
-      return { ok: true, dias, de: fmt(deD), ate: fmt(ateD), taxaPct: tx, impostoPct: im, total, produtos: lista };
+      return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista };
     };
 
     // JSON (publico, protegido por ?k=)
     app.get('/painel/trafego/dados', async (req: any, res: any) => {
       if (!PNL_TOKEN() || String(req.query.k || '') !== PNL_TOKEN()) return res.status(403).json({ ok: false, erro: 'acesso' });
       const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 14));
-      try { res.json(await _pnlDados(dias)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+      const deQ = req.query.de ? String(req.query.de) : undefined;
+      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
+      try { res.json(await _pnlDados(dias, deQ, ateQ)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
     });
     // token/link do painel (so admin: x-api-key)
     app.get('/painel/token', (req: any, res: any) => {
@@ -13447,6 +13455,8 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + '.ctl{display:flex;gap:7px;flex-wrap:wrap;align-items:center}'
         + '.sel{background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--fg);font-size:12.5px;font-weight:600;padding:8px 10px}'
         + '.btn{background:var(--acs);border:1px solid var(--ac);color:var(--ac);border-radius:10px;font-size:12.5px;font-weight:700;padding:8px 11px;cursor:pointer}'
+        + '.btn2{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;font-size:12.5px;font-weight:700;padding:8px 11px;cursor:pointer}'
+        + '.dt{padding:7px 9px;color-scheme:dark;max-width:150px}.dsep{color:var(--mut);font-size:12px;align-self:center}'
         + '.tabs{display:flex;gap:7px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px;-webkit-overflow-scrolling:touch}'
         + '.tab{flex:none;background:var(--card);border:1px solid var(--line);color:var(--mut);border-radius:999px;font-size:12.5px;font-weight:700;padding:7px 13px;cursor:pointer;white-space:nowrap}'
         + '.tab.on{background:var(--acs);border-color:var(--ac);color:var(--ac)}'
@@ -13470,7 +13480,7 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + '.sk{opacity:.45}'
         + '</style></head><body><div class="wrap">'
         + '<div class="top"><div class="brand"><div class="logo">🎹</div><div><h1>Trafego Pago</h1><div class="sub">Melodias e Riffs · ao vivo</div></div></div>'
-        + '<div class="ctl"><select class="sel" id="dias"><option value="7">7 dias</option><option value="14" selected>14 dias</option><option value="30">30 dias</option></select>'
+        + '<div class="ctl"><button class="btn2" id="qhoje">Hoje</button><button class="btn2" id="qontem">Ontem</button><select class="sel" id="dias"><option value="7">7 dias</option><option value="14" selected>14 dias</option><option value="30">30 dias</option></select><input type="date" class="sel dt" id="de"><span class="dsep">→</span><input type="date" class="sel dt" id="ate">'
         + '<button class="btn" id="rec">Atualizar</button></div></div>'
         + '<div class="tabs" id="tabs"></div>'
         + '<div id="body"></div>'
@@ -13522,14 +13532,22 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + 'function lin(tag,pc,v,minus){return "<div class=\\"line"+(minus?" minus":"")+"\\"><div><span class=tag>"+esc(tag)+"</span>"+(pc?"<span class=pct>"+esc(pc)+"</span>":"")+"</div><div class=vv>"+v+"</div></div>";}'
         + 'function carregar(){'
         + 'var dias=document.getElementById("dias").value;'
+        + 'var _de=document.getElementById("de").value;var _ate=document.getElementById("ate").value;'
+        + 'var _q="/painel/trafego/dados?k="+encodeURIComponent(K);'
+        + 'if(_de&&_ate){_q+="&de="+_de+"&ate="+_ate;}else if(_de){_q+="&de="+_de+"&ate="+_de;}else if(_ate){_q+="&de="+_ate+"&ate="+_ate;}else{_q+="&dias="+dias;}'
         + 'var foot=document.getElementById("foot");foot.textContent="Atualizando…";'
-        + 'fetch("/painel/trafego/dados?k="+encodeURIComponent(K)+"&dias="+dias).then(function(r){return r.json();}).then(function(j){'
+        + 'fetch(_q).then(function(r){return r.json();}).then(function(j){'
         + 'DADOS=j;render();'
         + 'if(j&&j.ok){var h=new Date();foot.textContent="Atualizado "+h.getHours()+":"+("0"+h.getMinutes()).slice(-2)+" · periodo "+j.de+" a "+j.ate+" · atualiza sozinho a cada 60s";}else{foot.textContent="";}'
         + '}).catch(function(){DADOS={ok:false,erro:"rede"};render();foot.textContent="";});'
         + '}'
         + 'document.getElementById("rec").onclick=carregar;'
-        + 'document.getElementById("dias").onchange=carregar;'
+        + 'document.getElementById("dias").onchange=function(){document.getElementById("de").value="";document.getElementById("ate").value="";carregar();};'
+        + 'document.getElementById("de").onchange=carregar;document.getElementById("ate").onchange=carregar;'
+        + 'function _ymd(d){return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);}'
+        + 'function _setR(a,b){document.getElementById("de").value=a;document.getElementById("ate").value=b;carregar();}'
+        + 'document.getElementById("qhoje").onclick=function(){var h=new Date();_setR(_ymd(h),_ymd(h));};'
+        + 'document.getElementById("qontem").onclick=function(){var o=new Date(Date.now()-86400000);_setR(_ymd(o),_ymd(o));};'
         + 'carregar();setInterval(carregar,60000);'
         + '})();'
         + '</script></body></html>';
