@@ -1007,6 +1007,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/oauth/')) return next(); // [MCP OAuth] authorize/token/register (gate pela MCP_API_KEY)
   if (req.path === '/area' || req.path.startsWith('/area/')) return next(); // [B] area de membros (auth propria por cookie)
   if (req.path === '/academy/audio-push' || req.path.startsWith('/academy/audio-push/')) return next(); // [B.16] upload/lista de audio da aula — gate por AUDIO_PUSH_TOKEN (nao usa ENGINE_API_KEY)
+  if (req.path === '/painel/trafego' || req.path === '/painel/trafego/dados') return next(); // [painel-trafego] painel web so-leitura: trava propria por token ?k= (NAO liberar /painel/token, que e admin)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
