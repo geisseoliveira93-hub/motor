@@ -485,6 +485,25 @@ function _formaPagamento(provider: string, b: any): string {
   if (/bol|billet/.test(raw)) return 'boleto';
   return '';
 }
+// [cartao-recusado] detecta recusa de cartao / sem limite dentro de um evento 'perdido'.
+// Olha o status cru + campos comuns de "motivo da recusa" dos provedores (Guru/LastLink).
+function _cartaoRecusado(provider: string, b: any, statusRaw: string): boolean {
+  const s = String(statusRaw || '').toLowerCase();
+  let motivo = '';
+  try {
+    motivo = String(
+      b?.payment?.refusal_reason || b?.payment?.refuse_reason || b?.payment?.message ||
+      b?.refusal_reason || b?.refuse_reason || b?.decline_reason || b?.motivo ||
+      b?.Data?.Purchase?.Payment?.RefusalReason || b?.Data?.Purchase?.RefusalReason ||
+      b?.Data?.Purchase?.Payment?.Message || ''
+    ).toLowerCase();
+  } catch { /* */ }
+  const txt = s + ' ' + motivo;
+  const recusa = /refus|recus|declin|denied|negad|insufficient|sem.?limit|no.?funds|not.?authorized|nao.?autoriz|n\u00e3o.?autoriz|card.?error|cart.?recus/.test(txt);
+  if (!recusa) return false;
+  const forma = _formaPagamento(provider, b);
+  return forma === 'cartao-credito' || forma === '' || /cart|card|credit/.test(txt);
+}
 // Tags no formato Sellflux: LastLink por ID do produto/oferta; Guru por slug do nome.
 function tagsCompraAuto(provider: string, b: any, p: { produtoId?: string; produtoNome?: string; status?: string }): string[] {
   const fase = _fasePagamento(provider, p.status || '');
@@ -3043,7 +3062,7 @@ app.get('/email/fluxos', (_req, res) => { res.json({ ok: true, fluxos: ((CONFIG 
 app.post('/email/fluxo', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.id || randomUUID());
-    const evento = (String(b.evento || '') === 'nao_pago') ? 'nao_pago' : 'pos_compra';
+    const evento = ['nao_pago','cartao_recusado'].includes(String(b.evento || '')) ? String(b.evento || '') : 'pos_compra';
     const item: any = { id, evento, label: String(b.label || ''), chave: String(b.chave || ''), porId: !!b.porId, delayDias: Math.max(0, Number(b.delayDias) || 0), assunto: String(b.assunto || ''), html: String(b.html || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], ativo: b.ativo === undefined ? true : !!b.ativo };
     const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id);
     lista.push(item); salvarConfigPermanente('emailFluxos', lista);
@@ -3395,7 +3414,12 @@ app.post('/webhook/payment/:provider', async (req, res) => {
     // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
     if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
     if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
-    if (categoria === 'perdido') { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+    if (categoria === 'perdido') {
+      // [cartao-recusado] se a recusa foi de cartao/sem limite, dispara o fluxo 'cartao_recusado';
+      // os demais nao-pagos (boleto/pix nao pago, abandono) caem em 'nao_pago'. Exclusivo: nunca os dois.
+      if (_cartaoRecusado(provider, b, p.status)) { try { await _emailFluxoDisparar('cartao_recusado', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+      else { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+    }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       // [tags-auto] tags no padrão Sellflux (idempotente, só acrescenta, NÃO dispara mensagem). Vale p/ TODAS as fases.
@@ -11697,6 +11721,7 @@ _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN endereco TEXT`);  // json
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN pontos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN dias_consecutivos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN ultimo_dia TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN email_sumido_em TEXT`); // [aluno-sumido] ultimo e-mail de reengajamento
 // semente da config de gamificação (perfil Equilibrado) se vazia
 try {
   const g = db.prepare(`SELECT id FROM academy_gamificacao WHERE id=1`).get();
@@ -12202,7 +12227,7 @@ const _acChecaConclusaoCurso = (alunoId: string, cursoId: string) => {
     const tot = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(cursoId, cursoId) as any).n;
     if (!tot) return;
     const feitas = (db.prepare(`SELECT COUNT(*) n FROM academy_progresso WHERE aluno_id=? AND curso_id=? AND visto=1`).get(alunoId, cursoId) as any).n;
-    if (feitas >= tot) { _acPontuar(alunoId, 'concluiu_curso', cursoId); _acLog(alunoId, 'concluiu_curso', cursoId); }
+    if (feitas >= tot) { _acPontuar(alunoId, 'concluiu_curso', cursoId); _acLog(alunoId, 'concluiu_curso', cursoId); try { _acCertificadoEmail(alunoId, cursoId); } catch { /* cert e-mail best-effort */ } }
   } catch {}
 };
 
@@ -12553,6 +12578,90 @@ app.get('/area/certificado/:cursoId', (req: any, res: any) => {
     res.type('html').send(_acPage(al, 'Certificado', corpo));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
+
+
+// ============================================================================
+// [aluno-sumido] Reengajamento: aluno sem acessar a area ha X dias recebe um e-mail
+// chamando de volta. Nasce DESLIGADO (email_sumido_ativo!='1'). Dispara 1x/dia, e nao
+// repete pro mesmo aluno dentro do periodo (coluna email_sumido_em).
+// [certificado] E-mail automatico com o certificado quando o aluno conclui o curso.
+// Nasce DESLIGADO (email_cert_ativo!='1'). Envia 1x por (aluno,curso) (dedup via academy_logs).
+// Ambos reaproveitam a fila de e-mail (_emailFilaEnfileirar + _tickEmail). Projeto 'teclado'.
+// ============================================================================
+function _acCertificadoEmail(alunoId: string, cursoId: string): void {
+  try {
+    if (pubFlag('email_cert_ativo','0') !== '1') return;
+    const ja = db.prepare(`SELECT 1 FROM academy_logs WHERE aluno_id=? AND tipo='cert_email' AND detalhe=? LIMIT 1`).get(alunoId, cursoId);
+    if (ja) return;
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(alunoId) as any;
+    const email = (al && al.email) ? String(al.email).trim() : '';
+    if (!email || !email.includes('@')) return;
+    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(cursoId) as any;
+    const nomeCurso = curso ? String(curso.nome || '') : '';
+    const nomeAluno = String((al && al.nome) || 'Aluno');
+    const hoje = new Date().toLocaleDateString('pt-BR');
+    const link = (PUBLIC_BASE_URL || '') + '/area/certificado/' + cursoId;
+    const assuntoCfg = String((CONFIG as any).emailCertAssunto || '').trim();
+    const assunto = (assuntoCfg || 'Seu certificado — {curso} \u{1F3C6}').replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso);
+    const introCfg = String((CONFIG as any).emailCertHtml || '').trim();
+    const intro = introCfg
+      ? introCfg.replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso).replace(/\r?\n/g, '<br>')
+      : `Parabéns, ${esc(nomeAluno)}! Você concluiu o curso <b>${esc(nomeCurso)}</b>. Aqui está o seu certificado.`;
+    const cert = `<div style="max-width:620px;margin:0 auto;background:linear-gradient(135deg,#14140f,#1c1a12);border:2px solid #e7c86a;border-radius:16px;padding:40px;text-align:center;color:#fff">`
+      + `<div style="color:#e7c86a;font-weight:800;letter-spacing:.2em;font-size:13px">MELODIAS E RIFFS</div>`
+      + `<div style="font-size:12px;color:#aa9b6a;margin-bottom:22px">A Escola do Músico Cristão</div>`
+      + `<div style="font-size:14px;color:#cfcfd8">Certificamos que</div>`
+      + `<div style="font-size:26px;font-weight:800;margin:8px 0">${esc(nomeAluno)}</div>`
+      + `<div style="font-size:14px;color:#cfcfd8">concluiu o curso</div>`
+      + `<div style="font-size:19px;font-weight:700;color:#e7c86a;margin:8px 0">${esc(nomeCurso)}</div>`
+      + `<div style="color:#8a8a96;font-size:12px;margin-top:18px">${esc(hoje)} · Prof. Ezequias</div></div>`;
+    const html = `<div style="font:16px/1.6 system-ui,Arial;color:#141a21;max-width:640px;margin:0 auto">`
+      + `<p style="margin:0 0 16px">${intro}</p>${cert}`
+      + `<p style="text-align:center;margin:22px 0 0"><a href="${link}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Ver e baixar o certificado (PDF)</a></p>`
+      + `<p style="color:#889;font-size:13px;text-align:center;margin:14px 0 0">Dica: na página do certificado, toque em "Imprimir / Salvar PDF".</p></div>`;
+    _emailFilaEnfileirar('teclado', email, assunto, html, {});
+    _acLog(alunoId, 'cert_email', cursoId);
+  } catch { /* best-effort */ }
+}
+app.get('/email/cert', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1', assunto: String((CONFIG as any).emailCertAssunto || ''), html: String((CONFIG as any).emailCertHtml || '') }); });
+app.post('/email/cert/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_cert_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1' }); });
+app.post('/email/cert/config', (req, res) => { const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailCertAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailCertHtml', String(b.html || '')); res.json({ ok: true }); });
+
+function _tickEmailSumido(): void {
+  try {
+    if (pubFlag('email_sumido_ativo','0') !== '1') return;
+    const nowBRT = new Date(Date.now() - 3 * 3600000);
+    const hojeStr = `${nowBRT.getUTCFullYear()}-${String(nowBRT.getUTCMonth()+1).padStart(2,'0')}-${String(nowBRT.getUTCDate()).padStart(2,'0')}`;
+    if (pubFlag('email_sumido_ultimo','') === hojeStr) return;
+    const dias = Math.max(1, Number((CONFIG as any).emailSumidoDias) || 15);
+    const lim = new Date(Date.now() - dias * 86400000).toISOString();
+    const rows = db.prepare(`SELECT id,nome,email FROM academy_matriculas WHERE email IS NOT NULL AND email<>'' AND ultimo_acesso IS NOT NULL AND ultimo_acesso<>'' AND ultimo_acesso < ? AND (email_sumido_em IS NULL OR email_sumido_em < ?) LIMIT 100`).all(lim, lim) as any[];
+    const assuntoCfg = String((CONFIG as any).emailSumidoAssunto || '').trim();
+    const htmlCfg = String((CONFIG as any).emailSumidoHtml || '').trim();
+    const base = (PUBLIC_BASE_URL || '') + '/area';
+    for (const r of rows) {
+      const email = String(r.email || '').trim(); if (!email.includes('@')) continue;
+      const nm = String(r.nome || '').trim();
+      const assunto = (assuntoCfg || 'Sentimos sua falta na Melodias e Riffs \u{1F3B6}').replace(/\{nome\}/g, nm);
+      const corpo = htmlCfg
+        ? htmlCfg.replace(/\{nome\}/g, nm).replace(/\r?\n/g, '<br>')
+        : `Oi ${esc(nm || '')}! Faz um tempinho que você não aparece na sua área de aluno. Que tal voltar e continuar de onde parou? Tem conteúdo esperando por você. \u{1F3B9}`;
+      const html = `<div style="font:16px/1.6 system-ui,Arial;color:#141a21;max-width:600px;margin:0 auto">`
+        + `<p style="margin:0 0 16px">${corpo}</p>`
+        + `<p style="text-align:center;margin:22px 0 0"><a href="${base}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Voltar para as aulas</a></p></div>`;
+      _emailFilaEnfileirar('teclado', email, assunto, html, {});
+      try { db.prepare(`UPDATE academy_matriculas SET email_sumido_em=? WHERE id=?`).run(agora(), r.id); } catch { /* */ }
+      try { _acLog(r.id, 'email_sumido', ''); } catch { /* */ }
+    }
+    setPubFlag('email_sumido_ultimo', hojeStr);
+  } catch { /* best-effort */ }
+}
+setInterval(() => { try { _tickEmailSumido(); } catch { /* */ } }, 60 * 60000); // checa 1x/hora; dispara no max 1x/dia
+app.get('/email/sumido', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1', dias: Number((CONFIG as any).emailSumidoDias) || 15, assunto: String((CONFIG as any).emailSumidoAssunto || ''), html: String((CONFIG as any).emailSumidoHtml || '') }); });
+app.post('/email/sumido/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_sumido_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1' }); });
+app.post('/email/sumido/config', (req, res) => { const b = req.body || {}; if (b.dias !== undefined) salvarConfigPermanente('emailSumidoDias', Math.max(1, Number(b.dias) || 15)); if (b.assunto !== undefined) salvarConfigPermanente('emailSumidoAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailSumidoHtml', String(b.html || '')); res.json({ ok: true }); });
+app.post('/email/sumido/enviar-agora', (_req, res) => { try { setPubFlag('email_sumido_ultimo',''); _tickEmailSumido(); res.json({ ok: true }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+
 
 // FAQ (admin): editar as perguntas frequentes do aluno
 app.get('/academy/faq', (_req: any, res: any) => { try { _ndOk(res, { faq: _ndJson(pubFlag('academy_faq', ''), []) }); } catch (e) { _ndErr(res, e); } });
