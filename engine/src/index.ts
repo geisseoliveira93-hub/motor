@@ -2807,6 +2807,64 @@ app.post('/email/anexo/upload', express.raw({ type: () => true, limit: '200mb' }
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// ============================================================================
+// [email-entrega] ENGENHARIA do e-mail automatico na COMPRA, POR PRODUTO.
+// Nasce DESLIGADO (pub_kv email_entrega_ativo != '1') e SEM nenhum produto montado.
+// Voce cria cada template depois (botao +). Sem template casado = nao manda nada.
+// Reusa a fila (_tickEmail) e os anexos (_emailResolverAnexos) ja existentes.
+// ============================================================================
+function _emailEntregaMatch(produtoId?: string, produtoNome?: string): any {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  for (const t of (((CONFIG as any).emailEntregaProduto) || [])) {
+    const chave = String(t.chave || '').toLowerCase();
+    if (!chave) continue;
+    const casa = t.porId ? (id && id === chave) : alvo.includes(chave);
+    if (casa && (t.assunto || t.html)) return t;
+  }
+  return null;
+}
+async function _emailEntregaCompra(projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<void> {
+  const para = String(email || '').trim();
+  if (!para || !para.includes('@')) return;
+  const t = _emailEntregaMatch(produtoId, produtoNome);
+  if (!t) return; // sem template pro produto -> nao manda nada
+  const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND padrao=1 AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto) as any)
+           || (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto) as any);
+  const nm = (nome || '').trim();
+  const assunto = String(t.assunto || '').replace(/\{nome\}/g, nm);
+  const html = String(t.html || '').replace(/\{nome\}/g, nm);
+  const anexosJson = (t.anexos && Array.isArray(t.anexos) && t.anexos.length) ? JSON.stringify(t.anexos) : null;
+  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(randomUUID(), String(projeto || ''), para, assunto, html, 'pendente', agora(), (t.dominio_id || (dom && dom.id) || null), anexosJson);
+}
+// GET: lista os templates por produto + estado do liga/desliga.
+app.get('/email/entrega', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_entrega_ativo','0')==='1', templates: ((CONFIG as any).emailEntregaProduto) || [] }); });
+// POST: cria/atualiza 1 template por produto. body:{chave, porId?, projeto?, assunto, html, anexos?[{nome,url|caminho|base64,tipo?}], dominio_id?}
+app.post('/email/entrega/produto', (req, res) => {
+  try {
+    const b = req.body || {}; const chave = String(b.chave || '').trim();
+    if (!chave) return res.json({ ok: false, erro: 'Informe a chave (id ou trecho do nome do produto).' });
+    const item: any = { chave, porId: !!b.porId, projeto: b.projeto || undefined, assunto: String(b.assunto || ''), html: String(b.html || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], dominio_id: b.dominio_id ? String(b.dominio_id) : undefined };
+    const lista = (((CONFIG as any).emailEntregaProduto) || []).filter((t: any) => String(t.chave || '').toLowerCase() !== chave.toLowerCase());
+    lista.push(item); salvarConfigPermanente('emailEntregaProduto', lista);
+    res.json({ ok: true, chave, total: lista.length });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+// POST: remove 1 template por produto. body:{chave}
+app.post('/email/entrega/produto/remover', (req, res) => {
+  const chave = String((req.body || {}).chave || '').toLowerCase();
+  const lista = (((CONFIG as any).emailEntregaProduto) || []).filter((t: any) => String(t.chave || '').toLowerCase() !== chave);
+  salvarConfigPermanente('emailEntregaProduto', lista);
+  res.json({ ok: true, total: lista.length });
+});
+// POST: liga/desliga o e-mail automatico na compra. body:{on:true/false}. Nasce DESLIGADO.
+app.post('/email/entrega/flag', (req, res) => {
+  const on = ((req.body || {}).on === true || (req.body||{}).on === '1' || (req.body||{}).on === 1 || (req.body||{}).on === 'on');
+  setPubFlag('email_entrega_ativo', on ? '1' : '0');
+  res.json({ ok: true, ativo: pubFlag('email_entrega_ativo','0')==='1' });
+});
+
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
 app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
 app.post('/comentario', (req, res) => {
@@ -3146,6 +3204,8 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
+    // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
+    if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       // [tags-auto] tags no padrão Sellflux (idempotente, só acrescenta, NÃO dispara mensagem). Vale p/ TODAS as fases.
