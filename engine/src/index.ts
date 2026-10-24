@@ -13499,13 +13499,14 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const porProd: Record<string, any> = {};
       for (const a of anuncios) {
         const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
-        const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 });
+        const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 });
         p.gasto += (a.gasto_centavos || 0) / 100;
         p.vendas += (a.vendas || 0);
         p.fat += (a.fat_centavos || 0) / 100;
         p.leads += (a.leads || 0);
         p.cliques += (a.cliques || 0);
         p.impressoes += (a.impressoes || 0);
+        p.ic += (a.ic || 0);
       }
       const tx = taxaPct();
       const im = impPct();
@@ -13515,7 +13516,7 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         const lucro = p.fat - taxaV - impV - p.gasto;
         return {
           produto: p.produto, gasto: p.gasto, vendas: p.vendas, fat: p.fat, leads: p.leads,
-          cliques: p.cliques, impressoes: p.impressoes,
+          cliques: p.cliques, impressoes: p.impressoes, ic: p.ic || 0, cpic: (p.ic || 0) > 0 ? p.gasto / (p.ic || 1) : 0,
           roas: p.gasto > 0 ? p.fat / p.gasto : 0,
           cpa: p.vendas > 0 ? p.gasto / p.vendas : 0,
           ticket: p.vendas > 0 ? p.fat / p.vendas : 0,
@@ -13524,8 +13525,8 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         };
       };
       const lista = Object.keys(porProd).map((k) => enrich(porProd[k])).sort((a, b) => b.fat - a.fat);
-      const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0 };
-      for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; }
+      const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 };
+      for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; tot.ic += (p.ic || 0); }
       const total = enrich(tot);
       const mapaContas = await _pnlContasMap();
       const _contasSet: Record<string, string> = {};
@@ -13536,7 +13537,7 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         const conta = String(a.ad_account_id || '');
         const contaNome = mapaContas[conta] || (conta ? ('Conta ' + conta.replace('act_', '')) : '(sem conta)');
         if (conta) _contasSet[conta] = contaNome;
-        return { produto: prod, conta, contaNome, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: a.vendas || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
+        return { produto: prod, conta, contaNome, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: a.vendas || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, ic: a.ic || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
       });
       const contas = Object.keys(_contasSet).map((id) => ({ id, nome: _contasSet[id] })).sort((aa, bb) => aa.nome.localeCompare(bb.nome));
       return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista, ads, contas };
@@ -13643,9 +13644,9 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + 'html+=kpi("Ticket medio",brl(p.ticket));'
         + 'html+=kpi("CPA",brl(p.cpa));'
         + 'html+="</div>";'
-        + 'var _ctr=p.impressoes>0?(p.cliques/p.impressoes*100):0;var _cpc=p.cliques>0?(p.gasto/p.cliques):0;var _cpm=p.impressoes>0?(p.gasto/p.impressoes*1000):0;var _cpl=p.leads>0?(p.gasto/p.leads):0;'
+        + 'var _ctr=p.impressoes>0?(p.cliques/p.impressoes*100):0;var _cpc=p.cliques>0?(p.gasto/p.cliques):0;var _cpm=p.impressoes>0?(p.gasto/p.impressoes*1000):0;var _cpl=p.leads>0?(p.gasto/p.leads):0;var _cpic=(p.ic||0)>0?(p.gasto/p.ic):0;'
         + 'html+="<div class=panel><h2>\u{1F4C8} Metricas de anuncio</h2><div class=mg>";'
-        + 'html+=mi("Cliques",num(p.cliques))+mi("Impressoes",num(p.impressoes))+mi("CTR",pct(_ctr))+mi("CPC",brl(_cpc))+mi("CPM",brl(_cpm))+mi("Leads",num(p.leads))+mi("CPL",brl(_cpl));'
+        + 'html+=mi("Cliques",num(p.cliques))+mi("Impressoes",num(p.impressoes))+mi("CTR",pct(_ctr))+mi("CPC",brl(_cpc))+mi("CPM",brl(_cpm))+mi("Leads",num(p.leads))+mi("CPL",brl(_cpl))+mi("IC",num(p.ic||0))+mi("CPIC",brl(_cpic));'
         + 'html+="</div></div>";'
         + 'html+="<div class=panel><h2>💰 Resultado real — o que sobra ("+esc(SEL)+")</h2>";'
         + 'html+=lin("Faturamento bruto","",brl(p.fat),false);'
@@ -13664,9 +13665,9 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         + 'html+="<div class=panel><h2>Por campanha ("+esc(SEL)+")</h2><div class=px><table><thead><tr><th>Campanha</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Fat.</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
         + 'for(var ci=0;ci<_camps.length;ci++){var c=_camps[ci];html+="<tr><td class=cre>"+esc(c.campanha)+"</td><td class=n>"+brl(c.gasto)+"</td><td class=n>"+num(c.vendas)+"</td><td class=n>"+brl(c.fat)+"</td><td class=n>"+x(c.roas)+"x</td><td class=n><span class="+(c.lucro>=0?"pos":"neg")+">"+brl(c.lucro)+"</span></td></tr>";}'
         + 'html+="</tbody></table></div></div>";'
-        + 'html+="<div class=panel><h2>Por criativo (anuncio)</h2><div class=px><table><thead><tr><th>Anuncio</th><th>Campanha</th><th>Conta</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
+        + 'html+="<div class=panel><h2>Por criativo (anuncio)</h2><div class=px><table><thead><tr><th>Anuncio</th><th>Campanha</th><th>Conta</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>IC</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
         + 'var _ao=_ads.slice().sort(function(a,b){return b.gasto-a.gasto;});'
-        + 'for(var ai=0;ai<_ao.length;ai++){var d=_ao[ai];html+="<tr><td class=cre>"+esc(d.ad)+"</td><td class=cmp>"+esc(d.campanha)+"</td><td class=cmp>"+esc(d.contaNome)+"</td><td class=n>"+brl(d.gasto)+"</td><td class=n>"+num(d.vendas)+"</td><td class=n>"+x(d.roas)+"x</td><td class=n><span class="+(d.lucro>=0?"pos":"neg")+">"+brl(d.lucro)+"</span></td></tr>";}'
+        + 'for(var ai=0;ai<_ao.length;ai++){var d=_ao[ai];html+="<tr><td class=cre>"+esc(d.ad)+"</td><td class=cmp>"+esc(d.campanha)+"</td><td class=cmp>"+esc(d.contaNome)+"</td><td class=n>"+brl(d.gasto)+"</td><td class=n>"+num(d.vendas)+"</td><td class=n>"+num(d.ic||0)+"</td><td class=n>"+x(d.roas)+"x</td><td class=n><span class="+(d.lucro>=0?"pos":"neg")+">"+brl(d.lucro)+"</span></td></tr>";}'
         + 'html+="</tbody></table></div></div>";}'
         + 'body.innerHTML=html;' 
         + '}'
