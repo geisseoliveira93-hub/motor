@@ -2562,6 +2562,7 @@ function _utmDoPayload(b: any): any {
 }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN dominio_id TEXT`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN anexos TEXT`); } catch { /* existe */ } // [email-anexos] json [{nome,url|base64|caminho,tipo?}]
+try { db.exec(`ALTER TABLE email_fila ADD COLUMN agendado_para TEXT`); } catch { /* existe */ } // [email-agendado] envio agendado (boas-vindas/nps/upsell)
 
 // [email] enviador SMTP self-contido (net/tls do Node, sem dependencia nova). Suporta
 // TLS implicito (465) e STARTTLS (587), AUTH LOGIN. Usado pelo worker da fila e pelo teste.
@@ -2699,7 +2700,7 @@ function _emailDomDoItem(m: any): any {
 }
 async function _tickEmail(): Promise<void> {
   try {
-    const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' ORDER BY criado_em ASC LIMIT 5`).all() as any[];
+    const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY criado_em ASC LIMIT 5`).all(agora()) as any[];
     for (const m of rows) {
       const dom = _emailDomDoItem(m);
       if (!dom) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando SMTP do projeto', m.id); } catch { /* */ } continue; }
@@ -2996,6 +2997,61 @@ app.post('/email/relatorio/enviar', async (req, res) => {
   try { const dias = Number((req.body||{}).dias) || undefined; const ok = await _emailRelatorioEnviar(dias); res.json({ ok, enfileirado: ok }); }
   catch (e:any) { res.json({ ok:false, erro:String(e&&e.message||e) }); }
 });
+
+// ============================================================================
+// [email-fluxos] E-mails automaticos por EVENTO, por produto, com atraso opcional.
+// evento 'pos_compra' (dispara na compra aprovada) cobre BOAS-VINDAS, NPS e UPSELL.
+// evento 'nao_pago' (dispara em pagamento perdido) cobre RECUPERACAO de Pix/boleto.
+// Cada fluxo tem seu ativo (nasce VAZIO; nada dispara ate voce criar e ativar).
+// Reusa a fila (agendado_para p/ atraso) e os anexos. So age quando a venda chegar no motor (webhooks).
+// ============================================================================
+function _emailFilaEnfileirar(projeto: string, para: string, assunto: string, html: string, opts?: { anexos?: any; dominio_id?: string | null; agendado_para?: string | null }): void {
+  try {
+    const anexos = (opts && opts.anexos && Array.isArray(opts.anexos) && opts.anexos.length) ? JSON.stringify(opts.anexos) : null;
+    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos,agendado_para) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), String(projeto || ''), String(para || ''), String(assunto || ''), String(html || ''), 'pendente', agora(), (opts && opts.dominio_id) || null, anexos, (opts && opts.agendado_para) || null);
+  } catch { /* best-effort */ }
+}
+function _emailFluxoMatch(evento: string, produtoId?: string, produtoNome?: string): any[] {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  const out: any[] = [];
+  for (const f of (((CONFIG as any).emailFluxos) || [])) {
+    if (!f || !f.ativo || String(f.evento || '') !== evento) continue;
+    const chave = String(f.chave || '').toLowerCase();
+    const casa = !chave || (f.porId ? (id && id === chave) : alvo.includes(chave));
+    if (casa && (f.assunto || f.html)) out.push(f);
+  }
+  return out;
+}
+async function _emailFluxoDisparar(evento: string, projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<void> {
+  const para = String(email || '').trim();
+  if (!para || !para.includes('@')) return;
+  const fluxos = _emailFluxoMatch(evento, produtoId, produtoNome);
+  if (!fluxos.length) return;
+  const nm = (nome || '').trim();
+  for (const f of fluxos) {
+    const assunto = String(f.assunto || '').replace(/\{nome\}/g, nm);
+    const html = String(f.html || '').replace(/\{nome\}/g, nm);
+    const dias = Math.max(0, Number(f.delayDias) || 0);
+    const agendado = dias > 0 ? new Date(Date.now() + dias * 86400000).toISOString() : null;
+    _emailFilaEnfileirar(String(projeto || ''), para, assunto, html, { anexos: f.anexos, agendado_para: agendado });
+  }
+}
+// GET: lista os fluxos. POST /email/fluxo: cria/atualiza. /remover e /ativo pra gerenciar.
+app.get('/email/fluxos', (_req, res) => { res.json({ ok: true, fluxos: ((CONFIG as any).emailFluxos) || [] }); });
+app.post('/email/fluxo', (req, res) => {
+  try {
+    const b = req.body || {}; const id = String(b.id || randomUUID());
+    const evento = (String(b.evento || '') === 'nao_pago') ? 'nao_pago' : 'pos_compra';
+    const item: any = { id, evento, label: String(b.label || ''), chave: String(b.chave || ''), porId: !!b.porId, delayDias: Math.max(0, Number(b.delayDias) || 0), assunto: String(b.assunto || ''), html: String(b.html || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], ativo: b.ativo === undefined ? true : !!b.ativo };
+    const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id);
+    lista.push(item); salvarConfigPermanente('emailFluxos', lista);
+    res.json({ ok: true, id, total: lista.length });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/email/fluxo/remover', (req, res) => { const id = String((req.body || {}).id || ''); const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id); salvarConfigPermanente('emailFluxos', lista); res.json({ ok: true, total: lista.length }); });
+app.post('/email/fluxo/ativo', (req, res) => { const b = req.body || {}; const id = String(b.id || ''); const lista = (((CONFIG as any).emailFluxos) || []).map((f: any) => String(f.id) === id ? { ...f, ativo: !!b.ativo } : f); salvarConfigPermanente('emailFluxos', lista); res.json({ ok: true }); });
 
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
 app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
@@ -3338,6 +3394,8 @@ app.post('/webhook/payment/:provider', async (req, res) => {
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
     // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
     if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
+    if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
+    if (categoria === 'perdido') { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-fluxos best-effort */ } }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       // [tags-auto] tags no padrão Sellflux (idempotente, só acrescenta, NÃO dispara mensagem). Vale p/ TODAS as fases.
