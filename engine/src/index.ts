@@ -12493,6 +12493,27 @@ app.post('/academy/importar/ia', (req: any, res: any) => {
     _ndOk(res, { adicionados: add, atualizados: atual, nao_encontrados: naoachou, total: linhas.length });
   } catch (e) { _ndErr(res, e); }
 });
+// [migracao-cred 25/10] seta CPF + senha=CPF (so digitos) por EMAIL, em lote. ADD-ONLY, nao cria aluno, idempotente (so preenche vazio salvo sobrescrever).
+app.post('/academy/importar/credencial', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const sobre = !!b.sobrescrever;
+    const linhas: any[] = Array.isArray(b.linhas) ? b.linhas : [];
+    let cpfSet = 0, senhaSet = 0, naoachou = 0;
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const email = String(r.email || '').trim().toLowerCase();
+        const cpf = String(r.cpf || '').replace(/\D/g, '');
+        if (!email || cpf.length < 3) continue;
+        const al = db.prepare(`SELECT id, cpf, senha_hash, senha_plana FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        if (!al) { naoachou++; continue; }
+        if (sobre || !al.cpf) { db.prepare(`UPDATE academy_matriculas SET cpf=? WHERE id=?`).run(cpf, al.id); cpfSet++; }
+        if (sobre || !(al.senha_plana || al.senha_hash)) { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash(cpf), cpf, al.id); senhaSet++; }
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { cpf_set: cpfSet, senha_set: senhaSet, nao_encontrados: naoachou, total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
+});
 // admin: gerar/retornar magic link do aluno
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: (PUBLIC_BASE_URL || '') + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
