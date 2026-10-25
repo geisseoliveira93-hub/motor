@@ -11762,6 +11762,7 @@ _acAlter(`ALTER TABLE academy_aulas ADD COLUMN duracao_seg INTEGER`);
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN anexos TEXT`);         // json [{nome,url,tamanho}]
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN curso_id TEXT`);       // desnormalizado p/ consulta rápida
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_hash TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_plana TEXT`); // [migracao-senha] senha visivel p/ admin (publico idoso)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN token_login TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN avatar TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN telefone TEXT`);
@@ -12446,6 +12447,51 @@ app.get('/academy/aluno/:id', (req: any, res: any) => {
 // admin: definir/gerar senha do aluno
 app.post('/academy/aluno/senha', (req: any, res: any) => {
   try { const b = req.body || {}; const senha = String(b.senha || Math.random().toString(36).slice(2, 10)); db.prepare(`UPDATE academy_matriculas SET senha_hash=? WHERE id=?`).run(_acHash(senha), b.id); _ndOk(res, { senha }); } catch (e) { _ndErr(res, e); }
+});
+// [migracao-senha 25/10] admin DEFINE senha (fica VISIVEL pro admin) + senha em massa = CPF (so digitos).
+app.post('/academy/aluno/senha-def', (req: any, res: any) => {
+  try { const b = req.body || {}; const senha = String(b.senha || '').trim(); if (!b.id || !senha) return _ndErr(res, 'id e senha obrigatorios'); db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash(senha), senha, b.id); _acLog(String(b.id), 'senha_definida', ''); _ndOk(res, { ok: true, senha }); } catch (e) { _ndErr(res, e); }
+});
+app.post('/academy/senha/padrao-cpf', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const sobrescrever = !!b.sobrescrever;
+    const rows = db.prepare(`SELECT id, cpf FROM academy_matriculas WHERE cpf IS NOT NULL AND cpf<>''`).all() as any[];
+    const semCpf = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE cpf IS NULL OR cpf=''`).get() as any).n;
+    const upd = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`);
+    const jaTem = db.prepare(`SELECT senha_plana, senha_hash FROM academy_matriculas WHERE id=?`);
+    let def = 0, pulados = 0, curtos = 0;
+    const tx = db.transaction((lista: any[]) => {
+      for (const r of lista) {
+        const cpf = String(r.cpf || '').replace(/\D/g, '');
+        if (cpf.length < 3) { curtos++; continue; }
+        const cur = jaTem.get(r.id) as any;
+        if (!sobrescrever && cur && (cur.senha_plana || cur.senha_hash)) { pulados++; continue; }
+        upd.run(_acHash(cpf), cpf, r.id); def++;
+      }
+    });
+    tx(rows);
+    _ndOk(res, { definidos: def, pulados, cpf_invalido: curtos, sem_cpf: semCpf });
+  } catch (e) { _ndErr(res, e); }
+});
+// [migracao-ia 25/10] registra ACESSO DE IA (IA Mentoria) por aluno via email, com validade (data YYYY-MM-DD | 6meses | 1ano | vitalicio). ADD-ONLY. Nao cria aluno.
+app.post('/academy/importar/ia', (req: any, res: any) => {
+  try {
+    const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
+    let add = 0, atual = 0, naoachou = 0;
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
+        const al = db.prepare(`SELECT id FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        if (!al) { naoachou++; continue; }
+        const val = String(r.validade || 'vitalicio');
+        const ex = db.prepare(`SELECT id FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='ia'`).get(al.id) as any;
+        if (ex) { db.prepare(`UPDATE academy_acesso SET validade=? WHERE id=?`).run(val, ex.id); atual++; }
+        else { db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'ia', 'ia', val, agora()); add++; }
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { adicionados: add, atualizados: atual, nao_encontrados: naoachou, total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
 });
 // admin: gerar/retornar magic link do aluno
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
