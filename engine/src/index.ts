@@ -4146,6 +4146,8 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       } else if (pubFlag('gcal_ativo') === '1') { _gcalIaAviso = 'fonte_ia_desligada'; }
       // [lembretes-sessao] cria os lembretes configurados deste evento (best-effort, não quebra a marcação)
       try { _criarLembretesSessao(projeto, id, inicio, fim, conversa.contato_id || null, _telBruto, _inst, String(args.nome || ''), seed.sala || ''); } catch { /* best-effort */ }
+      // [agente-off-apos-marcar 26/10] uma vez MARCADO, o agente para de atender esse lead (não transfere, não continua); só os lembretes seguem. status!='ativo' já bloqueia no topo de processarMensagemAgente. A confirmação desta marcação ainda sai (o guard só roda no início do turno).
+      try { db.prepare(`UPDATE agente_conversas SET status='agendado', atualizado_em=? WHERE id=?`).run(agora(), conversa.id); } catch { /* best-effort */ }
       return { ok: true, id, inicio, fim, sala: seed.sala || '', sala_instrucao: seed.sala ? ('IMPORTANTE: envie este link da sala fixa pro aluno na confirmacao, exatamente assim: ' + seed.sala + ' . Ignore qualquer outro link de meet que apareca.') : '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
     }
     if (nomeFerr === 'registrar_card_crm') {
