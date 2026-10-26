@@ -11856,6 +11856,10 @@ const _acCursosDoAluno = (alunoId: string): Set<string> => {
   } catch {}
   return ok;
 };
+// [IA 26/10] Tutor de IA (IA Mentoria) — app Cloudflare externo, embutido na área; gate de acesso é do próprio app (fonte da verdade = Worker/Guru)
+const _AC_IA_APP = 'https://melodias-riffs-app.pages.dev';
+const _acIaUrl = (al: any, pagina = 'inicio.html'): string =>
+  _AC_IA_APP + '/' + pagina + '?email=' + encodeURIComponent(String(al && al.email || '')) + '&cuser_fname=' + encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '');
 
 // ---------- [B.2] Tema / layout da área do aluno (M|R dark) ----------
 const _acCSS = `
@@ -11949,7 +11953,7 @@ const _acTop = (al: any, aba = ''): string => {
   return `<div class="top"><a class="logo" href="/area">M|R</a>
     <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
     <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-    <a href="https://melodias-riffs-app.pages.dev/inicio.html?email=${encodeURIComponent(String(al && al.email || ''))}&cuser_fname=${encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '')}" target="_blank">Fale com a IA</a></nav>
+    <a href="/area/ia" class="${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
     <div class="av" title="Minha conta" onclick="var m=document.getElementById('mn');m.classList.toggle('open')">⚙️
@@ -12154,6 +12158,22 @@ const _acPlayerHtml = (aula: any, curso: any, pos: number): string => {
   const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
   return `<div class="player"><iframe src="https://www.youtube-nocookie.com/embed/${esc(yid)}?rel=0&modestbranding=1&playsinline=1&origin=${org}${start}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe></div>`;
 };
+// [IA 26/10] Página da IA embutida na plataforma (com escape "nova aba"); o próprio app libera/vende
+app.get('/area/ia', (req: any, res: any) => {
+  const al = _acAluno(req);
+  if (!al) return res.redirect('/area/login');
+  try { _acLog(al.id, 'abriu_ia', ''); } catch {}
+  const url = _acIaUrl(al, 'inicio.html');
+  const corpo = `<div style="display:flex;flex-direction:column;height:calc(100vh - 58px)">
+    <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:#0c0c10;border-bottom:1px solid #1c1c24">
+      <b style="color:#e7c86a">🎹 IA Melodias e Riffs</b>
+      <span style="color:#8a8a96;font-size:13px">seu tutor de teclado gospel — tire dúvidas, envie foto da cifra e estude com a IA</span>
+      <a class="btn btn-ghost" style="margin-left:auto;padding:7px 14px" href="${url}" target="_blank">Abrir em nova aba ↗</a>
+    </div>
+    <iframe src="${url}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
+  </div>`;
+  res.type('html').send(_acPage(al, 'IA Melodias e Riffs', corpo, 'ia'));
+});
 app.get('/area/aula/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
@@ -12213,14 +12233,22 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     }).join('');
 
     const dmodo = curso.duvida_modo || 'professor';
-    const fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
-    const modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
+    let fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
+    let modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
       <h3 style="margin:0 0 10px">Sua dúvida nesta aula</h3>
       <textarea id="qtx" class="fld" rows="4" placeholder="Escreva sua dúvida..."></textarea>
       <div style="display:flex;gap:10px;margin-top:14px"><button class="btn btn-ghost" onclick="document.getElementById('md').classList.remove('open')">Cancelar</button>
       <button class="btn btn-g" onclick="acEnviarDuvida('${aula.id}','${curso.id}')">Enviar</button></div>
       <div id="qok" style="display:none;color:#9ff0c0;margin-top:12px">✅ Dúvida enviada! O professor vai responder.</div>
     </div></div>`;
+    // [IA 26/10] curso com dúvida_modo='ia' → abre o tutor de IA embutido (gaveta), em vez do modal do professor
+    if (dmodo === 'ia') {
+      fab = `<button class="fab" onclick="document.getElementById('iad').classList.add('open')">🎹 Falar com a IA</button>`;
+      modal = `<div class="modal" id="iad"><div class="bx" style="max-width:720px;width:100%;height:82vh;padding:0;display:flex;flex-direction:column;overflow:hidden">
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #26262f"><b style="flex:1;color:#e7c86a">🎹 IA Melodias e Riffs</b><a class="btn btn-ghost" style="padding:6px 12px" href="${_acIaUrl(al, 'app.html')}" target="_blank">Nova aba ↗</a><button class="btn btn-ghost" style="padding:6px 12px" onclick="document.getElementById('iad').classList.remove('open')">Fechar</button></div>
+        <iframe src="${_acIaUrl(al, 'app.html')}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
+      </div></div>`;
+    }
 
     // [B.15] player de ÁUDIO inline embaixo do vídeo (modo audiolivro) — toca dentro da plataforma
     const audioUrl = (aula as any).audio_url || '';
