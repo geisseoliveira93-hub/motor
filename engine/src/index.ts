@@ -32,6 +32,8 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 // Tokens que validam os webhooks de pagamento (vêm na URL: ?token=...).
 const GURU_TOKEN = process.env.GURU_TOKEN || '';
 const LASTLINK_TOKEN = process.env.LASTLINK_TOKEN || '';
+// [pagarme] Token que valida o webhook da Pagar.me (v5) — vem na URL: ?token=...
+const PAGARME_TOKEN = process.env.PAGARME_TOKEN || '';
 // (Opcional) Token do webhook da Cademí. As vendas hoje só passam por Guru/LastLink,
 // então a Cademí NÃO é necessária como gatilho de venda. Mas deixamos o endpoint pronto:
 // se um dia houver venda pelo checkout da própria Cademí, basta pôr CADEMI_TOKEN no .env
@@ -478,7 +480,7 @@ function _formaPagamento(provider: string, b: any): string {
   try {
     raw = String(provider === 'lastlink'
       ? (b?.Data?.Purchase?.PaymentMethod || b?.Data?.Purchase?.Payment?.Method || b?.Data?.Payment?.Method || b?.PaymentMethod || '')
-      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || '')).toLowerCase();
+      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || b?.data?.charges?.[0]?.payment_method || b?.data?.payment_method || b?.data?.last_transaction?.transaction_type || b?.data?.charges?.[0]?.last_transaction?.transaction_type || '')).toLowerCase();
   } catch { /* */ }
   if (/pix/.test(raw)) return 'pix';
   if (/credit|cartao|card|credito/.test(raw)) return 'cartao-credito';
@@ -3323,6 +3325,41 @@ function normalizaPagamento(provider: string, b: any): {
       valor: Number(prod?.Price || prod?.price || d?.Purchase?.Price || d?.Purchase?.Value || d?.Purchase?.Amount || d?.Offer?.Price || b?.Value || 0),
     };
   }
+  // [pagarme] Pagar.me v5 (painel dash.pagar.me). Webhook: { type:"order.paid"|"charge.*"|..., data:{...} }.
+  // data = ORDER (eventos order.*) ou CHARGE (eventos charge.*, que trazem data.order como resumo).
+  // Valores em CENTAVOS. O status é NORMALIZADO pros mesmos termos que classificaPagamento/_fasePagamento
+  // (ramo "guru") já entendem: paid / pending / refused / refunded / canceled. Assim nada mais precisa mudar.
+  if (provider === 'pagarme') {
+    const d = b?.data || {};
+    const ord = (d?.order && typeof d.order === 'object') ? d.order : d; // charge.* -> d.order ; order.* -> d
+    const cust = d?.customer || ord?.customer || {};
+    const mob = (cust?.phones?.mobile_phone || cust?.phones?.home_phone || {});
+    const telBruto = mob?.number
+      ? (String(mob.country_code || '55') + String(mob.area_code || '') + String(mob.number || ''))
+      : String(cust?.phone || cust?.phone_number || '');
+    const itens: any[] = (Array.isArray(d?.items) && d.items.length) ? d.items
+      : ((Array.isArray(ord?.items) && ord.items.length) ? ord.items : []);
+    const it0: any = itens[0] || {};
+    const tipo = String(b?.type || b?.event || '').toLowerCase();
+    const stRaw = String(d?.status || ord?.status || '').toLowerCase();
+    let status = '';
+    if (/refund/.test(tipo) || /refund|estorn|chargeback/.test(stRaw)) status = 'refunded';
+    else if (/\.paid$/.test(tipo) || stRaw === 'paid') status = 'paid';
+    else if (/payment_failed|\.failed$/.test(tipo) || /failed|refus|declin|not_authorized|nao_autoriz/.test(stRaw)) status = 'refused';
+    else if (/\.canceled$|\.cancelled$/.test(tipo) || /cancel/.test(stRaw)) status = 'canceled';
+    else if (/pending|\.created$/.test(tipo) || /pending|processing|waiting|generated/.test(stRaw)) status = 'pending';
+    else status = stRaw || tipo;
+    return {
+      pedido: String(ord?.id || d?.id || b?.id || randomUUID()),
+      status,
+      telefone: String(telBruto).replace(/\D/g, ''),
+      nome: cust?.name,
+      email: cust?.email,
+      produtoId: String(it0?.code || it0?.id || ''),
+      produtoNome: it0?.description || it0?.name || '',
+      valor: Number(d?.amount || ord?.amount || it0?.amount || 0) / 100,
+    };
+  }
   // Guru
   const contato = b?.contact || b?.subscriber || b?.customer || {};
   const prod = b?.product || b?.items?.[0] || {};
@@ -3368,7 +3405,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
   try {
     const provider = String(req.params.provider || '').toLowerCase();
     // valida o token da URL por provedor
-    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : '';
+    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : provider === 'pagarme' ? PAGARME_TOKEN : '';
     if (!tokenEsperado || String(req.query.token || '') !== tokenEsperado) {
       return res.status(401).json({ erro: 'token_invalido' });
     }
