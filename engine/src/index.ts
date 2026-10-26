@@ -7921,6 +7921,16 @@ function pbCarrosselUrls(onedriveRef: string): string[] {
     return urls;
   } catch { return []; }
 }
+// [cutover-nuvem] allowlist das plataformas que a NUVEM posta (as demais ficam no PC).
+// Vazio/ausente = posta TUDO (comportamento atual, inerte). Ex.: ["facebook","instagram"].
+function pbPlataformasNuvemAllow(): string[] {
+  try { const v = pubFlag('pub_plataformas_nuvem', ''); if (!v) return []; const a = JSON.parse(v); return Array.isArray(a) ? a.map((x: any) => String(x)) : []; } catch { return []; }
+}
+function pbPlataformaNuvemHabilitada(p: string): boolean {
+  const allow = pbPlataformasNuvemAllow();
+  if (!allow.length) return true; // vazio = nuvem posta todas as plataformas (padrão)
+  return allow.includes(String(p));
+}
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -7949,6 +7959,8 @@ async function pbPostarItem(item: any): Promise<void> {
   let sucessos = 0; let tentados = 0;
 
   for (const p of plataformas) {
+    // [cutover-nuvem] se houver allowlist, a nuvem só posta as plataformas habilitadas (resto fica no PC)
+    if (!pbPlataformaNuvemHabilitada(p)) { resultados[p] = 'PULADO: ' + p + ' nao habilitado na nuvem (fica no PC)'; continue; }
     try {
       let r: { id: string; url: string };
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
@@ -8046,6 +8058,15 @@ app.post('/pub/publicador/privacidade', (req, res) => {
 });
 
 app.post('/pub/publicador/desligar', (_req, res) => { setPubFlag('publicador_ativo', '0'); res.json({ ok: true, ativo: false }); });
+// [cutover-nuvem] lê/define quais plataformas a NUVEM posta (resto fica no PC). Vazio = todas.
+app.get('/pub/plataformas-nuvem', (_req, res) => { res.json({ ok: true, plataformas: pbPlataformasNuvemAllow() }); });
+app.post('/pub/plataformas-nuvem', (req, res) => {
+  try {
+    const arr = Array.isArray((req.body || {}).plataformas) ? (req.body.plataformas).map((x: any) => String(x)) : [];
+    setPubFlag('pub_plataformas_nuvem', JSON.stringify(arr));
+    res.json({ ok: true, plataformas: arr });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
 app.get('/pub/publicador/status', (_req, res) => {
   try {
     const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_publicacao GROUP BY status`).all() as any[];
