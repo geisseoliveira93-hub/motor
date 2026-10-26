@@ -32,8 +32,6 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 // Tokens que validam os webhooks de pagamento (vêm na URL: ?token=...).
 const GURU_TOKEN = process.env.GURU_TOKEN || '';
 const LASTLINK_TOKEN = process.env.LASTLINK_TOKEN || '';
-// [pagarme] Token que valida o webhook da Pagar.me (v5) — vem na URL: ?token=...
-const PAGARME_TOKEN = process.env.PAGARME_TOKEN || '';
 // (Opcional) Token do webhook da Cademí. As vendas hoje só passam por Guru/LastLink,
 // então a Cademí NÃO é necessária como gatilho de venda. Mas deixamos o endpoint pronto:
 // se um dia houver venda pelo checkout da própria Cademí, basta pôr CADEMI_TOKEN no .env
@@ -480,7 +478,7 @@ function _formaPagamento(provider: string, b: any): string {
   try {
     raw = String(provider === 'lastlink'
       ? (b?.Data?.Purchase?.PaymentMethod || b?.Data?.Purchase?.Payment?.Method || b?.Data?.Payment?.Method || b?.PaymentMethod || '')
-      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || b?.data?.charges?.[0]?.payment_method || b?.data?.payment_method || b?.data?.last_transaction?.transaction_type || b?.data?.charges?.[0]?.last_transaction?.transaction_type || '')).toLowerCase();
+      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || '')).toLowerCase();
   } catch { /* */ }
   if (/pix/.test(raw)) return 'pix';
   if (/credit|cartao|card|credito/.test(raw)) return 'cartao-credito';
@@ -3325,41 +3323,6 @@ function normalizaPagamento(provider: string, b: any): {
       valor: Number(prod?.Price || prod?.price || d?.Purchase?.Price || d?.Purchase?.Value || d?.Purchase?.Amount || d?.Offer?.Price || b?.Value || 0),
     };
   }
-  // [pagarme] Pagar.me v5 (painel dash.pagar.me). Webhook: { type:"order.paid"|"charge.*"|..., data:{...} }.
-  // data = ORDER (eventos order.*) ou CHARGE (eventos charge.*, que trazem data.order como resumo).
-  // Valores em CENTAVOS. O status é NORMALIZADO pros mesmos termos que classificaPagamento/_fasePagamento
-  // (ramo "guru") já entendem: paid / pending / refused / refunded / canceled. Assim nada mais precisa mudar.
-  if (provider === 'pagarme') {
-    const d = b?.data || {};
-    const ord = (d?.order && typeof d.order === 'object') ? d.order : d; // charge.* -> d.order ; order.* -> d
-    const cust = d?.customer || ord?.customer || {};
-    const mob = (cust?.phones?.mobile_phone || cust?.phones?.home_phone || {});
-    const telBruto = mob?.number
-      ? (String(mob.country_code || '55') + String(mob.area_code || '') + String(mob.number || ''))
-      : String(cust?.phone || cust?.phone_number || '');
-    const itens: any[] = (Array.isArray(d?.items) && d.items.length) ? d.items
-      : ((Array.isArray(ord?.items) && ord.items.length) ? ord.items : []);
-    const it0: any = itens[0] || {};
-    const tipo = String(b?.type || b?.event || '').toLowerCase();
-    const stRaw = String(d?.status || ord?.status || '').toLowerCase();
-    let status = '';
-    if (/refund/.test(tipo) || /refund|estorn|chargeback/.test(stRaw)) status = 'refunded';
-    else if (/\.paid$/.test(tipo) || stRaw === 'paid') status = 'paid';
-    else if (/payment_failed|\.failed$/.test(tipo) || /failed|refus|declin|not_authorized|nao_autoriz/.test(stRaw)) status = 'refused';
-    else if (/\.canceled$|\.cancelled$/.test(tipo) || /cancel/.test(stRaw)) status = 'canceled';
-    else if (/pending|\.created$/.test(tipo) || /pending|processing|waiting|generated/.test(stRaw)) status = 'pending';
-    else status = stRaw || tipo;
-    return {
-      pedido: String(ord?.id || d?.id || b?.id || randomUUID()),
-      status,
-      telefone: String(telBruto).replace(/\D/g, ''),
-      nome: cust?.name,
-      email: cust?.email,
-      produtoId: String(it0?.code || it0?.id || ''),
-      produtoNome: it0?.description || it0?.name || '',
-      valor: Number(d?.amount || ord?.amount || it0?.amount || 0) / 100,
-    };
-  }
   // Guru
   const contato = b?.contact || b?.subscriber || b?.customer || {};
   const prod = b?.product || b?.items?.[0] || {};
@@ -3405,7 +3368,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
   try {
     const provider = String(req.params.provider || '').toLowerCase();
     // valida o token da URL por provedor
-    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : provider === 'pagarme' ? PAGARME_TOKEN : '';
+    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : '';
     if (!tokenEsperado || String(req.query.token || '') !== tokenEsperado) {
       return res.status(401).json({ erro: 'token_invalido' });
     }
@@ -4183,8 +4146,6 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       } else if (pubFlag('gcal_ativo') === '1') { _gcalIaAviso = 'fonte_ia_desligada'; }
       // [lembretes-sessao] cria os lembretes configurados deste evento (best-effort, não quebra a marcação)
       try { _criarLembretesSessao(projeto, id, inicio, fim, conversa.contato_id || null, _telBruto, _inst, String(args.nome || ''), seed.sala || ''); } catch { /* best-effort */ }
-      // [agente-off-apos-marcar 26/10] uma vez MARCADO, o agente para de atender esse lead (não transfere, não continua); só os lembretes seguem. status!='ativo' já bloqueia no topo de processarMensagemAgente. A confirmação desta marcação ainda sai (o guard só roda no início do turno).
-      try { db.prepare(`UPDATE agente_conversas SET status='agendado', atualizado_em=? WHERE id=?`).run(agora(), conversa.id); } catch { /* best-effort */ }
       return { ok: true, id, inicio, fim, sala: seed.sala || '', sala_instrucao: seed.sala ? ('IMPORTANTE: envie este link da sala fixa pro aluno na confirmacao, exatamente assim: ' + seed.sala + ' . Ignore qualquer outro link de meet que apareca.') : '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
     }
     if (nomeFerr === 'registrar_card_crm') {
@@ -7921,16 +7882,6 @@ function pbCarrosselUrls(onedriveRef: string): string[] {
     return urls;
   } catch { return []; }
 }
-// [cutover-nuvem] allowlist das plataformas que a NUVEM posta (as demais ficam no PC).
-// Vazio/ausente = posta TUDO (comportamento atual, inerte). Ex.: ["facebook","instagram"].
-function pbPlataformasNuvemAllow(): string[] {
-  try { const v = pubFlag('pub_plataformas_nuvem', ''); if (!v) return []; const a = JSON.parse(v); return Array.isArray(a) ? a.map((x: any) => String(x)) : []; } catch { return []; }
-}
-function pbPlataformaNuvemHabilitada(p: string): boolean {
-  const allow = pbPlataformasNuvemAllow();
-  if (!allow.length) return true; // vazio = nuvem posta todas as plataformas (padrão)
-  return allow.includes(String(p));
-}
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -7959,8 +7910,6 @@ async function pbPostarItem(item: any): Promise<void> {
   let sucessos = 0; let tentados = 0;
 
   for (const p of plataformas) {
-    // [cutover-nuvem] se houver allowlist, a nuvem só posta as plataformas habilitadas (resto fica no PC)
-    if (!pbPlataformaNuvemHabilitada(p)) { resultados[p] = 'PULADO: ' + p + ' nao habilitado na nuvem (fica no PC)'; continue; }
     try {
       let r: { id: string; url: string };
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
@@ -8058,15 +8007,6 @@ app.post('/pub/publicador/privacidade', (req, res) => {
 });
 
 app.post('/pub/publicador/desligar', (_req, res) => { setPubFlag('publicador_ativo', '0'); res.json({ ok: true, ativo: false }); });
-// [cutover-nuvem] lê/define quais plataformas a NUVEM posta (resto fica no PC). Vazio = todas.
-app.get('/pub/plataformas-nuvem', (_req, res) => { res.json({ ok: true, plataformas: pbPlataformasNuvemAllow() }); });
-app.post('/pub/plataformas-nuvem', (req, res) => {
-  try {
-    const arr = Array.isArray((req.body || {}).plataformas) ? (req.body.plataformas).map((x: any) => String(x)) : [];
-    setPubFlag('pub_plataformas_nuvem', JSON.stringify(arr));
-    res.json({ ok: true, plataformas: arr });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
 app.get('/pub/publicador/status', (_req, res) => {
   try {
     const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_publicacao GROUP BY status`).all() as any[];
@@ -11916,10 +11856,6 @@ const _acCursosDoAluno = (alunoId: string): Set<string> => {
   } catch {}
   return ok;
 };
-// [IA 26/10] Tutor de IA (IA Mentoria) — app Cloudflare externo, embutido na área; gate de acesso é do próprio app (fonte da verdade = Worker/Guru)
-const _AC_IA_APP = 'https://melodias-riffs-app.pages.dev';
-const _acIaUrl = (al: any, pagina = 'inicio.html'): string =>
-  _AC_IA_APP + '/' + pagina + '?email=' + encodeURIComponent(String(al && al.email || '')) + '&cuser_fname=' + encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '');
 
 // ---------- [B.2] Tema / layout da área do aluno (M|R dark) ----------
 const _acCSS = `
@@ -12013,7 +11949,7 @@ const _acTop = (al: any, aba = ''): string => {
   return `<div class="top"><a class="logo" href="/area">M|R</a>
     <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
     <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-    <a href="/area/ia" class="${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
+    <a href="https://melodias-riffs-app.pages.dev/inicio.html?email=${encodeURIComponent(String(al && al.email || ''))}&cuser_fname=${encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '')}" target="_blank">Fale com a IA</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
     <div class="av" title="Minha conta" onclick="var m=document.getElementById('mn');m.classList.toggle('open')">⚙️
@@ -12218,22 +12154,6 @@ const _acPlayerHtml = (aula: any, curso: any, pos: number): string => {
   const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
   return `<div class="player"><iframe src="https://www.youtube-nocookie.com/embed/${esc(yid)}?rel=0&modestbranding=1&playsinline=1&origin=${org}${start}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe></div>`;
 };
-// [IA 26/10] Página da IA embutida na plataforma (com escape "nova aba"); o próprio app libera/vende
-app.get('/area/ia', (req: any, res: any) => {
-  const al = _acAluno(req);
-  if (!al) return res.redirect('/area/login');
-  try { _acLog(al.id, 'abriu_ia', ''); } catch {}
-  const url = _acIaUrl(al, 'inicio.html');
-  const corpo = `<div style="display:flex;flex-direction:column;height:calc(100vh - 58px)">
-    <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:#0c0c10;border-bottom:1px solid #1c1c24">
-      <b style="color:#e7c86a">🎹 IA Melodias e Riffs</b>
-      <span style="color:#8a8a96;font-size:13px">seu tutor de teclado gospel — tire dúvidas, envie foto da cifra e estude com a IA</span>
-      <a class="btn btn-ghost" style="margin-left:auto;padding:7px 14px" href="${url}" target="_blank">Abrir em nova aba ↗</a>
-    </div>
-    <iframe src="${url}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
-  </div>`;
-  res.type('html').send(_acPage(al, 'IA Melodias e Riffs', corpo, 'ia'));
-});
 app.get('/area/aula/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
@@ -12293,22 +12213,14 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     }).join('');
 
     const dmodo = curso.duvida_modo || 'professor';
-    let fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
-    let modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
+    const fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
+    const modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
       <h3 style="margin:0 0 10px">Sua dúvida nesta aula</h3>
       <textarea id="qtx" class="fld" rows="4" placeholder="Escreva sua dúvida..."></textarea>
       <div style="display:flex;gap:10px;margin-top:14px"><button class="btn btn-ghost" onclick="document.getElementById('md').classList.remove('open')">Cancelar</button>
       <button class="btn btn-g" onclick="acEnviarDuvida('${aula.id}','${curso.id}')">Enviar</button></div>
       <div id="qok" style="display:none;color:#9ff0c0;margin-top:12px">✅ Dúvida enviada! O professor vai responder.</div>
     </div></div>`;
-    // [IA 26/10] curso com dúvida_modo='ia' → abre o tutor de IA embutido (gaveta), em vez do modal do professor
-    if (dmodo === 'ia') {
-      fab = `<button class="fab" onclick="document.getElementById('iad').classList.add('open')">🎹 Falar com a IA</button>`;
-      modal = `<div class="modal" id="iad"><div class="bx" style="max-width:720px;width:100%;height:82vh;padding:0;display:flex;flex-direction:column;overflow:hidden">
-        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #26262f"><b style="flex:1;color:#e7c86a">🎹 IA Melodias e Riffs</b><a class="btn btn-ghost" style="padding:6px 12px" href="${_acIaUrl(al, 'app.html')}" target="_blank">Nova aba ↗</a><button class="btn btn-ghost" style="padding:6px 12px" onclick="document.getElementById('iad').classList.remove('open')">Fechar</button></div>
-        <iframe src="${_acIaUrl(al, 'app.html')}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
-      </div></div>`;
-    }
 
     // [B.15] player de ÁUDIO inline embaixo do vídeo (modo audiolivro) — toca dentro da plataforma
     const audioUrl = (aula as any).audio_url || '';
