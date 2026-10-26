@@ -12514,6 +12514,18 @@ app.post('/academy/importar/credencial', (req: any, res: any) => {
     _ndOk(res, { cpf_set: cpfSet, senha_set: senhaSet, nao_encontrados: naoachou, total: linhas.length });
   } catch (e) { _ndErr(res, e); }
 });
+// [migracao-senha-fixa 26/10] define a MESMA senha pra TODOS os alunos (migracao simples). ADD-ONLY. sobrescrever=false so preenche quem nao tem senha.
+app.post('/academy/senha/padrao-fixa', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const senha = String(b.senha || '').trim(); const sobre = !!b.sobrescrever;
+    if (senha.length < 4) return _ndErr(res, 'senha muito curta (min 4)');
+    const h = _acHash(senha);
+    let r: any;
+    if (sobre) r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=?`).run(h, senha);
+    else r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE (senha_hash IS NULL OR senha_hash='') AND (senha_plana IS NULL OR senha_plana='')`).run(h, senha);
+    _ndOk(res, { definidos: r.changes, senha });
+  } catch (e) { _ndErr(res, e); }
+});
 // admin: gerar/retornar magic link do aluno
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: (PUBLIC_BASE_URL || '') + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
