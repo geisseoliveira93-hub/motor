@@ -1285,7 +1285,7 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 });
 
 // Recarrega a config (produto->projeto, mensagens) sem reiniciar o serviço.
-app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
+app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); _configRuntimeCarregar(); res.json({ ok: true, config: CONFIG }); }); // [+fix-token] re-mescla config_runtime (produção/token sobrevivem ao reload, igual ao boot)
 app.get('/config', (_req, res) => res.json(CONFIG));
 
 // ======================= API SELLFLUX (CRM / Kanban / Agenda / Inbox / Respostas) =======================
@@ -4606,6 +4606,7 @@ CREATE TABLE IF NOT EXISTS grupos_wpp (
   atualizado_em TEXT
 );
 `);
+try { db.exec(`ALTER TABLE grupos_wpp ADD COLUMN oculto INTEGER DEFAULT 0`); } catch { /* ja existe */ } // [+grupos-ocultar]
 
 app.post('/disparo/grupos/sincronizar', async (req, res) => {
   try {
@@ -4633,8 +4634,11 @@ app.post('/disparo/grupos/sincronizar', async (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
-app.get('/disparo/grupos', (_req, res) => {
-  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho FROM grupos_wpp ORDER BY projeto, nome`).all();
+app.get('/disparo/grupos', (req, res) => {
+  // [+grupos-ocultar] por padrão NÃO lista os grupos ocultos; ?incluirOcultos=1 traz todos (p/ "Mostrar removidos")
+  const incluirOcultos = String((req.query as any).incluirOcultos || '') === '1';
+  const where = incluirOcultos ? '' : 'WHERE COALESCE(oculto,0)=0';
+  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho, COALESCE(oculto,0) oculto FROM grupos_wpp ${where} ORDER BY projeto, nome`).all();
   res.json({ ok: true, grupos: rows });
 });
 
@@ -4642,6 +4646,47 @@ app.post('/disparo/grupo/instrumento', (req, res) => {
   const b = req.body || {};
   db.prepare(`UPDATE grupos_wpp SET inst_manual=? WHERE id=?`).run(String(b.inst || ''), String(b.id || ''));
   res.json({ ok: true });
+});
+
+// [+grupos-remover] REMOVER grupos da lista do sistema (manual, pelo app). Reversível: o
+// "Sincronizar grupos" readiciona os que ainda existem no WhatsApp. Útil pra tirar grupos
+// que não são dos projetos (família/kids/sellflux/etc) e pra RESETAR a lista.
+app.post('/disparo/grupos/remover', (req, res) => {
+  try {
+    const jids = (((req.body || {}).jids) || []).map((x: any) => String(x)).filter(Boolean);
+    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
+    const ph = jids.map(() => '?').join(',');
+    const n = db.prepare(`DELETE FROM grupos_wpp WHERE id IN (${ph})`).run(...jids).changes;
+    res.json({ ok: true, removidos: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// [+grupos-limpar] LIMPAR todos os grupos de um projeto (e/ou instância) — pra resetar e
+// depois reimportar via POST /disparo/grupos/sincronizar {projeto}. Exige projeto ou instancia.
+app.post('/disparo/grupos/limpar', (req, res) => {
+  try {
+    const projeto = String((req.body || {}).projeto || '').trim();
+    const instancia = String((req.body || {}).instancia || '').trim();
+    if (!projeto && !instancia) return res.json({ ok: false, erro: 'informe projeto ou instancia' });
+    const conds: string[] = []; const args: any[] = [];
+    if (projeto) { conds.push('projeto=?'); args.push(projeto); }
+    if (instancia) { conds.push('instancia=?'); args.push(instancia); }
+    const n = db.prepare(`DELETE FROM grupos_wpp WHERE ${conds.join(' AND ')}`).run(...args).changes;
+    res.json({ ok: true, removidos: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// [+grupos-ocultar] OCULTAR (remover da lista, soft) ou RESTAURAR grupos. SOBREVIVE ao /sincronizar
+// (o UPSERT do sincronizar não mexe no campo oculto). Grupo oculto não aparece em /disparo/grupos
+// (sem ?incluirOcultos=1) nem é selecionável pra disparo. Reversível: oculto:0 restaura.
+app.post('/disparo/grupos/ocultar', (req, res) => {
+  try {
+    const b = req.body || {};
+    const jids = (b.jids || []).map((x: any) => String(x)).filter(Boolean);
+    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
+    const oculto = (b.oculto === 0 || b.oculto === '0' || b.oculto === false) ? 0 : 1;
+    const ph = jids.map(() => '?').join(',');
+    const n = db.prepare(`UPDATE grupos_wpp SET oculto=? WHERE id IN (${ph})`).run(oculto, ...jids).changes;
+    res.json({ ok: true, oculto, afetados: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 // [grupo-link] Tenta pegar o LINK de convite de um grupo (pra identificar/abrir). Precisa que o número seja ADMIN
@@ -13873,7 +13918,15 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         try { salvarConfig(); } catch { /* best-effort */ }
       }
     } catch { /* ignore */ }
-    const PNL_TOKEN = (): string => String((CONFIG as any).painelTrafegoToken || '');
+    const PNL_TOKEN = (): string => {
+      let t = String((CONFIG as any).painelTrafegoToken || '');
+      if (!t) { // [+fix-token] gera na hora se estiver vazio (ex.: após um reload que limpou) e persiste
+        t = randomBytes(18).toString('hex');
+        (CONFIG as any).painelTrafegoToken = t;
+        try { salvarConfig(); } catch { /* best-effort */ }
+      }
+      return t;
+    };
     const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
     const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
 
@@ -13978,6 +14031,15 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const deQ = req.query.de ? String(req.query.de) : undefined;
       const ateQ = req.query.ate ? String(req.query.ate) : undefined;
       try { res.json(await _pnlDados(dias, deQ, ateQ)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+    });
+    // [+mcp-trafego] leitura via MCP (x-api-key) — mesmos dados do painel, sem token de link
+    app.get('/trafego/dados', async (req: any, res: any) => {
+      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false, erro: 'acesso' });
+      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 1));
+      const deQ = req.query.de ? String(req.query.de) : undefined;
+      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
+      try { res.json(await _pnlDados(dias, deQ, ateQ)); }
+      catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
     });
     // token/link do painel (so admin: x-api-key)
     app.get('/painel/token', (req: any, res: any) => {
