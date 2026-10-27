@@ -5344,10 +5344,19 @@ app.get('/pub/canais', (_req, res) => {
 app.post('/pub/canais', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.id || randomUUID());
-    const ex = db.prepare(`SELECT id FROM canais_publicacao WHERE id=?`).get(id);
+    const ex = db.prepare(`SELECT * FROM canais_publicacao WHERE id=?`).get(id) as any;
     if (ex) {
+      // [fix-preserva-canal 27/10] UPDATE PARCIAL: campo que NAO vier no body MANTEM o valor atual.
+      // Antes zerava ig_business_id/fb_page_id/descricao_template/etc quando o body nao mandava — ex: o botao
+      // "Espelhar agenda" so manda nome/projeto/cor/plataformas, e isso derrubava a conexao FB/IG. So acrescenta logica.
+      const _has = (k: string) => Object.prototype.hasOwnProperty.call(b, k);
+      const _keepStr = (k: string, cur: any) => _has(k) ? (b[k] != null ? b[k] : '') : (cur != null ? cur : '');
+      const _keepNull = (k: string, cur: any) => _has(k) ? (b[k] || null) : (cur != null ? cur : null);
+      const _keepFlag = (k: string, cur: any, def: number) => _has(k) ? (b[k] ? 1 : 0) : (cur != null ? cur : def);
+      const _keepPlat = _has('plataformas') ? JSON.stringify(b.plataformas || []) : (ex.plataformas_json != null ? ex.plataformas_json : JSON.stringify([]));
+      const _keepTags = (_has('hashtags_padrao') || _has('hashtags_padrao_json')) ? JSON.stringify(b.hashtags_padrao || b.hashtags_padrao_json || []) : (ex.hashtags_padrao_json != null ? ex.hashtags_padrao_json : JSON.stringify([]));
       db.prepare(`UPDATE canais_publicacao SET nome=?, projeto=?, instrumento=?, cor=?, ativo=?, plataformas_json=?, ig_business_id=?, fb_page_id=?, yt_channel_id=?, tiktok_open_id=?, threads_user_id=?, pinterest_board_id=?, descricao_template=?, descricao_social_template=?, hashtags_padrao_json=?, usar_horario_otimo=?, mover_publicados=?, atualizado_em=? WHERE id=?`)
-        .run(b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), id);
+        .run(_keepStr('nome', ex.nome), _keepStr('projeto', ex.projeto), _keepStr('instrumento', ex.instrumento), _keepStr('cor', ex.cor), _keepFlag('ativo', ex.ativo, 1), _keepPlat, _keepNull('ig_business_id', ex.ig_business_id), _keepNull('fb_page_id', ex.fb_page_id), _keepNull('yt_channel_id', ex.yt_channel_id), _keepNull('tiktok_open_id', ex.tiktok_open_id), _keepNull('threads_user_id', ex.threads_user_id), _keepNull('pinterest_board_id', ex.pinterest_board_id), _keepNull('descricao_template', ex.descricao_template), _keepNull('descricao_social_template', ex.descricao_social_template), _keepTags, _keepFlag('usar_horario_otimo', ex.usar_horario_otimo, 0), _keepFlag('mover_publicados', ex.mover_publicados, 1), agora(), id);
     } else {
       db.prepare(`INSERT INTO canais_publicacao(id,nome,projeto,instrumento,cor,ativo,plataformas_json,ig_business_id,fb_page_id,yt_channel_id,tiktok_open_id,threads_user_id,pinterest_board_id,descricao_template,descricao_social_template,hashtags_padrao_json,usar_horario_otimo,mover_publicados,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), agora());
@@ -9932,6 +9941,55 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   app.get('/webinarios/:id', (req: any, res: any) => {
     const wb = wbGet(String(req.params.id)); if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
     res.json({ ok: true, webinario: wb, link: wbBase() + '/w/' + wb.slug });
+  });
+  // [+mensagens 27/10] consulta ADMIN (x-api-key) dos comentarios PROGRAMADOS/IMPORTADOS da audiencia simulada.
+  // Ficam em webinario_sim.coment_json (array {tempoSeg,nome,texto}); o 'ativo' da linha liga/desliga TODOS.
+  // Mostra o que esta CADASTRADO — NAO confirma exibicao no player (isso exige testar o player). So acrescenta rota.
+  app.get('/webinarios/:id/mensagens', (req: any, res: any) => {
+    try {
+      const wb = wbGet(String(req.params.id)); if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
+      const row = db.prepare(`SELECT * FROM webinario_sim WHERE slug=?`).get(wb.slug) as any;
+      let cfg: any = {}; let coment: any[] = [];
+      if (row) { try { cfg = JSON.parse(row.cfg_json || '{}'); } catch { cfg = {}; } try { coment = JSON.parse(row.coment_json || '[]'); } catch { coment = []; } }
+      const ativo = !!(row && row.ativo);
+      const atualizado = (row && row.atualizado_em) || null;
+      const hhmmss = (s: any) => { s = Math.max(0, Math.round(Number(s) || 0)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return (h > 0 ? String(h).padStart(2, '0') + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0'); };
+      const ordenado = coment.map((c: any, i: number) => ({ _i: i, ...c })).sort((a: any, b2: any) => (Number(a.tempoSeg) || 0) - (Number(b2.tempoSeg) || 0));
+      const total = ordenado.length;
+      const limite = Math.max(1, Math.min(2000, Number((req.query && req.query.limite)) || 500));
+      const offset = Math.max(0, Number((req.query && req.query.offset)) || 0);
+      const pagina = ordenado.slice(offset, offset + limite).map((c: any) => ({
+        id: 'sim-' + c._i,
+        webinarioId: wb.id, slug: wb.slug,
+        nome: c.nome || null, texto: c.texto || null,
+        momentoSeg: Math.round(Number(c.tempoSeg) || 0),
+        momentoHHMMSS: hhmmss(c.tempoSeg),
+        origem: 'programado',
+        habilitado: ativo,
+        criadoEm: null, atualizadoEm: atualizado
+      }));
+      const vazios = ordenado.filter((c: any) => !String(c.texto || '').trim()).length;
+      const tempoInvalido = ordenado.filter((c: any) => !(Number(c.tempoSeg) >= 0)).length;
+      const ultimoSeg = total ? Math.round(Number(ordenado[total - 1].tempoSeg) || 0) : 0;
+      const chatRealCount = (db.prepare(`SELECT COUNT(*) n FROM webinario_chat WHERE slug=?`).get(wb.slug) as any)?.n || 0;
+      res.json({
+        ok: true, webinarioId: wb.id, slug: wb.slug, nome: wb.nome,
+        simulacaoAtiva: ativo,
+        config: {
+          referenciaTempo: 'tempoSeg = segundos desde o inicio do video (campo salvo em cada comentario); exibicao no player NAO verificada nesta consulta',
+          modoTesteOuPrevia: 'a simulacao liga/desliga pelo campo ativo desta linha; nao ha modo de teste separado no motor',
+          pausaAvancoReinicio: 'comportamento de pausa/seek/reinicio e do PLAYER (front-end da sala), nao verificavel por esta rota',
+          viewers: cfg, atualizadoEm: atualizado
+        },
+        total, limite, offset, proximoOffset: (offset + limite < total ? offset + limite : null),
+        ordenadoPor: 'momentoSeg asc',
+        ultimaMinutagem: hhmmss(ultimoSeg), ultimoSeg,
+        avisos: { textosVazios: vazios, temposInvalidos: tempoInvalido },
+        chatRealCount,
+        camposAusentes: ['id proprio por comentario (uso o indice: sim-N)', 'habilitacao por comentario (vale o ativo da simulacao, igual pra todos)', 'datas por comentario (so existe atualizado_em da linha webinario_sim)'],
+        mensagens: pagina
+      });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
   // [+webinario-storage] serve o vídeo PRÓPRIO do webinário (fonte 'storage', ref no OneDrive): baixa 1x
   // pro cache /data/media e redireciona pro /media/<hash> (aceita Range/seek, cacheável no CDN). Público.
