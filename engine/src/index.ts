@@ -13976,6 +13976,15 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const ateQ = req.query.ate ? String(req.query.ate) : undefined;
       try { res.json(await _pnlDados(dias, deQ, ateQ)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
     });
+    // [+mcp-trafego] leitura via MCP (x-api-key) — mesmos dados do painel, sem token de link
+    app.get('/trafego/dados', async (req: any, res: any) => {
+      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false, erro: 'acesso' });
+      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 1));
+      const deQ = req.query.de ? String(req.query.de) : undefined;
+      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
+      try { res.json(await _pnlDados(dias, deQ, ateQ)); }
+      catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+    });
     // token/link do painel (so admin: x-api-key)
     app.get('/painel/token', (req: any, res: any) => {
       if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false });
