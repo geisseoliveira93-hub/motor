@@ -7920,6 +7920,27 @@ async function pbFbPublicar(canalId: string, a: { filePath: string; publicUrl: s
   const d3 = await r3.json() as any; if (!r3.ok) throw new Error(`FB reels finish: ${JSON.stringify(d3).slice(0, 200)}`);
   return { id: d1.video_id, url: `https://www.facebook.com/reel/${d1.video_id}` };
 }
+// [+fb-carrossel 27/10] carrossel no Facebook = post multi-foto: sobe cada imagem NÃO publicada (/photos published=false)
+// e depois cria 1 post no /feed com attached_media apontando pros ids. Usa o page token (tok.accessToken).
+async function pbFbCarrossel(canalId: string, refsPublicos: string[], caption: string): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const pageId = canal?.fb_page_id; const tok = pbTokLer(canalId, 'facebook');
+  if (!pageId || !tok?.accessToken) throw new Error('Facebook não conectado neste canal.');
+  const pageTok = tok.accessToken;
+  const mediaIds: string[] = [];
+  for (const url of refsPublicos.slice(0, 10)) {
+    const b = new URLSearchParams({ url, published: 'false', temporary: 'true', access_token: pageTok });
+    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/photos`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b });
+    const d = await r.json() as any; if (!r.ok || !d.id) throw new Error(`FB carrossel foto: ${JSON.stringify(d).slice(0, 200)}`);
+    mediaIds.push(String(d.id));
+  }
+  if (mediaIds.length < 2) throw new Error('Carrossel FB precisa de 2+ imagens.');
+  const attached = mediaIds.map((id) => ({ media_fbid: id }));
+  const b2 = new URLSearchParams({ attached_media: JSON.stringify(attached), access_token: pageTok });
+  if (caption) b2.set('message', caption);
+  const r2 = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/feed`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b2 });
+  const d2 = await r2.json() as any; if (!r2.ok || !d2.id) throw new Error(`FB carrossel feed: ${JSON.stringify(d2).slice(0, 200)}`);
+  const pid = d2.post_id || d2.id; return { id: pid, url: `https://www.facebook.com/${pid}` };
+}
 
 // ============================ UPLOADER — THREADS ============================
 async function pbThreadsPublicar(canalId: string, a: { publicUrl: string; filePath: string; formato: string; texto: string }): Promise<{ id: string; url: string }> {
@@ -7970,7 +7991,9 @@ async function pbPinterestPublicar(canalId: string, a: { filePath: string; forma
 function pbCarrosselUrls(onedriveRef: string): string[] {
   try {
     const arr = _odRcloneListar(onedriveRef) as any[]; // lista arquivos sob base/<ref>
-    const imgs = (arr || []).filter((x) => pbIsImagem(x.Path || x.Name || '')).map((x) => (x.Path ? String(x.Path) : `${onedriveRef}/${x.Name}`));
+    // [fix-carrossel-path 27/10] o lsjson devolve Path RELATIVO à pasta (ex "01.png"); precisa prefixar o onedriveRef
+    // pra baixar do lugar certo (antes baixava de "Postagem Automatica/01.png" e falhava -> "carrossel sem imagens").
+    const imgs = (arr || []).filter((x) => pbIsImagem(x.Path || x.Name || '')).map((x) => `${onedriveRef}/${String(x.Path || x.Name || '')}`);
     const urls: string[] = [];
     for (const rel of imgs.slice(0, 10)) { const m = pbBaixarMidia(rel); urls.push(m.publicUrl); }
     return urls;
@@ -8026,8 +8049,9 @@ async function pbPostarItem(item: any): Promise<void> {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
         else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
       } else if (p === 'facebook') {
-        if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: FB não faz carrossel aqui'; continue; }
-        r = await pbFbPublicar(canalId, { filePath: file, publicUrl, formato, titulo, descricao: captionSocial });
+        if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbFbCarrossel(canalId, carrosselUrls, captionSocial); }
+        else if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; }
+        else r = await pbFbPublicar(canalId, { filePath: file, publicUrl, formato, titulo, descricao: captionSocial });
       } else if (p === 'threads') {
         if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: Threads sem carrossel aqui'; continue; }
         r = await pbThreadsPublicar(canalId, { publicUrl, filePath: file, formato, texto: captionSocial || titulo });
