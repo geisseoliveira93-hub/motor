@@ -10,3 +10,13 @@ motor.melodiaseriffs.com.br {
 evolution.melodiaseriffs.com.br {
     reverse_proxy evolution:8080
 }
+
+# [27/10 - Claude, pedido do Ezequias] Domínio principal no motor:
+# a raiz (/) mostra a página de apresentação (/p/apresentacao) e qualquer /p/<slug> funciona aqui também.
+melodiaseriffs.com.br {
+    rewrite / /p/apresentacao
+    reverse_proxy engine:8080
+}
+www.melodiaseriffs.com.br {
+    redir https://melodiaseriffs.com.br{uri} 301
+}

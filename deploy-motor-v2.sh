@@ -42,6 +42,33 @@ echo
 echo "==> 7) Sincronizando status dos números com o Evolution..."
 curl -s -X POST http://localhost:8080/numbers/sync -H "x-api-key: $KEY" >/dev/null && echo "   ok."
 
+echo "==> 7b) Protegendo o Caddyfile (o deploy nunca apaga um dominio que esta no ar)..."
+# [+caddy-protecao 27/10] O pacote do GitHub traz um Caddyfile que pode nao ter os dominios criados
+# direto no servidor (teclado/baixo/violao/harpa/areadoaluno...). Aqui eles sao mantidos: tudo que
+# esta no Caddy em uso e falta no Caddyfile novo e ACRESCENTADO no fim (e o bloco global, se faltar).
+if docker compose --profile proxy ps caddy 2>/dev/null | grep -qiE "up|running"; then
+  if docker compose --profile proxy exec -T caddy cat /etc/caddy/Caddyfile > /tmp/Caddyfile.em-uso 2>/dev/null && [ -s /tmp/Caddyfile.em-uso ]; then
+    cp -f Caddyfile "Caddyfile.pacote-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    awk 'NR==FNR{ if ($0 ~ /^[^#[:space:]{][^{]*\{[[:space:]]*$/) { h=$0; sub(/[[:space:]]*\{[[:space:]]*$/,"",h); tem[h]=1 } next }
+         { if (!dentro && $0 ~ /^[^#[:space:]{][^{]*\{[[:space:]]*$/) { h=$0; sub(/[[:space:]]*\{[[:space:]]*$/,"",h); faltando=!(h in tem); if (faltando) print ""; dentro=1; prof=0 }
+           if (dentro && faltando) print
+           if (dentro) { n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); prof+=n-m; if (prof<=0) { dentro=0; faltando=0 } } }' Caddyfile /tmp/Caddyfile.em-uso > /tmp/Caddyfile.faltando || true
+    awk 'BEGIN{st=0} { if (st==0) { if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next; if ($0 ~ /^\{[[:space:]]*$/) { st=1; prof=0 } else exit } if (st==1) { print; n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); prof+=n-m; if (prof<=0) exit } }' /tmp/Caddyfile.em-uso > /tmp/Caddyfile.global || true
+    temglobal=$(awk '{ if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next; if ($0 ~ /^\{[[:space:]]*$/) print "sim"; exit }' Caddyfile)
+    if [ -s /tmp/Caddyfile.global ] && [ "$temglobal" != "sim" ]; then
+      { cat /tmp/Caddyfile.global; echo; cat Caddyfile; } > /tmp/Caddyfile.comglobal && cp -f /tmp/Caddyfile.comglobal Caddyfile
+      echo "   bloco global do Caddy mantido."
+    fi
+    if [ -s /tmp/Caddyfile.faltando ]; then
+      cat /tmp/Caddyfile.faltando >> Caddyfile
+      echo "   dominios que estavam no ar foram mantidos no Caddyfile:"
+      grep -oE '^[^#[:space:]{}][^{]*' /tmp/Caddyfile.faltando | sed 's/^/     /' || true
+    else
+      echo "   Caddyfile ok (nenhum dominio no ar ficou de fora)."
+    fi
+  fi
+fi
+
 echo "==> 8) Recarregando o Caddy (pega domínios novos do Caddyfile, ex: evolution.*)..."
 if docker compose --profile proxy ps caddy 2>/dev/null | grep -qiE "up|running"; then
   docker compose --profile proxy up -d caddy >/dev/null 2>&1 || true
