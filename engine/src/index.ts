@@ -1017,6 +1017,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/obs/on_publish')) return next(); // [+obs] webhooks do nginx-rtmp (valida por token na query)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
+  if (req.path.startsWith('/j/')) return next();      // [jornada 27/10] links pessoais do webinário (sala/oferta/vídeo), validados pelo token
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   if (req.path.startsWith('/w-media/')) return next(); // [+webinario-storage] serve o vídeo próprio do webinário (OneDrive) pro player, sem x-api-key
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
@@ -1284,7 +1285,7 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 });
 
 // Recarrega a config (produto->projeto, mensagens) sem reiniciar o serviço.
-app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); _configRuntimeCarregar(); res.json({ ok: true, config: CONFIG }); }); // [+fix-token] re-mescla config_runtime (produção/token sobrevivem ao reload, igual ao boot)
+app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
 app.get('/config', (_req, res) => res.json(CONFIG));
 
 // ======================= API SELLFLUX (CRM / Kanban / Agenda / Inbox / Respostas) =======================
@@ -4605,7 +4606,6 @@ CREATE TABLE IF NOT EXISTS grupos_wpp (
   atualizado_em TEXT
 );
 `);
-try { db.exec(`ALTER TABLE grupos_wpp ADD COLUMN oculto INTEGER DEFAULT 0`); } catch { /* ja existe */ } // [+grupos-ocultar]
 
 app.post('/disparo/grupos/sincronizar', async (req, res) => {
   try {
@@ -4633,11 +4633,8 @@ app.post('/disparo/grupos/sincronizar', async (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
-app.get('/disparo/grupos', (req, res) => {
-  // [+grupos-ocultar] por padrão NÃO lista os grupos ocultos; ?incluirOcultos=1 traz todos (p/ "Mostrar removidos")
-  const incluirOcultos = String((req.query as any).incluirOcultos || '') === '1';
-  const where = incluirOcultos ? '' : 'WHERE COALESCE(oculto,0)=0';
-  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho, COALESCE(oculto,0) oculto FROM grupos_wpp ${where} ORDER BY projeto, nome`).all();
+app.get('/disparo/grupos', (_req, res) => {
+  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho FROM grupos_wpp ORDER BY projeto, nome`).all();
   res.json({ ok: true, grupos: rows });
 });
 
@@ -4645,47 +4642,6 @@ app.post('/disparo/grupo/instrumento', (req, res) => {
   const b = req.body || {};
   db.prepare(`UPDATE grupos_wpp SET inst_manual=? WHERE id=?`).run(String(b.inst || ''), String(b.id || ''));
   res.json({ ok: true });
-});
-
-// [+grupos-remover] REMOVER grupos da lista do sistema (manual, pelo app). Reversível: o
-// "Sincronizar grupos" readiciona os que ainda existem no WhatsApp. Útil pra tirar grupos
-// que não são dos projetos (família/kids/sellflux/etc) e pra RESETAR a lista.
-app.post('/disparo/grupos/remover', (req, res) => {
-  try {
-    const jids = (((req.body || {}).jids) || []).map((x: any) => String(x)).filter(Boolean);
-    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
-    const ph = jids.map(() => '?').join(',');
-    const n = db.prepare(`DELETE FROM grupos_wpp WHERE id IN (${ph})`).run(...jids).changes;
-    res.json({ ok: true, removidos: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
-});
-// [+grupos-limpar] LIMPAR todos os grupos de um projeto (e/ou instância) — pra resetar e
-// depois reimportar via POST /disparo/grupos/sincronizar {projeto}. Exige projeto ou instancia.
-app.post('/disparo/grupos/limpar', (req, res) => {
-  try {
-    const projeto = String((req.body || {}).projeto || '').trim();
-    const instancia = String((req.body || {}).instancia || '').trim();
-    if (!projeto && !instancia) return res.json({ ok: false, erro: 'informe projeto ou instancia' });
-    const conds: string[] = []; const args: any[] = [];
-    if (projeto) { conds.push('projeto=?'); args.push(projeto); }
-    if (instancia) { conds.push('instancia=?'); args.push(instancia); }
-    const n = db.prepare(`DELETE FROM grupos_wpp WHERE ${conds.join(' AND ')}`).run(...args).changes;
-    res.json({ ok: true, removidos: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
-});
-// [+grupos-ocultar] OCULTAR (remover da lista, soft) ou RESTAURAR grupos. SOBREVIVE ao /sincronizar
-// (o UPSERT do sincronizar não mexe no campo oculto). Grupo oculto não aparece em /disparo/grupos
-// (sem ?incluirOcultos=1) nem é selecionável pra disparo. Reversível: oculto:0 restaura.
-app.post('/disparo/grupos/ocultar', (req, res) => {
-  try {
-    const b = req.body || {};
-    const jids = (b.jids || []).map((x: any) => String(x)).filter(Boolean);
-    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
-    const oculto = (b.oculto === 0 || b.oculto === '0' || b.oculto === false) ? 0 : 1;
-    const ph = jids.map(() => '?').join(',');
-    const n = db.prepare(`UPDATE grupos_wpp SET oculto=? WHERE id IN (${ph})`).run(oculto, ...jids).changes;
-    res.json({ ok: true, oculto, afetados: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 // [grupo-link] Tenta pegar o LINK de convite de um grupo (pra identificar/abrir). Precisa que o número seja ADMIN
@@ -10252,6 +10208,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       if(o.url){ var a2=document.createElement('a'); a2.href=o.url; a2.target='_blank'; a2.textContent=o.botao||'Garantir agora'; ban.appendChild(a2); } off.appendChild(ban); } }
   function checkOfertas(){ var e=elapsed(); ofertas.forEach(function(o){ if(o._shown){return;} if(e < (Number(o.momento)||0)){return;} o._shown=true; mostrarOferta(o); }); }
   setInterval(checkOfertas, 1000);
+  /* [jornada 27/10] reprise (agenda aberta): a oferta aparece tambem pelo tempo do VIDEO (quem pula ate o momento ve a oferta) */ setInterval(function(){ if(EVG||!videoEl){return;} var tv=Math.floor(videoEl.currentTime||0); ofertas.forEach(function(o){ if(o._shown){return;} if(tv<(Number(o.momento)||0)){return;} o._shown=true; mostrarOferta(o); }); },1000);
 })();`;
 
   // gera o HTML da sala (client JS sem template-literal pra não conflitar com o template do server)
@@ -10318,6 +10275,7 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   }
 
   console.log('[webinario-sala] carregado: /webinarios (config) + /w/:slug (sala) + /w-api/:slug/* (chat/contador/vendas reais)');
+  (globalThis as any).__wbJornada = { wbGet, wbConfigPublico, wbRoomHtml }; // [jornada 27/10] expõe p/ a régua do webinário (/j/...)
 }
 
 // ============================================================================
@@ -13915,15 +13873,7 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         try { salvarConfig(); } catch { /* best-effort */ }
       }
     } catch { /* ignore */ }
-    const PNL_TOKEN = (): string => {
-      let t = String((CONFIG as any).painelTrafegoToken || '');
-      if (!t) { // [+fix-token] gera na hora se estiver vazio (ex.: após um reload que limpou) e persiste
-        t = randomBytes(18).toString('hex');
-        (CONFIG as any).painelTrafegoToken = t;
-        try { salvarConfig(); } catch { /* best-effort */ }
-      }
-      return t;
-    };
+    const PNL_TOKEN = (): string => String((CONFIG as any).painelTrafegoToken || '');
     const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
     const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
 
@@ -14028,15 +13978,6 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
       const deQ = req.query.de ? String(req.query.de) : undefined;
       const ateQ = req.query.ate ? String(req.query.ate) : undefined;
       try { res.json(await _pnlDados(dias, deQ, ateQ)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
-    });
-    // [+mcp-trafego] leitura via MCP (x-api-key) — mesmos dados do painel, sem token de link
-    app.get('/trafego/dados', async (req: any, res: any) => {
-      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false, erro: 'acesso' });
-      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 1));
-      const deQ = req.query.de ? String(req.query.de) : undefined;
-      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
-      try { res.json(await _pnlDados(dias, deQ, ateQ)); }
-      catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
     });
     // token/link do painel (so admin: x-api-key)
     app.get('/painel/token', (req: any, res: any) => {
@@ -14195,6 +14136,625 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
   } catch (e: any) { console.log('[painel-trafego] erro no bloco (seguindo):', e && e.message ? e.message : e); }
 })();
 // ===================== [+painel-trafego] fim =====================
+
+// ============================================================================
+// [jornada-regua 27/10] RÉGUA DO WEBINÁRIO "Jornada Tecladista – Chamado para Servir"
+// ----------------------------------------------------------------------------
+// ADITIVO. Não altera nada que já existe; só acrescenta tabelas, um agendador,
+// um enviador próprio (WhatsApp pelo número do webinário) e rotas públicas /j/...
+//
+// Como funciona:
+//  - Quem se inscreve no formulário da página (/p/jornada-tecladista-webinario)
+//    vira um INSCRITO com Dia 1 = hoje (antes das 21h) ou amanhã (21h em diante).
+//  - Cada inscrito recebe links SÓ DELE: /j/a1|a2|a3/<token> (sala da aula, com
+//    o horário certo dele, gravação nos prazos e % assistido) e /j/oferta/<token>
+//    (link de compra que respeita os prazos dele) e /j/video/<token>.
+//  - Um agendador (1x por minuto) decide cada mensagem (WhatsApp + e-mail) pelo
+//    dia/horário de cada pessoa e pelo quanto ela assistiu; quem compra para de
+//    receber venda e ganha a mensagem de pós-venda (+ apostila se pagou até
+//    23h59 do Dia 3 na 1ª participação).
+//  - NASCE DESLIGADO: só roda com pub_kv jornada_ativo='1' (POST /jornada/ativar).
+//  - Textos aprovados pelo Ezequias em 27/10 (doc "Jornada Tecladista – Mensagens
+//    do Webinário", aba "Como chega (versão final)").
+// ============================================================================
+{
+  const JW: any = (globalThis as any).__wbJornada || {};
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS jornada_inscritos (
+      id TEXT PRIMARY KEY, contato_id TEXT, projeto TEXT, telefone TEXT, email TEXT, nome TEXT,
+      inscrito_em TEXT, dia1 TEXT, token TEXT UNIQUE, repeticao INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'ativo', comprou_em TEXT, compra_id TEXT, ganhou_apostila INTEGER DEFAULT 0,
+      resposta_id TEXT, criado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS jornada_envios (
+      id TEXT PRIMARY KEY, inscrito_id TEXT, chave TEXT, canal TEXT, status TEXT,
+      tipo TEXT, texto TEXT, url TEXT, legenda TEXT, para TEXT, detalhe TEXT,
+      agendado_para TEXT, criado_em TEXT, enviado_em TEXT, tentativas INTEGER DEFAULT 0,
+      UNIQUE (inscrito_id, chave, canal)
+    );
+    CREATE INDEX IF NOT EXISTS ix_jornada_envios_fila ON jornada_envios(status, canal, agendado_para);
+    CREATE INDEX IF NOT EXISTS ix_jornada_insc_contato ON jornada_inscritos(contato_id);
+  `);
+  try { db.exec(`ALTER TABLE jornada_envios ADD COLUMN instancia TEXT`); } catch { /* já existe */ }
+
+  // ---------------- configuração (padrão no código; ajuste fino via pub_kv 'jornada_cfg' JSON) ----------------
+  const JCFG_PADRAO: any = {
+    projeto: 'teclado',
+    instancia: 'EquipeMelodiasERiffs-Suporte2TECLADO',          // WhatsApp 98212-3953 (todas as mensagens da régua)
+    instanciaSuporte: 'Teclado-suporte',                          // WhatsApp (16) 99640-1030: SÓ a mensagem de pós-venda
+    formId: '69d8db36-54cb-4959-b20c-327371fa3080',               // formulário da página de inscrição
+    slugs: { a1: 'jornada-tecladista-aula-1-9d47', a2: 'jornada-tecladista-aula-2-6195', a3: 'jornada-tecladista-aula-3-ca21' },
+    dur: { a1: 5595, a2: 5283, a3: 8620 },                       // duração das aulas (s)
+    hora: '21:00',
+    ofertaSeg: 7005,                                              // momento da oferta na Aula 3 (s)
+    viuOfertaPct: 81,                                             // 7005/8620 ≈ 81%
+    checkout: 'https://clkdmg.site/pay/oferta-de-black-antecipada-teclado-gospel',
+    produtoMatch: ['black antecipada'],                           // como reconhecer a compra da oferta (nome do produto)
+    plataforma: 'https://melodiaseriffs.cademi.com.br',
+    suporte: '(16) 99640-1030',
+    videoPublico: 'https://motor.melodiaseriffs.com.br/media/17a391081214c88c.mp4',
+    videoEnvio: 'http://engine:8080/media/17a391081214c88c.mp4',  // a Evolution busca pela rede interna
+    paginaInscricao: 'https://motor.melodiaseriffs.com.br/p/jornada-tecladista-webinario',
+    envioIntervaloMs: 3000,
+  };
+  function jcfg(): any { let o: any = {}; try { o = JSON.parse(pubFlag('jornada_cfg', '{}') || '{}'); } catch { o = {}; } return { ...JCFG_PADRAO, ...o }; }
+  const jAtivo = (): boolean => pubFlag('jornada_ativo', '0') === '1';
+  const jBase = (): string => String(PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
+
+  // ---------------- tempo (Brasília = UTC-3, sem horário de verão) ----------------
+  const BRT_MS = 3 * 3600000;
+  const jDataBRT = (ms: number): string => new Date(ms - BRT_MS).toISOString().slice(0, 10);
+  const jHoraBRT = (ms: number): number => new Date(ms - BRT_MS).getUTCHours() + new Date(ms - BRT_MS).getUTCMinutes() / 60;
+  function jEm(dia1: string, dia: number, hhmm: string): number {
+    const [y, m, d] = dia1.split('-').map(Number); const [hh, mm] = hhmm.split(':').map(Number);
+    return Date.UTC(y, m - 1, d + (dia - 1), hh, mm, 0) + BRT_MS;
+  }
+  function jDia1Para(ms: number): string {
+    const h = jHoraBRT(ms); const hoje = jDataBRT(ms);
+    if (h < 21) return hoje;
+    return jDataBRT(ms + 86400000);
+  }
+  const jAulaN = (k: string): number => (k === 'a1' ? 1 : k === 'a2' ? 2 : 3);
+  function jInicioAula(ins: any, k: string): number { return jEm(ins.dia1, jAulaN(k), jcfg().hora); }
+  function jFimAula(ins: any, k: string): number { return jInicioAula(ins, k) + (Number(jcfg().dur[k]) || 5400) * 1000; }
+  const jFimApostila = (ins: any): number => jEm(ins.dia1, 3, '23:59') + 59000;
+  const jFimOferta = (ins: any): number => jEm(ins.dia1, 5, '23:59') + 59000;
+  // gravação: de cada aula até 18h do dia seguinte + as 3 juntas das 9h do Dia 4 às 9h do Dia 5 (Aula 3 fica até 9h do Dia 5)
+  function jJanelaGravacao(ins: any, k: string, now: number): boolean {
+    const fim = jFimAula(ins, k);
+    const ate = k === 'a3' ? jEm(ins.dia1, 5, '09:00') : jEm(ins.dia1, jAulaN(k) + 1, '18:00');
+    if (now >= fim && now < ate) return true;
+    return now >= jEm(ins.dia1, 4, '09:00') && now < jEm(ins.dia1, 5, '09:00');
+  }
+
+  // ---------------- presença / compra ----------------
+  function jPct(k: string, lead: string): number {
+    if (lead === 'teste') return Number((globalThis as any).__jornadaPctTeste) || 0; // cenário do /jornada/teste
+    try { const r = db.prepare(`SELECT MAX(pct) m FROM webinario_presenca WHERE slug=? AND lead=?`).get(jcfg().slugs[k], lead) as any; return Number(r && r.m) || 0; } catch { return 0; }
+  }
+  function jEntrouDesde(k: string, lead: string, desdeMs: number): boolean {
+    try { return !!db.prepare(`SELECT 1 FROM webinario_presenca WHERE slug=? AND lead=? AND ultimo_ping>=? LIMIT 1`).get(jcfg().slugs[k], lead, new Date(desdeMs).toISOString()); } catch { return false; }
+  }
+  const jNaSala = (k: string, lead: string): boolean => jEntrouDesde(k, lead, Date.now() - 120000);
+  const jFaixa = (pct: number): string => (pct < 10 ? 'nao' : pct < 50 ? 'menos' : 'mais');
+  function jAchaCompra(ins: any): any {
+    try {
+      const pats: string[] = (jcfg().produtoMatch || []).map((s: any) => String(s).toLowerCase());
+      const rows = db.prepare(`SELECT t.id,t.produto,t.status,t.criado_em,t.contato_id,c.email,c.telefone FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND t.criado_em>=? ORDER BY t.criado_em ASC LIMIT 2000`).all(String(ins.inscrito_em || '')) as any[];
+      const tel9 = String(ins.telefone || '').replace(/\D/g, '').slice(-9); const em = String(ins.email || '').toLowerCase().trim();
+      for (const r of rows) {
+        const prod = String(r.produto || '').toLowerCase();
+        if (pats.length && !pats.some((p) => prod.includes(p))) continue;
+        const mesmo = (r.contato_id && r.contato_id === ins.contato_id)
+          || (em && String(r.email || '').toLowerCase().trim() === em)
+          || (tel9.length === 9 && String(r.telefone || '').replace(/\D/g, '').slice(-9) === tel9);
+        if (mesmo) return r;
+      }
+    } catch { /* */ }
+    return null;
+  }
+
+  // Já é aluno? (compra liquidada da oferta em qualquer data, pelo contato, e-mail ou final do telefone)
+  function jJaCliente(contatoId: string, telefone: string, email: any): any {
+    try {
+      const pats: string[] = (jcfg().produtoMatch || []).map((s: any) => String(s).toLowerCase());
+      const tel9 = String(telefone || '').replace(/\D/g, '').slice(-9); const em = String(email || '').toLowerCase().trim();
+      const rows = db.prepare(`SELECT t.id,t.produto,t.criado_em FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND (t.contato_id=? OR (?<>'' AND lower(trim(c.email))=?) OR (length(?)=9 AND c.telefone LIKE '%'||?)) ORDER BY t.criado_em DESC LIMIT 50`)
+        .all(contatoId || '', em, em, tel9, tel9) as any[];
+      for (const r of rows) { const prod = String(r.produto || '').toLowerCase(); if (!pats.length || pats.some((p) => prod.includes(p))) return r; }
+    } catch { /* */ }
+    return null;
+  }
+
+  // ---------------- textos ----------------
+  function jPrimeiroNome(n: any): string { const s = String(n || '').trim().split(/\s+/)[0] || ''; return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : ''; }
+  const jCap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  function jVars(ins: any, envioMs: number): any {
+    const b = jBase(); const t = ins.token; const cfg = jcfg();
+    const quando = jDataBRT(envioMs) === ins.dia1 ? 'hoje' : 'amanhã';
+    return {
+      nome: jPrimeiroNome(ins.nome), quando,
+      link_a1: b + '/j/a1/' + t, link_a2: b + '/j/a2/' + t, link_a3: b + '/j/a3/' + t,
+      link_oferta: b + '/j/oferta/' + t, link_video: b + '/j/video/' + t,
+      plataforma: cfg.plataforma, suporte: cfg.suporte,
+    };
+  }
+  function jFill(tpl: string, v: any): string {
+    let t = String(tpl || '');
+    if (!v.nome) {
+      t = t.replace(/(^|\n)\{nome\},\s*([a-zà-ú])/g, (_m: string, a: string, c: string) => a + c.toUpperCase());
+      t = t.replace(/,\s*\{nome\}/g, '').replace(/\{nome\},?\s*/g, '');
+    }
+    return t.replace(/\{nome\}/g, v.nome).replace(/\{Quando\}/g, jCap(v.quando)).replace(/\{quando\}/g, v.quando)
+      .replace(/\{link_a1\}/g, v.link_a1).replace(/\{link_a2\}/g, v.link_a2).replace(/\{link_a3\}/g, v.link_a3)
+      .replace(/\{link_oferta\}/g, v.link_oferta).replace(/\{link_video\}/g, v.link_video)
+      .replace(/\{plataforma\}/g, v.plataforma).replace(/\{suporte\}/g, v.suporte);
+  }
+  function jEmailHtml(blocos: any[], v: any): string {
+    const corpo = blocos.map((b: any) => {
+      if (typeof b === 'string') return '<p style="margin:0 0 16px;font-size:16px;line-height:1.55;color:#1f2a35">' + esc(jFill(b, v)).replace(/\n/g, '<br>') + '</p>';
+      return '<p style="margin:22px 0;text-align:center"><a href="' + esc(jFill(b.u, v)) + '" style="display:inline-block;background:#F1541A;color:#ffffff;text-decoration:none;font-weight:700;font-size:17px;padding:14px 26px;border-radius:12px">' + esc(jFill(b.b, v)) + '</a></p>';
+    }).join('');
+    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+      + '<body style="margin:0;background:#f6f4ee;padding:24px 12px"><div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;padding:28px 24px;font-family:Arial,Helvetica,sans-serif">'
+      + corpo
+      + '<hr style="border:0;border-top:1px solid #eeeeee;margin:24px 0 12px"><div style="font-size:12px;color:#8a8a8a;text-align:center;line-height:1.5">Melodias e Riffs – A Escola do Músico Cristão<br>Você recebe este e-mail porque se inscreveu na Jornada Tecladista – Chamado para Servir.</div>'
+      + '</div></body></html>';
+  }
+
+  const PE = 'Professor Ezequias';
+  // ofertas (repetidas em várias mensagens)
+  const OF_WA = 'De ~R$ 1.500~ por apenas *R$ 597 à vista* ou *12x de R$ 59,70*.';
+  // Cada mensagem: k = chave; q = quando ({t:'rel',min} | {t:'dia',d,h} | {t:'compra'}); g = tolerância (min) p/ atraso;
+  // wa(ctx) -> {texto} | {tipo:'video',url,legenda} | null ; em(ctx) -> {assunto, blocos} | null ; ok(ctx) -> bool
+  const MSGS: any[] = [
+    // ======================= DIA 1 =======================
+    { k: 'm01', q: { t: 'rel', min: 0 }, g: 600,
+      wa: () => ({ texto: '{nome}, sua vaga na *Jornada Tecladista – Chamado para Servir* está garantida! ✅\n\n📅 *Aula 1: {quando} às 21h* (horário de Brasília)\nO link da sala chega aqui neste número na hora da aula.\n\n📌 Salve este contato para não perder nenhum aviso.\n\nSe ainda não tem teclado, assista do mesmo jeito: só deixe um caderno por perto.\n\n' + PE }),
+      em: () => ({ assunto: 'Sua vaga está garantida – Aula 1 {quando} às 21h', blocos: ['Olá, {nome}!', 'Que alegria ter você na Jornada Tecladista – Chamado para Servir.', 'A Aula 1 acontece {quando} às 21h, horário de Brasília. O link da sala vai chegar no seu WhatsApp e aqui no e-mail na hora da aula.', 'Para aproveitar melhor:\n• Reserve as 21h: a aula começa pontualmente.\n• Deixe o teclado por perto. Se ainda não tiver, assista mesmo assim.\n• Tenha um caderno para anotar.', 'Nos vemos lá!', PE + '\nMelodias e Riffs – A Escola do Músico Cristão'] }) },
+    { k: 'm01b', q: { t: 'video10' }, g: 180,
+      wa: () => ({ tipo: 'video', url: jcfg().videoEnvio, legenda: '{nome}, antes da primeira aula quero te apresentar algumas pessoas.\n\nSão alunos que, como você, sonhavam em tocar teclado na igreja. Muitos já tinham tentado YouTube, professor particular e até aula só de partitura, sem sair do lugar. Alguns conheceram o método numa jornada de aulas como esta que você vai fazer.\n\nHoje eles tocam na igreja: um começou com 9 dias de estudo; outros, com 2 e 3 meses.\n\nAssiste com calma, são 6 minutinhos. {Quando} às 21h é a sua vez de dar o primeiro passo.' }),
+      em: () => ({ assunto: 'Antes da Aula 1, conheça quem já toca na igreja', blocos: ['{nome}, enquanto a Aula 1 não chega, separei um vídeo curto com alguns alunos.', 'Tem quem tentou sozinho por dois anos, quem desistiu de aulas que só ensinavam partitura e quem achava que juntar as duas mãos era um sonho impossível. Todos queriam a mesma coisa que você: tocar na igreja.', 'E chegaram lá. Um deles começou a tocar com 9 dias de estudo; outros, com 2 e 3 meses.', { b: 'Assistir ao vídeo (6 minutos)', u: '{link_video}' }, 'Te espero {quando} às 21h.\n' + PE] }) },
+    { k: 'm02', q: { t: 'dia', d: 1, h: '20:00' }, g: 50,
+      wa: () => ({ texto: '{nome}, falta *1 hora*! ⏰\n\nHoje às 21h começa a Aula 1 da Jornada Tecladista. Já vai separando o teclado e o caderno.\n\nÀs 21h em ponto eu te mando o link aqui.' }),
+      em: () => ({ assunto: 'Daqui a 1 hora: Aula 1', blocos: ['{nome}, às 21h começa o primeiro passo da Jornada Tecladista.', 'Essa aula é para quem sonha em tocar na igreja, mesmo começando do zero. Chegue alguns minutos antes para entrar com calma.', 'O link chega no seu WhatsApp e aqui no e-mail às 21h.', PE] }) },
+    { k: 'm03', q: { t: 'dia', d: 1, h: '21:00' }, g: 40,
+      wa: () => ({ texto: '🎹 *Começou!* A Aula 1 já está rolando.\n\nEntra agora pelo seu link:\n{link_a1}\n\nO link é só seu, não precisa passar para ninguém.' }),
+      em: () => ({ assunto: 'A Aula 1 começou – entre agora', blocos: ['{nome}, a aula já começou.', { b: 'Entrar na Aula 1', u: '{link_a1}' }, 'Se o botão não abrir, copie este endereço no navegador:\n{link_a1}'] }) },
+    { k: 'm04', q: { t: 'dia', d: 1, h: '21:15' }, g: 20,
+      ok: (c: any) => !jEntrouDesde('a1', c.ins.contato_id, jInicioAula(c.ins, 'a1') - 900000),
+      wa: () => ({ texto: '{nome}, a Aula 1 começou há 15 minutos e ainda dá tempo de acompanhar. Entra pelo seu link:\n{link_a1}' }) },
+    // ======================= DIA 2 =======================
+    { k: 'm05_07', q: { t: 'dia', d: 2, h: '09:00' }, g: 120,
+      wa: (c: any) => {
+        const f = jFaixa(jPct('a1', c.ins.contato_id));
+        if (f === 'nao') return { texto: '{nome}, ontem foi a Aula 1 da Jornada Tecladista e senti sua falta por lá.\n\nA boa notícia: a gravação fica no ar *até hoje às 18h*.\n\nAssiste antes da Aula 2 de hoje à noite, porque uma aula puxa a outra:\n{link_a1}' };
+        if (f === 'menos') return { texto: '{nome}, você começou a Aula 1 ontem mas não chegou até o fim, né?\n\nVale muito terminar antes de hoje à noite: a Aula 2 continua de onde a primeira parou.\n\nA gravação fica no ar *até as 18h*:\n{link_a1}' };
+        return { texto: '{nome}, que bom que você ficou com a gente na Aula 1! 🙌\n\n*Hoje às 21h tem a Aula 2*, e ela continua exatamente de onde paramos. Te espero lá.' };
+      },
+      em: (c: any) => {
+        const f = jFaixa(jPct('a1', c.ins.contato_id));
+        if (f === 'nao') return { assunto: 'A gravação da Aula 1 sai do ar às 18h', blocos: ['{nome}, não conseguiu assistir à Aula 1 ontem? Sem problema: a gravação está liberada para você, mas só até hoje às 18h.', 'As aulas são em sequência. A Aula 2, hoje às 21h, continua exatamente de onde a primeira parou.', { b: 'Assistir à Aula 1', u: '{link_a1}' }, PE] };
+        if (f === 'menos') return { assunto: 'Faltou um pedaço da Aula 1', blocos: ['{nome}, você começou a Aula 1, mas parou antes do final.', 'O que vem na Aula 2 depende do que foi mostrado na primeira, então separe um tempinho hoje para assistir ao restante. A gravação fica no ar até as 18h.', { b: 'Assistir à Aula 1', u: '{link_a1}' }] };
+        return { assunto: 'Hoje às 21h: Aula 2', blocos: ['{nome}, obrigado por ter ficado com a gente na Aula 1.', 'Hoje às 21h vem a Aula 2, partindo exatamente de onde paramos. Se quiser rever algum trecho antes, a gravação da Aula 1 fica no ar até as 18h.', { b: 'Rever a Aula 1', u: '{link_a1}' }, PE] };
+      } },
+    { k: 'm08', q: { t: 'dia', d: 2, h: '16:00' }, g: 90,
+      ok: (c: any) => jPct('a1', c.ins.contato_id) < 50,
+      wa: () => ({ texto: '{nome}, a gravação da Aula 1 sai do ar *às 18h*, daqui a 2 horas. Depois disso não dá para reabrir.\n\nAinda dá tempo:\n{link_a1}' }),
+      em: () => ({ assunto: 'Últimas 2 horas da Aula 1', blocos: ['{nome}, às 18h a gravação da Aula 1 sai do ar.', 'Se você quer acompanhar a Aula 2 hoje sem se perder, este é o momento.', { b: 'Assistir agora', u: '{link_a1}' }] }) },
+    { k: 'm09', q: { t: 'dia', d: 2, h: '20:00' }, g: 50,
+      wa: () => ({ texto: '{nome}, daqui a *1 hora* começa a Aula 2! ⏰\n\nÀs 21h eu te mando o link aqui. Separa o teclado e o caderno.' }),
+      em: () => ({ assunto: 'Aula 2 hoje às 21h', blocos: ['{nome}, hoje às 21h tem a Aula 2 da Jornada Tecladista.', 'O link chega no seu WhatsApp e aqui no e-mail na hora. Chegue uns minutinhos antes!'] }) },
+    { k: 'm10', q: { t: 'dia', d: 2, h: '21:00' }, g: 40,
+      wa: () => ({ texto: '🎹 *A Aula 2 começou!*\n\nEntra pelo seu link:\n{link_a2}' }),
+      em: () => ({ assunto: 'A Aula 2 começou', blocos: ['{nome}, a Aula 2 já está acontecendo.', { b: 'Entrar na Aula 2', u: '{link_a2}' }] }) },
+    { k: 'm11', q: { t: 'dia', d: 2, h: '21:15' }, g: 20,
+      ok: (c: any) => !jEntrouDesde('a2', c.ins.contato_id, jInicioAula(c.ins, 'a2') - 900000),
+      wa: () => ({ texto: '{nome}, a Aula 2 começou há 15 minutos. Entra agora que ainda dá tempo:\n{link_a2}' }) },
+    // ======================= DIA 3 =======================
+    { k: 'm12', q: { t: 'dia', d: 3, h: '09:00' }, g: 120,
+      wa: (c: any) => {
+        const f = jFaixa(jPct('a2', c.ins.contato_id));
+        if (f === 'nao') return { texto: '{nome}, ontem teve a Aula 2 e você não conseguiu entrar.\n\nA gravação fica no ar *até hoje às 18h*:\n{link_a2}\n\nAssiste antes das 21h, porque hoje é a terceira e última aula, e ela fecha tudo o que começamos.' };
+        if (f === 'menos') return { texto: '{nome}, faltou um pedaço da Aula 2.\n\nTermina hoje, *até as 18h*, para chegar com tudo em dia na última aula:\n{link_a2}' };
+        return { texto: '{nome}, *hoje às 21h é a última aula* da Jornada Tecladista.\n\nÉ nela que eu mostro o caminho completo para você tocar na igreja com segurança. Não falta!' };
+      },
+      em: (c: any) => {
+        const f = jFaixa(jPct('a2', c.ins.contato_id));
+        if (f !== 'mais') return { assunto: 'A gravação da Aula 2 sai do ar às 18h', blocos: ['{nome}, hoje às 21h acontece a Aula 3, a última da Jornada Tecladista.', 'A gravação da Aula 2 fica no ar só até as 18h. As aulas são em sequência, então vale assistir antes.', { b: 'Assistir à Aula 2', u: '{link_a2}' }] };
+        return { assunto: 'Hoje é a última aula', blocos: ['{nome}, hoje às 21h acontece a Aula 3, a última da Jornada Tecladista.', 'Obrigado por ter ficado até aqui. Hoje eu fecho a jornada mostrando o caminho completo. Te espero às 21h.', PE] };
+      } },
+    { k: 'm13', q: { t: 'dia', d: 3, h: '16:00' }, g: 90,
+      ok: (c: any) => jPct('a2', c.ins.contato_id) < 50,
+      wa: () => ({ texto: '{nome}, a gravação da Aula 2 sai do ar *às 18h*.\n\nAinda dá tempo antes da última aula de hoje:\n{link_a2}' }),
+      em: () => ({ assunto: 'Aula 2 sai do ar em 2 horas', blocos: ['{nome}, às 18h a gravação da Aula 2 deixa de ficar disponível. Hoje às 21h tem a última aula.', { b: 'Assistir à Aula 2', u: '{link_a2}' }] }) },
+    { k: 'm14', q: { t: 'dia', d: 3, h: '20:00' }, g: 50,
+      wa: () => ({ texto: '{nome}, às 21h começa a *última aula* da Jornada Tecladista.\n\nNo final eu vou abrir uma *condição especial* só para quem participou das aulas. Fica até o fim! 🎁' }),
+      em: () => ({ assunto: 'Às 21h: a última aula (fique até o fim)', blocos: ['{nome}, hoje termina a Jornada Tecladista.', 'Na Aula 3 eu junto tudo o que vimos e mostro o caminho completo para tocar na igreja com segurança. No final, abro uma condição especial para quem participou.', 'O link chega às 21h.', PE] }) },
+    { k: 'm15', q: { t: 'dia', d: 3, h: '21:00' }, g: 40,
+      wa: () => ({ texto: '🎹 *A última aula começou!*\n\nEntra pelo seu link:\n{link_a3}' }),
+      em: () => ({ assunto: 'A Aula 3 começou', blocos: ['{nome}, a última aula já está acontecendo.', { b: 'Entrar na Aula 3', u: '{link_a3}' }] }) },
+    { k: 'm16', q: { t: 'dia', d: 3, h: '21:15' }, g: 20,
+      ok: (c: any) => !jEntrouDesde('a3', c.ins.contato_id, jInicioAula(c.ins, 'a3') - 900000),
+      wa: () => ({ texto: '{nome}, a Aula 3 começou há 15 minutos. É a última, entra agora:\n{link_a3}' }) },
+    { k: 'm17', q: { t: 'dia', d: 3, h: '22:57' }, g: 25, venda: true,
+      ok: (c: any) => jNaSala('a3', c.ins.contato_id),
+      wa: (c: any) => ({ texto: '{nome}, aqui está o link da condição que acabei de mostrar na aula:\n{link_oferta}\n\n*Curso e Mentoria de Teclado Gospel* com *2 anos de acesso*\n' + OF_WA
+        + (c.ins.repeticao ? '\n\nE você tem *7 dias de garantia incondicional*: se não for para você, devolvo 100% do valor.' : '\n\n🎁 E só até as *23h59 de hoje*: a apostila física do curso vai junto, com frete grátis.\n\nPara garantir a apostila, pague no Pix ou no cartão (o boleto demora para compensar).') }),
+      em: (c: any) => ({ assunto: c.ins.repeticao ? 'Sua condição especial' : 'Sua condição especial (apostila só até 23h59)', blocos: ['{nome}, como prometi, aqui está a condição para quem participou da Jornada Tecladista:',
+        '• Curso e Mentoria de Teclado Gospel, do zero ao avançado, com 2 anos de acesso: você paga o primeiro ano e o segundo é presente\n• Curso Como Tocar de Ouvido junto\n• Acompanhamento comigo todos os dias no grupo do WhatsApp e mentorias ao vivo toda semana\n• Garantia incondicional de 7 dias',
+        'De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70. Uma economia de mais de R$ 900.',
+        ...(c.ins.repeticao ? [] : ['Até as 23h59 de hoje, você ainda recebe a apostila física do curso em casa, com frete grátis para todo o Brasil. No Pix ou no cartão a confirmação é na hora; no boleto não dá tempo de garantir a apostila.']),
+        { b: 'Quero minha vaga', u: '{link_oferta}' }, PE] }) },
+    { k: 'm18', q: { t: 'dia', d: 3, h: '23:30' }, g: 20, venda: true,
+      ok: (c: any) => !c.ins.repeticao && jPct('a3', c.ins.contato_id) >= Number(jcfg().viuOfertaPct || 81),
+      wa: () => ({ texto: '{nome}, faltam *30 minutos* para acabar o bônus da apostila física com frete grátis.\n\nCurso e Mentoria de ~R$ 1.500~ por *R$ 597*, e a apostila vai junto só até as *23h59*. Depois disso ela não entra mais.\n\nSe você quer garantir:\n{link_oferta}' }),
+      em: () => ({ assunto: '30 minutos para a apostila', blocos: ['{nome}, às 23h59 encerra o bônus da apostila física.', 'O Curso e Mentoria de R$ 1.500 por apenas R$ 597 continua por mais 2 dias, mas a apostila é só hoje.', { b: 'Garantir agora', u: '{link_oferta}' }] }) },
+    // ======================= DIA 4 =======================
+    { k: 'm19', q: { t: 'dia', d: 4, h: '09:00' }, g: 120, todos: true,
+      wa: (c: any) => {
+        const links = '▶️ Aula 1: {link_a1}\n▶️ Aula 2: {link_a2}\n▶️ Aula 3: {link_a3}';
+        if (c.comprou) return { texto: '{nome}, liberei as gravações das 3 aulas da Jornada Tecladista por 24 horas, *até amanhã às 9h*, caso queira rever:\n\n' + links };
+        const viu = jPct('a3', c.ins.contato_id) >= 10;
+        const abre = viu ? '{nome}, como prometido, liberei as gravações das 3 aulas da Jornada Tecladista, mas só por 24 horas, *até amanhã às 9h*:'
+          : '{nome}, você não conseguiu ver a última aula, e foi nela que eu mostrei o caminho completo. Liberei as gravações das 3 aulas, mas só por 24 horas, *até amanhã às 9h*:';
+        return { texto: abre + '\n\n' + links + '\n\nNa Aula 3 eu falo de um prazo até 23h59: era o da apostila física, que já encerrou.\n\nO Curso e Mentoria de ~R$ 1.500~ por *R$ 597 à vista ou 12x de R$ 59,70* continua só *até amanhã às 23h59*:\n{link_oferta}' };
+      },
+      em: (c: any) => {
+        if (c.comprou) return { assunto: 'As 3 aulas liberadas – até amanhã às 9h', blocos: ['{nome}, as gravações da Jornada Tecladista estão liberadas até amanhã às 9h, caso queira rever.', { b: 'Aula 1', u: '{link_a1}' }, { b: 'Aula 2', u: '{link_a2}' }, { b: 'Aula 3', u: '{link_a3}' }] };
+        return { assunto: 'As 3 aulas liberadas – só até amanhã às 9h', blocos: ['{nome}, as gravações da Jornada Tecladista estão liberadas até amanhã às 9h. Depois disso saem do ar.', { b: 'Aula 1', u: '{link_a1}' }, { b: 'Aula 2', u: '{link_a2}' }, { b: 'Aula 3, com a condição especial', u: '{link_a3}' },
+          'Um aviso importante: na Aula 3 eu falo de um prazo até 23h59. Ele valia para a apostila física, que já encerrou.',
+          'A condição do Curso e Mentoria, com 2 anos de acesso, de R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70, continua só até amanhã às 23h59.',
+          { b: 'Ver a condição', u: '{link_oferta}' }, PE] };
+      } },
+    { k: 'm20', q: { t: 'dia', d: 4, h: '14:00' }, g: 120, venda: true,
+      em: () => ({ assunto: '35 anos tentando, 1 mês para tocar na igreja', blocos: ['{nome}, na Aula 3 eu contei a história da Ruth.', 'Ela tentou aprender teclado por 35 anos: estudou quando criança, depois de casada, até nos Estados Unidos. Nada funcionou, e ela estava pronta para desistir. Entrou no curso em dezembro e, em janeiro, estava tocando na igreja.', 'O que mudou não foi talento. Foi acompanhamento: em vez de uma aula por semana, ela teve 30 dias de dúvidas respondidas por mim, no grupo do WhatsApp.', 'É esse acompanhamento que você leva no Curso e Mentoria, por 2 anos, junto com o curso Como Tocar de Ouvido. De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70, só até amanhã às 23h59.', 'E com 7 dias de garantia: se não for para você, devolvo seu dinheiro.', { b: 'Quero começar', u: '{link_oferta}' }, PE] }) },
+    { k: 'm21', q: { t: 'dia', d: 4, h: '19:00' }, g: 90, venda: true,
+      wa: () => ({ texto: '{nome}, algumas dúvidas que sempre aparecem:\n\n❓ *"Não tenho tempo."*\nPor isso o acesso é de 2 anos: dá para estudar no seu ritmo.\n\n❓ *"E se eu não conseguir?"*\nVocê tem 7 dias de garantia e a minha resposta no grupo todos os dias.\n\n❓ *"Sou católico, serve para mim?"*\nServe: tem um módulo só de músicas católicas, além dos louvores evangélicos.\n\nO Curso e Mentoria de ~R$ 1.500~ por *R$ 597* vai só *até amanhã às 23h59*:\n{link_oferta}\n\nE lembra: as gravações saem do ar amanhã às 9h.' }),
+      em: () => ({ assunto: '"Será que é para mim?"', blocos: ['{nome}, se você ainda está em dúvida, talvez seja uma destas:', '• Idade: a Norma, de 64 anos, e a Zilda, de 74, já tocam na igreja, e temos alunos de 80 anos estudando. A Zilda começou no círculo de oração e o pastor pediu para ela tocar também à noite.\n• Tempo: são 2 anos de acesso, para estudar com calma.\n• Tecnologia: tem aplicativo próprio e uma equipe de suporte para ajudar com senha e acesso.\n• Igreja: tem repertório de louvores evangélicos e também de músicas católicas.\n• Risco: 7 dias de garantia incondicional.', 'De R$ 1.500 por apenas R$ 597. Essa condição encerra amanhã às 23h59.', { b: 'Garantir minha vaga', u: '{link_oferta}' }, PE] }) },
+    // ======================= DIA 5 =======================
+    { k: 'm22', q: { t: 'dia', d: 5, h: '08:00' }, g: 50, venda: true,
+      ok: (c: any) => jPct('a3', c.ins.contato_id) < Number(jcfg().viuOfertaPct || 81),
+      wa: () => ({ texto: '{nome}, *às 9h* as gravações da Jornada Tecladista saem do ar.\n\nSe você ainda não viu o final da Aula 3, é agora:\n{link_a3}\n\nE hoje é o último dia do Curso e Mentoria de ~R$ 1.500~ por *R$ 597*: encerra às 23h59.' }),
+      em: () => ({ assunto: 'As gravações saem do ar às 9h', blocos: ['{nome}, daqui a pouco as aulas deixam de ficar disponíveis.', 'No final da Aula 3 está o caminho completo e a condição especial: Curso e Mentoria de R$ 1.500 por apenas R$ 597, que vale só até hoje às 23h59.', { b: 'Assistir à Aula 3', u: '{link_a3}' }] }) },
+    { k: 'm23', q: { t: 'dia', d: 5, h: '12:00' }, g: 120, venda: true,
+      wa: () => ({ texto: '{nome}, *hoje é o último dia*. ⏳\n\nÀs 23h59 encerra a condição do *Curso e Mentoria de Teclado Gospel*: 2 anos de acesso, curso Como Tocar de Ouvido junto e acompanhamento comigo todos os dias.\n\n' + OF_WA + '\n\nDepois das 23h59, essa condição fecha para você.\n\nSe o seu sonho é tocar na igreja, não deixa para o ano que vem:\n{link_oferta}\n\n' + PE }),
+      em: () => ({ assunto: 'Último dia: encerra hoje às 23h59', blocos: ['{nome}, é hoje.', 'À meia-noite encerra a condição especial da Jornada Tecladista. Depois disso, o link deixa de funcionar para você.', 'O que você leva:\n• Curso e Mentoria de Teclado Gospel, do zero ao avançado, com 2 anos de acesso\n• Curso Como Tocar de Ouvido\n• Minha resposta no grupo do WhatsApp todos os dias e mentorias ao vivo toda semana\n• 7 dias de garantia incondicional', 'De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70. Uma economia de mais de R$ 900, só até as 23h59.', { b: 'Garantir minha vaga', u: '{link_oferta}' }, PE] }) },
+    { k: 'm24', q: { t: 'dia', d: 5, h: '18:00' }, g: 90, venda: true,
+      em: () => ({ assunto: 'Faltam 6 horas', blocos: ['{nome}, faltam 6 horas. Às 23h59 encerra o Curso e Mentoria de R$ 1.500 por R$ 597.', 'Se a dúvida é "será que eu consigo?", lembra que você tem 7 dias para conhecer tudo por dentro: as aulas, o grupo, as mentorias. Se não for para você, devolvo seu dinheiro e continuamos irmãos em Cristo.', { b: 'Quero entrar agora', u: '{link_oferta}' }, PE] }) },
+    { k: 'm25', q: { t: 'dia', d: 5, h: '22:00' }, g: 30, venda: true,
+      wa: () => ({ texto: '{nome}, faltam *2 horas*. ⏳\n\nÀs 23h59 encerra o Curso e Mentoria de ~R$ 1.500~ por *R$ 597*, e o link deixa de funcionar.\n\nÉ a sua última chance de entrar com essa condição:\n{link_oferta}\n\nNo Pix ou no cartão a confirmação é na hora.' }),
+      em: () => ({ assunto: 'Encerra à meia-noite', blocos: ['{nome}, são as últimas 2 horas.', 'Depois das 23h59, o Curso e Mentoria de R$ 1.500 por R$ 597 fecha para você.', { b: 'Entrar agora', u: '{link_oferta}' }] }) },
+    // ======================= DIA 6 =======================
+    { k: 'm26', q: { t: 'dia', d: 6, h: '10:00' }, g: 180, venda: true,
+      em: () => ({ assunto: 'A condição encerrou', blocos: ['{nome}, a condição especial da Jornada Tecladista encerrou ontem à meia-noite.', 'Obrigado por ter participado das aulas. Continue praticando o que você aprendeu, e conte comigo nos conteúdos que eu publico nas redes.', 'Que Deus abençoe sua caminhada na música.\n' + PE] }) },
+  ];
+  // pós-venda (dispara quando a compra da oferta é reconhecida) — sai do NÚMERO DE SUPORTE (1030), assinatura "Equipe Melodias e Riffs"
+  const POS_VENDA: any = { k: 'pos_venda', instancia: () => jcfg().instanciaSuporte,
+    wa: (c: any) => ({ texto: '{nome}, parabéns pela decisão! 🎉\n\nSua inscrição no *Curso e Mentoria de Teclado Gospel* está confirmada. Boas-vindas à família Melodias e Riffs!\n\n📲 *Acesso ao curso:* {plataforma}\nEntre com o e-mail que você usou na compra. Os dados de acesso também chegam no seu e-mail (se não encontrar, confira a caixa de spam).\n\n🛟 *Este é o número de suporte ao aluno.* Salve este contato: sempre que precisar de ajuda com acesso, aulas ou qualquer dúvida, é por aqui que a nossa equipe te atende.\n\n📬 Ao longo da semana você vai receber uma sequência de mensagens com mais informações e o link do grupo do WhatsApp dos alunos. É só aguardar!'
+      + (c.ins.ganhou_apostila ? '\n\n🎁 E você garantiu a *apostila física* com frete grátis!\nPara a gente enviar, responda esta mensagem com seu endereço completo:\n• Rua e número\n• Complemento (se tiver)\n• Bairro\n• Cidade e estado\n• CEP' : '')
+      + '\n\nEquipe Melodias e Riffs' }),
+    em: (c: any) => ({ assunto: 'Sua inscrição está confirmada – Curso e Mentoria de Teclado Gospel', blocos: ['{nome}, parabéns pela decisão!', 'Sua inscrição no Curso e Mentoria de Teclado Gospel está confirmada. Boas-vindas à família Melodias e Riffs!',
+      'Para acessar o curso, entre na plataforma com o e-mail que você usou na compra. Os dados de acesso chegam em outro e-mail, separado deste (se não encontrar, confira a caixa de spam).', { b: 'Acessar a plataforma', u: '{plataforma}' },
+      'Suporte ao aluno pelo WhatsApp: {suporte}. Salve esse número: sempre que precisar de ajuda com acesso, aulas ou qualquer dúvida, é por ele que a nossa equipe te atende.',
+      'Ao longo da semana você vai receber uma sequência de mensagens com mais informações e o link do grupo do WhatsApp dos alunos. É só aguardar!',
+      ...(c.ins.ganhou_apostila ? ['Você também garantiu a apostila física com frete grátis! Para a gente enviar, mande seu endereço completo pelo WhatsApp de suporte, {suporte}: rua, número, complemento, bairro, cidade, estado e CEP.'] : []),
+      'Equipe Melodias e Riffs'] }) };
+
+  // ---------------- agendamento de cada mensagem ----------------
+  function jQuandoMs(m: any, ins: any): number | null {
+    const insMs = Date.parse(ins.inscrito_em);
+    if (m.q.t === 'rel') return insMs + (Number(m.q.min) || 0) * 60000;
+    if (m.q.t === 'dia') return jEm(ins.dia1, m.q.d, m.q.h);
+    if (m.q.t === 'video10') {
+      const t = insMs + 10 * 60000; const h = jHoraBRT(t);
+      if (jDataBRT(t) === ins.dia1 && h >= 20.5) return null;            // já é a noite da Aula 1: não manda o vídeo
+      if (h >= 22.5) return Date.parse(jDataBRT(t + 86400000) + 'T12:00:00.000Z'); // 9h BRT do dia seguinte
+      if (h < 8) return Date.parse(jDataBRT(t) + 'T12:00:00.000Z');                 // 9h BRT do mesmo dia
+      return t;
+    }
+    return null;
+  }
+  function jRegistra(ins: any, chave: string, canal: string, status: string, extra: any = {}): void {
+    try {
+      db.prepare(`INSERT OR IGNORE INTO jornada_envios(id,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(randomUUID(), ins.id, chave, canal, status, extra.tipo || null, extra.texto || null, extra.url || null, extra.legenda || null, extra.para || null, extra.detalhe || null, extra.agendado_para || agora(), agora(), extra.instancia || null);
+    } catch { /* */ }
+  }
+  const jJaFeito = (ins: any, chave: string): boolean => !!db.prepare(`SELECT 1 FROM jornada_envios WHERE inscrito_id=? AND chave=? LIMIT 1`).get(ins.id, chave);
+  function jEnfileira(ins: any, m: any, ctx: any, agoraMs: number): void {
+    const v = jVars(ins, agoraMs);
+    let algum = false;
+    if (m.wa && ins.telefone) {
+      const w = m.wa(ctx);
+      if (w) {
+        const inst = m.instancia ? m.instancia() : null;
+        if (w.tipo === 'video') jRegistra(ins, m.k, 'wa', 'pendente', { tipo: 'video', url: w.url, legenda: jFill(w.legenda, v), para: ins.telefone, instancia: inst });
+        else jRegistra(ins, m.k, 'wa', 'pendente', { tipo: 'texto', texto: jFill(w.texto, v), para: ins.telefone, instancia: inst });
+        algum = true;
+      }
+    }
+    if (m.em && ins.email && String(ins.email).includes('@')) {
+      const e = m.em(ctx);
+      if (e) {
+        try {
+          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+            .run(randomUUID(), String(ins.projeto || jcfg().projeto), String(ins.email).trim(), jFill(e.assunto, v), jEmailHtml(e.blocos, v), 'pendente', agora(), null, null);
+          jRegistra(ins, m.k, 'email', 'enviado', { para: ins.email, detalhe: 'na fila de e-mail' });
+          algum = true;
+        } catch (er: any) { jRegistra(ins, m.k, 'email', 'falhou', { detalhe: String(er?.message || er).slice(0, 200) }); }
+      }
+    }
+    if (!algum) jRegistra(ins, m.k, 'nada', 'pulado', { detalhe: 'sem canal/variante' });
+  }
+
+  // ---------------- inscrição (lê as respostas do formulário) ----------------
+  function jNovoToken(): string {
+    for (let i = 0; i < 20; i++) { const t = randomBytes(5).toString('base64').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6); if (t.length >= 5 && !db.prepare(`SELECT 1 FROM jornada_inscritos WHERE token=?`).get(t)) return t; }
+    return randomUUID().replace(/-/g, '').slice(0, 8);
+  }
+  function jInscrever(dados: { contatoId: string; telefone: string; nome?: string; email?: string; quandoMs?: number; respostaId?: string; dia1?: string }): any {
+    const cfg = jcfg(); const quandoMs = dados.quandoMs || Date.now();
+    const anteriores = db.prepare(`SELECT * FROM jornada_inscritos WHERE contato_id=? ORDER BY inscrito_em DESC`).all(dados.contatoId) as any[];
+    const ativo = anteriores.find((a) => jEm(a.dia1, 7, '00:00') > quandoMs && a.status !== 'cancelado');
+    if (ativo) return { ok: true, ja: true, inscrito: ativo };
+    const ins: any = { id: randomUUID(), contato_id: dados.contatoId, projeto: cfg.projeto, telefone: String(dados.telefone || '').replace(/\D/g, ''), email: dados.email || null, nome: dados.nome || null,
+      inscrito_em: new Date(quandoMs).toISOString(), dia1: dados.dia1 || jDia1Para(quandoMs), token: jNovoToken(), repeticao: anteriores.length, status: 'ativo', resposta_id: dados.respostaId || null };
+    // Quem JÁ é aluno (comprou numa jornada anterior ou já tem a compra da oferta) assiste às aulas normalmente, mas não recebe mensagens de venda nem pós-venda de novo.
+    const jaAluno: any = anteriores.find((a) => a.status === 'comprou') || jJaCliente(ins.contato_id, ins.telefone, ins.email);
+    if (jaAluno) { ins.status = 'comprou'; ins.comprou_em = jaAluno.comprou_em || jaAluno.criado_em || null; ins.compra_id = jaAluno.compra_id || jaAluno.id || null; }
+    db.prepare(`INSERT INTO jornada_inscritos(id,contato_id,projeto,telefone,email,nome,inscrito_em,dia1,token,repeticao,status,resposta_id,criado_em,comprou_em,compra_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(ins.id, ins.contato_id, ins.projeto, ins.telefone, ins.email, ins.nome, ins.inscrito_em, ins.dia1, ins.token, ins.repeticao, ins.status, ins.resposta_id, agora(), ins.comprou_em || null, ins.compra_id || null);
+    try { aplicarTag(cfg.projeto, ins.contato_id, 'jornada-inscrito'); if (ins.repeticao) aplicarTag(cfg.projeto, ins.contato_id, 'jornada-repeticao'); } catch { /* */ }
+    return { ok: true, inscrito: ins };
+  }
+  function jLerFormulario(): void {
+    const cfg = jcfg(); const desde = pubFlag('jornada_form_desde', '');
+    if (!desde) return;
+    const rows = db.prepare(`SELECT * FROM formulario_respostas WHERE formulario_id=? AND criado_em>? ORDER BY criado_em ASC LIMIT 200`).all(cfg.formId, desde) as any[];
+    for (const r of rows) {
+      try {
+        if (r.contato_id) {
+          let d: any = {}; try { d = JSON.parse(r.dados || '{}'); } catch { d = {}; }
+          const c = db.prepare(`SELECT * FROM contatos WHERE id=?`).get(r.contato_id) as any;
+          jInscrever({ contatoId: r.contato_id, telefone: (c && c.telefone) || String(d.whatsapp || d.telefone || ''), nome: (d.nome || (c && c.nome) || ''), email: (d.email || (c && c.email) || ''), quandoMs: Date.parse(r.criado_em) || Date.now(), respostaId: r.id });
+        }
+      } catch (e: any) { console.log('[jornada] inscrição erro', e?.message || e); }
+      setPubFlag('jornada_form_desde', String(r.criado_em));
+    }
+  }
+
+  // ---------------- compras ----------------
+  function jChecarCompras(agoraMs: number): void {
+    const lista = db.prepare(`SELECT * FROM jornada_inscritos WHERE status='ativo' AND inscrito_em>=?`).all(new Date(agoraMs - 12 * 86400000).toISOString()) as any[];
+    for (const ins of lista) {
+      const t = jAchaCompra(ins); if (!t) continue;
+      const compraMs = Date.parse(t.criado_em) || agoraMs;
+      const ganhou = !ins.repeticao && compraMs <= jFimApostila(ins) ? 1 : 0;
+      db.prepare(`UPDATE jornada_inscritos SET status='comprou', comprou_em=?, compra_id=?, ganhou_apostila=? WHERE id=?`).run(t.criado_em, t.id, ganhou, ins.id);
+      ins.status = 'comprou'; ins.comprou_em = t.criado_em; ins.ganhou_apostila = ganhou;
+      try { aplicarTag(ins.projeto, ins.contato_id, 'jornada-comprou'); if (ganhou) aplicarTag(ins.projeto, ins.contato_id, 'ganhou-apostila'); } catch { /* */ }
+      if (!jJaFeito(ins, POS_VENDA.k)) jEnfileira(ins, POS_VENDA, { ins, comprou: true }, agoraMs);
+      console.log('[jornada] compra reconhecida', { inscrito: ins.id, apostila: !!ganhou });
+    }
+  }
+
+  // ---------------- etiquetas pós-aula (% assistido) ----------------
+  function jEtiquetas(ins: any, agoraMs: number): void {
+    for (const k of ['a1', 'a2', 'a3']) {
+      const chave = 'tag_' + k;
+      if (agoraMs < jEm(ins.dia1, jAulaN(k) + 1, '08:50') || jJaFeito(ins, chave)) continue;
+      const pct = jPct(k, ins.contato_id); const f = jFaixa(pct);
+      const tag = 'jornada-aula' + jAulaN(k) + '-' + (f === 'nao' ? 'nao-assistiu' : f === 'menos' ? 'menos50' : 'mais50');
+      try { aplicarTag(ins.projeto, ins.contato_id, tag); if (k === 'a3' && pct >= Number(jcfg().viuOfertaPct || 81)) aplicarTag(ins.projeto, ins.contato_id, 'jornada-viu-oferta'); } catch { /* */ }
+      jRegistra(ins, chave, 'tag', 'enviado', { detalhe: tag + ' (' + pct + '%)' });
+    }
+  }
+
+  // Decide as mensagens de UM inscrito num instante. dry=true: só diz o que faria (não grava nem envia).
+  function jDecidir(ins: any, agoraMs: number, dry: boolean): any[] {
+    const out: any[] = [];
+    const comprou = ins.status === 'comprou';
+    const insMs = Date.parse(ins.inscrito_em);
+    for (const m of MSGS) {
+      if (!dry && jJaFeito(ins, m.k)) continue;
+      const t = jQuandoMs(m, ins);
+      const quando = t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ');
+      const pula = (motivo: string): void => { out.push({ k: m.k, quando, acao: 'pula', motivo }); if (!dry) jRegistra(ins, m.k, 'nada', 'pulado', { detalhe: motivo }); };
+      if (t === null) { pula('não se aplica (horário)'); continue; }
+      if (t > agoraMs) { out.push({ k: m.k, quando, acao: 'futuro' }); continue; }
+      if (m.q.t !== 'rel' && t < insMs) { pula('antes da inscrição'); continue; }
+      if (agoraMs - t > (Number(m.g) || 60) * 60000) { pula('atrasada (sistema fora do ar?)'); continue; }
+      if (comprou && m.venda) { pula('já comprou'); continue; }
+      const ctx = { ins, comprou };
+      let ok = true; try { ok = m.ok ? !!m.ok(ctx) : true; } catch { ok = false; }
+      if (!ok) { pula('condição não atendida'); continue; }
+      if (dry) {
+        let wa: any = null; let em: any = null; const v = jVars(ins, agoraMs);
+        try { const w = m.wa ? m.wa(ctx) : null; wa = w ? (w.tipo === 'video' ? { video: w.url, legenda: jFill(w.legenda, v) } : jFill(w.texto, v)) : null; } catch { wa = null; }
+        try { const e = m.em ? m.em(ctx) : null; em = e ? jFill(e.assunto, v) : null; } catch { em = null; }
+        out.push({ k: m.k, quando, acao: 'envia', whatsapp: wa, email_assunto: em });
+      } else { jEnfileira(ins, m, ctx, agoraMs); out.push({ k: m.k, quando, acao: 'envia' }); }
+    }
+    return out;
+  }
+
+  // ---------------- o agendador ----------------
+  let jRodando = false;
+  function jTick(): void {
+    if (!jAtivo() || jRodando) return; jRodando = true;
+    try {
+      const agoraMs = Date.now();
+      jLerFormulario();
+      jChecarCompras(agoraMs);
+      const lista = db.prepare(`SELECT * FROM jornada_inscritos WHERE status IN ('ativo','comprou') AND dia1>=?`).all(jDataBRT(agoraMs - 7 * 86400000)) as any[];
+      for (const ins of lista) {
+        jEtiquetas(ins, agoraMs);
+        jDecidir(ins, agoraMs, false);
+        if (agoraMs > jEm(ins.dia1, 7, '00:00') && ins.status === 'ativo') db.prepare(`UPDATE jornada_inscritos SET status='encerrado' WHERE id=?`).run(ins.id);
+      }
+    } catch (e: any) { console.log('[jornada] tick erro', e?.message || e); }
+    finally { jRodando = false; }
+  }
+  setInterval(jTick, 60000);
+
+  // ---------------- enviador próprio do WhatsApp (número do webinário, ritmo de 4–7s) ----------------
+  let jEnviando = false;
+  async function jTickEnvio(): Promise<void> {
+    if (jEnviando) return; jEnviando = true;
+    try {
+      const it = db.prepare(`SELECT * FROM jornada_envios WHERE canal='wa' AND status='pendente' AND agendado_para<=? ORDER BY agendado_para ASC LIMIT 1`).get(agora()) as any;
+      if (!it) return;
+      const cfg = jcfg();
+      try {
+        const inst = String(it.instancia || cfg.instancia);
+        if ((it.tipo || 'texto') === 'texto') await enviarTexto(cfg.projeto as any, String(it.para), String(it.texto || ''), inst);
+        else await enviarMidia(cfg.projeto as any, String(it.para), String(it.tipo), String(it.url || ''), String(it.legenda || ''), inst);
+        db.prepare(`UPDATE jornada_envios SET status='enviado', enviado_em=? WHERE id=?`).run(agora(), it.id);
+      } catch (e: any) {
+        const t = (Number(it.tentativas) || 0) + 1;
+        db.prepare(`UPDATE jornada_envios SET tentativas=?, status=?, detalhe=?, agendado_para=? WHERE id=?`).run(t, t >= 3 ? 'falhou' : 'pendente', String(e?.message || e).slice(0, 300), new Date(Date.now() + 60000).toISOString(), it.id);
+      }
+    } finally { jEnviando = false; }
+  }
+  // ritmo: espera cfg.envioIntervaloMs (padrão 3s) + 0–2s entre um envio e outro (+ o "digitando…" do enviarTexto)
+  (function jLoopEnvio(): void { setTimeout(async () => { try { await jTickEnvio(); } catch { /* */ } jLoopEnvio(); }, (Number(jcfg().envioIntervaloMs) || 3000) + Math.floor(Math.random() * 2000)); })();
+
+  // ---------------- páginas públicas /j/... ----------------
+  const jPagina = (titulo: string, texto: string, botao?: { t: string; u: string }): string => '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(titulo) + '</title></head>'
+    + '<body style="margin:0;background:#283D50;color:#fff;font-family:Arial,Helvetica,sans-serif;display:grid;place-items:center;min-height:100vh;padding:18px;box-sizing:border-box"><div style="max-width:520px;text-align:center">'
+    + '<h1 style="font-size:26px;margin:0 0 12px">' + esc(titulo) + '</h1><p style="font-size:17px;line-height:1.5;color:#e9eef3">' + esc(texto) + '</p>'
+    + (botao ? '<a href="' + esc(botao.u) + '" style="display:inline-block;margin-top:14px;background:#F1541A;color:#fff;text-decoration:none;font-weight:700;padding:14px 26px;border-radius:12px">' + esc(botao.t) + '</a>' : '')
+    + '</div></body></html>';
+  const jPorToken = (t: string): any => db.prepare(`SELECT * FROM jornada_inscritos WHERE token=?`).get(String(t || '').toLowerCase()) as any;
+
+  app.get('/j/:tipo/:token', (req: any, res: any) => {
+    try {
+      const tipo = String(req.params.tipo || ''); const ins = jPorToken(req.params.token); const cfg = jcfg();
+      if (!ins) return res.redirect(302, cfg.paginaInscricao);
+      const now = Date.now();
+      if (tipo === 'oferta') {
+        try { db.prepare(`INSERT INTO jornada_envios(id,inscrito_id,chave,canal,status,detalhe,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), ins.id, 'clique_oferta_' + now, 'clique', 'enviado', 'clique no link da oferta', agora()); } catch { /* */ }
+        if (now <= jFimOferta(ins)) {
+          const sep = cfg.checkout.includes('?') ? '&' : '?';
+          return res.redirect(302, cfg.checkout + sep + 'utm_source=webinario&utm_medium=whatsapp-email&utm_campaign=jornada-tecladista&utm_content=' + encodeURIComponent(ins.token));
+        }
+        const dl = jDataBRT(jFimOferta(ins)).split('-').reverse().slice(0, 2).join('/');
+        return res.type('html').send(jPagina('Essa condição encerrou', 'A condição especial da Jornada Tecladista era válida até ' + dl + ', às 23h59. Obrigado por ter participado das aulas!'));
+      }
+      if (tipo === 'video') return res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quem já toca na igreja</title></head><body style="margin:0;background:#111;display:grid;place-items:center;min-height:100vh"><video src="' + esc(cfg.videoPublico) + '" controls playsinline style="width:100%;max-width:960px;max-height:100vh"></video></body></html>');
+      if (!['a1', 'a2', 'a3'].includes(tipo)) return res.redirect(302, cfg.paginaInscricao);
+      if (!req.query.lead) return res.redirect(302, '/j/' + tipo + '/' + ins.token + '?lead=' + encodeURIComponent(ins.contato_id));
+      if (!JW.wbGet || !JW.wbConfigPublico || !JW.wbRoomHtml) return res.status(500).send('sala indisponível');
+      const wb = JW.wbGet(cfg.slugs[tipo]); if (!wb) return res.status(404).send('aula não encontrada');
+      const ini = jInicioAula(ins, tipo); const fim = jFimAula(ins, tipo); const dur = Math.round((fim - ini) / 1000);
+      const c: any = JW.wbConfigPublico(wb);
+      c.ofertas = (c.ofertas || []).map((o: any) => ({ ...o, url: jBase() + '/j/oferta/' + ins.token }));
+      if (now < fim) {
+        // antes da aula dele: contagem regressiva; durante: "ao vivo" sincronizado com o horário dele
+        c.agenda = { tipo: 'diario', estado: now < ini ? 'antes' : 'ao_vivo', inicio_ms: ini, fim_ms: fim, duracao: dur };
+      } else if (jJanelaGravacao(ins, tipo, now)) {
+        c.agenda = { tipo: 'aberto', estado: 'ao_vivo', inicio_ms: now, fim_ms: 0, duracao: dur };
+        c.chat_real = false; c.popups = false;
+      } else {
+        const n = jAulaN(tipo);
+        return res.type('html').send(jPagina('A gravação da Aula ' + n + ' saiu do ar', 'As gravações ficaram disponíveis por tempo limitado. Fique de olho no seu WhatsApp: as próximas mensagens trazem tudo o que você precisa.'));
+      }
+      c.server_now = now;
+      const cfgJson = JSON.stringify(c).replace(/</g, '\\u003c');
+      return res.type('html').send(JW.wbRoomHtml(cfgJson, String(wb.slug), String(wb.nome || 'Jornada Tecladista')));
+    } catch (e: any) { return res.status(500).send('erro: ' + String(e?.message || e)); }
+  });
+
+  // ---------------- painel (x-api-key) ----------------
+  app.get('/jornada/status', (_req: any, res: any) => {
+    try {
+      const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM jornada_inscritos GROUP BY status`).all();
+      const envios = db.prepare(`SELECT canal, status, COUNT(*) n FROM jornada_envios GROUP BY canal, status`).all();
+      const apostila = db.prepare(`SELECT nome, telefone, email, comprou_em FROM jornada_inscritos WHERE ganhou_apostila=1 ORDER BY comprou_em DESC LIMIT 200`).all();
+      res.json({ ok: true, ativo: jAtivo(), form_desde: pubFlag('jornada_form_desde', ''), cfg: jcfg(), inscritos: porStatus, envios, ganhadores_apostila: apostila });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/jornada/ativar', (req: any, res: any) => {
+    const b = req.body || {}; const on = !!b.ativo;
+    setPubFlag('jornada_ativo', on ? '1' : '0');
+    if (on && (b.desde || !pubFlag('jornada_form_desde', ''))) setPubFlag('jornada_form_desde', String(b.desde || agora()));
+    res.json({ ok: true, ativo: jAtivo(), form_desde: pubFlag('jornada_form_desde', '') });
+  });
+  app.post('/jornada/cfg', (req: any, res: any) => {
+    try { const atual = (() => { try { return JSON.parse(pubFlag('jornada_cfg', '{}') || '{}'); } catch { return {}; } })(); setPubFlag('jornada_cfg', JSON.stringify({ ...atual, ...(req.body || {}) })); res.json({ ok: true, cfg: jcfg() }); }
+    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/jornada/inscritos', (req: any, res: any) => {
+    const lim = Math.min(500, Number(req.query.limite) || 50);
+    const rows = (db.prepare(`SELECT * FROM jornada_inscritos ORDER BY inscrito_em DESC LIMIT ?`).all(lim) as any[]).map((i) => ({ ...i, pct: { a1: jPct('a1', i.contato_id), a2: jPct('a2', i.contato_id), a3: jPct('a3', i.contato_id) }, links: jVars(i, Date.now()) }));
+    res.json({ ok: true, inscritos: rows });
+  });
+  app.get('/jornada/envios', (req: any, res: any) => {
+    const id = String(req.query.inscrito || '');
+    const rows = id ? db.prepare(`SELECT * FROM jornada_envios WHERE inscrito_id=? ORDER BY criado_em ASC`).all(id) : db.prepare(`SELECT * FROM jornada_envios ORDER BY criado_em DESC LIMIT 200`).all();
+    res.json({ ok: true, envios: rows });
+  });
+  // inscrição manual (teste): {telefone, nome, email, dia1?}
+  app.post('/jornada/inscrever', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const cfg = jcfg(); const tel = String(b.telefone || '').replace(/\D/g, '');
+      if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
+      const cid = upsertContato(cfg.projeto, tel, b.nome || undefined, b.email || undefined, 'jornada-manual');
+      res.json(jInscrever({ contatoId: cid, telefone: tel, nome: b.nome, email: b.email, dia1: b.dia1 }));
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/jornada/cancelar', (req: any, res: any) => {
+    const b = req.body || {};
+    const r = db.prepare(`UPDATE jornada_inscritos SET status='cancelado' WHERE id=? OR token=? OR telefone=?`).run(String(b.id || '-'), String(b.token || '-'), String(b.telefone || '-').replace(/\D/g, ''));
+    db.prepare(`UPDATE jornada_envios SET status='cancelado' WHERE status='pendente' AND inscrito_id IN (SELECT id FROM jornada_inscritos WHERE status='cancelado')`).run();
+    res.json({ ok: true, alterados: r.changes });
+  });
+  // TESTE: manda AGORA uma (ou todas) as mensagens pra um número/e-mail de teste, sem mexer nos inscritos.
+  // body: {telefone, email?, nome?, chaves?: ['m01',...] | 'todas', cenario?: {faixa:'nao'|'menos'|'mais', comprou?:bool, repeticao?:bool, apostila?:bool}}
+  app.post('/jornada/teste', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const tel = String(b.telefone || '').replace(/\D/g, '');
+      if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
+      const cen = b.cenario || {};
+      const agoraMs = Date.now();
+      const ins: any = { id: 'teste-' + randomUUID().slice(0, 8), contato_id: 'teste', projeto: jcfg().projeto, telefone: tel, email: b.email || null, nome: b.nome || 'Teste', inscrito_em: new Date(agoraMs).toISOString(), dia1: jDia1Para(agoraMs), token: 'teste', repeticao: cen.repeticao ? 1 : 0, ganhou_apostila: cen.apostila ? 1 : 0 };
+      const faixaPct = cen.faixa === 'nao' ? 0 : cen.faixa === 'menos' ? 30 : 90;
+      (globalThis as any).__jornadaPctTeste = faixaPct;
+      const todas = !b.chaves || b.chaves === 'todas';
+      const lista = [...MSGS, POS_VENDA].filter((m) => todas || (Array.isArray(b.chaves) && b.chaves.includes(m.k)));
+      let n = 0; let atraso = 0;
+      for (const m of lista) {
+        const ctx: any = { ins, comprou: !!cen.comprou };
+        const v = jVars(ins, agoraMs);
+        if (m.wa) { const w = (() => { try { return m.wa(ctx); } catch { return null; } })(); if (w) {
+          const id = randomUUID(); atraso += 6000;
+          db.prepare(`INSERT INTO jornada_envios(id,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(id, ins.id, m.k, 'wa', 'pendente', w.tipo === 'video' ? 'video' : 'texto', w.tipo === 'video' ? null : jFill(w.texto, v), w.tipo === 'video' ? w.url : null, w.tipo === 'video' ? jFill(w.legenda, v) : null, tel, 'TESTE', new Date(agoraMs + atraso).toISOString(), agora(), m.instancia ? m.instancia() : null);
+          n++; } }
+        if (m.em && b.email) { const e = (() => { try { return m.em(ctx); } catch { return null; } })(); if (e) {
+          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), jcfg().projeto, String(b.email), '[TESTE ' + m.k + '] ' + jFill(e.assunto, v), jEmailHtml(e.blocos, v), 'pendente', agora(), null, null);
+          n++; } }
+      }
+      res.json({ ok: true, enfileiradas: n, obs: 'WhatsApp sai pelo número do webinário a cada ~6s; e-mails pela fila (até 5 a cada 20s). Links de teste usam o token "teste" (não abrem sala).' });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  // SIMULAR (não envia nada): o que a régua faria pra um inscrito num instante. body: {inscrito|token, agora?: ISO, pct?: {a1,a2,a3}}
+  app.post('/jornada/simular', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const ins = db.prepare(`SELECT * FROM jornada_inscritos WHERE id=? OR token=?`).get(String(b.inscrito || '-'), String(b.token || '-')) as any;
+      if (!ins) return res.json({ ok: false, erro: 'inscrito não encontrado' });
+      const agoraMs = b.agora ? Date.parse(String(b.agora)) : Date.now();
+      // cronograma completo (horário de Brasília) + decisão no instante pedido
+      const cronograma = MSGS.map((m: any) => { const t = jQuandoMs(m, ins); return { k: m.k, quando: t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ') }; });
+      res.json({ ok: true, inscrito: { id: ins.id, dia1: ins.dia1, token: ins.token, status: ins.status, repeticao: ins.repeticao }, prazos: { apostila: new Date(jFimApostila(ins) - BRT_MS).toISOString().slice(0, 16), oferta: new Date(jFimOferta(ins) - BRT_MS).toISOString().slice(0, 16) }, cronograma, decisao: jDecidir(ins, agoraMs, true) });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  console.log('[jornada] régua do webinário carregada; ativo=', jAtivo());
+}
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
