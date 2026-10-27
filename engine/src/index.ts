@@ -1284,7 +1284,7 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 });
 
 // Recarrega a config (produto->projeto, mensagens) sem reiniciar o serviço.
-app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
+app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); _configRuntimeCarregar(); res.json({ ok: true, config: CONFIG }); }); // [+fix-token] re-mescla config_runtime (produção/token sobrevivem ao reload, igual ao boot)
 app.get('/config', (_req, res) => res.json(CONFIG));
 
 // ======================= API SELLFLUX (CRM / Kanban / Agenda / Inbox / Respostas) =======================
@@ -13870,7 +13870,15 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
         try { salvarConfig(); } catch { /* best-effort */ }
       }
     } catch { /* ignore */ }
-    const PNL_TOKEN = (): string => String((CONFIG as any).painelTrafegoToken || '');
+    const PNL_TOKEN = (): string => {
+      let t = String((CONFIG as any).painelTrafegoToken || '');
+      if (!t) { // [+fix-token] gera na hora se estiver vazio (ex.: após um reload que limpou) e persiste
+        t = randomBytes(18).toString('hex');
+        (CONFIG as any).painelTrafegoToken = t;
+        try { salvarConfig(); } catch { /* best-effort */ }
+      }
+      return t;
+    };
     const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
     const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
 
