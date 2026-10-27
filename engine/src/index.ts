@@ -4643,6 +4643,33 @@ app.post('/disparo/grupo/instrumento', (req, res) => {
   res.json({ ok: true });
 });
 
+// [+grupos-remover] REMOVER grupos da lista do sistema (manual, pelo app). Reversível: o
+// "Sincronizar grupos" readiciona os que ainda existem no WhatsApp. Útil pra tirar grupos
+// que não são dos projetos (família/kids/sellflux/etc) e pra RESETAR a lista.
+app.post('/disparo/grupos/remover', (req, res) => {
+  try {
+    const jids = (((req.body || {}).jids) || []).map((x: any) => String(x)).filter(Boolean);
+    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
+    const ph = jids.map(() => '?').join(',');
+    const n = db.prepare(`DELETE FROM grupos_wpp WHERE id IN (${ph})`).run(...jids).changes;
+    res.json({ ok: true, removidos: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+// [+grupos-limpar] LIMPAR todos os grupos de um projeto (e/ou instância) — pra resetar e
+// depois reimportar via POST /disparo/grupos/sincronizar {projeto}. Exige projeto ou instancia.
+app.post('/disparo/grupos/limpar', (req, res) => {
+  try {
+    const projeto = String((req.body || {}).projeto || '').trim();
+    const instancia = String((req.body || {}).instancia || '').trim();
+    if (!projeto && !instancia) return res.json({ ok: false, erro: 'informe projeto ou instancia' });
+    const conds: string[] = []; const args: any[] = [];
+    if (projeto) { conds.push('projeto=?'); args.push(projeto); }
+    if (instancia) { conds.push('instancia=?'); args.push(instancia); }
+    const n = db.prepare(`DELETE FROM grupos_wpp WHERE ${conds.join(' AND ')}`).run(...args).changes;
+    res.json({ ok: true, removidos: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
+
 // [grupo-link] Tenta pegar o LINK de convite de um grupo (pra identificar/abrir). Precisa que o número seja ADMIN
 // do grupo; se não for, o Evolution recusa — e aí o motivo já volta explicado (mesma causa do erro ao mudar nome/foto).
 app.get('/disparo/grupo/link', async (req, res) => {
