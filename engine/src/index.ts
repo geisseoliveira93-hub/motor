@@ -14382,7 +14382,9 @@ console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
   };
   function jcfg(): any { let o: any = {}; try { o = JSON.parse(pubFlag('jornada_cfg', '{}') || '{}'); } catch { o = {}; } return { ...JCFG_PADRAO, ...o }; }
   const jAtivo = (): boolean => pubFlag('jornada_ativo', '0') === '1';
-  const jBase = (): string => String(PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
+  // [+links-dominio 27/10] os links pessoais (aulas/oferta/vídeo) podem sair no domínio do instrumento: cfg.baseLinks (via POST /jornada/cfg).
+  // Sem baseLinks fica igual a antes. Linha anterior: const jBase = (): string => String(PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
+  const jBase = (): string => String(jcfg().baseLinks || PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
 
   // ---------------- tempo (Brasília = UTC-3, sem horário de verão) ----------------
   const BRT_MS = 3 * 3600000;
