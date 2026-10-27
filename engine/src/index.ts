@@ -8009,6 +8009,24 @@ function pbPlataformaNuvemHabilitada(p: string): boolean {
   if (!allow.length) return true; // vazio = nuvem posta todas as plataformas (padrão)
   return allow.includes(String(p));
 }
+// [guardrail-yt-limite 27/10] teto diário de uploads YouTube na nuvem (cota padrão ~6/dia, aumento negado pelo Google; PC+nuvem dividiam a cota). Inerte se youtube não estiver no allowlist da nuvem, e se pub_yt_limite_dia<=0.
+function _pbDiaBRT(): string { const d = new Date(Date.now() - 3 * 3600000); return d.toISOString().slice(0, 10); }
+function pbYtLimiteDia(): number { const v = parseInt(pubFlag('pub_yt_limite_dia', '5'), 10); return (isNaN(v) || v < 0) ? 5 : v; }
+function pbYtCountHoje(): number { const v = parseInt(pubFlag('pub_yt_count_' + _pbDiaBRT(), '0'), 10); return isNaN(v) ? 0 : v; }
+function pbYtRegistraUpload(): void { try { setPubFlag('pub_yt_count_' + _pbDiaBRT(), String(pbYtCountHoje() + 1)); } catch { /* */ } }
+function pbYtPodePostarHoje(): boolean { const lim = pbYtLimiteDia(); if (lim <= 0) return true; return pbYtCountHoje() < lim; }
+// cria um item YouTube-only adiado p/ outro dia (escoa a fila sem estourar a cota; NÃO re-posta FB/IG do item original)
+function pbAdiarYoutube(item: any, diasFrente: number): void {
+  try {
+    const novoId = 'ytadiado-' + String(item.id) + '-' + Date.now();
+    if (db.prepare(`SELECT id FROM fila_publicacao WHERE id=?`).get(novoId)) return;
+    const quando = new Date(Date.now() + Math.max(1, diasFrente) * 24 * 3600000);
+    try { const orig = new Date(item.data_agendada); if (!isNaN(orig.getTime())) quando.setUTCHours(orig.getUTCHours(), orig.getUTCMinutes(), 0, 0); } catch { /* */ }
+    db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,onedrive_item_id,arquivo_nome,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,prioridade,trial_reels,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(novoId, item.canal_id, item.projeto || null, item.onedrive_ref, item.onedrive_item_id || null, item.arquivo_nome || null, item.thumb_ref || null, item.formato, JSON.stringify(['youtube']), item.titulo, item.descricao || '', item.descricao_social || '', quando.toISOString(), 'agendado', (item.prioridade || 0), (item.trial_reels || 0), agora(), agora());
+    pbLog('yt-adiado', String(item.id), 'limite diario YT -> ' + novoId + ' @ ' + quando.toISOString());
+  } catch (e) { pbLog('yt-adiado-erro', String(item.id), String((e as any)?.message || e)); }
+}
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -8035,6 +8053,7 @@ async function pbPostarItem(item: any): Promise<void> {
   const resultados: Record<string, string> = {};
   const videoIds: Record<string, string> = {};
   let sucessos = 0; let tentados = 0;
+  let ytAdiado = false; // [guardrail-yt-limite] YouTube deste item foi adiado por bater o teto diário
 
   for (const p of plataformas) {
     // [cutover-nuvem] se houver allowlist, a nuvem só posta as plataformas habilitadas (resto fica no PC)
@@ -8044,7 +8063,10 @@ async function pbPostarItem(item: any): Promise<void> {
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
       if (p === 'youtube') {
         if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: YouTube só vídeo aqui'; continue; }
+        // [guardrail-yt-limite 27/10] respeita o teto diário de uploads YT (cota compartilhada). Não conta como falha; o item escoa p/ outro dia.
+        if (!pbYtPodePostarHoje()) { resultados[p] = 'ADIADO: limite diario YouTube (' + pbYtCountHoje() + '/' + pbYtLimiteDia() + ')'; ytAdiado = true; continue; }
         r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: pbFlagPriv(canalId), thumbFile });
+        pbYtRegistraUpload();
       } else if (p === 'instagram') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
         else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
@@ -8076,7 +8098,14 @@ async function pbPostarItem(item: any): Promise<void> {
     // sucesso (total ou parcial): marca publicado, nunca re-posta
     db.prepare(`UPDATE fila_publicacao SET status='publicado', tentativas_consecutivas=0, erro=?, atualizado_em=? WHERE id=?`)
       .run(sucessos < tentados ? 'parcial: ' + JSON.stringify(resultados) : null, agora(), item.id);
+    // [guardrail-yt-limite] FB/IG já saíram; se o YouTube foi adiado por limite, cria item YT-only p/ outro dia (sem re-postar FB/IG)
+    if (ytAdiado) pbAdiarYoutube(item, 1);
     pbLog('publicado', item.id, `${sucessos}/${tentados} rede(s)`);
+  } else if (ytAdiado && tentados === 0) {
+    // [guardrail-yt-limite] item só de YouTube (ou YT + plataformas puladas) adiado por limite -> reempurra +1 dia, SEM contar como falha/quarentena
+    db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`)
+      .run(new Date(Date.now() + 24 * 3600000).toISOString(), 'adiado: limite diario YouTube', agora(), item.id);
+    pbLog('yt-adiado-reempurra', item.id, 'limite diario YT');
   } else if (tentados === 0) {
     // nada aplicável (ex.: imagem só com youtube) — tira da fila
     db.prepare(`UPDATE fila_publicacao SET status='publicado', erro='nada a postar (todas as redes puladas)', atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -8144,6 +8173,16 @@ app.post('/pub/plataformas-nuvem', (req, res) => {
     const arr = Array.isArray((req.body || {}).plataformas) ? (req.body.plataformas).map((x: any) => String(x)) : [];
     setPubFlag('pub_plataformas_nuvem', JSON.stringify(arr));
     res.json({ ok: true, plataformas: arr });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+// [guardrail-yt-limite 27/10] lê/define o teto diário de uploads YouTube na nuvem (0 = sem limite). Mostra o contador de hoje (fuso BRT).
+app.get('/pub/publicador/yt-limite', (_req, res) => { res.json({ ok: true, limiteDia: pbYtLimiteDia(), hoje: pbYtCountHoje(), dia: _pbDiaBRT(), podePostarAgora: pbYtPodePostarHoje() }); });
+app.post('/pub/publicador/yt-limite', (req, res) => {
+  try {
+    const b = req.body || {};
+    if (b.limiteDia !== undefined) { const n = parseInt(String(b.limiteDia), 10); if (isNaN(n) || n < 0) return res.status(400).json({ ok: false, erro: 'limiteDia: inteiro >= 0 (0 = sem limite)' }); setPubFlag('pub_yt_limite_dia', String(n)); }
+    if (b.resetHoje === true) setPubFlag('pub_yt_count_' + _pbDiaBRT(), '0');
+    res.json({ ok: true, limiteDia: pbYtLimiteDia(), hoje: pbYtCountHoje(), dia: _pbDiaBRT() });
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 app.get('/pub/publicador/status', (_req, res) => {
