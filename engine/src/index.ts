@@ -14043,6 +14043,57 @@ app.get('/obs/canais-youtube', (_req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
 });
 console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
+// [+obs-audiencia] Audiencia ao vivo dos canais YouTube (espectadores agora + curtidas + pico). ADITIVO, so-leitura. Reaproveita _ytFetch, pbYtTokenLives, _ytLiveChatCache, _obsRotas.
+const _ytBroadcastCache: Record<string, { videoId: string; ts: number }> = {};
+const _obsAudPico: Record<string, number> = {};
+let _obsAudCache: { ts: number; dados: any } | null = null;
+async function _ytVideoAoVivo(canalId: string, token: string): Promise<string> {
+  const c = _ytBroadcastCache[canalId]; if (c && Date.now() - c.ts < 60000) return c.videoId;
+  const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveBroadcasts?part=id,snippet&broadcastStatus=active&broadcastType=all&mine=true&maxResults=1');
+  const it = (j && j.items && j.items[0]) || null;
+  const vid = (it && it.id) || '';
+  const lc = (it && it.snippet && it.snippet.liveChatId) || '';
+  if (lc) _ytLiveChatCache[canalId] = { liveChatId: lc, ts: Date.now() }; // aproveita e alimenta o cache do chat
+  _ytBroadcastCache[canalId] = { videoId: vid, ts: Date.now() };
+  return vid;
+}
+async function _obsAudiencia(): Promise<any> {
+  if (_obsAudCache && Date.now() - _obsAudCache.ts < 9000) return _obsAudCache.dados; // cache ~10s (economiza cota)
+  const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
+  const vistos = new Set<string>();
+  const canais: any[] = [];
+  let total = 0;
+  for (const r of rotas) {
+    if (vistos.has(r.canal_id)) continue; vistos.add(r.canal_id);
+    let nome = String(r.nome || '').replace(/^YouTube\s+/i, '') || String(r.canal_id);
+    try { const row = db.prepare(`SELECT nome FROM canais_publicacao WHERE id=?`).get(r.canal_id) as any; if (row && row.nome) nome = row.nome; } catch { /* */ }
+    const item: any = { canal_id: r.canal_id, nome, agora: null, curtidas: null, pico: 0, aovivo: false };
+    try {
+      const token = await pbYtTokenLives(r.canal_id);
+      const vid = await _ytVideoAoVivo(r.canal_id, token);
+      if (vid) {
+        const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails,statistics&id=' + encodeURIComponent(vid));
+        const v = (j && j.items && j.items[0]) || null;
+        const cv = v && v.liveStreamingDetails && v.liveStreamingDetails.concurrentViewers;
+        const lk = v && v.statistics && v.statistics.likeCount;
+        item.agora = (cv === undefined || cv === null) ? null : Number(cv);
+        item.curtidas = (lk === undefined || lk === null) ? null : Number(lk);
+        item.aovivo = item.agora !== null;
+        item.pico = _obsAudPico[vid] || 0;
+        if (item.agora && item.agora > item.pico) { _obsAudPico[vid] = item.agora; item.pico = item.agora; }
+        if (item.agora) total += item.agora;
+      }
+    } catch (e: any) { item.erro = String(e && e.message || e).slice(0, 80); }
+    canais.push(item);
+  }
+  const dados = { ok: true, canais, total, ts: agora() };
+  _obsAudCache = { ts: Date.now(), dados };
+  return dados;
+}
+app.get('/obs/audiencia', async (_req, res) => {
+  try { const d = await _obsAudiencia(); res.json(d); } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo YouTube).');
 
 // ===================== [+painel-trafego] Painel web de Trafego (link protegido, ao vivo) =====================
 // ADITIVO. Inserido antes do app.listen. Reaproveita: app, db, CONFIG, salvarConfig, fetch, randomBytes,
