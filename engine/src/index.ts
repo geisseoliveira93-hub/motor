@@ -881,6 +881,9 @@ function produtoFluxoMatch(produtoId?: string, produtoNome?: string): FluxoProdu
   return null;
 }
 
+// [+recup-dedup 28/10] tabela do anti-duplicado da recuperação (sobrevive a deploy, /data/engine.db).
+try { db.exec(`CREATE TABLE IF NOT EXISTS recup_enviada ( id TEXT PRIMARY KEY, telefone TEXT, projeto TEXT, criado_em TEXT )`); } catch { /* ja existe */ }
+try { db.exec(`CREATE INDEX IF NOT EXISTS ix_recup_env ON recup_enviada(telefone,projeto,criado_em)`); } catch { /* ja existe */ }
 /** Dispara a ENTREGA: usa o fluxo do produto/projeto se houver; senão a mensagem simples. */
 async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
   // [+recup-dedilhados] se a compra é do dedilhados, cancela o fluxo de recuperação pendente (não cobrar quem já comprou)
@@ -899,9 +902,24 @@ async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string
 }
 /** Dispara a RECUPERAÇÃO: usa o fluxo do projeto se houver; senão a mensagem simples. */
 async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string): Promise<'fluxo' | 'mensagem'> {
+  // [+recup-dedup 28/10] a LastLink manda vários eventos "perdido" pro MESMO carrinho (abandonou/expirou/cancelou);
+  // antes o motor disparava 1 recuperação por evento = mensagem duplicada/triplicada. Agora: 1 por telefone+projeto
+  // a cada N horas (padrão 12; CONFIG.recupDedupHoras; 0 = sem trava). ADITIVO, best-effort (nunca bloqueia por erro).
+  try {
+    const horas = Number((CONFIG as any).recupDedupHoras ?? 12);
+    if (horas > 0) {
+      const limite = new Date(Date.now() - horas * 3600 * 1000).toISOString();
+      const ja = db.prepare(`SELECT 1 FROM recup_enviada WHERE telefone=? AND projeto=? AND criado_em>? LIMIT 1`).get(String(telefone || ''), projeto, limite);
+      if (ja) return 'mensagem'; // já mandou recentemente — ignora o evento repetido
+      db.prepare(`INSERT INTO recup_enviada(id,telefone,projeto,criado_em) VALUES(?,?,?,?)`).run(randomUUID(), String(telefone || ''), projeto, agora());
+    }
+  } catch { /* best-effort */ }
+  // [+recup-numero 28/10] número DEDICADO de recuperação (CONFIG.numeroRecuperacao[projeto]); vazio = número padrão do projeto.
+  // Resolve o caso de ter vazado pelo número pessoal quando o padrão zerou no deploy.
+  const instRecup = (((CONFIG as any).numeroRecuperacao) || {})[projeto] || undefined;
   const fluxo = CONFIG.recuperacaoFluxo?.[projeto];
-  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome); return 'fluxo'; }
-  await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome)).catch(() => {});
+  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome, undefined, instRecup); return 'fluxo'; }
+  await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome), instRecup).catch(() => {});
   return 'mensagem';
 }
 
@@ -5620,6 +5638,19 @@ app.post('/config/numero-padrao', (req, res) => {
   if (inst) (CONFIG as any).numeroPadrao[projeto] = inst; else delete (CONFIG as any).numeroPadrao[projeto];
   try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   res.json({ ok: true, numeroPadrao: (CONFIG as any).numeroPadrao });
+});
+// [+recup-numero 28/10] número DEDICADO de recuperação por projeto + horas do anti-duplicado. ADITIVO.
+app.get('/config/numero-recuperacao', (_req, res) => { res.json({ ok: true, numeroRecuperacao: (CONFIG as any).numeroRecuperacao || {}, recupDedupHoras: Number((CONFIG as any).recupDedupHoras ?? 12) }); });
+app.post('/config/numero-recuperacao', (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '');
+  if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
+  if (!(CONFIG as any).numeroRecuperacao) (CONFIG as any).numeroRecuperacao = {};
+  const inst = String(b.instancia || '').trim();
+  if (inst) (CONFIG as any).numeroRecuperacao[projeto] = inst; else delete (CONFIG as any).numeroRecuperacao[projeto];
+  if (b.dedupHoras !== undefined) (CONFIG as any).recupDedupHoras = Math.max(0, Number(b.dedupHoras) || 0);
+  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  res.json({ ok: true, numeroRecuperacao: (CONFIG as any).numeroRecuperacao, recupDedupHoras: Number((CONFIG as any).recupDedupHoras ?? 12) });
 });
 
 // ======================= [motor2] Endpoints de gestão (trilha/tags/flags) =======================
