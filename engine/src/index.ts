@@ -12146,6 +12146,8 @@ _acAlter(`ALTER TABLE academy_aulas ADD COLUMN curso_id TEXT`);       // desnorm
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_hash TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_plana TEXT`); // [migracao-senha] senha visivel p/ admin (publico idoso)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN token_login TEXT`);
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN reset_token TEXT`);   // [+login-reset 28/10] token de recuperação de senha
+_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN reset_expira TEXT`);  // [+login-reset 28/10] validade do link (1h)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN avatar TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN telefone TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN cpf TEXT`);
@@ -12166,6 +12168,8 @@ try {
 
 // ---------- [B.1] Helpers de auth / aluno ----------
 const AC_SALT = pubFlag('academy_salt', '') || (() => { const s = randomUUID(); try { setPubFlag('academy_salt', s); } catch {} return s; })();
+// [+area-url 28/10] base pública da área do aluno (subdomínio próprio). Fallback no motor se AREA_URL não setado.
+const _AREA_URL = String(process.env.AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br').replace(/\/+$/, '');
 const _acHash = (senha: string): string => createHash('sha256').update(String(senha || '') + ':' + AC_SALT).digest('hex');
 const _acToken = (): string => (randomUUID() + randomUUID()).replace(/-/g, '');
 const _acCookie = (req: any, nome: string): string => {
@@ -12173,12 +12177,16 @@ const _acCookie = (req: any, nome: string): string => {
   const m = raw.match(new RegExp('(?:^|; )' + nome + '=([^;]+)'));
   return m ? decodeURIComponent(m[1]) : '';
 };
-const _acSetSession = (res: any, alunoId: string, req: any) => {
+const _acSetSession = (res: any, alunoId: string, req: any, lembrar = true) => {
   const token = _acToken();
-  const exp = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString(); // 1 ano = login persistente
+  const exp = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString(); // 1 ano no banco (login persistente)
   db.prepare(`INSERT INTO academy_sessoes (token,aluno_id,dispositivo,criado_em,expira_em,ultimo_uso) VALUES (?,?,?,?,?,?)`)
     .run(token, alunoId, String((req && req.headers && req.headers['user-agent']) || '').slice(0, 120), agora(), exp, agora());
-  res.setHeader('Set-Cookie', 'ac_sess=' + token + '; Path=/area; Max-Age=31536000; HttpOnly; SameSite=Lax');
+  // [+login-lembrar 28/10] com "Lembrar de mim" (padrão): cookie dura 1 ano. Sem: cookie de SESSÃO (some ao fechar o navegador).
+  const cookie = lembrar
+    ? 'ac_sess=' + token + '; Path=/area; Max-Age=31536000; HttpOnly; SameSite=Lax'
+    : 'ac_sess=' + token + '; Path=/area; HttpOnly; SameSite=Lax';
+  res.setHeader('Set-Cookie', cookie);
   return token;
 };
 const _acAluno = (req: any): any => {
@@ -12356,15 +12364,42 @@ const _acPage = (al: any, titulo: string, corpo: string, aba = '', extraHead = '
   + _acTop(al, aba) + corpo + '</body></html>';
 
 // ---------- [B.3] Login / magic link / logout ----------
+// [+login-novo 28/10] CSS compartilhado das telas de acesso (login/esqueci/redefinir).
+const _acAuthCss =
+  'body{display:flex;align-items:center;justify-content:center;min-height:100vh}.bx{background:#13131a;border:1px solid #23232c;border-radius:16px;padding:30px;max-width:380px;width:100%}.lg{font-weight:800;color:#e7c86a;font-size:26px;letter-spacing:.06em;text-align:center;margin-bottom:4px}.slogan{color:#aeaeba;text-align:center;font-size:12px;margin-bottom:4px}.sub{color:#aeaeba;text-align:center;margin-bottom:18px;font-size:14px}.er{background:#3a1620;border:1px solid #7a2238;color:#ffb3c0;border-radius:8px;padding:9px 12px;font-size:13px;margin-bottom:10px}.ok{background:#11301f;border:1px solid #2e7d4f;color:#9be7b7;border-radius:8px;padding:10px 12px;font-size:13px;margin-top:12px}.pwrap{position:relative}.eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:0;color:#aeaeba;cursor:pointer;font-size:15px;padding:4px;line-height:1}.rowb{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:14px}.chk{display:flex;align-items:center;gap:7px;color:#aeaeba;font-size:12.5px;cursor:pointer}.chk input{width:15px;height:15px;accent-color:#e7c86a}.lnk{color:#e7c86a;font-size:12.5px;text-decoration:none}.lnk:hover{text-decoration:underline}.sup{display:block;text-align:center;margin-top:16px;color:#8a8a96;font-size:12px;text-decoration:none}.sup b{color:#25d366}';
+// Botão discreto de suporte (WhatsApp final 1030).
+const _acSuporteLink = '<a class="sup" href="https://wa.me/5516996401030" target="_blank" rel="noopener">💬 Precisa de ajuda? <b>Falar com o suporte</b></a>';
 const _acLoginHtml = (erro = ''): string =>
-  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — Melodias e Riffs</title><style>' + _acCSS
-  + 'body{display:flex;align-items:center;justify-content:center;min-height:100vh}.bx{background:#13131a;border:1px solid #23232c;border-radius:16px;padding:30px;max-width:380px;width:100%}.lg{font-weight:800;color:#e7c86a;font-size:26px;letter-spacing:.06em;text-align:center;margin-bottom:6px}.sub{color:#aeaeba;text-align:center;margin-bottom:18px;font-size:14px}.er{background:#3a1620;border:1px solid #7a2238;color:#ffb3c0;border-radius:8px;padding:9px 12px;font-size:13px;margin-bottom:10px}</style></head><body>'
-  + '<form class="bx" method="post" action="/area/login"><div class="lg">M|R</div><div class="sub">Área do aluno</div>'
+  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — Melodias e Riffs</title><style>' + _acCSS + _acAuthCss + '</style></head><body>'
+  + '<form class="bx" method="post" action="/area/login"><div class="lg">M|R</div><div class="slogan">A Escola do Músico Cristão</div><div class="sub">Área do aluno</div>'
   + (erro ? '<div class="er">' + esc(erro) + '</div>' : '')
-  + '<label>E-mail</label><input class="fld" name="email" type="email" required autofocus>'
-  + '<label>Senha</label><input class="fld" name="senha" type="password" required>'
+  + '<label>E-mail</label><input class="fld" name="email" type="email" required autofocus autocomplete="username">'
+  + '<label>Senha</label><div class="pwrap"><input class="fld" id="pw" name="senha" type="password" required autocomplete="current-password" style="padding-right:40px"><button type="button" class="eye" id="eye">👁️</button></div>'
+  + '<div class="rowb"><label class="chk"><input type="checkbox" name="lembrar" value="1" checked> Lembrar de mim</label><a class="lnk" href="/area/esqueci">Esqueci minha senha</a></div>'
   + '<button class="btn btn-g" style="width:100%;margin-top:18px" type="submit">Entrar</button>'
   + '<p style="color:#8a8a96;font-size:12.5px;text-align:center;margin-top:16px">Recebeu um link de acesso? É só clicar nele que você entra direto.</p>'
+  + _acSuporteLink
+  + '<script>(function(){var b=document.getElementById("eye"),p=document.getElementById("pw");if(b&&p)b.addEventListener("click",function(){p.type=p.type==="password"?"text":"password";b.textContent=p.type==="password"?"👁️":"🙈";});})();</script>'
+  + '</form></body></html>';
+// [+login-reset 28/10] tela "Esqueci minha senha" (pede e-mail).
+const _acEsqueciHtml = (msg = '', erro = ''): string =>
+  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recuperar acesso — Melodias e Riffs</title><style>' + _acCSS + _acAuthCss + '</style></head><body>'
+  + '<form class="bx" method="post" action="/area/esqueci"><div class="lg">M|R</div><div class="slogan">A Escola do Músico Cristão</div><div class="sub">Recuperar acesso</div>'
+  + (erro ? '<div class="er">' + esc(erro) + '</div>' : '')
+  + (msg ? '<div class="ok">' + esc(msg) + '</div>' : '<label>Seu e-mail de cadastro</label><input class="fld" name="email" type="email" required autofocus autocomplete="username"><button class="btn btn-g" style="width:100%;margin-top:18px" type="submit">Enviar link de recuperação</button>')
+  + '<p style="text-align:center;margin-top:16px"><a class="lnk" href="/area/login">← Voltar pro login</a></p>'
+  + _acSuporteLink
+  + '</form></body></html>';
+// [+login-reset 28/10] tela "Redefinir senha" (nova senha via token do e-mail).
+const _acRedefinirHtml = (token: string, erro = ''): string =>
+  '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Criar nova senha — Melodias e Riffs</title><style>' + _acCSS + _acAuthCss + '</style></head><body>'
+  + '<form class="bx" method="post" action="/area/redefinir/' + esc(token) + '"><div class="lg">M|R</div><div class="slogan">A Escola do Músico Cristão</div><div class="sub">Criar nova senha</div>'
+  + (erro ? '<div class="er">' + esc(erro) + '</div>' : '')
+  + '<label>Nova senha</label><div class="pwrap"><input class="fld" id="pw" name="senha" type="password" required minlength="6" autocomplete="new-password" style="padding-right:40px"><button type="button" class="eye" id="eye">👁️</button></div>'
+  + '<label>Repetir a nova senha</label><input class="fld" name="senha2" type="password" required minlength="6" autocomplete="new-password">'
+  + '<button class="btn btn-g" style="width:100%;margin-top:18px" type="submit">Salvar nova senha</button>'
+  + _acSuporteLink
+  + '<script>(function(){var b=document.getElementById("eye"),p=document.getElementById("pw");if(b&&p)b.addEventListener("click",function(){p.type=p.type==="password"?"text":"password";b.textContent=p.type==="password"?"👁️":"🙈";});})();</script>'
   + '</form></body></html>';
 
 app.get('/area/login', (req: any, res: any) => {
@@ -12379,7 +12414,7 @@ app.post('/area/login', (req: any, res: any) => {
     if (!al || !al.senha_hash || al.senha_hash !== _acHash(String(b.senha || ''))) {
       return res.type('html').send(_acLoginHtml('E-mail ou senha incorretos.'));
     }
-    _acSetSession(res, al.id, req);
+    _acSetSession(res, al.id, req, String((b && b.lembrar) || '') === '1'); // [+login-lembrar] sem marcar = sessão só até fechar o navegador
     _acMarcarAcesso(al); _acLog(al.id, 'login', 'senha');
     res.redirect('/area');
   } catch (e) { res.type('html').send(_acLoginHtml('Erro ao entrar. Tente de novo.')); }
@@ -12400,6 +12435,58 @@ app.get('/area/logout', (req: any, res: any) => {
   try { const t = _acCookie(req, 'ac_sess'); if (t) db.prepare(`DELETE FROM academy_sessoes WHERE token=?`).run(t); } catch {}
   res.setHeader('Set-Cookie', 'ac_sess=; Path=/area; Max-Age=0');
   res.redirect('/area/login');
+});
+// [+login-reset 28/10] Esqueci minha senha: pede e-mail e manda link de recuperação (válido 1h) pelo SMTP do teclado.
+app.get('/area/esqueci', (req: any, res: any) => {
+  if (_acAluno(req)) return res.redirect('/area');
+  res.type('html').send(_acEsqueciHtml());
+});
+app.post('/area/esqueci', (req: any, res: any) => {
+  try {
+    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    if (email) {
+      const al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+      if (al) {
+        const tok = _acToken();
+        const expira = new Date(Date.now() + 3600 * 1000).toISOString(); // 1h
+        db.prepare(`UPDATE academy_matriculas SET reset_token=?, reset_expira=? WHERE id=?`).run(tok, expira, al.id);
+        const link = _AREA_URL + '/area/redefinir/' + tok;
+        const prim = esc(String(al.nome || '').trim().split(/\s+/)[0] || '');
+        const html = '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;color:#222;line-height:1.5">'
+          + '<h2 style="color:#b9873a;margin:0 0 10px">Melodias e Riffs — Recuperar acesso</h2>'
+          + '<p>Olá' + (prim ? ' ' + prim : '') + '! Recebemos um pedido pra criar uma nova senha da sua área do aluno.</p>'
+          + '<p style="margin:18px 0"><a href="' + link + '" style="display:inline-block;background:#e7c86a;color:#201a08;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:bold">Criar nova senha</a></p>'
+          + '<p style="color:#666;font-size:13px">Ou copie e cole este link no navegador:<br>' + esc(link) + '</p>'
+          + '<p style="color:#666;font-size:13px">Este link vale por <b>1 hora</b>. Se não foi você que pediu, pode ignorar este e-mail — sua senha atual continua a mesma.</p>'
+          + '</div>';
+        try { db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), 'teclado', String(al.email), 'Recuperar acesso — Melodias e Riffs', html, 'pendente', agora()); } catch { /* best-effort */ }
+        try { _acLog(al.id, 'reset_pedido', 'esqueci-senha'); } catch { /* */ }
+      }
+    }
+  } catch { /* best-effort: nunca vaza se o e-mail existe */ }
+  // resposta SEMPRE igual (não revela se o e-mail está cadastrado)
+  res.type('html').send(_acEsqueciHtml('Se o e-mail estiver cadastrado, enviamos um link pra criar uma nova senha. O link vale 1 hora. Confira também a caixa de spam.'));
+});
+app.get('/area/redefinir/:token', (req: any, res: any) => {
+  const tok = String(req.params.token || '');
+  const al = db.prepare(`SELECT id FROM academy_matriculas WHERE reset_token=? AND reset_expira IS NOT NULL AND reset_expira>?`).get(tok, agora()) as any;
+  if (!al) return res.type('html').send(_acEsqueciHtml('', 'Link inválido ou expirado. Peça um novo abaixo.'));
+  res.type('html').send(_acRedefinirHtml(tok));
+});
+app.post('/area/redefinir/:token', (req: any, res: any) => {
+  const tok = String(req.params.token || '');
+  try {
+    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE reset_token=? AND reset_expira IS NOT NULL AND reset_expira>?`).get(tok, agora()) as any;
+    if (!al) return res.type('html').send(_acEsqueciHtml('', 'Link inválido ou expirado. Peça um novo abaixo.'));
+    const b = req.body || {};
+    const senha = String(b.senha || ''); const senha2 = String(b.senha2 || '');
+    if (senha.length < 6) return res.type('html').send(_acRedefinirHtml(tok, 'A senha precisa ter pelo menos 6 caracteres.'));
+    if (senha !== senha2) return res.type('html').send(_acRedefinirHtml(tok, 'As duas senhas não são iguais.'));
+    db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=?, reset_token=NULL, reset_expira=NULL WHERE id=?`).run(_acHash(senha), senha, al.id);
+    _acSetSession(res, al.id, req, true); // após redefinir, entra direto (persistente)
+    _acMarcarAcesso(al); _acLog(al.id, 'reset_ok', 'redefiniu-senha');
+    res.redirect('/area');
+  } catch (e) { res.type('html').send(_acRedefinirHtml(tok, 'Erro ao salvar. Tente de novo.')); }
 });
 
 // ---------- [B.4] HOME do aluno (banner + prateleiras por vitrine) ----------
@@ -12850,7 +12937,7 @@ app.get('/academy/aluno/:id', (req: any, res: any) => {
     const perguntas = db.prepare(`SELECT * FROM academy_perguntas WHERE aluno_id=? ORDER BY criado_em DESC`).all(al.id);
     const progresso = db.prepare(`SELECT curso_id, COUNT(*) aulas, SUM(visto) vistas, AVG(pct) pct FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id);
     const tags = db.prepare(`SELECT t.* FROM academy_tags t JOIN academy_aluno_tags at ON at.tag_id=t.id WHERE at.aluno_id=?`).all(al.id);
-    const magic = al.token_login ? ((PUBLIC_BASE_URL || '') + '/area/entrar/' + al.token_login) : '';
+    const magic = al.token_login ? (_AREA_URL + '/area/entrar/' + al.token_login) : ''; // [+area-url 28/10] link mágico pelo subdomínio areadoaluno
     _ndOk(res, { aluno: al, acessos, pontuacoes, logs, perguntas, progresso, tags, magic_link: magic });
   } catch (e) { _ndErr(res, e); }
 });
@@ -12938,7 +13025,7 @@ app.post('/academy/senha/padrao-fixa', (req: any, res: any) => {
 });
 // admin: gerar/retornar magic link do aluno
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
-  try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: (PUBLIC_BASE_URL || '') + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
+  try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: _AREA_URL + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
 });
 // admin: criar/matricular aluno (e conceder acesso opcional)
 app.post('/academy/matricular', (req: any, res: any) => {
