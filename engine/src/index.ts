@@ -12323,6 +12323,7 @@ _acAlter(`ALTER TABLE academy_aulas ADD COLUMN descricao TEXT`);
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN duracao_seg INTEGER`);
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN anexos TEXT`);         // json [{nome,url,tamanho}]
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN curso_id TEXT`);       // desnormalizado p/ consulta rápida
+_acAlter(`ALTER TABLE academy_modulos ADD COLUMN capa TEXT`);         // [item 5 28/10] capa do módulo (card na página do curso)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_hash TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_plana TEXT`); // [migracao-senha] senha visivel p/ admin (publico idoso)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN token_login TEXT`);
@@ -12447,6 +12448,8 @@ a{color:inherit;text-decoration:none}
 .menu.open{display:block}
 .menu a{display:block;padding:9px 12px;border-radius:8px;font-size:14px;color:#dcdce4}
 .menu a:hover{background:#20202a}
+/* [menu celular 28/10] nav dentro do menu + troca ⚙️/☰ (só no celular) */
+.mnav{display:none}.mdiv{display:none}.avm{display:none}
 .wrap{max-width:1180px;margin:0 auto;padding:0 20px 60px}
 .hero{position:relative;height:300px;border-radius:0;overflow:hidden;margin-bottom:10px}
 .hero .bg{position:absolute;inset:0;background-size:cover;background-position:center;filter:brightness(.55)}
@@ -12455,9 +12458,10 @@ a{color:inherit;text-decoration:none}
 .hero p{color:#d7d7df;max-width:48ch}
 .shelf{margin:26px 0}
 .shelf h2{font-size:15px;color:#bdbdc8;font-weight:600;margin:0 0 12px}
-.rail{display:flex;gap:14px;overflow-x:auto;overflow-y:hidden;padding:14px 16px 18px;scrollbar-width:thin}
-.card{flex:0 0 172px;width:172px}
-.card .pz{position:relative;width:172px;height:244px;border-radius:12px;overflow:hidden;background:#17171f;border:1px solid #23232c;transition:transform .2s cubic-bezier(.2,.7,.3,1),filter .2s,box-shadow .2s,outline-color .2s;outline:2px solid transparent;outline-offset:2px}
+.rail{display:flex;gap:16px;overflow-x:auto;overflow-y:hidden;padding:14px 16px 10px;scrollbar-width:none;-ms-overflow-style:none}
+.rail::-webkit-scrollbar{display:none;height:0}
+.card{flex:0 0 210px;width:210px}
+.card .pz{position:relative;width:210px;height:320px;border-radius:14px;overflow:hidden;background:#17171f;border:1px solid #23232c;transition:transform .2s cubic-bezier(.2,.7,.3,1),filter .2s,box-shadow .2s,outline-color .2s;outline:2px solid transparent;outline-offset:2px}
 .card{cursor:pointer}.card:hover .pz{transform:translateY(-4px) scale(1.045);filter:brightness(1.12);box-shadow:0 16px 30px -12px #000c;outline-color:#e7c86a}.cattile{transition:transform .2s,border-color .2s}.cattile:hover{transform:translateY(-3px)}
 .card .pz img{width:100%;height:100%;object-fit:cover;display:block}
 .card .pz .lock{position:absolute;inset:0;display:grid;place-items:center;background:#000000a8;font-size:30px}
@@ -12482,11 +12486,23 @@ a{color:inherit;text-decoration:none}
 .pill.on{background:#143d27;border-color:#1e7a46;color:#9ff0c0}
 .anexo{display:flex;align-items:center;gap:12px;background:#15151c;border:1px solid #23232c;border-radius:10px;padding:12px 14px;margin:8px 0}
 .tree{background:#13131a;border:1px solid #23232c;border-radius:12px;overflow:hidden}
-.tree .mod{padding:13px 15px;border-bottom:1px solid #20202a;font-weight:600;font-size:14px}
-.tree .au{display:flex;gap:10px;align-items:center;padding:10px 15px 10px 18px;border-bottom:1px solid #1a1a22;font-size:13.3px;color:#cfcfd8}
-.tree .au.on{background:#1a1a22;color:#fff}
-.tree .au .dot{width:16px;height:16px;border-radius:50%;border:2px solid #44444f;flex:none}
-.tree .au .dot.done{background:#2ecc71;border-color:#2ecc71}
+/* [ajuste 28/10] módulos em sanfona (abre/fecha ao clicar) */
+.tree .mod{display:flex;align-items:center;gap:10px;padding:13px 15px;border-bottom:1px solid #20202a;font-weight:700;font-size:14px;cursor:pointer;user-select:none}
+.tree .mod .ch{color:#8a8a96;font-size:12px;width:12px;text-align:center;transition:transform .2s}
+.tree .mod.open .ch{transform:rotate(90deg);color:#e7c86a}
+.tree .mod .tt{flex:1}
+.tree .mod .ct{font-size:11.5px;color:#8a8a96;font-weight:600;background:#0c0c10;border:1px solid #23232c;border-radius:999px;padding:2px 8px}
+.tree .mod .ct.done{color:#2ecc71;border-color:#2ecc7155}
+.tree .aulas{display:none}
+.tree .mod.open + .aulas{display:block}
+.tree .au{display:flex;gap:10px;align-items:center;padding:10px 15px 10px 16px;border-bottom:1px solid #1a1a22;font-size:13.3px;color:#cfcfd8;text-decoration:none;border-left:3px solid transparent}
+.tree .au:hover{background:#111118}
+/* aula atual = AMARELA; aula vista = check verde */
+.tree .au.on{background:#1a1708;color:#e7c86a;font-weight:700;border-left-color:#e7c86a}
+.tree .au .dot{width:17px;height:17px;border-radius:50%;border:2px solid #44444f;flex:none;display:flex;align-items:center;justify-content:center;font-size:10px;color:transparent}
+.tree .au .dot.done{background:#2ecc71;border-color:#2ecc71;color:#06230f}
+.tree .au .dot.done::after{content:"✓"}
+.tree .au.on .dot:not(.done){border-color:#e7c86a}
 .tree .au .dot.half{background:conic-gradient(#e7c86a 50%,#44444f 0)}
 .card2{background:#13131a;border:1px solid #23232c;border-radius:12px;padding:18px}
 .fld{width:100%;background:#0e0e14;border:1px solid #2a2a34;border-radius:9px;padding:11px 13px;color:#ececf0;font-size:14px}
@@ -12498,7 +12514,7 @@ label{display:block;font-size:12.5px;color:#aeaeba;margin:12px 0 5px}
 .modal{position:fixed;inset:0;background:#000a;display:none;z-index:60;align-items:center;justify-content:center;padding:18px}
 .modal.open{display:flex}
 .modal .bx{background:#15151c;border:1px solid #26262f;border-radius:14px;max-width:480px;width:100%;padding:22px}
-@media(max-width:820px){.layoutaula{grid-template-columns:1fr}.top nav{display:none}}
+@media(max-width:820px){.layoutaula{grid-template-columns:1fr}.top nav{display:none}.mnav{display:block}.mdiv{display:block;height:1px;background:#26262f;margin:6px 8px}.avd{display:none}.avm{display:inline}.card{flex:0 0 158px;width:158px}.card .pz{width:158px;height:238px}.rail{gap:12px}}
 html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big .card .nm{font-size:15px}html.ac-big .btn,html.ac-big .pill{font-size:16px}html.ac-big .tree .au{font-size:15px}html.ac-big h1{font-size:clamp(24px,5vw,36px)}
 .adov{position:absolute;inset:0;background:#000;display:flex;flex-direction:column;z-index:5}.adov iframe{flex:1;width:100%;border:0}.adbar{display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0c0c10;border-top:1px solid #1c1c24;font-size:13px;color:#cfcfd8}.adcta{position:absolute;top:12px;right:12px;background:#e7c86a;color:#201a08;padding:8px 14px;border-radius:8px;font-weight:700;font-size:13px}.adfx{position:absolute;left:0;right:0;bottom:0;z-index:6;display:flex;align-items:center;gap:10px;padding:10px 12px;background:#0c0c10e8;border-top:1px solid #e7c86a;font-size:13px}.dmark{position:absolute;right:10px;top:10px;z-index:4;color:#ffffff40;font-size:11px;pointer-events:none;text-shadow:0 1px 2px #0008}.card.locked .nm{color:#8a8a96}.lock .unlock{display:block;font-size:11px;color:#e7c86a;margin-top:4px;font-weight:700}.cattile{flex:0 0 200px;height:96px;border-radius:12px;background:linear-gradient(135deg,#1b1b24,#23232e);border:1px solid #2a2a34;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#e7c86a;text-align:center;padding:0 12px}.cattile:hover{border-color:#e7c86a}.popov{position:fixed;inset:0;z-index:70;background:#000b;display:flex;align-items:center;justify-content:center;padding:18px}.pop{position:relative;background:#15151c;border:1px solid #26262f;border-radius:14px;padding:16px;width:100%}.popx{position:absolute;top:8px;right:8px;width:34px;height:34px;border-radius:50%;border:0;background:#0009;color:#fff;font-size:16px;cursor:pointer;z-index:2}.metp{display:none;position:fixed;right:18px;bottom:120px;z-index:50;background:#15151c;border:1px solid #26262f;border-radius:12px;padding:14px;width:240px;box-shadow:0 12px 30px #0008}
 /* [layout v3 23/10] carrossel do banner + setas das prateleiras + alto-falante */
@@ -12510,6 +12526,17 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 .hdots{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:3}
 .hdot{width:9px;height:9px;border-radius:50%;background:#ffffff40;cursor:pointer}
 .hdot.on{background:#e7c86a}
+/* [banner rico 28/10] imagens responsivas (desktop/celular), logo, título, texto, botão CTA, degradê */
+.hslide .bgd,.hslide .bgm{position:absolute;inset:0;background-size:cover;background-position:center}
+.hslide .bgm{display:none}
+.hslide .ov{z-index:3}
+.hslide .hlogo{max-height:46px;max-width:60%;object-fit:contain;margin-bottom:10px}
+.hslide h1{font-size:clamp(24px,4.4vw,40px);margin:.1em 0;font-weight:800;line-height:1.08;text-shadow:0 1px 6px rgba(0,0,0,.45)}
+.hslide .htxt{color:#dfe2ea;max-width:46ch;margin:.5em 0 0;font-size:clamp(14px,2vw,17px)}
+.hslide .hbtn{display:inline-block;margin-top:16px;border:0;border-radius:10px;padding:13px 22px;font-weight:700;font-size:15px;cursor:pointer;text-decoration:none;background:var(--bf,#fff);color:var(--bt,#111)}
+.hslide .hbtn:hover{background:var(--bfh,var(--bf,#fff));color:var(--bth,var(--bt,#111))}
+.hgrad{position:absolute;left:0;right:0;bottom:0;height:42%;z-index:2;pointer-events:none}
+@media(max-width:820px){.hslide .bgd{display:none}.hslide .bgm{display:block}.hslide .ov{align-items:center;text-align:center;justify-content:flex-end;padding-bottom:30px;max-width:none}.hslide .htxt{max-width:92%}.hslide .hbtn{width:100%;max-width:340px}}
 .railwrap{position:relative}
 .arw{position:absolute;top:10px;bottom:18px;width:46px;border:0;color:#fff;font-size:26px;cursor:pointer;z-index:4;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
 .arw.l{left:0;background:linear-gradient(90deg,#0d0d10,transparent)}
@@ -12526,8 +12553,12 @@ const _acTop = (al: any, aba = ''): string => {
     <a href="/area/ia" class="${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
-    <div class="av" title="Minha conta" onclick="var m=document.getElementById('mn');m.classList.toggle('open')">⚙️
+    <div class="av" title="Menu" onclick="var m=document.getElementById('mn');m.classList.toggle('open')"><span class="avd">⚙️</span><span class="avm">☰</span>
       <div class="menu" id="mn">${impers}
+        <a class="mnav" href="/area">Início</a>
+        <a class="mnav" href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
+        <a class="mnav" href="/area/ia">Fale com a IA</a>
+        <div class="mdiv"></div>
         <a href="/area/perfil">Perfil</a>
         <a href="/area/ranking">Ranking</a>
         <a href="/area/favoritos">Favoritas</a>
@@ -12722,19 +12753,46 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     const _bItv = Math.max(2, Number(pubFlag('academy_banner_intervalo', '6')) || 6);
     let hero = '';
     if (_bannersOk.length) {
-      const _slides = _bannersOk.map((b: any, i: number) => `<div class="hslide${i === 0 ? ' on' : ''}"><div class="bg" style="background-image:url('${esc(b.imagem || '')}')"></div>
-        <div class="ov"><h1>${esc(b.nome || '')}</h1>${b.link ? `<div style="margin-top:14px"><a class="btn btn-g" href="${esc(b.link)}" target="_blank">Saber mais</a></div>` : ''}</div></div>`).join('');
+      // [banner rico 28/10] cada slide: imagens responsivas (desktop/celular) + logo + título/cor + texto/cor + sombra + degradê + botão CTA (cores+hover) + ação ao clicar
+      const _slides = _bannersOk.map((b: any, i: number) => {
+        const titulo = String(b.titulo || b.nome || '');
+        const tcor = b.titulo_cor ? `color:${esc(b.titulo_cor)};` : '';
+        const txt = String(b.texto || '');
+        const txcor = b.texto_cor ? `color:${esc(b.texto_cor)};` : '';
+        const sh = b.sombra_on ? `text-shadow:0 2px 12px ${esc(b.sombra_cor || '#000000')};` : '';
+        const imgD = esc(b.imagem || '');
+        const imgM = esc(b.imagem_mobile || b.imagem || '');
+        const logo = b.logo_url ? `<img class="hlogo" src="${esc(b.logo_url)}" alt="">` : '';
+        const acao = String(b.acao || (b.link ? 'externa' : 'nada'));
+        let href = '', tgt = '';
+        if (acao === 'externa' && b.link) { href = esc(b.link); tgt = ' target="_blank" rel="noopener"'; }
+        else if (acao === 'produto' && b.acao_produto_id) { href = '/area/curso/' + esc(String(b.acao_produto_id)); }
+        const btnTxt = b.btn_texto ? esc(b.btn_texto) : ((acao === 'externa' && b.link) ? 'Saber mais' : '');
+        const bvars = `--bf:${esc(b.btn_cor_fundo || '#ffffff')};--bt:${esc(b.btn_cor_texto || '#111111')};--bfh:${esc(b.btn_cor_fundo_hover || b.btn_cor_fundo || '#ffffff')};--bth:${esc(b.btn_cor_texto_hover || b.btn_cor_texto || '#111111')};`;
+        const btn = btnTxt ? (href ? `<a class="hbtn" style="${bvars}" href="${href}"${tgt}>${btnTxt}</a>` : `<span class="hbtn" style="${bvars}">${btnTxt}</span>`) : '';
+        const grad = b.degrade_on ? `<div class="hgrad" style="background:linear-gradient(to top, ${esc(b.degrade_cor || '#0a0a0c')}, transparent)"></div>` : '';
+        return `<div class="hslide${i === 0 ? ' on' : ''}">`
+          + `<div class="bgd" style="background-image:url('${imgD}')"></div>`
+          + `<div class="bgm" style="background-image:url('${imgM}')"></div>`
+          + grad
+          + `<div class="ov">${logo}<h1 style="${tcor}${sh}">${esc(titulo)}</h1>`
+          + (txt ? `<p class="htxt" style="${txcor}${sh}">${esc(txt)}</p>` : '')
+          + btn
+          + `</div></div>`;
+      }).join('');
       const _hdots = _bannersOk.length > 1 ? `<div class="hdots">${_bannersOk.map((_b: any, i: number) => `<span class="hdot${i === 0 ? ' on' : ''}"></span>`).join('')}</div>` : '';
-      hero = `<div class="heroC" id="heroC" data-itv="${_bItv}">${_slides}${_hdots}</div>`;
+      const _alt0 = Math.max(0, Math.min(100, Number(_bannersOk[0].altura_pct) || 0));
+      const _hcStyle = _alt0 ? ` style="height:clamp(240px, ${_alt0}vh, 760px)"` : '';
+      hero = `<div class="heroC" id="heroC" data-itv="${_bItv}"${_hcStyle}>${_slides}${_hdots}</div>`;
     }
     const cardHtml = (c: any): string => _acCardCurso(c, meus, pmap);
     let shelves = '';
     const novos = cursos.filter((c) => c.criado_em && c.criado_em >= new Date(Date.now() - 30 * 864e5).toISOString());
-    if (novos.length) shelves += `<div class="shelf"><h2>✨ Novidades</h2>${_acRail(novos.map(cardHtml).join(''))}</div>`;
-    // [layout v3 23/10 Ezequias] FILTRADO POR ALUNO (menos poluído):
-    //  - "E-books e Cifras" SEMPRE aparece COMPLETA (vitrine dos low-tickets, oferta p/ todo mundo).
-    //  - as outras vitrines (instrumentos) só aparecem se o aluno TEM curso nelas, e mostram SÓ os cursos que ele tem.
-    // (as versões antigas — faixa "Categorias" e "todas as vitrines" — ficam preservadas no backup/MANIFEST.)
+    if (false /* [ajuste 28/10] faixa "Novidades" removida do Início a pedido do Ezequias — banner rico ocupa o topo */ && novos.length) shelves += `<div class="shelf"><h2>✨ Novidades</h2>${_acRail(novos.map(cardHtml).join(''))}</div>`;
+    // [ajuste 28/10 Ezequias] REGRA ÚNICA p/ TODAS as vitrines (E-books/Cifras deixou de ser exceção):
+    //  - a vitrine só aparece se o aluno TEM pelo menos 1 curso nela;
+    //  - e dentro dela mostra TODOS os cursos: os que ele tem normais; os que NÃO tem em preto-e-branco com cadeado (abre a compra).
+    // (regra antiga 23/10 preservada no backup/MANIFEST: E-books sempre completa + instrumentos só com os cursos do aluno.)
     const _ordVit = vitrines.slice().sort((a: any, b: any) => {
       const ea = /e-?books?/i.test(String(a.nome || '') + ' ' + String(a.categoria || '')) ? 0 : 1;
       const eb = /e-?books?/i.test(String(b.nome || '') + ' ' + String(b.categoria || '')) ? 0 : 1;
@@ -12742,11 +12800,12 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
       return (Number(a.ordem || 0) - Number(b.ordem || 0)) || String(a.nome || '').localeCompare(String(b.nome || ''));
     });
     for (const v of _ordVit) {
-      const ehEbooks = /e-?books?/i.test(String(v.nome || '') + ' ' + String(v.categoria || ''));
-      let doV = cursos.filter((c) => c.vitrine_id === v.id);
-      if (!ehEbooks) { const meusV = doV.filter((c) => meus.has(c.id)); if (!meusV.length) continue; doV = meusV; }
+      // [regra antiga 23/10 — preservada como comentário]: const ehEbooks = /e-?books?/i.test(nome+categoria); if (!ehEbooks) { doV = só os do aluno }
+      const doV = cursos.filter((c) => c.vitrine_id === v.id);
+      const meusV = doV.filter((c) => meus.has(c.id));
+      if (!meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela
       if (!doV.length) continue;
-      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(doV.map(cardHtml).join(''))}</div>`;
+      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(doV.map(cardHtml).join(''))}</div>`; // mostra TODOS (cadeado faz o resto)
     }
     const semVit = cursos.filter((c) => !c.vitrine_id && meus.has(c.id));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
@@ -12774,21 +12833,36 @@ app.get('/area/curso/:id', (req: any, res: any) => {
     const vistos = new Set(prog.filter((p) => p.visto).map((p) => p.aula_id));
     const nAulas = aulas.length;
     const nFeitas = aulas.filter((a) => vistos.has(a.id)).length;
-    // "continuar de onde parei": 1a aula não vista (ou a 1a)
-    const prox = aulas.find((a) => !vistos.has(a.id)) || aulas[0];
+    // [item 5 28/10] botão: sem nada visto -> "Começar" (aula 1); com >=1 visto -> "Continuar de onde parei" (volta na última aula concluída)
+    const comecar = aulas[0];
+    const ultimaFeita = aulas.slice().reverse().find((a) => vistos.has(a.id));
+    const alvoBtn = nFeitas ? (ultimaFeita || comecar) : comecar;
+    const btnLabel = nFeitas ? 'Continuar de onde parei' : '▶ Começar';
+    // [item 5 28/10] módulos em CARDS (prateleira com seta); clica -> 1a aula do módulo. Capa própria do módulo (ou a do curso).
     const modCards = mods.map((m) => {
       const aus = aulas.filter((a) => a.modulo_id === m.id);
-      return `<div class="card2" style="margin:10px 0"><div style="font-weight:700">${esc(m.nome || '')}</div><div style="color:#8a8a96;font-size:13px;margin-top:3px">${aus.length} aula${aus.length === 1 ? '' : 's'}</div></div>`;
+      const feitasM = aus.filter((a) => vistos.has(a.id)).length;
+      const alvoM = aus[0];
+      const capaM = (m as any).capa || curso.capa || '';
+      const img = capaM ? `<img src="${esc(capaM)}" alt="">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:13px;font-weight:700">${esc(m.nome || '')}</div>`;
+      const barra = aus.length ? `<div class="pb"><i style="width:${Math.round(feitasM / aus.length * 100)}%"></i></div>` : '';
+      const legenda = `<div class="nm">${esc(m.nome || '')}</div><div style="font-size:12px;color:#8a8a96;margin-top:2px">${aus.length} aula${aus.length === 1 ? '' : 's'}${aus.length ? ` · ${feitasM}/${aus.length}` : ''}</div>`;
+      if (!alvoM) return `<div class="card" style="cursor:default"><div class="pz">${img}</div>${legenda.replace(/\d+\/\d+/, 'em breve')}</div>`;
+      return `<a class="card" href="/area/aula/${alvoM.id}"><div class="pz">${img}${barra}</div>${legenda}</a>`;
     }).join('');
+    const modRail = modCards
+      ? `<div class="railwrap"><button class="arw l" data-d="-1" aria-label="voltar">‹</button><div class="rail">${modCards}</div><button class="arw r" data-d="1" aria-label="avançar">›</button></div>`
+      : '<div class="card2">Conteúdo em breve.</div>';
     const corpo = `<div class="wrap">
       <div class="coverhero"><div class="bg" style="background-image:url('${esc(curso.capa || '')}')"></div>
         <div class="in"><div class="meta">${mods.length} módulos · ${nAulas} aulas · ${nFeitas}/${nAulas} concluídas${_acTempoCursoHtml(al.id, curso.id)}</div>
         <h1>${esc(curso.nome || '')}</h1>
-        ${prox ? `<a class="btn btn-l" href="/area/aula/${prox.id}">${nFeitas ? 'Continuar de onde parei' : 'Começar'}</a>` : ''}</div></div>
+        ${alvoBtn ? `<a class="btn btn-l" href="/area/aula/${alvoBtn.id}">${btnLabel}</a>` : ''}</div></div>
       ${nAulas > 0 && nFeitas >= nAulas ? `<div class="card2" style="border:1px solid #e7c86a;margin-bottom:14px;display:flex;align-items:center;gap:12px"><span style="font-size:24px">\u{1F3C6}</span><div style="flex:1">Você concluiu este curso!</div><a class="btn btn-g" href="/area/certificado/${curso.id}">Ver certificado</a></div>` : ''}
-      <h2 style="font-size:15px;color:#bdbdc8">Módulos</h2>${modCards || '<div class="card2">Conteúdo em breve.</div>'}
+      <h2 style="font-size:15px;color:#bdbdc8">Módulos</h2>${modRail}
       ${(function(){try{var pv=db.prepare(`SELECT * FROM academy_provas WHERE curso_id=? ORDER BY criado_em`).all(curso.id);if(!pv.length)return '';return '<h2 style="font-size:15px;color:#bdbdc8;margin-top:18px">Provas</h2>'+pv.map(function(p){return `<a class="card2" style="display:flex;align-items:center;gap:10px;margin:8px 0" href="/area/prova/${p.id}">📝 <b>${esc(p.titulo||'Prova')}</b><span style="margin-left:auto;color:#8a8a96;font-size:12px">nota mín ${p.nota_minima}%</span></a>`;}).join('');}catch(e){return '';}})()}
-      </div>`;
+      </div>
+      <script>document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});</script>`;
     _acLog(al.id, 'abriu_curso', curso.id);
     res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
@@ -12871,6 +12945,9 @@ app.get('/area/aula/:id', (req: any, res: any) => {
 
     const tree = mods.map((m) => {
       const aus = aulas.filter((a) => a.modulo_id === m.id);
+      // [ajuste 28/10] sanfona: o módulo da aula ATUAL já abre; os outros vêm fechados
+      const temAtual = aus.some((a) => a.id === aula.id);
+      const nFeitasM = aus.filter((a) => vmap[a.id] && vmap[a.id].visto).length;
       const lis = aus.map((a) => {
         const p = vmap[a.id];
         const cls = p && p.visto ? 'done' : (p && p.pos_seg ? 'half' : '');
@@ -12878,7 +12955,9 @@ app.get('/area/aula/:id', (req: any, res: any) => {
         if (!_l.ok) return `<div class="au" style="opacity:.55"><span class="dot"></span><span>🔒 ${esc(a.nome || '')}</span></div>`;
         return `<a class="au ${a.id === aula.id ? 'on' : ''}" href="/area/aula/${a.id}"><span class="dot ${cls}"></span><span>${esc(a.nome || '')}</span></a>`;
       }).join('');
-      return `<div class="mod">${esc(m.nome || '')}</div>${lis}`;
+      const _ctDone = (aus.length && nFeitasM >= aus.length) ? ' done' : '';
+      const _ct = aus.length ? `<span class="ct${_ctDone}">${nFeitasM}/${aus.length}${(nFeitasM >= aus.length && aus.length) ? ' ✓' : ''}</span>` : '';
+      return `<div class="mod${temAtual ? ' open' : ''}" onclick="acMod(this)"><span class="ch">▸</span><span class="tt">${esc(m.nome || '')}</span>${_ct}</div><div class="aulas">${lis}</div>`;
     }).join('');
 
     const dmodo = curso.duvida_modo || 'professor';
@@ -12918,6 +12997,8 @@ app.get('/area/aula/:id', (req: any, res: any) => {
         <div class="tree">${tree}</div>
       </div></div>${fab}${modal}${_acMetronomo()}
       <script>
+      // [ajuste 28/10] abre/fecha o módulo (sanfona) na árvore de aulas
+      function acMod(el){el.classList.toggle('open');}
       async function acVisto(aula,curso){var p=document.getElementById('vpill');var on=p.classList.contains('on');
         await fetch('/area/api/visto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:aula,curso:curso,visto:!on})});
         if(on){p.classList.remove('on');p.textContent='Marcar como vista';}else{p.classList.add('on');p.textContent='✓ Concluída';}}
@@ -13056,7 +13137,7 @@ app.post('/academy/vitrine', (req: any, res: any) => {
 app.post('/academy/vitrine/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_vitrines WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
 // Módulos
 app.post('/academy/modulo', (req: any, res: any) => {
-  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_modulos SET nome=?, ordem=? WHERE id=?`).run(b.nome, b.ordem || 0, b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_modulos (id,curso_id,nome,ordem) VALUES (?,?,?,?)`).run(id, b.curso_id, b.nome, b.ordem || 0); _acRecount(b.curso_id); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_modulos SET nome=?, ordem=?, capa=? WHERE id=?`).run(b.nome, b.ordem || 0, b.capa || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_modulos (id,curso_id,nome,ordem,capa) VALUES (?,?,?,?,?)`).run(id, b.curso_id, b.nome, b.ordem || 0, b.capa || ''); _acRecount(b.curso_id); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
 });
 app.post('/academy/modulo/remover', (req: any, res: any) => { try { const b = req.body || {}; db.prepare(`DELETE FROM academy_modulos WHERE id=?`).run(b.id); if (b.curso_id) _acRecount(b.curso_id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
 // Aulas
@@ -13093,7 +13174,30 @@ app.post('/academy/curso/meta', (req: any, res: any) => {
 // Banners
 app.get('/academy/banners', (_req: any, res: any) => { try { _ndOk(res, { banners: db.prepare(`SELECT * FROM academy_banners ORDER BY ordem, criado_em`).all() }); } catch (e) { _ndErr(res, e); } });
 app.post('/academy/banner', (req: any, res: any) => {
-  try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_banners SET nome=?, imagem=?, link=?, status=?, ordem=?, tipo=?, tamanho=?, freq=?, alvo_publico=?, alvo_tag=?, produto_alvo=? WHERE id=?`).run(b.nome, b.imagem || '', b.link || '', b.status || 'rascunho', b.ordem || 0, b.tipo || 'hero', b.tamanho || 'm', b.freq || 'day', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_banners (id,nome,imagem,link,status,ordem,criado_em,tipo,tamanho,freq,alvo_publico,alvo_tag,produto_alvo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, b.nome, b.imagem || '', b.link || '', b.status || 'rascunho', b.ordem || 0, agora(), b.tipo || 'hero', b.tamanho || 'm', b.freq || 'day', b.alvo_publico || 'todos', b.alvo_tag || '', b.produto_alvo || ''); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
+  try {
+    const b = req.body || {};
+    // [banner rico 28/10] salva campos antigos + novos (add-only). Colunas montadas dinamicamente.
+    const vals: any = {
+      nome: b.nome, imagem: b.imagem || '', link: b.link || '', status: b.status || 'rascunho', ordem: b.ordem || 0,
+      tipo: b.tipo || 'hero', tamanho: b.tamanho || 'm', freq: b.freq || 'day',
+      alvo_publico: b.alvo_publico || 'todos', alvo_tag: b.alvo_tag || '', produto_alvo: b.produto_alvo || '',
+      titulo: b.titulo || '', titulo_cor: b.titulo_cor || '', texto: b.texto || '', texto_cor: b.texto_cor || '',
+      sombra_on: b.sombra_on ? 1 : 0, sombra_cor: b.sombra_cor || '', logo_url: b.logo_url || '',
+      btn_texto: b.btn_texto || '', btn_cor_texto: b.btn_cor_texto || '', btn_cor_fundo: b.btn_cor_fundo || '',
+      btn_cor_texto_hover: b.btn_cor_texto_hover || '', btn_cor_fundo_hover: b.btn_cor_fundo_hover || '',
+      acao: b.acao || (b.link ? 'externa' : 'nada'), acao_produto_id: b.acao_produto_id || '',
+      imagem_mobile: b.imagem_mobile || '', altura_pct: Number(b.altura_pct) || 0,
+      degrade_on: b.degrade_on ? 1 : 0, degrade_cor: b.degrade_cor || '', menu_cor: b.menu_cor || ''
+    };
+    const cols = Object.keys(vals);
+    if (b.id) {
+      db.prepare(`UPDATE academy_banners SET ${cols.map((c) => c + '=?').join(', ')} WHERE id=?`).run(...cols.map((c) => vals[c]), b.id);
+      return _ndOk(res, { id: b.id });
+    }
+    const id = randomUUID();
+    db.prepare(`INSERT INTO academy_banners (id,criado_em,${cols.join(',')}) VALUES (?,?,${cols.map(() => '?').join(',')})`).run(id, agora(), ...cols.map((c) => vals[c]));
+    _ndOk(res, { id });
+  } catch (e) { _ndErr(res, e); }
 });
 app.post('/academy/banner/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_banners WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
 // Tags
@@ -13637,9 +13741,10 @@ const _acPlayerComAnuncios = (aula: any, curso: any, pos: number, al: any): stri
   else {
     ehYt = true;
     const yid = ref.replace(/^https?:\/\/(www\.)?(youtu\.be\/|youtube\.com\/(watch\?v=|embed\/))?/, '').split(/[?&]/)[0];
-    const org = encodeURIComponent(PUBLIC_BASE_URL || '');
+    // [fix Erro 153 — 28/10] NÃO fixar o origin no domínio do motor. O origin é setado no NAVEGADOR
+    // (location.origin), em acCarregaAula(), pra funcionar em QUALQUER domínio (areadoaluno.*, motor.*, etc.).
     const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
-    lessonSrc = 'https://www.youtube-nocookie.com/embed/' + yid + '?rel=0&modestbranding=1&playsinline=1&enablejsapi=1&origin=' + org + start;
+    lessonSrc = 'https://www.youtube-nocookie.com/embed/' + yid + '?rel=0&modestbranding=1&playsinline=1&enablejsapi=1' + start;
   }
   const btnPre = pre && pre.cta_link ? (esc(pre.cta_texto || 'Saber mais') + ' ›') : 'Continuar para a aula ›';
   const preOverlay = pre ? `<div class="adov" id="pread">
@@ -13662,7 +13767,7 @@ const _acPlayerComAnuncios = (aula: any, curso: any, pos: number, al: any): stri
       <div class="adbar"><span>Uma mensagem rápida…</span><button class="btn btn-ghost" onclick="acFechaMid()">Continuar a aula ›</button>
         ${mid.cta_link ? `<a class="btn btn-g" href="${esc(mid.cta_link)}" target="_blank" onclick="acAdClick('${mid.id}')">${esc(mid.cta_texto || 'Ver oferta')} ›</a>` : ''}</div>
     </div>` : '';
-  const lessonIframe = `<iframe id="lessonfr" ${pre ? 'data-src' : 'src'}="${lessonSrc}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>`;
+  const lessonIframe = `<iframe id="lessonfr" data-src="${lessonSrc}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe>`;
   const fimPre = pre && pre.fim ? JSON.stringify(String(pre.fim)) : 'null';
   const fimFx = faixa && faixa.fim ? JSON.stringify(String(faixa.fim)) : 'null';
   const script = `<script>
@@ -13671,19 +13776,25 @@ const _acPlayerComAnuncios = (aula: any, curso: any, pos: number, al: any): stri
     function acAdVisto(id){try{fetch('/area/api/anuncio-visto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anuncio:id,aula:'${aula.id}'})});}catch(e){}}
     function acAdClick(id){try{fetch('/area/api/anuncio-click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anuncio:id})});}catch(e){}}
     function acCd(elId,fim){var el=document.getElementById(elId);if(!el||!fim)return;function tick(){var d=new Date(fim)-new Date();if(d<=0){el.textContent='Encerrado';return;}var h=Math.floor(d/3.6e6),m=Math.floor(d%3.6e6/6e4),s=Math.floor(d%6e4/1e3);el.textContent='Acaba em '+(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(s<10?'0':'')+s;}tick();setInterval(tick,1000);}
-    function acFechaPre(){var o=document.getElementById('pread');if(o)o.style.display='none';var fr=document.getElementById('lessonfr');if(fr&&fr.getAttribute('data-src'))fr.src=fr.getAttribute('data-src');acIniciaYt();}
+    // [fix 153 28/10] carrega o vídeo setando o origin no NAVEGADOR (location.origin), não no domínio do motor
+    function acCarregaAula(){var fr=document.getElementById('lessonfr');if(!fr)return;var b=fr.getAttribute('data-src');if(!b)return;if(_ehYt&&b.indexOf('origin=')<0){b+=(b.indexOf('?')<0?'?':'&')+'origin='+encodeURIComponent(location.origin);}fr.src=b;fr.removeAttribute('data-src');}
+    function acFechaPre(){var o=document.getElementById('pread');if(o)o.style.display='none';acCarregaAula();acIniciaYt();}
     function acFechaPost(){var o=document.getElementById('postad');if(o)o.style.display='none';var f=document.getElementById('postfr');if(f)f.src='';}
     function acMostraPost(){if(!_postId)return;var o=document.getElementById('postad');var f=document.getElementById('postfr');if(o&&f){f.src=_postSrc;o.style.display='flex';acAdVisto(_postId);}}
     if(_preId){acAdVisto(_preId);var sk=document.getElementById('adskip'),c=document.getElementById('adcount'),n=_pularApos;acCd('adcd',_fimPre);
       if(n<=0){if(sk)sk.style.display='inline-block';}else{var t=setInterval(function(){n--;if(c)c.textContent='Anúncio · '+n+'s';if(n<=0){clearInterval(t);if(sk)sk.style.display='inline-block';if(c)c.textContent='Anúncio';}},1000);}}
     if(_faixaId){acAdVisto(_faixaId);acCd('fxcd',_fimFx);}
     var _ytP=null;
-    function acIniciaYt(){ if(!_ehYt||!_postId||_ytP) return;
+    // [28/10] a API do YouTube agora liga SEMPRE pra vídeo (não só quando tem anúncio pós) — precisa p/ marcar os 90%
+    function acIniciaYt(){ if(!_ehYt||_ytP) return;
       if(!window.YT||!window.YT.Player){var tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);window.onYouTubeIframeAPIReady=acIniciaYt;return;}
       try{_ytP=new YT.Player('lessonfr',{events:{onStateChange:function(e){if(e.data===YT.PlayerState.ENDED)acMostraPost();}}});}catch(e){}
+      // [auto-marca 90% 28/10] assistiu 90% do vídeo -> marca a aula como vista sozinho (NÃO pula de aula; botão manual continua valendo)
+      var _vDone=(function(){var vp=document.getElementById('vpill');return !!(vp&&vp.classList.contains('on'));})();
+      setInterval(function(){try{if(_vDone||!_ytP||!_ytP.getCurrentTime||!_ytP.getDuration)return;var d=_ytP.getDuration()||0,c=_ytP.getCurrentTime()||0;if(d>0&&(c/d)>=0.9){_vDone=true;fetch('/area/api/visto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aula:'${aula.id}',curso:'${curso.id}',visto:true})});var vp=document.getElementById('vpill');if(vp){vp.classList.add('on');vp.textContent='✓ Concluída';}}}catch(e){}},2000);
       if(_midId){setInterval(function(){try{if(_midDone||!_ytP||!_ytP.getCurrentTime)return;if(_ytP.getCurrentTime()>=_midSeg){_midDone=true;_ytP.pauseVideo();var o=document.getElementById('midad'),f=document.getElementById('midfr');if(o&&f){f.src=_midSrc;o.style.display='flex';acAdVisto(_midId);}}}catch(e){}},1000);}}
     function acFechaMid(){var o=document.getElementById('midad'),f=document.getElementById('midfr');if(o)o.style.display='none';if(f)f.src='';try{if(_ytP&&_ytP.playVideo)_ytP.playVideo();}catch(e){}}
-    if(!_preId){acIniciaYt();}
+    if(!_preId){acCarregaAula();acIniciaYt();}
   </script>`;
   return `<div class="player" style="position:relative">${lessonIframe}${_dm}${preOverlay}${postOverlay}${midOverlay}${faixaBar}</div>${script}`;
 };
@@ -13904,6 +14015,26 @@ db.exec(`CREATE TABLE IF NOT EXISTS academy_categorias ( nome TEXT PRIMARY KEY, 
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN alvo_publico TEXT`);  // todos | nao_compradores | inativos | tag
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN alvo_tag TEXT`);
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN produto_alvo TEXT`);
+// [banner rico 28/10] campos do hero rico (título/texto/logo/botão/imagens responsivas/aparência) — add-only
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN titulo TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN titulo_cor TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN texto TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN texto_cor TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN sombra_on INTEGER`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN sombra_cor TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN logo_url TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN btn_texto TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN btn_cor_texto TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN btn_cor_fundo TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN btn_cor_texto_hover TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN btn_cor_fundo_hover TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN acao TEXT`);            // nada | produto | externa
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN acao_produto_id TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN imagem_mobile TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN altura_pct INTEGER`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN degrade_on INTEGER`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN degrade_cor TEXT`);
+_acAlter(`ALTER TABLE academy_banners ADD COLUMN menu_cor TEXT`);
 
 // público-alvo bate? (reusado por pop-up segmentado)
 const _acPublicoOk = (al: any, alvo_publico: string, alvo_tag: string, produto_alvo: string, meus: Set<string>): boolean => {
