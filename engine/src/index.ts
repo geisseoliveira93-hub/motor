@@ -7979,7 +7979,7 @@ async function pbIgRuploadBytes(containerId: string, igToken: string, filePath: 
 async function pbIgPermalink(postId: string, igToken: string): Promise<string> {
   try { const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${postId}?fields=permalink&access_token=${encodeURIComponent(igToken)}`); const d = await r.json() as any; return d.permalink || ''; } catch { return ''; }
 }
-async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: string; formato: string; caption: string }): Promise<{ id: string; url: string }> {
+async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: string; formato: string; caption: string; trial?: boolean }): Promise<{ id: string; url: string }> {
   const canal = pbCanal(canalId); const igId = canal?.ig_business_id;
   const tok = pbTokLer(canalId, 'instagram');
   if (!igId || !tok?.accessToken) throw new Error('Instagram não conectado neste canal.');
@@ -8002,7 +8002,9 @@ async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: s
   }
   const tipo = (f === 'horizontal') ? 'VIDEO' : 'REELS'; // vertical/reels => REELS; horizontal => VIDEO feed
   const params: Record<string, string> = { media_type: tipo, upload_type: 'resumable', caption: a.caption };
-  if (tipo === 'REELS') params.share_to_feed = 'true';
+  // [+trial-reels 28/10] REEL DE TESTE: manda trial_params + share_to_feed=false (espelha o instagram-upload.ts do PC);
+  // sem isso o reel de teste virava reel NORMAL no feed e duplicava com o vertical. Reel normal continua share_to_feed=true.
+  if (tipo === 'REELS') { if (a.trial) { params.trial_params = JSON.stringify({ graduation_strategy: 'SS_PERFORMANCE' }); params.share_to_feed = 'false'; } else { params.share_to_feed = 'true'; } }
   let c = '';
   try {
     c = await pbIgCriarContainer(igId, igToken, params);
@@ -8012,7 +8014,7 @@ async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: s
     // fallback: container por URL pública (crawler do Meta baixa)
     pbLog('ig rupload falhou, tentando por URL', (e as any)?.message);
     const p2: Record<string, string> = { media_type: tipo, video_url: a.publicUrl, caption: a.caption };
-    if (tipo === 'REELS') p2.share_to_feed = 'true';
+    if (tipo === 'REELS') { if (a.trial) { p2.trial_params = JSON.stringify({ graduation_strategy: 'SS_PERFORMANCE' }); p2.share_to_feed = 'false'; } else { p2.share_to_feed = 'true'; } }
     c = await pbIgCriarContainer(igId, igToken, p2);
     await pbIgPoll(igToken, c);
   }
@@ -8217,7 +8219,7 @@ async function pbPostarItem(item: any): Promise<void> {
         pbYtRegistraUpload();
       } else if (p === 'instagram') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
-        else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
+        else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial, trial: !!item.trial_reels }); }
       } else if (p === 'facebook') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbFbCarrossel(canalId, carrosselUrls, captionSocial); }
         else if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; }
@@ -8364,18 +8366,19 @@ app.get('/pub/conexoes/listar', (_req, res) => {
 app.post('/pub/fila/importar', (req, res) => {
   try {
     const itens: any[] = (req.body?.itens) || [];
-    const stmt = db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,criado_em,atualizado_em)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?, 'agendado', ?, ?)
+    // [+trial-reels-importar 28/10] passa a gravar trial_reels (antes era ignorado = reel de teste virava reel normal e duplicava no IG).
+    const stmt = db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,trial_reels,criado_em,atualizado_em)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?, 'agendado', ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET canal_id=excluded.canal_id, onedrive_ref=excluded.onedrive_ref, thumb_ref=excluded.thumb_ref,
         formato=excluded.formato, plataformas_json=excluded.plataformas_json, titulo=excluded.titulo, descricao=excluded.descricao,
-        descricao_social=excluded.descricao_social, data_agendada=excluded.data_agendada, atualizado_em=excluded.atualizado_em`);
+        descricao_social=excluded.descricao_social, data_agendada=excluded.data_agendada, trial_reels=excluded.trial_reels, atualizado_em=excluded.atualizado_em`);
     let n = 0;
     const tx = db.transaction((rows: any[]) => {
       for (const it of rows) {
         const id = String(it.id || randomUUID());
         stmt.run(id, String(it.canalId ?? it.canal_id ?? ''), it.projeto || null, it.onedriveRef || it.onedrive_ref || '', it.thumbRef || it.thumb_ref || null,
           it.formato || 'vertical', JSON.stringify(it.plataformas || it.plataformas_json || []), it.titulo || '', it.descricao || null, it.descricaoSocial || it.descricao_social || null,
-          it.dataAgendada || it.data_agendada || new Date().toISOString(), agora(), agora());
+          it.dataAgendada || it.data_agendada || new Date().toISOString(), ((it.trialReels ?? it.trial_reels) ? 1 : 0), agora(), agora());
         n++;
       }
     });
