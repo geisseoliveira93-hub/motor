@@ -576,7 +576,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
 
     // ETAPA 9: publicar — aguarda verificação concluir (até 10 min), publica, confirma "mesmo assim".
     logI('aguardando verificacao concluir (ate 10 min)');
-    const MAX_ESPERA_MS = 10 * 60_000;
+    const MAX_ESPERA_MS = 6 * 60_000; // [producao] 6min (antes 10) p/ caber no timeout do worker; se não concluir, o diálogo "publicar mesmo assim" resolve
     const t0 = Date.now();
     let ultimoLog = 0;
     while (Date.now() - t0 < MAX_ESPERA_MS) {

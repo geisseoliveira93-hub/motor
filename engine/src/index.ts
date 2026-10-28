@@ -8303,6 +8303,12 @@ function pbAdiarYoutube(item: any, diasFrente: number): void {
     pbLog('yt-adiado', String(item.id), 'limite diario YT -> ' + novoId + ' @ ' + quando.toISOString());
   } catch (e) { pbLog('yt-adiado-erro', String(item.id), String((e as any)?.message || e)); }
 }
+// [+yt-browser-nuvem] extrai o ID do vídeo de uma URL youtu.be/<id> ou youtube.com/shorts/<id>
+function pbYtIdDaUrl(url?: string): string {
+  if (!url) return '';
+  const m = String(url).match(/(?:youtu\.be\/|shorts\/|[?&]v=)([\w-]{6,})/);
+  return m ? m[1] : '';
+}
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -8339,10 +8345,20 @@ async function pbPostarItem(item: any): Promise<void> {
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
       if (p === 'youtube') {
         if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: YouTube só vídeo aqui'; continue; }
-        // [guardrail-yt-limite 27/10] respeita o teto diário de uploads YT (cota compartilhada). Não conta como falha; o item escoa p/ outro dia.
-        if (!pbYtPodePostarHoje()) { resultados[p] = 'ADIADO: limite diario YouTube (' + pbYtCountHoje() + '/' + pbYtLimiteDia() + ')'; ytAdiado = true; continue; }
-        r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: pbFlagPriv(canalId), thumbFile });
-        pbYtRegistraUpload();
+        // [+yt-browser-nuvem 28/10] Método do YouTube: 'navegador' (invisível, sai pelo IP de casa via
+        // proxy, SEM cota) é o padrão; 'api' usa o OAuth antigo (com teto diário). Flag por canal ou global.
+        const _ytMetodo = pubFlag('pub_yt_metodo_' + canalId, '') || pubFlag('pub_yt_metodo', 'navegador');
+        if (_ytMetodo === 'navegador') {
+          const _ytmod: any = await import('./yt-browser-nuvem');
+          const _rb = await _ytmod.publicarYoutubeNuvem({ projeto: canalId, arquivo: file, titulo, descricao: descYt, thumbnailPath: thumbFile || '', privacy: pbFlagPriv(canalId) });
+          if (!_rb || !_rb.ok) throw new Error('navegador YT: ' + ((_rb && _rb.erro) || 'falhou') + (_rb && _rb.proxyUsado ? ' (proxy ' + _rb.proxyUsado + ')' : ''));
+          r = { id: pbYtIdDaUrl(_rb.postUrl) || '', url: _rb.postUrl || '' };
+        } else {
+          // [guardrail-yt-limite 27/10] API OAuth: respeita o teto diário de uploads YT (cota compartilhada). Não conta como falha; o item escoa p/ outro dia.
+          if (!pbYtPodePostarHoje()) { resultados[p] = 'ADIADO: limite diario YouTube (' + pbYtCountHoje() + '/' + pbYtLimiteDia() + ')'; ytAdiado = true; continue; }
+          r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: pbFlagPriv(canalId), thumbFile });
+          pbYtRegistraUpload();
+        }
       } else if (p === 'instagram') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
         else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial, trial: !!item.trial_reels }); }
@@ -8410,7 +8426,7 @@ async function tickPublicador() {
     const nowIso = new Date().toISOString();
     const itens = db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' AND data_agendada<=? AND COALESCE(aguardando_instrumento,0)=0 ORDER BY COALESCE(prioridade,0) DESC, data_agendada ASC LIMIT 5`).all(nowIso) as any[];
     for (const item of itens) {
-      try { await pbComTimeout(pbPostarItem(item), 8 * 60 * 1000); }
+      try { await pbComTimeout(pbPostarItem(item), 12 * 60 * 1000); }
       catch (e) { try { db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(new Date(Date.now() + 30 * 60000).toISOString(), 'timeout/erro worker: ' + String((e as any)?.message || e), agora(), item.id); } catch { /* */ } }
     }
   } finally { _pubBusy = false; }
@@ -8452,6 +8468,24 @@ app.post('/pub/plataformas-nuvem', (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 // [guardrail-yt-limite 27/10] lê/define o teto diário de uploads YouTube na nuvem (0 = sem limite). Mostra o contador de hoje (fuso BRT).
+// [+yt-browser-nuvem 28/10] Método de postagem do YouTube: 'navegador' (invisível, sem cota — padrão) | 'api' (OAuth c/ teto).
+// GET mostra o global + por canal. POST { metodo, canalId? } define (canalId vazio = global). metodo='' limpa o por-canal.
+app.get('/pub/publicador/yt-metodo', (_req, res) => {
+  const porCanal: any = {};
+  for (const c of ['teclado', 'baixo', 'violao', 'comunidade']) { const v = pubFlag('pub_yt_metodo_' + c, ''); if (v) porCanal[c] = v; }
+  res.json({ ok: true, global: pubFlag('pub_yt_metodo', 'navegador'), porCanal });
+});
+app.post('/pub/publicador/yt-metodo', (req, res) => {
+  try {
+    const b = req.body || {};
+    const metodo = String(b.metodo || '').toLowerCase();
+    if (metodo && metodo !== 'navegador' && metodo !== 'api') return res.status(400).json({ ok: false, erro: "metodo: 'navegador' | 'api' (ou vazio p/ limpar o por-canal)" });
+    const canalId = b.canalId ? String(b.canalId).toLowerCase() : '';
+    if (canalId) setPubFlag('pub_yt_metodo_' + canalId, metodo);
+    else setPubFlag('pub_yt_metodo', metodo || 'navegador');
+    res.json({ ok: true, global: pubFlag('pub_yt_metodo', 'navegador'), alterado: canalId || 'global', metodo: metodo || 'navegador' });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
 app.get('/pub/publicador/yt-limite', (_req, res) => { res.json({ ok: true, limiteDia: pbYtLimiteDia(), hoje: pbYtCountHoje(), dia: _pbDiaBRT(), podePostarAgora: pbYtPodePostarHoje() }); });
 app.post('/pub/publicador/yt-limite', (req, res) => {
   try {
@@ -8475,7 +8509,7 @@ app.post('/pub/publicador/testar', async (req, res) => {
     const item = id ? db.prepare(`SELECT * FROM fila_publicacao WHERE id=?`).get(String(id)) as any
       : db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' ORDER BY data_agendada ASC LIMIT 1`).get() as any;
     if (!item) return res.status(404).json({ ok: false, erro: 'nenhum item pra testar' });
-    await pbComTimeout(pbPostarItem(item), 8 * 60 * 1000);
+    await pbComTimeout(pbPostarItem(item), 12 * 60 * 1000);
     const depois = db.prepare(`SELECT status, resultado_por_plataforma_json, erro FROM fila_publicacao WHERE id=?`).get(item.id);
     res.json({ ok: true, item: item.id, resultado: depois });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
