@@ -409,12 +409,22 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     }
 
     // ETAPA 7: avançar pelo wizard (Monetização + Autocertificação), parando na Visibilidade.
+    let autocertEnviada = false; // depois de enviar 1x, o questionário fica TRAVADO na tela — não re-tenta
     async function preencherAutoCertificacao(): Promise<boolean> {
+      if (autocertEnviada) return false;
       const totalRadios = await page
         .locator('tp-yt-paper-radio-button[name^="VIDEO_SELF_CERTIFICATION_ANSWER_"]')
         .count()
         .catch(() => 0);
       if (!totalRadios) return false;
+      // Já foi enviada numa passada anterior? (os campos continuam na tela, só travados) → não re-tenta.
+      const jaBloqueada = await page
+        .evaluate(() => {
+          const t = ((globalThis as any).document.body?.innerText || '');
+          return /bloqueado porque você enviou|bloqueado porque voce enviou|classifica[çc][ãa]o enviada/i.test(t);
+        })
+        .catch(() => false);
+      if (jaBloqueada) { autocertEnviada = true; return false; }
       logI('autocertificacao detectada — expandindo e marcando "nao contem" em tudo', { totalRadios });
       await page
         .evaluate(async () => {
@@ -446,6 +456,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
         );
         const okSubmit = await clicarNativo('#submit-questionnaire-button');
         if (!okSubmit) await page.click('#submit-questionnaire-button', { timeout: 8000 });
+        autocertEnviada = true;
         await delayHumano(1000, 1800);
         await snap('07b-autocert-enviada');
         logI('classificacao enviada');
