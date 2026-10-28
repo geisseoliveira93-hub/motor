@@ -23,10 +23,16 @@
  * pode ser necessário um proxy residencial BR (mesma razão do TikTok).
  */
 
-import { chromium } from 'playwright';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
+
+// Navegador DISFARÇADO: patchright (igual ao PC) com fallback pro playwright comum. Lazy import
+// porque só é usado aqui — mantém o boot do engine leve e não quebra se um dos dois faltar.
+async function carregarChromium(): Promise<any> {
+  const mod: any = await import('patchright').catch(() => import('playwright'));
+  return mod.chromium;
+}
 
 const USER_AGENT_DEFAULT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
@@ -223,6 +229,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     } else {
       logW('SEM proxy residencial configurado — saindo pelo IP do servidor (datacenter); o Google provavelmente vai recusar');
     }
+    const chromium = await carregarChromium();
     browser = await chromium.launch(launchOpts);
     ctx = await browser.newContext({
       storageState: sess.storageState,
