@@ -10293,6 +10293,27 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
     videoEl.oncontextmenu=function(){return false;};
     vid.appendChild(videoEl);
     if(EVG){ videoEl.addEventListener('loadedmetadata',function(){ try{ var pp=Math.max(0,(snow()-SS)/1000); if(videoEl.duration&&pp<videoEl.duration){ videoEl.currentTime=pp; } }catch(e){} }); videoEl.addEventListener('seeking',function(){ try{ var mx=Math.max(0,(snow()-SS)/1000); if(videoEl.currentTime>mx+2){ videoEl.currentTime=mx; } }catch(e){} }); }
+    // [+sala-ao-vivo 27/10] Sessao com horario (ao vivo simulado): SEM controles (sem play/pause, tempo, barra, volume).
+    // Comeca sem som (o navegador so deixa tocar sozinho assim) com o botao "Clique para ativar o som";
+    // fica sempre no ponto "ao vivo" (quem entra depois pega do meio) e nao deixa pausar. Sala sem horario fica igual.
+    if(EVG){ try{
+      videoEl.controls=false; videoEl.removeAttribute('controls'); videoEl.muted=true; videoEl.defaultMuted=true; videoEl.setAttribute('muted','');
+      videoEl.setAttribute('tabindex','-1'); videoEl.style.pointerEvents='none';
+      var _vivoPos=function(){ return Math.max(0,(snow()-SS)/1000); };
+      var _sync=function(forca){ try{ var alvo=_vivoPos(); if(videoEl.duration&&alvo>=videoEl.duration){ return; } if(forca||Math.abs((videoEl.currentTime||0)-alvo)>5){ videoEl.currentTime=alvo; } }catch(e){} };
+      var _tocar=function(){ try{ var pr=videoEl.play(); if(pr&&pr.catch){ pr.catch(function(){}); } }catch(e){} };
+      var somBtn=document.createElement('button'); somBtn.type='button'; somBtn.textContent='🔊 Clique para ativar o som';
+      somBtn.style.cssText='position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:20;background:#F1541A;color:#fff;border:0;border-radius:999px;padding:12px 22px;font:700 15px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.4);cursor:pointer;white-space:nowrap';
+      var ativarSom=function(){ try{ videoEl.muted=false; videoEl.volume=1; }catch(e){} _sync(true); _tocar(); somBtn.style.display='none'; };
+      somBtn.onclick=function(ev){ if(ev){ ev.stopPropagation(); } ativarSom(); };
+      vid.appendChild(somBtn);
+      vid.addEventListener('click',function(){ if(videoEl.muted){ ativarSom(); } });
+      videoEl.addEventListener('volumechange',function(){ somBtn.style.display=videoEl.muted?'':'none'; });
+      videoEl.addEventListener('pause',function(){ if(!videoEl.ended && fase()==='vivo'){ setTimeout(function(){ _sync(true); _tocar(); },400); } });
+      setInterval(function(){ if(fase()!=='vivo' || videoEl.ended){ return; } if(videoEl.paused){ _sync(true); _tocar(); } else { _sync(false); } },8000);
+      document.addEventListener('keydown',function(ev){ var k=ev.key||''; if(k===' '||k==='k'||k==='K'||k==='ArrowLeft'||k==='ArrowRight'||k==='j'||k==='l'||k==='MediaPlayPause'){ if(!ev.target||!/^(INPUT|TEXTAREA)$/.test(ev.target.tagName||'')){ ev.preventDefault(); } } });
+      _tocar();
+    }catch(e){} }
   } else {
     var yid=ytId(cfg.youtube_url);
     if(yid){
