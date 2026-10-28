@@ -880,6 +880,18 @@ function produtoFluxoMatch(produtoId?: string, produtoNome?: string): FluxoProdu
   }
   return null;
 }
+/** [+recup-produto 28/10] Acha o fluxo de RECUPERAÇÃO do produto (igual ao produtoFluxoMatch, mas na lista de recuperação). */
+function _recupProdutoMatch(produtoId?: string, produtoNome?: string): any | null {
+  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
+  const id = String(produtoId || '').toLowerCase();
+  for (const fp of (((CONFIG as any).recuperacaoFluxoProduto) || [])) {
+    const chave = String(fp.chave || '').toLowerCase();
+    if (!chave) continue;
+    const casa = fp.porId ? (id && id === chave) : alvo.includes(chave);
+    if (casa && Array.isArray(fp.fluxo) && fp.fluxo.length) return fp;
+  }
+  return null;
+}
 
 // [+recup-dedup 28/10] tabela do anti-duplicado da recuperação (sobrevive a deploy, /data/engine.db).
 try { db.exec(`CREATE TABLE IF NOT EXISTS recup_enviada ( id TEXT PRIMARY KEY, telefone TEXT, projeto TEXT, criado_em TEXT )`); } catch { /* ja existe */ }
@@ -901,7 +913,7 @@ async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string
   return 'mensagem';
 }
 /** Dispara a RECUPERAÇÃO: usa o fluxo do projeto se houver; senão a mensagem simples. */
-async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string): Promise<'fluxo' | 'mensagem'> {
+async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
   // [+recup-dedup 28/10] a LastLink manda vários eventos "perdido" pro MESMO carrinho (abandonou/expirou/cancelou);
   // antes o motor disparava 1 recuperação por evento = mensagem duplicada/triplicada. Agora: 1 por telefone+projeto
   // a cada N horas (padrão 12; CONFIG.recupDedupHoras; 0 = sem trava). ADITIVO, best-effort (nunca bloqueia por erro).
@@ -917,6 +929,9 @@ async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: st
   // [+recup-numero 28/10] número DEDICADO de recuperação (CONFIG.numeroRecuperacao[projeto]); vazio = número padrão do projeto.
   // Resolve o caso de ter vazado pelo número pessoal quando o padrão zerou no deploy.
   const instRecup = (((CONFIG as any).numeroRecuperacao) || {})[projeto] || undefined;
+  // [+recup-produto 28/10] fluxo de recuperação POR PRODUTO (ex.: dedilhados manda vídeo+link); não afeta os outros produtos de teclado.
+  const fpRec = _recupProdutoMatch(produtoId, produtoNome);
+  if (fpRec) { enfileirarFluxo(projeto, telefone, fpRec.fluxo, nome, { chamarPeloNome: fpRec.chamarPeloNome, nomeFallback: fpRec.nomeFallback }, fpRec.instancia || instRecup, fpRec.chave); return 'fluxo'; }
   const fluxo = CONFIG.recuperacaoFluxo?.[projeto];
   if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome, undefined, instRecup); return 'fluxo'; }
   await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome), instRecup).catch(() => {});
@@ -1560,6 +1575,31 @@ app.post('/flows/produto/remover', (req, res) => {
   salvarConfig();
   removerFluxoEntregaDb(chave); // [entrega-perm] remove também da tabela
   res.json({ ok: true, removidos: antes - (CONFIG.entregaFluxoProduto || []).length });
+});
+// [+recup-produto 28/10] Fluxo de RECUPERAÇÃO por PRODUTO (igual ao de entrega, mas pra pagamento/carrinho perdido).
+// Persiste no CONFIG (sobrevive ao deploy via config_runtime/camada 1). Casa por nome/id do produto.
+app.get('/flows/recuperacao-produto', (_req, res) => { res.json({ ok: true, recuperacaoFluxoProduto: (CONFIG as any).recuperacaoFluxoProduto || [] }); });
+app.post('/flows/recuperacao-produto', (req, res) => {
+  const b = req.body || {};
+  const chave = String(b.chave || '').trim();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const item: any = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
+    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined),
+    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined) };
+  const lista = (CONFIG as any).recuperacaoFluxoProduto || [];
+  const i = lista.findIndex((f: any) => String(f.chave).toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
+  if (i >= 0) lista[i] = item; else lista.push(item);
+  (CONFIG as any).recuperacaoFluxoProduto = lista;
+  salvarConfig();
+  res.json({ ok: true, total: lista.length, item });
+});
+app.post('/flows/recuperacao-produto/remover', (req, res) => {
+  const chave = String((req.body || {}).chave || '').trim().toLowerCase();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const antes = ((CONFIG as any).recuperacaoFluxoProduto || []).length;
+  (CONFIG as any).recuperacaoFluxoProduto = ((CONFIG as any).recuperacaoFluxoProduto || []).filter((f: any) => String(f.chave).toLowerCase() !== chave);
+  salvarConfig();
+  res.json({ ok: true, removidos: antes - ((CONFIG as any).recuperacaoFluxoProduto || []).length });
 });
 
 // [entrega-manual] Põe um contato no fluxo de entrega de um produto (substitui as tags
@@ -3533,7 +3573,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
-        await dispararRecuperacao(projeto, p.telefone, p.nome).catch(() => {});
+        await dispararRecuperacao(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
         await rodarAutomacoes(projeto, 'pagamento_perdido', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'reembolso') {
         aplicarTag(projeto, cid, 'reembolso'); // sem mensagem automática
