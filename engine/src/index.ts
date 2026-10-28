@@ -32,8 +32,6 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 // Tokens que validam os webhooks de pagamento (vêm na URL: ?token=...).
 const GURU_TOKEN = process.env.GURU_TOKEN || '';
 const LASTLINK_TOKEN = process.env.LASTLINK_TOKEN || '';
-// [pagarme] Token que valida o webhook da Pagar.me (v5) — vem na URL: ?token=...
-const PAGARME_TOKEN = process.env.PAGARME_TOKEN || '';
 // (Opcional) Token do webhook da Cademí. As vendas hoje só passam por Guru/LastLink,
 // então a Cademí NÃO é necessária como gatilho de venda. Mas deixamos o endpoint pronto:
 // se um dia houver venda pelo checkout da própria Cademí, basta pôr CADEMI_TOKEN no .env
@@ -259,8 +257,6 @@ type FluxoPasso = {
   janela?: { de?: string; ate?: string };
   // (opcional) tag a aplicar neste passo (p/ passos de ação futuros). Hoje o seed não usa.
   tag?: string;
-  // [+webinario-dedilhados 28/10] pular este passo se a pessoa JÁ se inscreveu no webinário (Jornada). Checado na HORA do envio.
-  pularSeInscrito?: boolean;
 };
 // Um fluxo por PRODUTO: casa pelo id OU por um pedaço do nome do produto, e entrega
 // o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
@@ -299,11 +295,8 @@ type Config = {
   // [num-escolha] Número PADRÃO de envio por projeto (nome da instância). Usado por numeroConectado
   // como preferência; se vazio/desconectado, cai no 1º conectado. Evita mandar do número errado (ex.: pessoal).
   numeroPadrao?: Partial<Record<Projeto, string>>;
-  // [+presenca] mostrar "digitando…" (texto) e "gravando áudio…" (áudio) antes de enviar no 1-a-1. Default: ligado.
-  presencaSimulada?: boolean;
 };
 const CONFIG_DEFAULT: Config = {
-  presencaSimulada: true,
   produtoProjeto: {},
   palavraChaveProjeto: [
     { contem: 'baixo', projeto: 'baixo' },
@@ -345,35 +338,12 @@ function carregarConfig(): Config {
 }
 let CONFIG = carregarConfig();
 
-// ===================== [+seguranca-camada1] CONFIG também no BANCO (sobrevive a deploy) =====================
-// Problema histórico: o deploy copiava engine/config.json POR CIMA de /data/config.json e apagava os
-// configs de produção (agentesHabilitados, agenteModoWa, canalIg, numeroPadrao, presencaSimulada...).
-// Solução definitiva: espelhar TODO o CONFIG numa tabela do /data/engine.db (que o deploy NÃO toca).
-// No boot o BANCO MANDA: mescla o snapshot do banco POR CIMA do config.json. Como todos os setters já
-// chamam salvarConfig(), basta salvarConfig() gravar também no banco — cobre tudo de uma vez. Add-only.
-try { db.exec(`CREATE TABLE IF NOT EXISTS config_runtime ( chave TEXT PRIMARY KEY, valor TEXT NOT NULL, atualizado_em TEXT NOT NULL DEFAULT (datetime('now')) )`); } catch { /* ja existe */ }
-function _configRuntimeSalvar(): void {
-  try { db.prepare(`INSERT INTO config_runtime(chave,valor,atualizado_em) VALUES('CONFIG',?,datetime('now')) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em`).run(JSON.stringify(CONFIG)); } catch { /* best-effort */ }
-}
-function _configRuntimeCarregar(): void {
-  try {
-    const r = db.prepare(`SELECT valor FROM config_runtime WHERE chave='CONFIG'`).get() as any;
-    if (r && r.valor) { const snap = JSON.parse(r.valor); CONFIG = { ...CONFIG, ...snap }; console.log('[seguranca] CONFIG mesclado do banco (sobrevive a deploy).'); }
-    else { _configRuntimeSalvar(); console.log('[seguranca] config_runtime semeado do config.json (1a vez).'); }
-  } catch (e: any) { console.log('[seguranca] erro ao carregar config_runtime (seguindo):', e?.message || e); }
-}
-_configRuntimeCarregar();
-// Convenience p/ código novo: muda UMA chave de topo do CONFIG e já persiste nos 2 lugares.
-function salvarConfigPermanente(chave: string, valor: any): void { (CONFIG as any)[chave] = valor; salvarConfig(); }
-void salvarConfigPermanente; // reservado p/ uso futuro (evita "não usado")
-
 // ----------------------- Salvar config (construtor de fluxos do app) -----------------------
 // Grava o CONFIG atual em /data/config.json (volume do engine). Usado pelos endpoints /flows
 // pro app publicar os fluxos de entrega/recuperacao sem editar o arquivo na mao.
 function salvarConfig(): void {
   fs.mkdirSync('/data', { recursive: true });
   fs.writeFileSync('/data/config.json', JSON.stringify(CONFIG, null, 2), 'utf8');
-  try { _configRuntimeSalvar(); } catch { /* best-effort */ } // [+seguranca-camada1] espelha no banco (sobrevive a deploy)
 }
 
 // ----------------------- [entrega-perm] Fluxos de entrega PERMANENTES -----------------------
@@ -392,7 +362,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS fluxos_entrega (
 )`);
 // [entrega-janela/acompanhamento] colunas ADITIVAS na fila_envio: janela de horário por passo +
 // identificação do fluxo/passo (p/ a aba "Campanhas ativas": contadores, histórico, reenviar).
-for (const col of ['janela_de TEXT', 'janela_ate TEXT', 'fluxo_chave TEXT', 'passo INTEGER', 'pular_se_inscrito INTEGER DEFAULT 0']) {
+for (const col of ['janela_de TEXT', 'janela_ate TEXT', 'fluxo_chave TEXT', 'passo INTEGER']) {
   try { db.exec(`ALTER TABLE fila_envio ADD COLUMN ${col}`); } catch { /* já existe */ }
 }
 // HH:MM no fuso America/Sao_Paulo.
@@ -482,31 +452,12 @@ function _formaPagamento(provider: string, b: any): string {
   try {
     raw = String(provider === 'lastlink'
       ? (b?.Data?.Purchase?.PaymentMethod || b?.Data?.Purchase?.Payment?.Method || b?.Data?.Payment?.Method || b?.PaymentMethod || '')
-      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || b?.data?.charges?.[0]?.payment_method || b?.data?.payment_method || b?.data?.last_transaction?.transaction_type || b?.data?.charges?.[0]?.last_transaction?.transaction_type || '')).toLowerCase();
+      : (b?.payment?.method || b?.payment_method || b?.method || b?.payment?.type || '')).toLowerCase();
   } catch { /* */ }
   if (/pix/.test(raw)) return 'pix';
   if (/credit|cartao|card|credito/.test(raw)) return 'cartao-credito';
   if (/bol|billet/.test(raw)) return 'boleto';
   return '';
-}
-// [cartao-recusado] detecta recusa de cartao / sem limite dentro de um evento 'perdido'.
-// Olha o status cru + campos comuns de "motivo da recusa" dos provedores (Guru/LastLink).
-function _cartaoRecusado(provider: string, b: any, statusRaw: string): boolean {
-  const s = String(statusRaw || '').toLowerCase();
-  let motivo = '';
-  try {
-    motivo = String(
-      b?.payment?.refusal_reason || b?.payment?.refuse_reason || b?.payment?.message ||
-      b?.refusal_reason || b?.refuse_reason || b?.decline_reason || b?.motivo ||
-      b?.Data?.Purchase?.Payment?.RefusalReason || b?.Data?.Purchase?.RefusalReason ||
-      b?.Data?.Purchase?.Payment?.Message || ''
-    ).toLowerCase();
-  } catch { /* */ }
-  const txt = s + ' ' + motivo;
-  const recusa = /refus|recus|declin|denied|negad|insufficient|sem.?limit|no.?funds|not.?authorized|nao.?autoriz|n\u00e3o.?autoriz|card.?error|cart.?recus/.test(txt);
-  if (!recusa) return false;
-  const forma = _formaPagamento(provider, b);
-  return forma === 'cartao-credito' || forma === '' || /cart|card|credit/.test(txt);
 }
 // Tags no formato Sellflux: LastLink por ID do produto/oferta; Guru por slug do nome.
 function tagsCompraAuto(provider: string, b: any, p: { produtoId?: string; produtoNome?: string; status?: string }): string[] {
@@ -556,88 +507,6 @@ function seedFluxoDedilhados(): void {
   } catch (e: any) { console.log('[entrega-dedilhados] erro no seed (seguindo):', e?.message || e); }
 }
 seedFluxoDedilhados();
-
-// ===================== [+recup-dedilhados] Fluxo de recuperação "Dedilhados – Botão WhatsApp" =====================
-// Quem toca no botão de WhatsApp da página de Dedilhados chega no 8151 com a FRASE-GATILHO. O motor, sozinho:
-// detecta a frase -> aplica tag -> dispara 3 mensagens (texto+vídeo+texto / imagem+texto / texto) -> e PARA na hora
-// se a pessoa RESPONDER (cancela pendentes + handoff pro agente de venda) ou COMPRAR (cancela pendentes).
-// PERMANENTE por natureza: o fluxo é FIXO no código (sobrevive a deploy, não depende de config.json).
-// SEPARADO do CONFIG.recuperacaoFluxo genérico (carrinho abandonado de todos os produtos de teclado).
-const _RECUP_DED_CHAVE = 'recuperacao-dedilhados-botao';
-const _RECUP_DED_TAG = 'lead-dedilhados-botao';
-const _RECUP_DED_FRASE = 'pagina do metodo de dedilhados'; // comparado sem acento e em minúsculo
-const _RECUP_DED_INST = 'Teclado-mr3-novo'; // número 8151
-const _RECUP_DED_AGENTE = 'Vendas Low Dedilhados';
-const _RECUP_DED_CKT = 'https://lastlink.com/p/CD0AA67DB/checkout-payment';
-const _RECUP_DED_FLUXO: FluxoPasso[] = [
-  { tipo: 'texto', delaySegundos: 0, texto: 'Oi! Que bom que você veio pela página dos dedilhados 😊\nFiz esse vídeo rapidinho pra te mostrar por dentro como são as aulas e o que você recebe.\nDá uma olhada com calma 👇' },
-  { tipo: 'video', delaySegundos: 3, url: 'https://motor.melodiaseriffs.com.br/media/e09ef5bf2fc9c2b3.mp4', legenda: '' },
-  { tipo: 'texto', delaySegundos: 3, texto: 'Resumindo o que você leva 👇\n\n🎹 20 dedilhados em vídeo, passo a passo (tecla por tecla)\n📄 PDF com todos organizados pra consultar na hora\n⏱️ Exercícios pra soltar os dedos e ganhar velocidade\n🎁 4 bônus: rotina de 15 min/dia, acordes + baixos, exercícios de fluidez e o mapa visual dos dedilhados\n\nTudo com acesso vitalício — é seu pra sempre, estuda no seu tempo 🙏🏼\n\nE tá rolando a promoção de Black antecipada: de R$97 por R$37 à vista.\n\n👉 Pra garantir o seu acesso: ' + _RECUP_DED_CKT + '\n\nQualquer dúvida é só me chamar aqui 😊' },
-  { tipo: 'imagem', delaySegundos: 10800, url: 'https://motor.melodiaseriffs.com.br/media/a26d4d04182a3159.png', legenda: '' }, // msg 2 = 3h depois da msg 1
-  { tipo: 'texto', delaySegundos: 3, texto: '{nome}, deixa eu tirar as dúvidas mais comuns antes de você decidir 😊\n\n❓ "Sou iniciante, será que consigo?" — Consegue sim, é feito pra quem tá começando, bem devagar, tecla por tecla.\n❓ "Não tenho muito tempo" — Tem um bônus só sobre praticar em 15 minutinhos por dia.\n❓ "Já tenho uma idade" — Tem gente de 60+ tocando em dedilhado hoje. Não é dom, é método 🙏🏼\n\nE você ainda tem 7 dias de garantia: se não curtir, devolvo todo o valor, sem complicação.\n\n👉 ' + _RECUP_DED_CKT },
-  { tipo: 'texto', delaySegundos: 86400, janela: { de: '08:00', ate: '22:00' }, texto: 'Oi {nome}! Passando só pra lembrar que a promoção da Black antecipada (de R$97 por R$37) ainda tá de pé por aqui 🎹\n\nSe tá querendo tocar os louvores com mais firmeza e emoção, esse é o empurrãozinho pra começar hoje mesmo 😊\n\n⚠️ Só que esse valor é por tempo limitado — quando a Black antecipada encerrar, volta pro preço normal. Não deixa pra depois e acabar perdendo 🙏🏼\n\n👉 Garante agora o seu acesso: ' + _RECUP_DED_CKT }, // msg 3 = 1 dia depois da msg 2, só 08-22h
-];
-// [+flows-motor] Override EDITÁVEL dos fluxos FIXOS (ex.: recuperação dedilhados).
-// Fica no banco /data/engine.db -> SOBREVIVE A DEPLOY. Sem override, usa o padrão do código.
-// Só ADICIONA: o _RECUP_DED_FLUXO continua intacto como padrão/fallback.
-try { db.exec(`CREATE TABLE IF NOT EXISTS fluxo_fixo_override ( chave TEXT PRIMARY KEY, fluxo_json TEXT, atualizado_em TEXT )`); } catch { /* ja existe */ }
-function _fixoOverrideGet(chave: string): FluxoPasso[] | null {
-  try {
-    const r = db.prepare(`SELECT fluxo_json FROM fluxo_fixo_override WHERE chave=?`).get(String(chave)) as any;
-    if (!r || !r.fluxo_json) return null;
-    const arr = JSON.parse(r.fluxo_json);
-    return (Array.isArray(arr) && arr.length) ? arr as FluxoPasso[] : null;
-  } catch { return null; }
-}
-function _fixoOverrideSave(chave: string, fluxo: FluxoPasso[]): void {
-  db.prepare(`INSERT OR REPLACE INTO fluxo_fixo_override(chave,fluxo_json,atualizado_em) VALUES(?,?,?)`).run(String(chave), JSON.stringify(fluxo || []), agora());
-}
-function _fixoOverrideDel(chave: string): void {
-  try { db.prepare(`DELETE FROM fluxo_fixo_override WHERE chave=?`).run(String(chave)); } catch { /* */ }
-}
-// Fluxo ATUAL da recuperação dedilhados: override salvo (se houver) OU o padrão fixo do código.
-function _recupDedFluxoAtual(): FluxoPasso[] {
-  return _fixoOverrideGet(_RECUP_DED_CHAVE) || _RECUP_DED_FLUXO;
-}
-
-function _normFrase(s: any): string {
-  try { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); } catch { return String(s || '').toLowerCase(); }
-}
-function _contatoTemTagNome(projeto: string, contatoId: string, tagNome: string): boolean {
-  try {
-    const t = db.prepare(`SELECT id FROM tags WHERE projeto=? AND nome=?`).get(projeto, tagNome) as any;
-    if (!t) return false;
-    return !!(db.prepare(`SELECT 1 FROM contato_tags WHERE contato_id=? AND tag_id=? LIMIT 1`).get(contatoId, t.id) as any);
-  } catch { return false; }
-}
-function _recupDedPendentes(telefone: string): number {
-  try { return Number((db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE para=? AND fluxo_chave=? AND status='pendente'`).get(String(telefone), _RECUP_DED_CHAVE) as any)?.n || 0); } catch { return 0; }
-}
-function _recupDedCancelarPendentes(telefone: string): number {
-  try { return Number((db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE para=? AND fluxo_chave=? AND status='pendente'`).run(String(telefone), _RECUP_DED_CHAVE) as any)?.changes || 0); } catch { return 0; }
-}
-function _iniciarRecupDedilhados(projeto: string, contatoId: string, telefone: string, nomeBruto?: string): boolean {
-  try {
-    // DEDUP "passa 1 vez": já tem a tag OU já existe qualquer mensagem desse fluxo p/ esse número
-    if (_contatoTemTagNome(projeto, contatoId, _RECUP_DED_TAG)) return false;
-    try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave=? LIMIT 1`).get(String(telefone), _RECUP_DED_CHAVE) as any) return false; } catch { /* */ }
-    aplicarTag(projeto, contatoId, _RECUP_DED_TAG);
-    try { rodarAutomacoes(projeto, 'tag_adicionada', { contatoId, telefone, tag: _RECUP_DED_TAG }).catch(() => { /* */ }); } catch { /* */ }
-    enfileirarFluxo(projeto as Projeto, String(telefone), _recupDedFluxoAtual(), _primeiroNomeBonito(nomeBruto), { chamarPeloNome: true, nomeFallback: '' }, _RECUP_DED_INST, _RECUP_DED_CHAVE);
-    return true;
-  } catch { return false; }
-}
-function _handoffRecupDedilhados(projeto: string, contatoId: string, telefone: string, ultimaMsg: string, instancia?: string): void {
-  try {
-    const a = (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE projeto=? AND lower(nome)=lower(?) LIMIT 1`).get(projeto, _RECUP_DED_AGENTE) as any)
-      || (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE lower(nome)=lower(?) LIMIT 1`).get(_RECUP_DED_AGENTE) as any);
-    if (!a) return; // agente ainda não criado -> não faz handoff (não quebra nada)
-    try { db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(contatoId, a.id, 'handoff-recup-dedilhados', agora()); } catch { /* */ }
-    try { const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(contatoId) as any; if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id); } catch { /* */ }
-    const _ct = db.prepare(`SELECT nome FROM contatos WHERE id=?`).get(contatoId) as any;
-    processarMensagemAgente(projeto, String(telefone), String(ultimaMsg || ''), (_ct && _ct.nome) || undefined, contatoId, { instancia: instancia || undefined, ativacaoManual: true }).catch(() => { /* */ });
-  } catch { /* best-effort: handoff nunca quebra o webhook */ }
-}
 
 
 /** Descobre o projeto de um pagamento pelo produto (id, nome).
@@ -772,31 +641,11 @@ function numeroConectado(projeto: Projeto): any {
   ).get(projeto);
 }
 
-// [+presenca] "digitando…" (texto) e "gravando áudio…" (áudio) antes de enviar — ritmo humano.
-// Global, LIGADO por padrão (CONFIG.presencaSimulada). SÓ no 1-a-1 (nunca em grupo) e SÓ nos envios
-// enviarTexto/enviarMidia (agentes, entrega, recuperação, lembretes) — NÃO no disparo em massa.
-function _presencaLigada(): boolean { const v = (CONFIG as any).presencaSimulada; return v === undefined ? true : !!v; }
-function _presencaMs(ref: string, modo: 'composing' | 'recording'): number {
-  if (modo === 'recording') return 2800;
-  const n = String(ref || '').length;
-  return Math.min(6000, Math.max(1400, Math.round((n / 22) * 1000))); // ~22 caracteres/seg
-}
-async function _simularPresenca(inst: string, para: string, modo: 'composing' | 'recording', ref: string): Promise<void> {
-  try {
-    if (!_presencaLigada()) return;
-    if (!inst || !para || String(para).includes('@g.us')) return; // nunca em grupo
-    const ms = _presencaMs(ref, modo);
-    try { await evo(`/chat/sendPresence/${encodeURIComponent(inst)}`, 'POST', { number: para, delay: ms, presence: modo }); } catch { /* best-effort */ }
-    await new Promise((r) => setTimeout(r, ms));
-  } catch { /* nunca quebra o envio */ }
-}
-
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
 async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string) {
   // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
   const inst = instancia || numeroConectado(projeto)?.instancia;
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
-  await _simularPresenca(inst, para, 'composing', texto); // [+presenca] "digitando…"
   return evo(`/message/sendText/${inst}`, 'POST', {
     number: para, text: texto,
   });
@@ -808,7 +657,6 @@ async function enviarMidia(projeto: Projeto, para: string, tipo: string, url: st
   const inst = instancia || numeroConectado(projeto)?.instancia;
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
   if (!url) throw new Error('midia_sem_url');
-  await _simularPresenca(inst, para, tipo === 'audio' ? 'recording' : 'composing', legenda || ''); // [+presenca] "gravando áudio…"/"digitando…"
   if (tipo === 'audio') {
     return evo(`/message/sendWhatsAppAudio/${inst}`, 'POST', { number: para, audio: url });
   }
@@ -830,21 +678,12 @@ async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, no
 
 /** Enfileira um FLUXO (vários passos com delay) pra um contato. O worker manda no ritmo,
  * respeitando o delay de cada passo (agendado_para). Preenche {nome} em texto/legenda. */
-// [+webinario-dedilhados 28/10] a pessoa já se inscreveu no webinário (Jornada)? Casa pelos últimos 8 dígitos do telefone.
-function _jornadaInscrito(telefone: string): boolean {
-  try {
-    const t = String(telefone || '').replace(/\D/g, ''); if (t.length < 8) return false;
-    const fim = t.slice(-8);
-    const r = db.prepare(`SELECT 1 FROM jornada_inscritos WHERE status!='cancelado' AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + fim);
-    return !!r;
-  } catch { return false; }
-}
 function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome, instancia?: string, chave?: string) {
   // [num-escolha] instancia opcional: grava o número de envio na fila; o tickFila respeita.
   // [entrega-janela/acompanhamento] grava também janela_de/ate (janela de horário) + fluxo_chave/passo (p/ Campanhas ativas).
   const ins = db.prepare(
-    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,janela_de,janela_ate,fluxo_chave,passo,pular_se_inscrito)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,janela_de,janela_ate,fluxo_chave,passo)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   );
   let acumulado = 0;
   const tx = db.transaction(() => {
@@ -856,7 +695,7 @@ function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], n
       const legenda = tipo === 'texto' ? '' : preencheNome(p.texto || p.legenda || '', nome, opts);
       ins.run(randomUUID(), projeto, para, 0, texto, tipo, p.url || null, legenda || null,
         'pendente', instancia || null, emSegundos(acumulado), agora(),
-        (p.janela?.de || null), (p.janela?.ate || null), (chave || null), idx, (p.pularSeInscrito ? 1 : 0));
+        (p.janela?.de || null), (p.janela?.ate || null), (chave || null), idx);
       idx++;
     }
   });
@@ -891,26 +730,9 @@ function produtoFluxoMatch(produtoId?: string, produtoNome?: string): FluxoProdu
   }
   return null;
 }
-/** [+recup-produto 28/10] Acha o fluxo de RECUPERAÇÃO do produto (igual ao produtoFluxoMatch, mas na lista de recuperação). */
-function _recupProdutoMatch(produtoId?: string, produtoNome?: string): any | null {
-  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
-  const id = String(produtoId || '').toLowerCase();
-  for (const fp of (((CONFIG as any).recuperacaoFluxoProduto) || [])) {
-    const chave = String(fp.chave || '').toLowerCase();
-    if (!chave) continue;
-    const casa = fp.porId ? (id && id === chave) : alvo.includes(chave);
-    if (casa && Array.isArray(fp.fluxo) && fp.fluxo.length) return fp;
-  }
-  return null;
-}
 
-// [+recup-dedup 28/10] tabela do anti-duplicado da recuperação (sobrevive a deploy, /data/engine.db).
-try { db.exec(`CREATE TABLE IF NOT EXISTS recup_enviada ( id TEXT PRIMARY KEY, telefone TEXT, projeto TEXT, criado_em TEXT )`); } catch { /* ja existe */ }
-try { db.exec(`CREATE INDEX IF NOT EXISTS ix_recup_env ON recup_enviada(telefone,projeto,criado_em)`); } catch { /* ja existe */ }
 /** Dispara a ENTREGA: usa o fluxo do produto/projeto se houver; senão a mensagem simples. */
 async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
-  // [+recup-dedilhados] se a compra é do dedilhados, cancela o fluxo de recuperação pendente (não cobrar quem já comprou)
-  try { if (/dedilhado/i.test(`${produtoId || ''} ${produtoNome || ''}`)) _recupDedCancelarPendentes(String(telefone || '')); } catch { /* best-effort */ }
   // Fluxo do PRODUTO (traz junto as opções de "chamar pelo nome"); senão fluxo por projeto.
   const fpProduto = produtoFluxoMatch(produtoId, produtoNome);
   // [campanhas-ativas] fluxo PAUSADO: novo comprador NÃO entra (não dispara nada deste produto).
@@ -924,28 +746,10 @@ async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string
   return 'mensagem';
 }
 /** Dispara a RECUPERAÇÃO: usa o fluxo do projeto se houver; senão a mensagem simples. */
-async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
-  // [+recup-dedup 28/10] a LastLink manda vários eventos "perdido" pro MESMO carrinho (abandonou/expirou/cancelou);
-  // antes o motor disparava 1 recuperação por evento = mensagem duplicada/triplicada. Agora: 1 por telefone+projeto
-  // a cada N horas (padrão 12; CONFIG.recupDedupHoras; 0 = sem trava). ADITIVO, best-effort (nunca bloqueia por erro).
-  try {
-    const horas = Number((CONFIG as any).recupDedupHoras ?? 12);
-    if (horas > 0) {
-      const limite = new Date(Date.now() - horas * 3600 * 1000).toISOString();
-      const ja = db.prepare(`SELECT 1 FROM recup_enviada WHERE telefone=? AND projeto=? AND criado_em>? LIMIT 1`).get(String(telefone || ''), projeto, limite);
-      if (ja) return 'mensagem'; // já mandou recentemente — ignora o evento repetido
-      db.prepare(`INSERT INTO recup_enviada(id,telefone,projeto,criado_em) VALUES(?,?,?,?)`).run(randomUUID(), String(telefone || ''), projeto, agora());
-    }
-  } catch { /* best-effort */ }
-  // [+recup-numero 28/10] número DEDICADO de recuperação (CONFIG.numeroRecuperacao[projeto]); vazio = número padrão do projeto.
-  // Resolve o caso de ter vazado pelo número pessoal quando o padrão zerou no deploy.
-  const instRecup = (((CONFIG as any).numeroRecuperacao) || {})[projeto] || undefined;
-  // [+recup-produto 28/10] fluxo de recuperação POR PRODUTO (ex.: dedilhados manda vídeo+link); não afeta os outros produtos de teclado.
-  const fpRec = _recupProdutoMatch(produtoId, produtoNome);
-  if (fpRec) { enfileirarFluxo(projeto, telefone, fpRec.fluxo, nome, { chamarPeloNome: fpRec.chamarPeloNome, nomeFallback: fpRec.nomeFallback }, fpRec.instancia || instRecup, fpRec.chave); return 'fluxo'; }
+async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: string): Promise<'fluxo' | 'mensagem'> {
   const fluxo = CONFIG.recuperacaoFluxo?.[projeto];
-  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome, undefined, instRecup); return 'fluxo'; }
-  await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome), instRecup).catch(() => {});
+  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome); return 'fluxo'; }
+  await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome)).catch(() => {});
   return 'mensagem';
 }
 
@@ -1058,12 +862,9 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/capi/webhook/')) return next(); // etapa29: webhook público de venda (Hotmart/Kiwify/Guru chamam sem x-api-key)
   if (req.path === '/track/snippet.js') return next(); // [#5 rastreio] snippet do navegador (sem x-api-key)
   if (req.path === '/track/evento') return next();     // [#5 rastreio] evento do navegador (sem x-api-key)
-  if (req.path.startsWith('/obs/on_publish')) return next(); // [+obs] webhooks do nginx-rtmp (valida por token na query)
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
-  if (req.path.startsWith('/j/')) return next();      // [jornada 27/10] links pessoais do webinário (sala/oferta/vídeo), validados pelo token
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
-  if (req.path.startsWith('/w-media/')) return next(); // [+webinario-storage] serve o vídeo próprio do webinário (OneDrive) pro player, sem x-api-key
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
   if (req.path.startsWith('/e-api/')) return next();  // [evento] API publica do evento (inscricao)
   if (req.path.startsWith('/c/')) return next();      // [#13 convite] pagina publica do convite (o aluno ve e agenda)
@@ -1073,7 +874,6 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/oauth/')) return next(); // [MCP OAuth] authorize/token/register (gate pela MCP_API_KEY)
   if (req.path === '/area' || req.path.startsWith('/area/')) return next(); // [B] area de membros (auth propria por cookie)
   if (req.path === '/academy/audio-push' || req.path.startsWith('/academy/audio-push/')) return next(); // [B.16] upload/lista de audio da aula — gate por AUDIO_PUSH_TOKEN (nao usa ENGINE_API_KEY)
-  if (req.path === '/painel/trafego' || req.path === '/painel/trafego/dados') return next(); // [painel-trafego] painel web so-leitura: trava propria por token ?k= (NAO liberar /painel/token, que e admin)
   const ip = ipDoReq(req);
   const agora2 = Date.now();
   const reg = falhasAuth.get(ip);
@@ -1329,7 +1129,7 @@ app.get('/numbers/:instancia/status', async (req, res) => {
 });
 
 // Recarrega a config (produto->projeto, mensagens) sem reiniciar o serviço.
-app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); _configRuntimeCarregar(); res.json({ ok: true, config: CONFIG }); }); // [+fix-token] re-mescla config_runtime (produção/token sobrevivem ao reload, igual ao boot)
+app.post('/config/reload', (_req, res) => { CONFIG = carregarConfig(); res.json({ ok: true, config: CONFIG }); });
 app.get('/config', (_req, res) => res.json(CONFIG));
 
 // ======================= API SELLFLUX (CRM / Kanban / Agenda / Inbox / Respostas) =======================
@@ -1547,7 +1347,6 @@ function normalizaFluxo(f: any): FluxoPasso[] {
     // [entrega-janela] janela de horário opcional por passo (HH:MM, fuso SP)
     janela: (p?.janela && (p.janela.de || p.janela.ate)) ? { de: String(p.janela.de || ''), ate: String(p.janela.ate || '') } : undefined,
     tag: p?.tag != null ? String(p.tag) : undefined,
-    pularSeInscrito: !!p?.pularSeInscrito, // [+webinario-dedilhados] pular passo se já inscrito no webinário
   }));
 }
 
@@ -1587,31 +1386,6 @@ app.post('/flows/produto/remover', (req, res) => {
   salvarConfig();
   removerFluxoEntregaDb(chave); // [entrega-perm] remove também da tabela
   res.json({ ok: true, removidos: antes - (CONFIG.entregaFluxoProduto || []).length });
-});
-// [+recup-produto 28/10] Fluxo de RECUPERAÇÃO por PRODUTO (igual ao de entrega, mas pra pagamento/carrinho perdido).
-// Persiste no CONFIG (sobrevive ao deploy via config_runtime/camada 1). Casa por nome/id do produto.
-app.get('/flows/recuperacao-produto', (_req, res) => { res.json({ ok: true, recuperacaoFluxoProduto: (CONFIG as any).recuperacaoFluxoProduto || [] }); });
-app.post('/flows/recuperacao-produto', (req, res) => {
-  const b = req.body || {};
-  const chave = String(b.chave || '').trim();
-  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
-  const item: any = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
-    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined),
-    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined) };
-  const lista = (CONFIG as any).recuperacaoFluxoProduto || [];
-  const i = lista.findIndex((f: any) => String(f.chave).toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
-  if (i >= 0) lista[i] = item; else lista.push(item);
-  (CONFIG as any).recuperacaoFluxoProduto = lista;
-  salvarConfig();
-  res.json({ ok: true, total: lista.length, item });
-});
-app.post('/flows/recuperacao-produto/remover', (req, res) => {
-  const chave = String((req.body || {}).chave || '').trim().toLowerCase();
-  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
-  const antes = ((CONFIG as any).recuperacaoFluxoProduto || []).length;
-  (CONFIG as any).recuperacaoFluxoProduto = ((CONFIG as any).recuperacaoFluxoProduto || []).filter((f: any) => String(f.chave).toLowerCase() !== chave);
-  salvarConfig();
-  res.json({ ok: true, removidos: antes - ((CONFIG as any).recuperacaoFluxoProduto || []).length });
 });
 
 // [entrega-manual] Põe um contato no fluxo de entrega de um produto (substitui as tags
@@ -1708,56 +1482,6 @@ app.post('/flows/projeto', (req, res) => {
   else CONFIG.recuperacaoFluxo = { ...(CONFIG.recuperacaoFluxo || {}), [projeto]: fluxo };
   salvarConfig();
   res.json({ ok: true, projeto, tipo, passos: fluxo.length });
-});
-
-// [+flows-motor] Visão UNIFICADA de TODOS os fluxos do motor (p/ a tela "Fluxos do motor").
-// Junta: entrega por produto, entrega/recuperação por projeto e os fluxos FIXOS (recup dedilhados).
-app.get('/flows/motor', (_req, res) => {
-  try {
-    const fixoDed = {
-      chave: _RECUP_DED_CHAVE, kind: 'fixo',
-      titulo: 'Dedilhados — Botão WhatsApp', projeto: 'teclado',
-      instancia: _RECUP_DED_INST, trigger: _RECUP_DED_FRASE, tag: _RECUP_DED_TAG,
-      agente: _RECUP_DED_AGENTE, checkout: _RECUP_DED_CKT,
-      editado: !!_fixoOverrideGet(_RECUP_DED_CHAVE),
-      stops: [
-        { ic: '✋', t: 'Se a pessoa RESPONDER', d: 'Cancela as mensagens pendentes e passa pro agente "' + _RECUP_DED_AGENTE + '".' },
-        { ic: '🛒', t: 'Se a pessoa COMPRAR', d: 'Cancela as mensagens pendentes na hora.' },
-      ],
-      fluxo: _recupDedFluxoAtual(),
-    };
-    res.json({
-      ok: true,
-      produto: (CONFIG.entregaFluxoProduto || []),
-      entregaProjeto: (CONFIG.entregaFluxo || {}),
-      recuperacaoProjeto: (CONFIG.recuperacaoFluxo || {}),
-      fixos: [fixoDed],
-      presencaSimulada: _presencaLigada(),
-    });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-
-// [+flows-motor] Salva o override de um fluxo FIXO (sobrevive a deploy). body: { chave, fluxo:[] }
-app.post('/flows/fixo/salvar', (req, res) => {
-  try {
-    const b = req.body || {};
-    const chave = String(b.chave || '').trim();
-    if (chave !== _RECUP_DED_CHAVE) return res.status(400).json({ ok: false, erro: 'chave_nao_permitida' });
-    const fluxo = normalizaFluxo(b.fluxo);
-    if (!fluxo.length) return res.status(400).json({ ok: false, erro: 'fluxo_vazio' });
-    _fixoOverrideSave(chave, fluxo);
-    res.json({ ok: true, chave, passos: fluxo.length });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-
-// [+flows-motor] Volta o fluxo FIXO pro padrão do código (remove o override). body: { chave }
-app.post('/flows/fixo/reset', (req, res) => {
-  try {
-    const chave = String((req.body || {}).chave || '').trim();
-    if (chave !== _RECUP_DED_CHAVE) return res.status(400).json({ ok: false, erro: 'chave_nao_permitida' });
-    _fixoOverrideDel(chave);
-    res.json({ ok: true, chave, restaurado: true });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
 
@@ -2342,10 +2066,6 @@ app.post('/pagina', (req, res) => {
 });
 app.post('/pagina/remover', (req, res) => { db.prepare(`DELETE FROM paginas WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
 app.get('/config/base', (_req, res) => { res.json({ ok: true, base: PUBLIC_BASE_URL || '' }); });
-
-// [+presenca] ligar/desligar o "digitando…/gravando áudio…" antes de enviar (1-a-1). Default: ligado.
-app.get('/config/presenca', (_req, res) => { res.json({ ok: true, ligado: _presencaLigada() }); });
-app.post('/config/presenca', (req, res) => { const b = req.body || {}; (CONFIG as any).presencaSimulada = (b.ligado !== false); salvarConfig(); res.json({ ok: true, ligado: _presencaLigada() }); });
 // [pagina-ia] Edita o HTML da página por instrução em português (usa o provedor de IA do motor).
 // Recebe { html, instrucao } e devolve { ok, html } com o HTML completo já alterado.
 app.post('/pagina/ia', async (req, res) => {
@@ -2400,7 +2120,7 @@ const _TRACK_PAGINA_JS = `(function(){
       }
       var CK=/(guru|lastlink|hotmart|kiwify|eduzz|monetizze|cakto|payt|kirvano|checkout|pay\\.|carrinho|comprar|assinar|inscrever)/i;
       var temCk=false; var as=document.querySelectorAll('a[href]');
-      for(var k=0;k<as.length;k++){ (function(a){ var h=a.getAttribute('href')||''; if(CK.test(h)){ temCk=true; if(a.getAttribute('data-mr-evento')==null) a.addEventListener('click',function(){ try{ var _k='_mr_ic_'+(location.pathname||''); var _n=Date.now(); var _l=0; try{ _l=parseInt(sessionStorage.getItem(_k)||localStorage.getItem(_k)||'0',10)||0; }catch(e){} if(_n-_l<1800000) return; try{ sessionStorage.setItem(_k,String(_n)); }catch(e){} try{ localStorage.setItem(_k,String(_n)); }catch(e){} }catch(e){} track('InitiateCheckout',{content_name:document.title||''}); }); } })(as[k]); }
+      for(var k=0;k<as.length;k++){ (function(a){ var h=a.getAttribute('href')||''; if(CK.test(h)){ temCk=true; if(a.getAttribute('data-mr-evento')==null) a.addEventListener('click',function(){ track('InitiateCheckout',{content_name:document.title||''}); }); } })(as[k]); }
       if(temCk) track('ViewContent',{content_name:document.title||''});
     }catch(e){}
   }
@@ -2653,8 +2373,6 @@ function _utmDoPayload(b: any): any {
   return o;
 }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN dominio_id TEXT`); } catch { /* existe */ }
-try { db.exec(`ALTER TABLE email_fila ADD COLUMN anexos TEXT`); } catch { /* existe */ } // [email-anexos] json [{nome,url|base64|caminho,tipo?}]
-try { db.exec(`ALTER TABLE email_fila ADD COLUMN agendado_para TEXT`); } catch { /* existe */ } // [email-agendado] envio agendado (boas-vindas/nps/upsell)
 
 // [email] enviador SMTP self-contido (net/tls do Node, sem dependencia nova). Suporta
 // TLS implicito (465) e STARTTLS (587), AUTH LOGIN. Usado pelo worker da fila e pelo teste.
@@ -2672,67 +2390,7 @@ function _smtpConn(sock: any): { wait: () => Promise<any>; send: (l: string) => 
   sock.on('close', () => settleErr(new Error('conexao SMTP fechada')));
   return { wait: () => new Promise((res, rej) => { resolver = res; rejecter = rej; }), send: (l: string) => { try { sock.write(l + '\r\n'); } catch (e) { settleErr(e); } } };
 }
-// [email-anexos] MIME do e-mail. Sem anexos = text/html (identico ao de antes).
-// Com anexos = multipart/mixed (HTML + cada arquivo base64). anexo: {nome,tipo?,base64}.
-function _emailMontarMIME(fromName: string, fromAddr: string, para: string, assunto: string, html: string, anexos?: any[]): string {
-  const htmlPart = String(html || '').replace(/\r?\n/g, '\r\n').replace(/^\./gm, '..');
-  const cab = [
-    'From: ' + _mimeEnc(fromName) + ' <' + fromAddr + '>',
-    'To: ' + para,
-    'Subject: ' + _mimeEnc(assunto),
-    'MIME-Version: 1.0',
-  ];
-  const lista = Array.isArray(anexos) ? anexos.filter((a) => a && a.base64 && String(a.base64).length) : [];
-  if (!lista.length) {
-    return cab.concat(['Content-Type: text/html; charset=UTF-8', 'Content-Transfer-Encoding: 8bit', '', htmlPart, '.']).join('\r\n');
-  }
-  const bnd = 'mr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
-  const partes: string[] = cab.concat([
-    'Content-Type: multipart/mixed; boundary="' + bnd + '"', '',
-    '--' + bnd, 'Content-Type: text/html; charset=UTF-8', 'Content-Transfer-Encoding: 8bit', '', htmlPart, ''
-  ]);
-  for (const a of lista) {
-    const nome = String(a.nome || 'arquivo');
-    const tipo = String(a.tipo || 'application/octet-stream');
-    const b64 = String(a.base64).replace(/\s+/g, '').replace(/.{76}/g, '$&\r\n');
-    partes.push('--' + bnd, 'Content-Type: ' + tipo + '; name="' + _mimeEnc(nome) + '"', 'Content-Transfer-Encoding: base64', 'Content-Disposition: attachment; filename="' + _mimeEnc(nome) + '"', '', b64, '');
-  }
-  partes.push('--' + bnd + '--', '.');
-  return partes.join('\r\n');
-}
-function _nomeDeUrl(u: string): string { try { const p = new URL(u).pathname.split('/').pop() || 'arquivo'; return decodeURIComponent(p) || 'arquivo'; } catch { return 'arquivo'; } }
-function _mimePorNome(n: string): string {
-  const e = String(n || '').toLowerCase().split('.').pop() || '';
-  const m: any = { pdf:'application/pdf', mp3:'audio/mpeg', m4a:'audio/mp4', wav:'audio/wav', ogg:'audio/ogg', mp4:'video/mp4', mov:'video/quicktime', jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', zip:'application/zip', doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xls:'application/vnd.ms-excel', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ppt:'application/vnd.ms-powerpoint', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation', txt:'text/plain', csv:'text/csv' };
-  return m[e] || 'application/octet-stream';
-}
-async function _emailBaixarUrl(url: string): Promise<Buffer | null> {
-  try {
-    const r = await (globalThis as any).fetch(url);
-    if (!r || !r.ok) return null;
-    const ab = await r.arrayBuffer();
-    const buf = Buffer.from(ab);
-    if (buf.length > 25 * 1024 * 1024) return null; // limite 25MB (padrao de anexo de e-mail)
-    return buf;
-  } catch { return null; }
-}
-// [email-anexos] resolve cada anexo (url -> baixa; caminho -> le do disco do motor; base64 -> usa) e devolve [{nome,tipo,base64}].
-async function _emailResolverAnexos(raw: any): Promise<any[]> {
-  let arr: any[] = [];
-  try { arr = typeof raw === 'string' ? JSON.parse(raw || '[]') : (Array.isArray(raw) ? raw : []); } catch { arr = []; }
-  if (!Array.isArray(arr) || !arr.length) return [];
-  const out: any[] = [];
-  for (const a of arr) {
-    if (!a) continue;
-    try {
-      if (a.base64 && String(a.base64).length) { out.push({ nome: String(a.nome || 'arquivo'), tipo: String(a.tipo || _mimePorNome(String(a.nome || ''))), base64: String(a.base64) }); continue; }
-      if (a.caminho && String(a.caminho).length) { const p = String(a.caminho); if (fs.existsSync(p)) { const b = fs.readFileSync(p); out.push({ nome: String(a.nome || (p.split(/[\\/]/).pop() || 'arquivo')), tipo: String(a.tipo || _mimePorNome(p)), base64: b.toString('base64') }); } continue; }
-      if (a.url && String(a.url).length) { const buf = await _emailBaixarUrl(String(a.url)); if (buf) out.push({ nome: String(a.nome || _nomeDeUrl(String(a.url))), tipo: String(a.tipo || _mimePorNome(String(a.nome || a.url))), base64: buf.toString('base64') }); continue; }
-    } catch { /* pula anexo que falhar, nao derruba o e-mail */ }
-  }
-  return out;
-}
-async function _smtpEnviar(dom: any, para: string, assunto: string, html: string, anexos?: any[]): Promise<void> {
+async function _smtpEnviar(dom: any, para: string, assunto: string, html: string): Promise<void> {
   const host = String(dom.smtp_host || '').trim();
   const port = Number(dom.smtp_porta) || 587;
   const user = String(dom.smtp_usuario || '').trim();
@@ -2759,7 +2417,15 @@ async function _smtpEnviar(dom: any, para: string, assunto: string, html: string
   conn.send('MAIL FROM:<' + fromAddr + '>'); r = await conn.wait(); if (r.code !== 250) throw new Error('MAIL FROM: ' + r.text);
   conn.send('RCPT TO:<' + para + '>'); r = await conn.wait(); if (r.code !== 250 && r.code !== 251) throw new Error('RCPT TO: ' + r.text);
   conn.send('DATA'); r = await conn.wait(); if (r.code !== 354) throw new Error('DATA: ' + r.text);
-  const corpo = _emailMontarMIME(fromName, fromAddr, para, assunto, html, anexos); // [email-anexos] monta text/html OU multipart/mixed
+  const corpo = [
+    'From: ' + _mimeEnc(fromName) + ' <' + fromAddr + '>',
+    'To: ' + para,
+    'Subject: ' + _mimeEnc(assunto),
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '', String(html || '').replace(/\r?\n/g, '\r\n').replace(/^\./gm, '..'), '.'
+  ].join('\r\n');
   conn.send(corpo); r = await conn.wait(); if (r.code !== 250) throw new Error('envio recusado: ' + r.text);
   try { conn.send('QUIT'); } catch { /* */ } try { sock.end(); } catch { /* */ }
 }
@@ -2792,14 +2458,13 @@ function _emailDomDoItem(m: any): any {
 }
 async function _tickEmail(): Promise<void> {
   try {
-    const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY criado_em ASC LIMIT 5`).all(agora()) as any[];
+    const rows = db.prepare(`SELECT * FROM email_fila WHERE status='pendente' ORDER BY criado_em ASC LIMIT 5`).all() as any[];
     for (const m of rows) {
       const dom = _emailDomDoItem(m);
       if (!dom) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando SMTP do projeto', m.id); } catch { /* */ } continue; }
       if (Number(dom.warmup_on) && _emailEnviadosHoje(String(dom.id)) >= _emailCapHoje(dom)) { try { db.prepare(`UPDATE email_fila SET erro=? WHERE id=?`).run('aguardando aquecimento (limite diario do remetente atingido)', m.id); } catch { /* */ } continue; }
       try {
-        const _anx = await _emailResolverAnexos((m as any).anexos); // [email-anexos]
-        await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''), _anx);
+        await _smtpEnviar(dom, String(m.para), String(m.assunto || ''), String(m.html || ''));
         db.prepare(`UPDATE email_fila SET status='enviado', enviado_em=?, erro=NULL, dominio_id=? WHERE id=?`).run(agora(), String(dom.id), m.id);
       } catch (e: any) {
         const t = (Number(m.tentativas) || 0) + 1; const st = t >= 5 ? 'erro' : 'pendente';
@@ -2872,299 +2537,9 @@ app.post('/email/enviar', (req, res) => {
   const b = req.body || {};
   let assunto = String(b.assunto || ''); let html = String(b.html || '');
   if (b.templateId) { const t = db.prepare(`SELECT * FROM email_templates WHERE id=?`).get(String(b.templateId)) as any; if (t) { assunto = assunto || t.assunto; html = html || t.html; } }
-  // [email-anexos+lote] 1 ou varios destinatarios (b.para string/array, ou b.lote). anexos=[{nome,url|base64|caminho,tipo?}]
-  const brutoDest = (b.lote !== undefined ? b.lote : b.para);
-  let destinatarios: string[] = [];
-  if (Array.isArray(brutoDest)) destinatarios = brutoDest.map((x: any) => String(x || '').trim());
-  else destinatarios = String(brutoDest || '').split(/[,;\n\r]+/).map((x) => x.trim());
-  destinatarios = destinatarios.filter((x) => x && x.includes('@'));
-  if (!destinatarios.length) return res.json({ ok: false, erro: 'Informe ao menos um destinatario com @.' });
-  const anexosJson = (b.anexos && Array.isArray(b.anexos) && b.anexos.length) ? JSON.stringify(b.anexos) : null;
-  const domId = b.dominio_id ? String(b.dominio_id) : null;
-  const ins = db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`);
-  const tx = db.transaction((lista: string[]) => { for (const p of lista) ins.run(randomUUID(), String(b.projeto || ''), p, assunto, html, 'pendente', agora(), domId, anexosJson); });
-  tx(destinatarios);
-  res.json({ ok: true, enfileirado: true, quantos: destinatarios.length, com_anexos: !!anexosJson, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
+  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id) VALUES(?,?,?,?,?,?,?,?)`).run(randomUUID(), String(b.projeto || ''), String(b.para || ''), assunto, html, 'pendente', agora(), b.dominio_id ? String(b.dominio_id) : null);
+  res.json({ ok: true, enfileirado: true, obs: 'Envio real ocorre quando o SMTP do dominio estiver ligado.' });
 });
-// [email-anexos] UPLOAD de anexo grande (arquivo do PC). Sobe os bytes crus (content-type qualquer), guarda em /data/media/email-anexos (persiste em deploy) e devolve caminho+url. Depois use no /email/enviar como {nome, caminho} (ou {nome,url}). Ideal p/ lote: sobe 1x, manda p/ muitos.
-const EMAIL_ANEXO_DIR = '/data/media/email-anexos';
-try { fs.mkdirSync(EMAIL_ANEXO_DIR, { recursive: true }); } catch { /* ok */ }
-app.post('/email/anexo/upload', express.raw({ type: () => true, limit: '200mb' }), (req: any, res: any) => {
-  try {
-    const nome = String(req.query.nome || req.headers['x-nome'] || 'arquivo').replace(/[\\/\r\n]+/g, '_');
-    const buf: Buffer = (req.body && Buffer.isBuffer(req.body)) ? req.body : Buffer.from([]);
-    if (!buf.length) return res.json({ ok: false, erro: 'arquivo vazio (envie os bytes no corpo, content-type application/octet-stream)' });
-    const safe = randomUUID().slice(0, 8) + '_' + nome;
-    fs.writeFileSync(EMAIL_ANEXO_DIR + '/' + safe, buf);
-    const url = 'https://motor.melodiaseriffs.com.br/media/email-anexos/' + encodeURIComponent(safe);
-    res.json({ ok: true, nome, caminho: EMAIL_ANEXO_DIR + '/' + safe, url, tipo: _mimePorNome(nome), tamanho: buf.length });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-
-// ============================================================================
-// [email-entrega] ENGENHARIA do e-mail automatico na COMPRA, POR PRODUTO.
-// Nasce DESLIGADO (pub_kv email_entrega_ativo != '1') e SEM nenhum produto montado.
-// Voce cria cada template depois (botao +). Sem template casado = nao manda nada.
-// Reusa a fila (_tickEmail) e os anexos (_emailResolverAnexos) ja existentes.
-// ============================================================================
-function _emailEntregaMatch(produtoId?: string, produtoNome?: string): any {
-  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
-  const id = String(produtoId || '').toLowerCase();
-  for (const t of (((CONFIG as any).emailEntregaProduto) || [])) {
-    const chave = String(t.chave || '').toLowerCase();
-    if (!chave) continue;
-    const casa = t.porId ? (id && id === chave) : alvo.includes(chave);
-    if (casa && (t.assunto || t.html)) return t;
-  }
-  return null;
-}
-async function _emailEntregaCompra(projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<void> {
-  const para = String(email || '').trim();
-  if (!para || !para.includes('@')) return;
-  const t = _emailEntregaMatch(produtoId, produtoNome);
-  if (!t) return; // sem template pro produto -> nao manda nada
-  const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND padrao=1 AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto) as any)
-           || (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto) as any);
-  const nm = (nome || '').trim();
-  const assunto = String(t.assunto || '').replace(/\{nome\}/g, nm);
-  const html = String(t.html || '').replace(/\{nome\}/g, nm);
-  const anexosJson = (t.anexos && Array.isArray(t.anexos) && t.anexos.length) ? JSON.stringify(t.anexos) : null;
-  db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
-    .run(randomUUID(), String(projeto || ''), para, assunto, html, 'pendente', agora(), (t.dominio_id || (dom && dom.id) || null), anexosJson);
-}
-// GET: lista os templates por produto + estado do liga/desliga.
-app.get('/email/entrega', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_entrega_ativo','0')==='1', templates: ((CONFIG as any).emailEntregaProduto) || [] }); });
-// POST: cria/atualiza 1 template por produto. body:{chave, porId?, projeto?, assunto, html, anexos?[{nome,url|caminho|base64,tipo?}], dominio_id?}
-app.post('/email/entrega/produto', (req, res) => {
-  try {
-    const b = req.body || {}; const chave = String(b.chave || '').trim();
-    if (!chave) return res.json({ ok: false, erro: 'Informe a chave (id ou trecho do nome do produto).' });
-    const item: any = { chave, porId: !!b.porId, projeto: b.projeto || undefined, assunto: String(b.assunto || ''), html: String(b.html || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], dominio_id: b.dominio_id ? String(b.dominio_id) : undefined };
-    const lista = (((CONFIG as any).emailEntregaProduto) || []).filter((t: any) => String(t.chave || '').toLowerCase() !== chave.toLowerCase());
-    lista.push(item); salvarConfigPermanente('emailEntregaProduto', lista);
-    res.json({ ok: true, chave, total: lista.length });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-// POST: remove 1 template por produto. body:{chave}
-app.post('/email/entrega/produto/remover', (req, res) => {
-  const chave = String((req.body || {}).chave || '').toLowerCase();
-  const lista = (((CONFIG as any).emailEntregaProduto) || []).filter((t: any) => String(t.chave || '').toLowerCase() !== chave);
-  salvarConfigPermanente('emailEntregaProduto', lista);
-  res.json({ ok: true, total: lista.length });
-});
-// POST: liga/desliga o e-mail automatico na compra. body:{on:true/false}. Nasce DESLIGADO.
-app.post('/email/entrega/flag', (req, res) => {
-  const on = ((req.body || {}).on === true || (req.body||{}).on === '1' || (req.body||{}).on === 1 || (req.body||{}).on === 'on');
-  setPubFlag('email_entrega_ativo', on ? '1' : '0');
-  res.json({ ok: true, ativo: pubFlag('email_entrega_ativo','0')==='1' });
-});
-
-// ============================================================================
-// [email-lembrete] E-mail de LEMBRETE de live/webinario, JUNTO com o WhatsApp.
-// Reusa o motor de lembretes de sessao (agenda_lembretes/tickLembretesSessao):
-// quando um lembrete dispara, se este e-mail estiver LIGADO e o contato tiver e-mail,
-// manda o mesmo lembrete tambem por e-mail. Nasce DESLIGADO (email_lembrete_ativo!='1').
-// ============================================================================
-function _emailLembreteEnviar(projeto: string, contatoId: string | null, texto: string): void {
-  try {
-    if (pubFlag('email_lembrete_ativo','0') !== '1') return;
-    if (!contatoId) return;
-    const ct = db.prepare(`SELECT email FROM contatos WHERE id=?`).get(contatoId) as any;
-    const email = (ct && ct.email) ? String(ct.email).trim() : '';
-    if (!email || !email.includes('@')) return;
-    const assunto = String((CONFIG as any).emailLembreteAssunto || 'Lembrete: sua aula ao vivo 🎹');
-    const esc = String(texto || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const html = '<div style="font:16px/1.6 system-ui,Arial;color:#141a21">' + esc.replace(/\r?\n/g, '<br>').replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>') + '</div>';
-    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), String(projeto || ''), email, assunto, html, 'pendente', agora(), null, null);
-  } catch { /* best-effort: nunca quebra o lembrete do WhatsApp */ }
-}
-// GET: estado do liga/desliga + assunto do e-mail de lembrete.
-app.get('/email/lembrete', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_lembrete_ativo','0')==='1', assunto: String((CONFIG as any).emailLembreteAssunto || '') }); });
-// POST: liga/desliga. body:{on:true/false}. Nasce DESLIGADO.
-app.post('/email/lembrete/flag', (req, res) => {
-  const on = ((req.body || {}).on === true || (req.body||{}).on === '1' || (req.body||{}).on === 1 || (req.body||{}).on === 'on');
-  setPubFlag('email_lembrete_ativo', on ? '1' : '0');
-  res.json({ ok: true, ativo: pubFlag('email_lembrete_ativo','0')==='1' });
-});
-// POST: define o assunto do e-mail de lembrete. body:{assunto}
-app.post('/email/lembrete/config', (req, res) => {
-  const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailLembreteAssunto', String(b.assunto || ''));
-  res.json({ ok: true, assunto: String((CONFIG as any).emailLembreteAssunto || '') });
-});
-
-// ============================================================================
-// [email-relatorio] RELATORIO SEMANAL por e-mail pro dono (Ezequias).
-// Reaproveita os dados do painel (/painel/trafego/dados via localhost). Nasce DESLIGADO
-// (email_relatorio_ativo!='1'). Dia/hora/destinatario configuraveis. Tambem da pra mandar na hora.
-// ============================================================================
-async function _emailRelatorioGerar(dias: number): Promise<{ assunto: string; html: string } | null> {
-  try {
-    const token = String((CONFIG as any).painelTrafegoToken || '');
-    if (!token) return null;
-    const rr = await fetch('http://localhost:' + PORT + '/painel/trafego/dados?k=' + encodeURIComponent(token) + '&dias=' + dias);
-    const j: any = await rr.json();
-    if (!j || !j.ok) return null;
-    const brl = (n: any): string => 'R$ ' + (Number(n) || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const x2 = (n: any): string => (Number(n) || 0).toFixed(2).replace('.', ',');
-    const cor = (n: any): string => (Number(n) >= 0 ? '#1a9e5f' : '#c0392b');
-    const t = j.total || {};
-    let linhas = '';
-    for (const p of (j.produtos || [])) {
-      linhas += '<tr><td style="padding:8px 10px;border-bottom:1px solid #eee">' + String(p.produto || '') + '</td>'
-        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + brl(p.gasto) + '</td>'
-        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + (p.vendas || 0) + '</td>'
-        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + brl(p.fat) + '</td>'
-        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right">' + x2(p.roas) + 'x</td>'
-        + '<td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right;color:' + cor(p.lucro) + ';font-weight:700">' + brl(p.lucro) + '</td></tr>';
-    }
-    const link = (PUBLIC_BASE_URL || '') + '/painel/trafego?k=' + token;
-    const assunto = 'Seu resumo de trafego — Melodias e Riffs (' + String(j.de || '') + ' a ' + String(j.ate || '') + ')';
-    const html = '<div style="font:15px/1.6 system-ui,Arial;color:#141a21;max-width:640px">'
-      + '<h2 style="margin:0 0 4px">\u{1F4CA} Resumo de trafego</h2>'
-      + '<p style="color:#667;margin:0 0 16px">Periodo: ' + String(j.de || '') + ' a ' + String(j.ate || '') + '</p>'
-      + '<table style="width:100%;border-collapse:collapse;margin-bottom:14px">'
-      + '<tr><td style="padding:6px 0">Faturamento</td><td style="padding:6px 0;text-align:right;font-weight:700">' + brl(t.fat) + '</td></tr>'
-      + '<tr><td style="padding:6px 0">Vendas</td><td style="padding:6px 0;text-align:right;font-weight:700">' + (t.vendas || 0) + '</td></tr>'
-      + '<tr><td style="padding:6px 0">Investido em anuncios</td><td style="padding:6px 0;text-align:right;font-weight:700">' + brl(t.gasto) + '</td></tr>'
-      + '<tr><td style="padding:6px 0">ROAS</td><td style="padding:6px 0;text-align:right;font-weight:700">' + x2(t.roas) + 'x</td></tr>'
-      + '<tr><td style="padding:6px 0;border-top:2px solid #141a21">Lucro liquido</td><td style="padding:6px 0;text-align:right;font-weight:800;border-top:2px solid #141a21;color:' + cor(t.lucro) + '">' + brl(t.lucro) + '</td></tr>'
-      + '</table>'
-      + '<h3 style="margin:18px 0 8px">Por produto</h3>'
-      + '<table style="width:100%;border-collapse:collapse;font-size:13px">'
-      + '<thead><tr style="color:#889;text-align:left"><th style="padding:8px 10px;border-bottom:2px solid #eee">Produto</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Investido</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Vendas</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Fat.</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">ROAS</th><th style="padding:8px 10px;border-bottom:2px solid #eee;text-align:right">Lucro</th></tr></thead>'
-      + '<tbody>' + linhas + '</tbody></table>'
-      + '<p style="margin:18px 0 0"><a href="' + link + '" style="color:#3b82f6">Abrir o painel completo &rarr;</a></p>'
-      + '</div>';
-    return { assunto, html };
-  } catch { return null; }
-}
-async function _emailRelatorioEnviar(dias?: number): Promise<boolean> {
-  const d = (Number(dias) > 0) ? Number(dias) : (Number((CONFIG as any).emailRelatorioDias) || 7);
-  const para = String((CONFIG as any).emailRelatorioPara || 'geisseoliveira.93@gmail.com').trim();
-  if (!para || !para.includes('@')) return false;
-  const rep = await _emailRelatorioGerar(d);
-  if (!rep) return false;
-  try {
-    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), 'teclado', para, rep.assunto, rep.html, 'pendente', agora(), null, null);
-    return true;
-  } catch { return false; }
-}
-let _relTicking = false;
-async function _tickEmailRelatorio(): Promise<void> {
-  if (_relTicking) return; _relTicking = true;
-  try {
-    if (pubFlag('email_relatorio_ativo','0') !== '1') return;
-    const nowBRT = new Date(Date.now() - 3 * 3600000);
-    const dia = nowBRT.getUTCDay();
-    const hora = nowBRT.getUTCHours();
-    const diaCfg = Number((CONFIG as any).emailRelatorioDia); const diaAlvo = isFinite(diaCfg) ? diaCfg : 1;
-    const horaCfg = Number((CONFIG as any).emailRelatorioHora); const horaAlvo = isFinite(horaCfg) ? horaCfg : 8;
-    if (dia !== diaAlvo || hora < horaAlvo) return;
-    const hojeStr = `${nowBRT.getUTCFullYear()}-${String(nowBRT.getUTCMonth()+1).padStart(2,'0')}-${String(nowBRT.getUTCDate()).padStart(2,'0')}`;
-    if (pubFlag('email_relatorio_ultimo','') === hojeStr) return;
-    const ok = await _emailRelatorioEnviar();
-    if (ok) setPubFlag('email_relatorio_ultimo', hojeStr);
-  } catch { /* best-effort */ } finally { _relTicking = false; }
-}
-setInterval(() => { _tickEmailRelatorio().catch(() => {}); }, 15 * 60000);
-app.get('/email/relatorio', (_req, res) => {
-  res.json({ ok: true, ativo: pubFlag('email_relatorio_ativo','0')==='1',
-    para: String((CONFIG as any).emailRelatorioPara || 'geisseoliveira.93@gmail.com'),
-    dia: isFinite(Number((CONFIG as any).emailRelatorioDia)) ? Number((CONFIG as any).emailRelatorioDia) : 1,
-    hora: isFinite(Number((CONFIG as any).emailRelatorioHora)) ? Number((CONFIG as any).emailRelatorioHora) : 8,
-    dias: Number((CONFIG as any).emailRelatorioDias) || 7 });
-});
-app.post('/email/relatorio/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_relatorio_ativo', on?'1':'0'); res.json({ ok:true, ativo: pubFlag('email_relatorio_ativo','0')==='1' }); });
-app.post('/email/relatorio/config', (req, res) => {
-  const b = req.body || {};
-  if (b.para !== undefined) salvarConfigPermanente('emailRelatorioPara', String(b.para||''));
-  if (b.dia !== undefined) salvarConfigPermanente('emailRelatorioDia', Math.max(0, Math.min(6, Number(b.dia)||0)));
-  if (b.hora !== undefined) salvarConfigPermanente('emailRelatorioHora', Math.max(0, Math.min(23, Number(b.hora)||0)));
-  if (b.dias !== undefined) salvarConfigPermanente('emailRelatorioDias', Math.max(1, Math.min(90, Number(b.dias)||7)));
-  res.json({ ok:true });
-});
-app.post('/email/relatorio/enviar', async (req, res) => {
-  try { const dias = Number((req.body||{}).dias) || undefined; const ok = await _emailRelatorioEnviar(dias); res.json({ ok, enfileirado: ok }); }
-  catch (e:any) { res.json({ ok:false, erro:String(e&&e.message||e) }); }
-});
-
-// ============================================================================
-// [email-fluxos] E-mails automaticos por EVENTO, por produto, com atraso opcional.
-// evento 'pos_compra' (dispara na compra aprovada) cobre BOAS-VINDAS, NPS e UPSELL.
-// evento 'nao_pago' (dispara em pagamento perdido) cobre RECUPERACAO de Pix/boleto.
-// Cada fluxo tem seu ativo (nasce VAZIO; nada dispara ate voce criar e ativar).
-// Reusa a fila (agendado_para p/ atraso) e os anexos. So age quando a venda chegar no motor (webhooks).
-// ============================================================================
-function _emailFilaEnfileirar(projeto: string, para: string, assunto: string, html: string, opts?: { anexos?: any; dominio_id?: string | null; agendado_para?: string | null }): void {
-  try {
-    const anexos = (opts && opts.anexos && Array.isArray(opts.anexos) && opts.anexos.length) ? JSON.stringify(opts.anexos) : null;
-    db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos,agendado_para) VALUES(?,?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), String(projeto || ''), String(para || ''), String(assunto || ''), String(html || ''), 'pendente', agora(), (opts && opts.dominio_id) || null, anexos, (opts && opts.agendado_para) || null);
-  } catch { /* best-effort */ }
-}
-// [canal-whatsapp] enfileira UMA mensagem de WhatsApp na fila_envio (mesmo worker tickFila,
-// respeita agendado_para e o ritmo anti-ban). Reaproveitado pelos fluxos, aluno-sumido e certificado.
-function _wppFilaEnfileirar(projeto: string, para: string, texto: string, opts?: { instancia?: string | null; agendado_para?: string | null }): void {
-  try {
-    const tel = String(para || '').replace(/\D/g, '');
-    if (tel.length < 8 || !String(texto || '').trim()) return;
-    db.prepare(`INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,status,instancia,agendado_para,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), String(projeto || 'teclado'), tel, 0, String(texto || ''), 'texto', 'pendente', (opts && opts.instancia) || null, (opts && opts.agendado_para) || null, agora());
-  } catch { /* best-effort */ }
-}
-function _emailFluxoMatch(evento: string, produtoId?: string, produtoNome?: string): any[] {
-  const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
-  const id = String(produtoId || '').toLowerCase();
-  const out: any[] = [];
-  for (const f of (((CONFIG as any).emailFluxos) || [])) {
-    if (!f || !f.ativo || String(f.evento || '') !== evento) continue;
-    const chave = String(f.chave || '').toLowerCase();
-    const casa = !chave || (f.porId ? (id && id === chave) : alvo.includes(chave));
-    if (casa && (f.assunto || f.html || f.wtexto)) out.push(f);
-  }
-  return out;
-}
-async function _emailFluxoDisparar(evento: string, projeto: string, email?: string, nome?: string, produtoId?: string, produtoNome?: string, telefone?: string): Promise<void> {
-  const para = String(email || '').trim();
-  const temEmail = !!para && para.includes('@');
-  const tel = String(telefone || '').replace(/\D/g, '');
-  const temWpp = tel.length >= 8;
-  if (!temEmail && !temWpp) return;
-  const fluxos = _emailFluxoMatch(evento, produtoId, produtoNome);
-  if (!fluxos.length) return;
-  const nm = (nome || '').trim();
-  for (const f of fluxos) {
-    const dias = Math.max(0, Number(f.delayDias) || 0);
-    // canal e-mail
-    if (temEmail && (f.assunto || f.html)) {
-      const assunto = String(f.assunto || '').replace(/\{nome\}/g, nm);
-      const html = String(f.html || '').replace(/\{nome\}/g, nm);
-      const agendado = dias > 0 ? new Date(Date.now() + dias * 86400000).toISOString() : null;
-      _emailFilaEnfileirar(String(projeto || ''), para, assunto, html, { anexos: f.anexos, agendado_para: agendado });
-    }
-    // canal WhatsApp
-    if (temWpp && f.wtexto) {
-      const wtexto = String(f.wtexto || '').replace(/\{nome\}/g, nm);
-      _wppFilaEnfileirar(String(projeto || 'teclado'), tel, wtexto, { agendado_para: dias > 0 ? emSegundos(dias * 86400) : null });
-    }
-  }
-}
-// GET: lista os fluxos. POST /email/fluxo: cria/atualiza. /remover e /ativo pra gerenciar.
-app.get('/email/fluxos', (_req, res) => { res.json({ ok: true, fluxos: ((CONFIG as any).emailFluxos) || [] }); });
-app.post('/email/fluxo', (req, res) => {
-  try {
-    const b = req.body || {}; const id = String(b.id || randomUUID());
-    const evento = ['nao_pago','cartao_recusado'].includes(String(b.evento || '')) ? String(b.evento || '') : 'pos_compra';
-    const item: any = { id, evento, label: String(b.label || ''), chave: String(b.chave || ''), porId: !!b.porId, delayDias: Math.max(0, Number(b.delayDias) || 0), assunto: String(b.assunto || ''), html: String(b.html || ''), wtexto: String(b.wtexto || ''), anexos: Array.isArray(b.anexos) ? b.anexos : [], ativo: b.ativo === undefined ? true : !!b.ativo };
-    const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id);
-    lista.push(item); salvarConfigPermanente('emailFluxos', lista);
-    res.json({ ok: true, id, total: lista.length });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-app.post('/email/fluxo/remover', (req, res) => { const id = String((req.body || {}).id || ''); const lista = (((CONFIG as any).emailFluxos) || []).filter((f: any) => String(f.id) !== id); salvarConfigPermanente('emailFluxos', lista); res.json({ ok: true, total: lista.length }); });
-app.post('/email/fluxo/ativo', (req, res) => { const b = req.body || {}; const id = String(b.id || ''); const lista = (((CONFIG as any).emailFluxos) || []).map((f: any) => String(f.id) === id ? { ...f, ativo: !!b.ativo } : f); salvarConfigPermanente('emailFluxos', lista); res.json({ ok: true }); });
 
 // ---- COMENTARIOS IG/FB (inbox; responder de verdade liga no fim via Meta) ----
 app.get('/comentarios', (req, res) => { const projeto = String(req.query.projeto || ''); res.json({ ok: true, comentarios: db.prepare(`SELECT * FROM comentarios WHERE projeto=? ORDER BY criado_em DESC LIMIT 300`).all(projeto) }); });
@@ -3351,13 +2726,6 @@ app.post('/webhook/evolution', (req, res) => {
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         if (!ehGrupo) rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
         try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && (_agenteDevResponder(projeto, cid) || _temAgenteAtribuido(cid)) && !_contatoEhAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila (ou agente atribuído manual/handoff); [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
-        // [+recup-dedilhados] gatilho por FRASE do botão WhatsApp + PARADA automática (só teclado, 1-a-1, nunca grupo)
-        if (!ehGrupo && projeto === 'teclado') {
-          try {
-            if (_normFrase(texto).includes(_RECUP_DED_FRASE)) { _iniciarRecupDedilhados(projeto, cid, telefone, data.pushName); } // a FRASE inicia o fluxo (dedup 1x)
-            else if (_recupDedPendentes(telefone) > 0) { _recupDedCancelarPendentes(telefone); _handoffRecupDedilhados(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela msg 2/3 + passa pro agente
-          } catch { /* best-effort: nunca quebra o webhook */ }
-        }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -3396,41 +2764,6 @@ function normalizaPagamento(provider: string, b: any): {
       valor: Number(prod?.Price || prod?.price || d?.Purchase?.Price || d?.Purchase?.Value || d?.Purchase?.Amount || d?.Offer?.Price || b?.Value || 0),
     };
   }
-  // [pagarme] Pagar.me v5 (painel dash.pagar.me). Webhook: { type:"order.paid"|"charge.*"|..., data:{...} }.
-  // data = ORDER (eventos order.*) ou CHARGE (eventos charge.*, que trazem data.order como resumo).
-  // Valores em CENTAVOS. O status é NORMALIZADO pros mesmos termos que classificaPagamento/_fasePagamento
-  // (ramo "guru") já entendem: paid / pending / refused / refunded / canceled. Assim nada mais precisa mudar.
-  if (provider === 'pagarme') {
-    const d = b?.data || {};
-    const ord = (d?.order && typeof d.order === 'object') ? d.order : d; // charge.* -> d.order ; order.* -> d
-    const cust = d?.customer || ord?.customer || {};
-    const mob = (cust?.phones?.mobile_phone || cust?.phones?.home_phone || {});
-    const telBruto = mob?.number
-      ? (String(mob.country_code || '55') + String(mob.area_code || '') + String(mob.number || ''))
-      : String(cust?.phone || cust?.phone_number || '');
-    const itens: any[] = (Array.isArray(d?.items) && d.items.length) ? d.items
-      : ((Array.isArray(ord?.items) && ord.items.length) ? ord.items : []);
-    const it0: any = itens[0] || {};
-    const tipo = String(b?.type || b?.event || '').toLowerCase();
-    const stRaw = String(d?.status || ord?.status || '').toLowerCase();
-    let status = '';
-    if (/refund/.test(tipo) || /refund|estorn|chargeback/.test(stRaw)) status = 'refunded';
-    else if (/\.paid$/.test(tipo) || stRaw === 'paid') status = 'paid';
-    else if (/payment_failed|\.failed$/.test(tipo) || /failed|refus|declin|not_authorized|nao_autoriz/.test(stRaw)) status = 'refused';
-    else if (/\.canceled$|\.cancelled$/.test(tipo) || /cancel/.test(stRaw)) status = 'canceled';
-    else if (/pending|\.created$/.test(tipo) || /pending|processing|waiting|generated/.test(stRaw)) status = 'pending';
-    else status = stRaw || tipo;
-    return {
-      pedido: String(ord?.id || d?.id || b?.id || randomUUID()),
-      status,
-      telefone: String(telBruto).replace(/\D/g, ''),
-      nome: cust?.name,
-      email: cust?.email,
-      produtoId: String(it0?.code || it0?.id || ''),
-      produtoNome: it0?.description || it0?.name || '',
-      valor: Number(d?.amount || ord?.amount || it0?.amount || 0) / 100,
-    };
-  }
   // Guru
   const contato = b?.contact || b?.subscriber || b?.customer || {};
   const prod = b?.product || b?.items?.[0] || {};
@@ -3466,17 +2799,17 @@ function classificaPagamento(provider: string, statusRaw: string): 'aprovado' | 
 // [etapa31] gancho do CAPI: é preenchido dentro do bloco CAPI (etapa29) no boot.
 // Serve pra espelhar a MESMA venda que chega pela entrega (Guru/LastLink) no pixel Meta,
 // sem precisar criar webhook novo. Fica null até o bloco CAPI rodar no startup.
-let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; produtoId?: string | null; evento?: string; nome?: string | null; pedido?: string | null }) => Promise<void>) | null = null;
+let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; produtoId?: string | null; evento?: string }) => Promise<void>) | null = null;
 // [#9 VSL camada2 batch B] gancho de rastreio por MARCO do player de VSL (play/oferta/cta_click ->
 // Meta CAPI + GA4, reusa track_config do projeto). Preenchido no bloco CAPI (etapa29) no boot.
 // Inerte até pubFlag('vsl_capi_ativo')='1'.
-let vslTrackHook: ((projeto: string, eventName: string, dados: { email?: string | null; telefone?: string | null; pagina?: string | null; clientIp?: string | null; userAgent?: string | null; fbp?: string | null; fbc?: string | null }) => Promise<void>) | null = null;
+let vslTrackHook: ((projeto: string, eventName: string, dados: { email?: string | null; telefone?: string | null; pagina?: string | null }) => Promise<void>) | null = null;
 
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
     const provider = String(req.params.provider || '').toLowerCase();
     // valida o token da URL por provedor
-    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : provider === 'pagarme' ? PAGARME_TOKEN : '';
+    const tokenEsperado = provider === 'guru' ? GURU_TOKEN : provider === 'lastlink' ? LASTLINK_TOKEN : '';
     if (!tokenEsperado || String(req.query.token || '') !== tokenEsperado) {
       return res.status(401).json({ erro: 'token_invalido' });
     }
@@ -3534,21 +2867,11 @@ app.post('/webhook/payment/:provider', async (req, res) => {
           email: p.email, telefone: p.telefone,
           valorCentavos: Math.round(Number(p.valor || 0) * 100),
           produto: p.produtoNome, produtoId: p.produtoId, evento: _capiEv,
-          nome: (p as any).nome || null, pedido: (p as any).pedido || null,
           utms: _utmVenda,
         }).catch(() => {});
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
-    // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
-    if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
-    if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
-    if (categoria === 'perdido') {
-      // [cartao-recusado] se a recusa foi de cartao/sem limite, dispara o fluxo 'cartao_recusado';
-      // os demais nao-pagos (boleto/pix nao pago, abandono) caem em 'nao_pago'. Exclusivo: nunca os dois.
-      if (_cartaoRecusado(provider, b, p.status)) { try { await _emailFluxoDisparar('cartao_recusado', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
-      else { try { await _emailFluxoDisparar('nao_pago', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
-    }
     if (p.telefone) {
       const cid = upsertContato(projeto, p.telefone, p.nome, p.email, `pagamento:${provider}`);
       // [tags-auto] tags no padrão Sellflux (idempotente, só acrescenta, NÃO dispara mensagem). Vale p/ TODAS as fases.
@@ -3585,7 +2908,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
-        await dispararRecuperacao(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        await dispararRecuperacao(projeto, p.telefone, p.nome).catch(() => {});
         await rodarAutomacoes(projeto, 'pagamento_perdido', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
       } else if (categoria === 'reembolso') {
         aplicarTag(projeto, cid, 'reembolso'); // sem mensagem automática
@@ -3737,9 +3060,6 @@ async function tickFila() {
       // pro próximo início da janela em vez de enviar. Não conta como falha.
       if (item.janela_de && item.janela_ate && !_dentroJanela(item.janela_de, item.janela_ate)) {
         db.prepare(`UPDATE fila_envio SET agendado_para=? WHERE id=?`).run(_proximaJanelaISO(item.janela_de), item.id);
-      } else if (Number(item.pular_se_inscrito) === 1 && _jornadaInscrito(item.para)) {
-        // [+webinario-dedilhados] a pessoa já se inscreveu no webinário → não manda o lembrete (marca pulado).
-        db.prepare(`UPDATE fila_envio SET status='pulado' WHERE id=?`).run(item.id);
       } else {
       try {
         const tipo = item.tipo || 'texto';
@@ -3927,33 +3247,6 @@ function _fmtDiaBR(iso: string): string {
   } catch { return ''; }
 }
 // Cria as linhas de lembrete de um evento (pula os que já passaram). Retorna quantos criou.
-// [+lembretes-nome] Deixa o {nome} bonito a partir do nome cru do perfil do WhatsApp.
-// Remove emoji/símbolos/números/pontuação (mantém letras acentuadas), pega só a 1ª palavra e
-// capitaliza (1ª maiúscula, resto minúsculo). Se sobrar vazio ou parecer número/telefone, devolve ''.
-// Ex.: "aleandro Dias 💈" -> "Aleandro"; "🎹 JOÃO" -> "João"; "MARIA silva" -> "Maria";
-//      "5516999999999" -> ""; "" -> "". Vale pros 4 projetos (usa a mesma função).
-function _primeiroNomeBonito(nome: any): string {
-  try {
-    let s = String(nome == null ? '' : nome).normalize('NFC');
-    s = s.replace(/[^\p{L}\s]/gu, ' ').replace(/\s+/g, ' ').trim(); // só letras (inclui acentos) e espaço
-    if (!s) return '';
-    const prim = s.split(' ')[0] || '';
-    if (!prim || !/\p{L}/u.test(prim)) return '';
-    return prim.charAt(0).toUpperCase() + prim.slice(1).toLowerCase();
-  } catch { return ''; }
-}
-// [+lembretes-nome] Quando NÃO há nome, limpa o texto pra não sobrar "Oi !" nem vírgula solta no começo.
-// Ex.: "Oi !" -> "Oi!"; ", daqui a 1 hora" -> "Daqui a 1 hora".
-function _limpaTextoSemNome(txt: string): string {
-  try {
-    let t = String(txt || '');
-    t = t.replace(/[ \t]+([,!?.;:])/g, '$1');                       // tira espaço antes de pontuação
-    t = t.replace(/[ \t]{2,}/g, ' ');                                // colapsa espaços duplicados
-    t = t.replace(/(^|\n)[ \t]*[,;:!.–—-]+[ \t]*/g, '$1'); // remove pontuação solta no começo da linha
-    t = t.replace(/^(\s*)([\p{L}])/u, (_m, sp, c) => sp + c.toUpperCase()); // capitaliza a 1ª letra do texto
-    return t;
-  } catch { return txt; }
-}
 function _criarLembretesSessao(projeto: string, eventoId: string, inicioISO: string, fimISO: string, contatoId: string | null, telefoneBruto: any, instancia: string, nomePessoa: string, sala: string): number {
   const tel = _normalizarTelBR(telefoneBruto);
   const temWa = !!tel;
@@ -3968,9 +3261,7 @@ function _criarLembretesSessao(projeto: string, eventoId: string, inicioISO: str
     if (!enviarISO) continue;
     if (new Date(enviarISO).getTime() <= nowMs) continue; // já passou -> não cria
     let txt = String(lb.texto || '');
-    const _nomeB = _primeiroNomeBonito(nomePessoa); // [+lembretes-nome] 1º nome limpo/capitalizado (ou '')
-    txt = txt.replace(/\{nome\}/g, _nomeB).replace(/\{dia\}/g, diaBR).replace(/\{hora\}/g, horaBR).replace(/\{instrumento\}/g, String(projeto || ''));
-    if (!_nomeB) txt = _limpaTextoSemNome(txt); // [+lembretes-nome] sem nome: não deixa "Oi !" nem vírgula solta
+    txt = txt.replace(/\{nome\}/g, String(nomePessoa || '')).replace(/\{dia\}/g, diaBR).replace(/\{hora\}/g, horaBR).replace(/\{instrumento\}/g, String(projeto || ''));
     if (lb.incluir_link_sala && sala && txt.indexOf('{sala}') < 0) txt = txt.replace(/\s+$/, '') + '\n' + sala;
     txt = txt.replace(/\{sala\}/g, String(sala || ''));
     const status = temWa ? 'pendente' : 'pulado';
@@ -4010,7 +3301,6 @@ async function tickLembretesSessao(): Promise<void> {
         if (!got.changes) continue;
         try { await enviarTexto(r.projeto as any, r.telefone, r.texto, r.instancia ? String(r.instancia) : undefined); }
         catch (e: any) { db.prepare(`UPDATE agenda_lembretes SET status='erro', erro=? WHERE id=?`).run(String(e && e.message || e), r.id); }
-        try { _emailLembreteEnviar(String(r.projeto||''), r.contato_id || null, String(r.texto||'')); } catch { /* [email-lembrete] best-effort */ }
       } catch { /* best-effort por linha */ }
     }
   } catch { /* best-effort */ } finally { _lembTicking = false; }
@@ -4257,8 +3547,6 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       } else if (pubFlag('gcal_ativo') === '1') { _gcalIaAviso = 'fonte_ia_desligada'; }
       // [lembretes-sessao] cria os lembretes configurados deste evento (best-effort, não quebra a marcação)
       try { _criarLembretesSessao(projeto, id, inicio, fim, conversa.contato_id || null, _telBruto, _inst, String(args.nome || ''), seed.sala || ''); } catch { /* best-effort */ }
-      // [agente-off-apos-marcar 26/10] uma vez MARCADO, o agente para de atender esse lead (não transfere, não continua); só os lembretes seguem. status!='ativo' já bloqueia no topo de processarMensagemAgente. A confirmação desta marcação ainda sai (o guard só roda no início do turno).
-      try { db.prepare(`UPDATE agente_conversas SET status='agendado', atualizado_em=? WHERE id=?`).run(agora(), conversa.id); } catch { /* best-effort */ }
       return { ok: true, id, inicio, fim, sala: seed.sala || '', sala_instrucao: seed.sala ? ('IMPORTANTE: envie este link da sala fixa pro aluno na confirmacao, exatamente assim: ' + seed.sala + ' . Ignore qualquer outro link de meet que apareca.') : '', googleEventId: _gcalIaId, avisoGoogle: _gcalIaAviso };
     }
     if (nomeFerr === 'registrar_card_crm') {
@@ -4679,7 +3967,6 @@ CREATE TABLE IF NOT EXISTS grupos_wpp (
   atualizado_em TEXT
 );
 `);
-try { db.exec(`ALTER TABLE grupos_wpp ADD COLUMN oculto INTEGER DEFAULT 0`); } catch { /* ja existe */ } // [+grupos-ocultar]
 
 app.post('/disparo/grupos/sincronizar', async (req, res) => {
   try {
@@ -4707,11 +3994,8 @@ app.post('/disparo/grupos/sincronizar', async (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
-app.get('/disparo/grupos', (req, res) => {
-  // [+grupos-ocultar] por padrão NÃO lista os grupos ocultos; ?incluirOcultos=1 traz todos (p/ "Mostrar removidos")
-  const incluirOcultos = String((req.query as any).incluirOcultos || '') === '1';
-  const where = incluirOcultos ? '' : 'WHERE COALESCE(oculto,0)=0';
-  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho, COALESCE(oculto,0) oculto FROM grupos_wpp ${where} ORDER BY projeto, nome`).all();
+app.get('/disparo/grupos', (_req, res) => {
+  const rows = db.prepare(`SELECT id, nome, COALESCE(inst_manual, projeto) inst, projeto, instancia, tamanho FROM grupos_wpp ORDER BY projeto, nome`).all();
   res.json({ ok: true, grupos: rows });
 });
 
@@ -4719,47 +4003,6 @@ app.post('/disparo/grupo/instrumento', (req, res) => {
   const b = req.body || {};
   db.prepare(`UPDATE grupos_wpp SET inst_manual=? WHERE id=?`).run(String(b.inst || ''), String(b.id || ''));
   res.json({ ok: true });
-});
-
-// [+grupos-remover] REMOVER grupos da lista do sistema (manual, pelo app). Reversível: o
-// "Sincronizar grupos" readiciona os que ainda existem no WhatsApp. Útil pra tirar grupos
-// que não são dos projetos (família/kids/sellflux/etc) e pra RESETAR a lista.
-app.post('/disparo/grupos/remover', (req, res) => {
-  try {
-    const jids = (((req.body || {}).jids) || []).map((x: any) => String(x)).filter(Boolean);
-    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
-    const ph = jids.map(() => '?').join(',');
-    const n = db.prepare(`DELETE FROM grupos_wpp WHERE id IN (${ph})`).run(...jids).changes;
-    res.json({ ok: true, removidos: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
-});
-// [+grupos-limpar] LIMPAR todos os grupos de um projeto (e/ou instância) — pra resetar e
-// depois reimportar via POST /disparo/grupos/sincronizar {projeto}. Exige projeto ou instancia.
-app.post('/disparo/grupos/limpar', (req, res) => {
-  try {
-    const projeto = String((req.body || {}).projeto || '').trim();
-    const instancia = String((req.body || {}).instancia || '').trim();
-    if (!projeto && !instancia) return res.json({ ok: false, erro: 'informe projeto ou instancia' });
-    const conds: string[] = []; const args: any[] = [];
-    if (projeto) { conds.push('projeto=?'); args.push(projeto); }
-    if (instancia) { conds.push('instancia=?'); args.push(instancia); }
-    const n = db.prepare(`DELETE FROM grupos_wpp WHERE ${conds.join(' AND ')}`).run(...args).changes;
-    res.json({ ok: true, removidos: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
-});
-// [+grupos-ocultar] OCULTAR (remover da lista, soft) ou RESTAURAR grupos. SOBREVIVE ao /sincronizar
-// (o UPSERT do sincronizar não mexe no campo oculto). Grupo oculto não aparece em /disparo/grupos
-// (sem ?incluirOcultos=1) nem é selecionável pra disparo. Reversível: oculto:0 restaura.
-app.post('/disparo/grupos/ocultar', (req, res) => {
-  try {
-    const b = req.body || {};
-    const jids = (b.jids || []).map((x: any) => String(x)).filter(Boolean);
-    if (!jids.length) return res.json({ ok: false, erro: 'informe jids' });
-    const oculto = (b.oculto === 0 || b.oculto === '0' || b.oculto === false) ? 0 : 1;
-    const ph = jids.map(() => '?').join(',');
-    const n = db.prepare(`UPDATE grupos_wpp SET oculto=? WHERE id IN (${ph})`).run(oculto, ...jids).changes;
-    res.json({ ok: true, oculto, afetados: n });
-  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
 // [grupo-link] Tenta pegar o LINK de convite de um grupo (pra identificar/abrir). Precisa que o número seja ADMIN
@@ -5134,7 +4377,6 @@ app.post('/wa/mcp/enviar', async (req: any, res: any) => {
     if (_waEnviadosHoje() >= teto) return res.json({ ok: false, erro: `teto diário de ${teto} mensagens atingido para o MCP (ajuste em Config)` });
     const id = randomUUID();
     try {
-      await _simularPresenca(inst, tel, 'composing', texto); // [+presenca] "digitando…" (MCP 1-a-1)
       const r: any = await evo(`/message/sendText/${inst}`, 'POST', { number: tel, text: texto });
       const msgId = String(r?.key?.id || r?.id || '');
       db.prepare(`INSERT INTO wa_mcp_log(id,criado_em,instancia,telefone,texto,status,erro,msg_id) VALUES(?,?,?,?,?,?,?,?)`).run(id, agora(), inst, tel, texto, 'enviado', '', msgId);
@@ -5417,19 +4659,10 @@ app.get('/pub/canais', (_req, res) => {
 app.post('/pub/canais', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.id || randomUUID());
-    const ex = db.prepare(`SELECT * FROM canais_publicacao WHERE id=?`).get(id) as any;
+    const ex = db.prepare(`SELECT id FROM canais_publicacao WHERE id=?`).get(id);
     if (ex) {
-      // [fix-preserva-canal 27/10] UPDATE PARCIAL: campo que NAO vier no body MANTEM o valor atual.
-      // Antes zerava ig_business_id/fb_page_id/descricao_template/etc quando o body nao mandava — ex: o botao
-      // "Espelhar agenda" so manda nome/projeto/cor/plataformas, e isso derrubava a conexao FB/IG. So acrescenta logica.
-      const _has = (k: string) => Object.prototype.hasOwnProperty.call(b, k);
-      const _keepStr = (k: string, cur: any) => _has(k) ? (b[k] != null ? b[k] : '') : (cur != null ? cur : '');
-      const _keepNull = (k: string, cur: any) => _has(k) ? (b[k] || null) : (cur != null ? cur : null);
-      const _keepFlag = (k: string, cur: any, def: number) => _has(k) ? (b[k] ? 1 : 0) : (cur != null ? cur : def);
-      const _keepPlat = _has('plataformas') ? JSON.stringify(b.plataformas || []) : (ex.plataformas_json != null ? ex.plataformas_json : JSON.stringify([]));
-      const _keepTags = (_has('hashtags_padrao') || _has('hashtags_padrao_json')) ? JSON.stringify(b.hashtags_padrao || b.hashtags_padrao_json || []) : (ex.hashtags_padrao_json != null ? ex.hashtags_padrao_json : JSON.stringify([]));
       db.prepare(`UPDATE canais_publicacao SET nome=?, projeto=?, instrumento=?, cor=?, ativo=?, plataformas_json=?, ig_business_id=?, fb_page_id=?, yt_channel_id=?, tiktok_open_id=?, threads_user_id=?, pinterest_board_id=?, descricao_template=?, descricao_social_template=?, hashtags_padrao_json=?, usar_horario_otimo=?, mover_publicados=?, atualizado_em=? WHERE id=?`)
-        .run(_keepStr('nome', ex.nome), _keepStr('projeto', ex.projeto), _keepStr('instrumento', ex.instrumento), _keepStr('cor', ex.cor), _keepFlag('ativo', ex.ativo, 1), _keepPlat, _keepNull('ig_business_id', ex.ig_business_id), _keepNull('fb_page_id', ex.fb_page_id), _keepNull('yt_channel_id', ex.yt_channel_id), _keepNull('tiktok_open_id', ex.tiktok_open_id), _keepNull('threads_user_id', ex.threads_user_id), _keepNull('pinterest_board_id', ex.pinterest_board_id), _keepNull('descricao_template', ex.descricao_template), _keepNull('descricao_social_template', ex.descricao_social_template), _keepTags, _keepFlag('usar_horario_otimo', ex.usar_horario_otimo, 0), _keepFlag('mover_publicados', ex.mover_publicados, 1), agora(), id);
+        .run(b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), id);
     } else {
       db.prepare(`INSERT INTO canais_publicacao(id,nome,projeto,instrumento,cor,ativo,plataformas_json,ig_business_id,fb_page_id,yt_channel_id,tiktok_open_id,threads_user_id,pinterest_board_id,descricao_template,descricao_social_template,hashtags_padrao_json,usar_horario_otimo,mover_publicados,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, b.nome || '', b.projeto || '', b.instrumento || '', b.cor || '', b.ativo != null ? (b.ativo ? 1 : 0) : 1, JSON.stringify(b.plataformas || []), b.ig_business_id || null, b.fb_page_id || null, b.yt_channel_id || null, b.tiktok_open_id || null, b.threads_user_id || null, b.pinterest_board_id || null, b.descricao_template || null, b.descricao_social_template || null, JSON.stringify(b.hashtags_padrao || []), b.usar_horario_otimo ? 1 : 0, b.mover_publicados != null ? (b.mover_publicados ? 1 : 0) : 1, agora(), agora());
@@ -5693,19 +4926,6 @@ app.post('/config/numero-padrao', (req, res) => {
   if (inst) (CONFIG as any).numeroPadrao[projeto] = inst; else delete (CONFIG as any).numeroPadrao[projeto];
   try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   res.json({ ok: true, numeroPadrao: (CONFIG as any).numeroPadrao });
-});
-// [+recup-numero 28/10] número DEDICADO de recuperação por projeto + horas do anti-duplicado. ADITIVO.
-app.get('/config/numero-recuperacao', (_req, res) => { res.json({ ok: true, numeroRecuperacao: (CONFIG as any).numeroRecuperacao || {}, recupDedupHoras: Number((CONFIG as any).recupDedupHoras ?? 12) }); });
-app.post('/config/numero-recuperacao', (req, res) => {
-  const b = req.body || {};
-  const projeto = String(b.projeto || '');
-  if (!PROJETOS.includes(projeto as any)) return res.status(400).json({ ok: false, erro: 'projeto_invalido' });
-  if (!(CONFIG as any).numeroRecuperacao) (CONFIG as any).numeroRecuperacao = {};
-  const inst = String(b.instancia || '').trim();
-  if (inst) (CONFIG as any).numeroRecuperacao[projeto] = inst; else delete (CONFIG as any).numeroRecuperacao[projeto];
-  if (b.dedupHoras !== undefined) (CONFIG as any).recupDedupHoras = Math.max(0, Number(b.dedupHoras) || 0);
-  try { salvarConfig(); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  res.json({ ok: true, numeroRecuperacao: (CONFIG as any).numeroRecuperacao, recupDedupHoras: Number((CONFIG as any).recupDedupHoras ?? 12) });
 });
 
 // ======================= [motor2] Endpoints de gestão (trilha/tags/flags) =======================
@@ -6065,34 +5285,6 @@ function _contaNos(fluxoJson: string): number {
   try { const o = JSON.parse(fluxoJson || '{}'); return Array.isArray(o.nodes) ? o.nodes.length : 0; } catch { return 0; }
 }
 
-app.post('/crm/contatos/acao-massa', (req, res) => {
-  try {
-    const b = req.body || {};
-    const projeto = String(b.projeto || '');
-    const acao = String(b.acao || '');
-    const valor = String(b.valor || '');
-    const alvo = b.alvo || {};
-    if (!valor) return res.json({ ok: false, erro: 'valor_obrigatorio' });
-    let ids: string[] = [];
-    if (Array.isArray(alvo.ids) && alvo.ids.length) ids = alvo.ids.map((x: any) => String(x));
-    else if (alvo.tag) {
-      ids = (db.prepare(`SELECT c.id FROM contatos c JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id WHERE t.nome=? AND (?='' OR c.projeto=?)`).all(String(alvo.tag), projeto, projeto) as any[]).map((r) => String(r.id));
-    }
-    if (!ids.length) return res.json({ ok: false, erro: 'sem_alvo' });
-    let afetados = 0;
-    if (acao === 'add_tag') {
-      for (const cid of ids) { aplicarTag(projeto, cid, valor); const ct = db.prepare(`SELECT telefone, nome FROM contatos WHERE id=?`).get(cid) as any; rodarAutomacoes(projeto, 'tag_adicionada', { contatoId: cid, tag: valor, telefone: ct?.telefone, nome: ct?.nome }).catch(() => {}); afetados++; }
-    } else if (acao === 'remove_tag') {
-      const t = db.prepare(`SELECT id FROM tags WHERE projeto=? AND nome=?`).get(projeto, valor) as any;
-      if (t) for (const cid of ids) { db.prepare(`DELETE FROM contato_tags WHERE contato_id=? AND tag_id=?`).run(cid, t.id); afetados++; }
-    } else if (acao === 'add_fluxo') {
-      return res.json({ ok: false, erro: 'add_fluxo_indisponivel', msg: 'Entrada direta em fluxo ainda nao disponivel; use Adicionar tag com a tag de entrada do fluxo.' });
-    } else {
-      return res.json({ ok: false, erro: 'acao_invalida' });
-    }
-    res.json({ ok: true, afetados, total: afetados });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
 app.get('/fluxo/campanhas', (req, res) => {
   try {
     const tipo = String((req.query as any).tipo || '');
@@ -7005,12 +6197,10 @@ function _odBaixarPub(rel: string): string {
 }
 // envia por uma INSTÂNCIA específica (não pelo projeto). Reusa evo().
 async function enviarTextoVia(instancia: string, para: string, texto: string) {
-  await _simularPresenca(instancia, para, 'composing', texto); // [+presenca] "digitando…" (pula grupo)
   return evo(`/message/sendText/${encodeURIComponent(instancia)}`, 'POST', { number: para, text: texto });
 }
 async function enviarMidiaVia(instancia: string, para: string, tipo: string, url: string, legenda?: string) {
   if (!url) throw new Error('midia_sem_url');
-  await _simularPresenca(instancia, para, tipo === 'audio' ? 'recording' : 'composing', legenda || ''); // [+presenca]
   if (tipo === 'audio') return evo(`/message/sendWhatsAppAudio/${encodeURIComponent(instancia)}`, 'POST', { number: para, audio: url });
   const mediatype = tipo === 'video' ? 'video' : (tipo === 'documento' || tipo === 'document') ? 'document' : 'image';
   const body: any = { number: para, mediatype, media: url };
@@ -8006,27 +7196,6 @@ async function pbFbPublicar(canalId: string, a: { filePath: string; publicUrl: s
   const d3 = await r3.json() as any; if (!r3.ok) throw new Error(`FB reels finish: ${JSON.stringify(d3).slice(0, 200)}`);
   return { id: d1.video_id, url: `https://www.facebook.com/reel/${d1.video_id}` };
 }
-// [+fb-carrossel 27/10] carrossel no Facebook = post multi-foto: sobe cada imagem NÃO publicada (/photos published=false)
-// e depois cria 1 post no /feed com attached_media apontando pros ids. Usa o page token (tok.accessToken).
-async function pbFbCarrossel(canalId: string, refsPublicos: string[], caption: string): Promise<{ id: string; url: string }> {
-  const canal = pbCanal(canalId); const pageId = canal?.fb_page_id; const tok = pbTokLer(canalId, 'facebook');
-  if (!pageId || !tok?.accessToken) throw new Error('Facebook não conectado neste canal.');
-  const pageTok = tok.accessToken;
-  const mediaIds: string[] = [];
-  for (const url of refsPublicos.slice(0, 10)) {
-    const b = new URLSearchParams({ url, published: 'false', temporary: 'true', access_token: pageTok });
-    const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/photos`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b });
-    const d = await r.json() as any; if (!r.ok || !d.id) throw new Error(`FB carrossel foto: ${JSON.stringify(d).slice(0, 200)}`);
-    mediaIds.push(String(d.id));
-  }
-  if (mediaIds.length < 2) throw new Error('Carrossel FB precisa de 2+ imagens.');
-  const attached = mediaIds.map((id) => ({ media_fbid: id }));
-  const b2 = new URLSearchParams({ attached_media: JSON.stringify(attached), access_token: pageTok });
-  if (caption) b2.set('message', caption);
-  const r2 = await fetch(`https://graph.facebook.com/${PB_META_VER}/${pageId}/feed`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b2 });
-  const d2 = await r2.json() as any; if (!r2.ok || !d2.id) throw new Error(`FB carrossel feed: ${JSON.stringify(d2).slice(0, 200)}`);
-  const pid = d2.post_id || d2.id; return { id: pid, url: `https://www.facebook.com/${pid}` };
-}
 
 // ============================ UPLOADER — THREADS ============================
 async function pbThreadsPublicar(canalId: string, a: { publicUrl: string; filePath: string; formato: string; texto: string }): Promise<{ id: string; url: string }> {
@@ -8077,41 +7246,11 @@ async function pbPinterestPublicar(canalId: string, a: { filePath: string; forma
 function pbCarrosselUrls(onedriveRef: string): string[] {
   try {
     const arr = _odRcloneListar(onedriveRef) as any[]; // lista arquivos sob base/<ref>
-    // [fix-carrossel-path 27/10] o lsjson devolve Path RELATIVO à pasta (ex "01.png"); precisa prefixar o onedriveRef
-    // pra baixar do lugar certo (antes baixava de "Postagem Automatica/01.png" e falhava -> "carrossel sem imagens").
-    const imgs = (arr || []).filter((x) => pbIsImagem(x.Path || x.Name || '')).map((x) => `${onedriveRef}/${String(x.Path || x.Name || '')}`);
+    const imgs = (arr || []).filter((x) => pbIsImagem(x.Path || x.Name || '')).map((x) => (x.Path ? String(x.Path) : `${onedriveRef}/${x.Name}`));
     const urls: string[] = [];
     for (const rel of imgs.slice(0, 10)) { const m = pbBaixarMidia(rel); urls.push(m.publicUrl); }
     return urls;
   } catch { return []; }
-}
-// [cutover-nuvem] allowlist das plataformas que a NUVEM posta (as demais ficam no PC).
-// Vazio/ausente = posta TUDO (comportamento atual, inerte). Ex.: ["facebook","instagram"].
-function pbPlataformasNuvemAllow(): string[] {
-  try { const v = pubFlag('pub_plataformas_nuvem', ''); if (!v) return []; const a = JSON.parse(v); return Array.isArray(a) ? a.map((x: any) => String(x)) : []; } catch { return []; }
-}
-function pbPlataformaNuvemHabilitada(p: string): boolean {
-  const allow = pbPlataformasNuvemAllow();
-  if (!allow.length) return true; // vazio = nuvem posta todas as plataformas (padrão)
-  return allow.includes(String(p));
-}
-// [guardrail-yt-limite 27/10] teto diário de uploads YouTube na nuvem (cota padrão ~6/dia, aumento negado pelo Google; PC+nuvem dividiam a cota). Inerte se youtube não estiver no allowlist da nuvem, e se pub_yt_limite_dia<=0.
-function _pbDiaBRT(): string { const d = new Date(Date.now() - 3 * 3600000); return d.toISOString().slice(0, 10); }
-function pbYtLimiteDia(): number { const v = parseInt(pubFlag('pub_yt_limite_dia', '5'), 10); return (isNaN(v) || v < 0) ? 5 : v; }
-function pbYtCountHoje(): number { const v = parseInt(pubFlag('pub_yt_count_' + _pbDiaBRT(), '0'), 10); return isNaN(v) ? 0 : v; }
-function pbYtRegistraUpload(): void { try { setPubFlag('pub_yt_count_' + _pbDiaBRT(), String(pbYtCountHoje() + 1)); } catch { /* */ } }
-function pbYtPodePostarHoje(): boolean { const lim = pbYtLimiteDia(); if (lim <= 0) return true; return pbYtCountHoje() < lim; }
-// cria um item YouTube-only adiado p/ outro dia (escoa a fila sem estourar a cota; NÃO re-posta FB/IG do item original)
-function pbAdiarYoutube(item: any, diasFrente: number): void {
-  try {
-    const novoId = 'ytadiado-' + String(item.id) + '-' + Date.now();
-    if (db.prepare(`SELECT id FROM fila_publicacao WHERE id=?`).get(novoId)) return;
-    const quando = new Date(Date.now() + Math.max(1, diasFrente) * 24 * 3600000);
-    try { const orig = new Date(item.data_agendada); if (!isNaN(orig.getTime())) quando.setUTCHours(orig.getUTCHours(), orig.getUTCMinutes(), 0, 0); } catch { /* */ }
-    db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,onedrive_item_id,arquivo_nome,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,prioridade,trial_reels,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(novoId, item.canal_id, item.projeto || null, item.onedrive_ref, item.onedrive_item_id || null, item.arquivo_nome || null, item.thumb_ref || null, item.formato, JSON.stringify(['youtube']), item.titulo, item.descricao || '', item.descricao_social || '', quando.toISOString(), 'agendado', (item.prioridade || 0), (item.trial_reels || 0), agora(), agora());
-    pbLog('yt-adiado', String(item.id), 'limite diario YT -> ' + novoId + ' @ ' + quando.toISOString());
-  } catch (e) { pbLog('yt-adiado-erro', String(item.id), String((e as any)?.message || e)); }
 }
 async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
@@ -8139,27 +7278,20 @@ async function pbPostarItem(item: any): Promise<void> {
   const resultados: Record<string, string> = {};
   const videoIds: Record<string, string> = {};
   let sucessos = 0; let tentados = 0;
-  let ytAdiado = false; // [guardrail-yt-limite] YouTube deste item foi adiado por bater o teto diário
 
   for (const p of plataformas) {
-    // [cutover-nuvem] se houver allowlist, a nuvem só posta as plataformas habilitadas (resto fica no PC)
-    if (!pbPlataformaNuvemHabilitada(p)) { resultados[p] = 'PULADO: ' + p + ' nao habilitado na nuvem (fica no PC)'; continue; }
     try {
       let r: { id: string; url: string };
       const file = midia?.file || ''; const publicUrl = midia?.publicUrl || '';
       if (p === 'youtube') {
         if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: YouTube só vídeo aqui'; continue; }
-        // [guardrail-yt-limite 27/10] respeita o teto diário de uploads YT (cota compartilhada). Não conta como falha; o item escoa p/ outro dia.
-        if (!pbYtPodePostarHoje()) { resultados[p] = 'ADIADO: limite diario YouTube (' + pbYtCountHoje() + '/' + pbYtLimiteDia() + ')'; ytAdiado = true; continue; }
         r = await pbYtUpload(canalId, file, { titulo, descricao: descYt, ehShorts: ehVertical, privacy: pbFlagPriv(canalId), thumbFile });
-        pbYtRegistraUpload();
       } else if (p === 'instagram') {
         if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbIgCarrossel(canalId, carrosselUrls, captionSocial); }
         else { if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; } r = await pbIgPublicar(canalId, { filePath: file, publicUrl, formato, caption: captionSocial }); }
       } else if (p === 'facebook') {
-        if (formato === 'carrossel') { if (!carrosselUrls.length) { resultados[p] = 'PULADO: carrossel sem imagens'; continue; } r = await pbFbCarrossel(canalId, carrosselUrls, captionSocial); }
-        else if (!midia) { resultados[p] = 'PULADO: sem mídia'; continue; }
-        else r = await pbFbPublicar(canalId, { filePath: file, publicUrl, formato, titulo, descricao: captionSocial });
+        if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: FB não faz carrossel aqui'; continue; }
+        r = await pbFbPublicar(canalId, { filePath: file, publicUrl, formato, titulo, descricao: captionSocial });
       } else if (p === 'threads') {
         if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: Threads sem carrossel aqui'; continue; }
         r = await pbThreadsPublicar(canalId, { publicUrl, filePath: file, formato, texto: captionSocial || titulo });
@@ -8184,14 +7316,7 @@ async function pbPostarItem(item: any): Promise<void> {
     // sucesso (total ou parcial): marca publicado, nunca re-posta
     db.prepare(`UPDATE fila_publicacao SET status='publicado', tentativas_consecutivas=0, erro=?, atualizado_em=? WHERE id=?`)
       .run(sucessos < tentados ? 'parcial: ' + JSON.stringify(resultados) : null, agora(), item.id);
-    // [guardrail-yt-limite] FB/IG já saíram; se o YouTube foi adiado por limite, cria item YT-only p/ outro dia (sem re-postar FB/IG)
-    if (ytAdiado) pbAdiarYoutube(item, 1);
     pbLog('publicado', item.id, `${sucessos}/${tentados} rede(s)`);
-  } else if (ytAdiado && tentados === 0) {
-    // [guardrail-yt-limite] item só de YouTube (ou YT + plataformas puladas) adiado por limite -> reempurra +1 dia, SEM contar como falha/quarentena
-    db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`)
-      .run(new Date(Date.now() + 24 * 3600000).toISOString(), 'adiado: limite diario YouTube', agora(), item.id);
-    pbLog('yt-adiado-reempurra', item.id, 'limite diario YT');
   } else if (tentados === 0) {
     // nada aplicável (ex.: imagem só com youtube) — tira da fila
     db.prepare(`UPDATE fila_publicacao SET status='publicado', erro='nada a postar (todas as redes puladas)', atualizado_em=? WHERE id=?`).run(agora(), item.id);
@@ -8252,25 +7377,6 @@ app.post('/pub/publicador/privacidade', (req, res) => {
 });
 
 app.post('/pub/publicador/desligar', (_req, res) => { setPubFlag('publicador_ativo', '0'); res.json({ ok: true, ativo: false }); });
-// [cutover-nuvem] lê/define quais plataformas a NUVEM posta (resto fica no PC). Vazio = todas.
-app.get('/pub/plataformas-nuvem', (_req, res) => { res.json({ ok: true, plataformas: pbPlataformasNuvemAllow() }); });
-app.post('/pub/plataformas-nuvem', (req, res) => {
-  try {
-    const arr = Array.isArray((req.body || {}).plataformas) ? (req.body.plataformas).map((x: any) => String(x)) : [];
-    setPubFlag('pub_plataformas_nuvem', JSON.stringify(arr));
-    res.json({ ok: true, plataformas: arr });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-// [guardrail-yt-limite 27/10] lê/define o teto diário de uploads YouTube na nuvem (0 = sem limite). Mostra o contador de hoje (fuso BRT).
-app.get('/pub/publicador/yt-limite', (_req, res) => { res.json({ ok: true, limiteDia: pbYtLimiteDia(), hoje: pbYtCountHoje(), dia: _pbDiaBRT(), podePostarAgora: pbYtPodePostarHoje() }); });
-app.post('/pub/publicador/yt-limite', (req, res) => {
-  try {
-    const b = req.body || {};
-    if (b.limiteDia !== undefined) { const n = parseInt(String(b.limiteDia), 10); if (isNaN(n) || n < 0) return res.status(400).json({ ok: false, erro: 'limiteDia: inteiro >= 0 (0 = sem limite)' }); setPubFlag('pub_yt_limite_dia', String(n)); }
-    if (b.resetHoje === true) setPubFlag('pub_yt_count_' + _pbDiaBRT(), '0');
-    res.json({ ok: true, limiteDia: pbYtLimiteDia(), hoje: pbYtCountHoje(), dia: _pbDiaBRT() });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
 app.get('/pub/publicador/status', (_req, res) => {
   try {
     const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM fila_publicacao GROUP BY status`).all() as any[];
@@ -8614,17 +7720,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       if (projT) {
         const cfgT = trackLer(String(projT));
         if (cfgT && cfgT.ativo !== 0 && (cfgT.meta_pixel_id || cfgT.ga4_mid)) {
-          let _fn: string | null = null, _ln: string | null = null;
-          try { const _nm = String((dados as any).nome || '').trim(); if (_nm) { const _ps = _nm.split(/\s+/); _fn = _ps.shift() || null; _ln = _ps.length ? _ps.join(' ') : null; } } catch { /* nome best-effort */ }
-          let _fbcP: string | null = null;
-          try {
-            const _tel = dados.telefone ? String(dados.telefone).replace(/\D/g, '') : '';
-            let _cc: any = null;
-            if (_tel) _cc = db.prepare(`SELECT utm_fbclid FROM contatos WHERE projeto=? AND telefone=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(projT), _tel) as any;
-            if ((!_cc || !_cc.utm_fbclid) && dados.email) _cc = db.prepare(`SELECT utm_fbclid FROM contatos WHERE lower(email)=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(dados.email).toLowerCase()) as any;
-            if (_cc && _cc.utm_fbclid) _fbcP = 'fb.1.' + Date.now() + '.' + String(_cc.utm_fbclid);
-          } catch { /* fbc best-effort */ }
-          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, eventId: (dados as any).pedido || undefined, firstName: _fn, lastName: _ln, fbc: _fbcP, externalId: dados.email || dados.telefone || null, utms: (dados as any).utms || null }, fonte);
+          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, externalId: dados.email || dados.telefone || null, utms: (dados as any).utms || null }, fonte);
           return;
         }
       }
@@ -8656,7 +7752,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     try {
       const cfgT = trackLer(String(projeto || ''));
       if (cfgT && cfgT.ativo !== 0 && (cfgT.meta_pixel_id || cfgT.ga4_mid)) {
-        await trackEnviarTudo(cfgT, eventName, { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: null, produto: null, pagina: dados.pagina || null, clientIp: (dados as any).clientIp || null, userAgent: (dados as any).userAgent || null, fbp: (dados as any).fbp || null, fbc: (dados as any).fbc || null }, 'vsl');
+        await trackEnviarTudo(cfgT, eventName, { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: null, produto: null, pagina: dados.pagina || null }, 'vsl');
       }
     } catch { /* best-effort: nunca quebra o ingest do player */ }
   };
@@ -10064,8 +9160,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
     let ofertas: any[] = []; try { ofertas = JSON.parse(wb.ofertas_json || '[]'); } catch { ofertas = []; }
     let videoUrl = '';
     if (Number(wb.modo) === 1) videoUrl = String(wb.video_tipo) === 'url' ? String(wb.video_ref || '') : '';
-    // [+webinario-storage] vídeo próprio enviado do PC (fonte 'storage', ref no OneDrive) -> serve pelo /w-media/:slug (Range + cache, igual ao VSL, já comprimido)
-    if (Number(wb.modo) === 1 && String(wb.video_tipo) === 'storage' && String(wb.video_ref || '')) videoUrl = (PUBLIC_BASE_URL || '') + '/w-media/' + wb.slug;
     const s = simGet(wb.slug);
     const sim = s ? {
       vMin: Number(s.cfg.vMin) || 0, vMax: Number(s.cfg.vMax) || 0,
@@ -10090,68 +9184,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   app.get('/webinarios/:id', (req: any, res: any) => {
     const wb = wbGet(String(req.params.id)); if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
     res.json({ ok: true, webinario: wb, link: wbBase() + '/w/' + wb.slug });
-  });
-  // [+mensagens 27/10] consulta ADMIN (x-api-key) dos comentarios PROGRAMADOS/IMPORTADOS da audiencia simulada.
-  // Ficam em webinario_sim.coment_json (array {tempoSeg,nome,texto}); o 'ativo' da linha liga/desliga TODOS.
-  // Mostra o que esta CADASTRADO — NAO confirma exibicao no player (isso exige testar o player). So acrescenta rota.
-  app.get('/webinarios/:id/mensagens', (req: any, res: any) => {
-    try {
-      const wb = wbGet(String(req.params.id)); if (!wb) return res.status(404).json({ ok: false, erro: 'nao_encontrado' });
-      const row = db.prepare(`SELECT * FROM webinario_sim WHERE slug=?`).get(wb.slug) as any;
-      let cfg: any = {}; let coment: any[] = [];
-      if (row) { try { cfg = JSON.parse(row.cfg_json || '{}'); } catch { cfg = {}; } try { coment = JSON.parse(row.coment_json || '[]'); } catch { coment = []; } }
-      const ativo = !!(row && row.ativo);
-      const atualizado = (row && row.atualizado_em) || null;
-      const hhmmss = (s: any) => { s = Math.max(0, Math.round(Number(s) || 0)); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60; return (h > 0 ? String(h).padStart(2, '0') + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0'); };
-      const ordenado = coment.map((c: any, i: number) => ({ _i: i, ...c })).sort((a: any, b2: any) => (Number(a.tempoSeg) || 0) - (Number(b2.tempoSeg) || 0));
-      const total = ordenado.length;
-      const limite = Math.max(1, Math.min(2000, Number((req.query && req.query.limite)) || 500));
-      const offset = Math.max(0, Number((req.query && req.query.offset)) || 0);
-      const pagina = ordenado.slice(offset, offset + limite).map((c: any) => ({
-        id: 'sim-' + c._i,
-        webinarioId: wb.id, slug: wb.slug,
-        nome: c.nome || null, texto: c.texto || null,
-        momentoSeg: Math.round(Number(c.tempoSeg) || 0),
-        momentoHHMMSS: hhmmss(c.tempoSeg),
-        origem: 'programado',
-        habilitado: ativo,
-        criadoEm: null, atualizadoEm: atualizado
-      }));
-      const vazios = ordenado.filter((c: any) => !String(c.texto || '').trim()).length;
-      const tempoInvalido = ordenado.filter((c: any) => !(Number(c.tempoSeg) >= 0)).length;
-      const ultimoSeg = total ? Math.round(Number(ordenado[total - 1].tempoSeg) || 0) : 0;
-      const chatRealCount = (db.prepare(`SELECT COUNT(*) n FROM webinario_chat WHERE slug=?`).get(wb.slug) as any)?.n || 0;
-      res.json({
-        ok: true, webinarioId: wb.id, slug: wb.slug, nome: wb.nome,
-        simulacaoAtiva: ativo,
-        config: {
-          referenciaTempo: 'tempoSeg = segundos desde o inicio do video (campo salvo em cada comentario); exibicao no player NAO verificada nesta consulta',
-          modoTesteOuPrevia: 'a simulacao liga/desliga pelo campo ativo desta linha; nao ha modo de teste separado no motor',
-          pausaAvancoReinicio: 'comportamento de pausa/seek/reinicio e do PLAYER (front-end da sala), nao verificavel por esta rota',
-          viewers: cfg, atualizadoEm: atualizado
-        },
-        total, limite, offset, proximoOffset: (offset + limite < total ? offset + limite : null),
-        ordenadoPor: 'momentoSeg asc',
-        ultimaMinutagem: hhmmss(ultimoSeg), ultimoSeg,
-        avisos: { textosVazios: vazios, temposInvalidos: tempoInvalido },
-        chatRealCount,
-        camposAusentes: ['id proprio por comentario (uso o indice: sim-N)', 'habilitacao por comentario (vale o ativo da simulacao, igual pra todos)', 'datas por comentario (so existe atualizado_em da linha webinario_sim)'],
-        mensagens: pagina
-      });
-    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-  // [+webinario-storage] serve o vídeo PRÓPRIO do webinário (fonte 'storage', ref no OneDrive): baixa 1x
-  // pro cache /data/media e redireciona pro /media/<hash> (aceita Range/seek, cacheável no CDN). Público.
-  app.get('/w-media/:slug', async (req: any, res: any) => {
-    try {
-      const wb = wbGet(String(req.params.slug)); if (!wb) return res.status(404).send('nao_encontrado');
-      const ref = String(wb.video_ref || ''); if (!ref) return res.status(404).send('sem_video');
-      if (/^https?:\/\//i.test(ref)) return res.redirect(302, ref); // ref já é URL direta
-      const dest = _odDestPath(ref); const nome = dest.split('/').pop();
-      try { if (fs.existsSync(dest) && fs.statSync(dest).size > 0) return res.redirect(302, '/media/' + nome); } catch { /* */ }
-      await _odBaixarGrande(ref); // dedupe + atômico (.part), cacheia em /data/media
-      return res.redirect(302, '/media/' + nome);
-    } catch { res.status(500).send('erro'); }
   });
   app.post('/webinarios', (req: any, res: any) => {
     try {
@@ -10379,27 +9411,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
     videoEl.oncontextmenu=function(){return false;};
     vid.appendChild(videoEl);
     if(EVG){ videoEl.addEventListener('loadedmetadata',function(){ try{ var pp=Math.max(0,(snow()-SS)/1000); if(videoEl.duration&&pp<videoEl.duration){ videoEl.currentTime=pp; } }catch(e){} }); videoEl.addEventListener('seeking',function(){ try{ var mx=Math.max(0,(snow()-SS)/1000); if(videoEl.currentTime>mx+2){ videoEl.currentTime=mx; } }catch(e){} }); }
-    // [+sala-ao-vivo 27/10] Sessao com horario (ao vivo simulado): SEM controles (sem play/pause, tempo, barra, volume).
-    // Comeca sem som (o navegador so deixa tocar sozinho assim) com o botao "Clique para ativar o som";
-    // fica sempre no ponto "ao vivo" (quem entra depois pega do meio) e nao deixa pausar. Sala sem horario fica igual.
-    if(EVG){ try{
-      videoEl.controls=false; videoEl.removeAttribute('controls'); videoEl.muted=true; videoEl.defaultMuted=true; videoEl.setAttribute('muted','');
-      videoEl.setAttribute('tabindex','-1'); videoEl.style.pointerEvents='none';
-      var _vivoPos=function(){ return Math.max(0,(snow()-SS)/1000); };
-      var _sync=function(forca){ try{ var alvo=_vivoPos(); if(videoEl.duration&&alvo>=videoEl.duration){ return; } if(forca||Math.abs((videoEl.currentTime||0)-alvo)>5){ videoEl.currentTime=alvo; } }catch(e){} };
-      var _tocar=function(){ try{ var pr=videoEl.play(); if(pr&&pr.catch){ pr.catch(function(){}); } }catch(e){} };
-      var somBtn=document.createElement('button'); somBtn.type='button'; somBtn.textContent='🔊 Clique para ativar o som';
-      somBtn.style.cssText='position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:20;background:#F1541A;color:#fff;border:0;border-radius:999px;padding:12px 22px;font:700 15px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,.4);cursor:pointer;white-space:nowrap';
-      var ativarSom=function(){ try{ videoEl.muted=false; videoEl.volume=1; }catch(e){} _sync(true); _tocar(); somBtn.style.display='none'; };
-      somBtn.onclick=function(ev){ if(ev){ ev.stopPropagation(); } ativarSom(); };
-      vid.appendChild(somBtn);
-      vid.addEventListener('click',function(){ if(videoEl.muted){ ativarSom(); } });
-      videoEl.addEventListener('volumechange',function(){ somBtn.style.display=videoEl.muted?'':'none'; });
-      videoEl.addEventListener('pause',function(){ if(!videoEl.ended && fase()==='vivo'){ setTimeout(function(){ _sync(true); _tocar(); },400); } });
-      setInterval(function(){ if(fase()!=='vivo' || videoEl.ended){ return; } if(videoEl.paused){ _sync(true); _tocar(); } else { _sync(false); } },8000);
-      document.addEventListener('keydown',function(ev){ var k=ev.key||''; if(k===' '||k==='k'||k==='K'||k==='ArrowLeft'||k==='ArrowRight'||k==='j'||k==='l'||k==='MediaPlayPause'){ if(!ev.target||!/^(INPUT|TEXTAREA)$/.test(ev.target.tagName||'')){ ev.preventDefault(); } } });
-      _tocar();
-    }catch(e){} }
   } else {
     var yid=ytId(cfg.youtube_url);
     if(yid){
@@ -10472,7 +9483,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       var p=document.createElement('div'); p.style.color='#9aa3b2'; p.style.margin='8px 0 14px'; p.textContent=o.conteudo||'';
       var a=document.createElement('a'); a.href=o.url||'#'; a.target='_blank'; a.textContent=o.botao||'Quero garantir'; a.style.display='inline-block'; a.style.background='#7c6cf0'; a.style.color='#fff'; a.style.fontWeight='700'; a.style.textDecoration='none'; a.style.padding='11px 22px'; a.style.borderRadius='999px';
       b.appendChild(x); b.appendChild(h); b.appendChild(p); b.appendChild(a); m.appendChild(b); document.body.appendChild(m);
-      /* [+webinario-popup-v2 26/10] classe propria + estilo inline (extensao do navegador nao esmaga o .modal) + IMAGEM/arte opcional (o.imagem) */ m.className='mrwbofm'; m.style.cssText='position:fixed;left:0;top:0;width:100%;height:100%;margin:0;padding:16px;box-sizing:border-box;background:rgba(0,0,0,.68);display:flex;align-items:center;justify-content:center;z-index:2147483000;overflow:auto'; b.className='mrwbofb'; b.style.cssText='position:relative;box-sizing:border-box;width:100%;max-width:440px;margin:auto;background:#171a22;border:1px solid #262a36;border-radius:16px;padding:20px;text-align:center;color:#f2f4f8;font-family:inherit'; x.style.cssText='position:absolute;top:8px;right:8px;z-index:3;cursor:pointer;width:32px;height:32px;line-height:32px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-weight:700;font-size:16px;text-align:center'; a.style.padding='14px 26px'; a.style.fontSize='17px'; if(o.cor_botao){ a.style.background=o.cor_botao; } if(o.imagem){ var im=document.createElement('img'); im.src=o.imagem; im.alt=o.titulo||'Oferta'; im.style.cssText='display:block;width:100%;height:auto;border-radius:12px;margin:0 0 14px;cursor:pointer'; im.onclick=function(){ if(o.url){ window.open(o.url,'_blank'); } }; b.insertBefore(im,h); if(!o.texto_com_imagem){ h.style.display='none'; p.style.display='none'; } }
     } else { var off=document.getElementById('offer'); if(!off){return;} var ban=document.createElement('div'); ban.className='banner'; ban.style.position='relative';
       var x2=document.createElement('span'); x2.className='x'; x2.textContent='✕'; x2.onclick=function(){ if(ban.parentNode){ban.parentNode.removeChild(ban);} showReabrir(o); };
       var h2=document.createElement('div'); h2.style.fontSize='16px'; h2.style.fontWeight='700'; h2.style.color='#fff'; h2.textContent=o.titulo||'Oferta';
@@ -10481,7 +9491,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
       if(o.url){ var a2=document.createElement('a'); a2.href=o.url; a2.target='_blank'; a2.textContent=o.botao||'Garantir agora'; ban.appendChild(a2); } off.appendChild(ban); } }
   function checkOfertas(){ var e=elapsed(); ofertas.forEach(function(o){ if(o._shown){return;} if(e < (Number(o.momento)||0)){return;} o._shown=true; mostrarOferta(o); }); }
   setInterval(checkOfertas, 1000);
-  /* [jornada 27/10] reprise (agenda aberta): a oferta aparece tambem pelo tempo do VIDEO (quem pula ate o momento ve a oferta) */ setInterval(function(){ if(EVG||!videoEl){return;} var tv=Math.floor(videoEl.currentTime||0); ofertas.forEach(function(o){ if(o._shown){return;} if(tv<(Number(o.momento)||0)){return;} o._shown=true; mostrarOferta(o); }); },1000);
 })();`;
 
   // gera o HTML da sala (client JS sem template-literal pra não conflitar com o template do server)
@@ -10548,7 +9557,6 @@ console.log('[webinario] simulacao e mensagens programadas carregadas: /webinari
   }
 
   console.log('[webinario-sala] carregado: /webinarios (config) + /w/:slug (sala) + /w-api/:slug/* (chat/contador/vendas reais)');
-  (globalThis as any).__wbJornada = { wbGet, wbConfigPublico, wbRoomHtml }; // [jornada 27/10] expõe p/ a régua do webinário (/j/...)
 }
 
 // ============================================================================
@@ -11225,9 +10233,7 @@ app.post('/vsl/evento', (req: any, res: any) => {
         if (vv2 && vv2.projeto) {
           let em: string | null = null, tel: string | null = null;
           if (b.contato_id) { try { const ct = db.prepare(`SELECT email, telefone FROM contatos WHERE id=?`).get(String(b.contato_id)) as any; if (ct) { em = ct.email || null; tel = ct.telefone || null; } } catch { /* */ } }
-          const _vip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || (req.socket && req.socket.remoteAddress) || '');
-          const _vua = String(req.headers['user-agent'] || '');
-          vslTrackHook(String(vv2.projeto), evName, { email: em, telefone: tel, pagina: (b.url || null), clientIp: _vip || null, userAgent: _vua || null, fbp: (b.fbp || null), fbc: (b.fbc || null) }).catch(() => { /* */ });
+          vslTrackHook(String(vv2.projeto), evName, { email: em, telefone: tel, pagina: null }).catch(() => { /* */ });
         }
       }
     } catch { /* capi marco best-effort */ }
@@ -12099,7 +11105,6 @@ _acAlter(`ALTER TABLE academy_aulas ADD COLUMN duracao_seg INTEGER`);
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN anexos TEXT`);         // json [{nome,url,tamanho}]
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN curso_id TEXT`);       // desnormalizado p/ consulta rápida
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_hash TEXT`);
-_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN senha_plana TEXT`); // [migracao-senha] senha visivel p/ admin (publico idoso)
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN token_login TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN avatar TEXT`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN telefone TEXT`);
@@ -12108,8 +11113,6 @@ _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN endereco TEXT`);  // json
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN pontos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN dias_consecutivos INTEGER`);
 _acAlter(`ALTER TABLE academy_matriculas ADD COLUMN ultimo_dia TEXT`);
-_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN email_sumido_em TEXT`); // [aluno-sumido] ultimo e-mail de reengajamento
-_acAlter(`ALTER TABLE academy_matriculas ADD COLUMN termo_aceite TEXT`); // [termo] quando o aluno aceitou o termo de compromisso
 // semente da config de gamificação (perfil Equilibrado) se vazia
 try {
   const g = db.prepare(`SELECT id FROM academy_gamificacao WHERE id=1`).get();
@@ -12193,10 +11196,6 @@ const _acCursosDoAluno = (alunoId: string): Set<string> => {
   } catch {}
   return ok;
 };
-// [IA 26/10] Tutor de IA (IA Mentoria) — app Cloudflare externo, embutido na área; gate de acesso é do próprio app (fonte da verdade = Worker/Guru)
-const _AC_IA_APP = 'https://melodias-riffs-app.pages.dev';
-const _acIaUrl = (al: any, pagina = 'inicio.html'): string =>
-  _AC_IA_APP + '/' + pagina + '?email=' + encodeURIComponent(String(al && al.email || '')) + '&cuser_fname=' + encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '');
 
 // ---------- [B.2] Tema / layout da área do aluno (M|R dark) ----------
 const _acCSS = `
@@ -12290,7 +11289,7 @@ const _acTop = (al: any, aba = ''): string => {
   return `<div class="top"><a class="logo" href="/area">M|R</a>
     <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
     <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-    <a href="/area/ia" class="${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
+    <a href="https://melodias-riffs-app.pages.dev/inicio.html?email=${encodeURIComponent(String(al && al.email || ''))}&cuser_fname=${encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '')}" target="_blank">Fale com a IA</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
     <div class="av" title="Minha conta" onclick="var m=document.getElementById('mn');m.classList.toggle('open')">⚙️
@@ -12370,32 +11369,10 @@ function _acHomeJS(): string {
     var h=document.getElementById('heroC');if(h){var sl=h.querySelectorAll('.hslide'),dt=h.querySelectorAll('.hdot'),c=0,itv=(Number(h.getAttribute('data-itv'))||6)*1000;function go(i){sl[c].classList.remove('on');if(dt[c])dt[c].classList.remove('on');c=i;sl[c].classList.add('on');if(dt[c])dt[c].classList.add('on');}dt.forEach(function(d,i){d.addEventListener('click',function(){go(i);});});if(sl.length>1)setInterval(function(){go((c+1)%sl.length);},itv);}
   })();</script>`;
 }
-function _acTermoPendente(al: any): boolean {
-  try {
-    const cfg = db.prepare(`SELECT exigir_termo, termo FROM academy_config WHERE id=1`).get() as any;
-    if (!cfg || !Number(cfg.exigir_termo)) return false;
-    if (!String(cfg.termo || '').trim()) return false; // sem texto de termo = nao bloqueia (seguro)
-    return !al || !al.termo_aceite;
-  } catch { return false; }
-}
-app.get('/area/termo', (req: any, res: any) => {
-  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
-  const cfg = db.prepare(`SELECT termo FROM academy_config WHERE id=1`).get() as any;
-  const termo = String((cfg && cfg.termo) || '').trim();
-  if (!termo || al.termo_aceite) return res.redirect('/area');
-  const html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Termo \u2014 Melodias e Riffs</title><style>' + _acCSS + 'body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.bx{background:#13131a;border:1px solid #23232c;border-radius:16px;padding:28px;max-width:640px;width:100%}.lg{font-weight:800;color:#e7c86a;font-size:22px;text-align:center;margin-bottom:6px}.sub{color:#aeaeba;text-align:center;margin-bottom:18px;font-size:14px}.termo{max-height:50vh;overflow:auto;background:#0e0e14;border:1px solid #23232c;border-radius:10px;padding:16px;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#dcdce4;margin-bottom:16px}</style></head><body><div class="bx"><div class="lg">Termo de compromisso</div><div class="sub">Pra continuar na \u00e1rea de aluno, leia e aceite:</div><div class="termo">' + esc(termo) + '</div><form method="post" action="/area/api/aceitar-termo"><label style="display:flex;gap:8px;align-items:flex-start;font-size:14px;color:#dcdce4;margin-bottom:14px;cursor:pointer"><input type="checkbox" required style="margin-top:3px"> Li e aceito o termo acima.</label><button class="btn btn-g" type="submit" style="width:100%">Aceitar e continuar</button></form></div></body></html>';
-  res.type('html').send(html);
-});
-app.post('/area/api/aceitar-termo', (req: any, res: any) => {
-  const al = _acAluno(req); if (!al) return res.redirect('/area/login');
-  try { db.prepare(`UPDATE academy_matriculas SET termo_aceite=? WHERE id=?`).run(agora(), al.id); _acLog(al.id, 'aceitou_termo', ''); } catch { /* */ }
-  res.redirect('/area');
-});
 app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   _acMarcarAcesso(al);
-  if (_acTermoPendente(al)) return res.redirect('/area/termo');
   try {
     const meus = _acCursosDoAluno(al.id);
     // [banner v3 23/10] carrossel: TODOS os banners hero publicados que o aluno QUALIFICA (segmentado por _acPublicoOk), com intervalo configurável (pub_kv academy_banner_intervalo).
@@ -12448,7 +11425,6 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
 app.get('/area/curso/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
-  if (_acTermoPendente(al)) return res.redirect('/area/termo');
   try {
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(String(req.params.id)) as any;
     if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
@@ -12495,27 +11471,10 @@ const _acPlayerHtml = (aula: any, curso: any, pos: number): string => {
   const start = pos > 5 ? ('&start=' + Math.floor(pos)) : '';
   return `<div class="player"><iframe src="https://www.youtube-nocookie.com/embed/${esc(yid)}?rel=0&modestbranding=1&playsinline=1&origin=${org}${start}" allow="autoplay; encrypted-media; fullscreen" allowfullscreen></iframe></div>`;
 };
-// [IA 26/10] Página da IA embutida na plataforma (com escape "nova aba"); o próprio app libera/vende
-app.get('/area/ia', (req: any, res: any) => {
-  const al = _acAluno(req);
-  if (!al) return res.redirect('/area/login');
-  try { _acLog(al.id, 'abriu_ia', ''); } catch {}
-  const url = _acIaUrl(al, 'inicio.html');
-  const corpo = `<div style="display:flex;flex-direction:column;height:calc(100vh - 58px)">
-    <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:#0c0c10;border-bottom:1px solid #1c1c24">
-      <b style="color:#e7c86a">🎹 IA Melodias e Riffs</b>
-      <span style="color:#8a8a96;font-size:13px">seu tutor de teclado gospel — tire dúvidas, envie foto da cifra e estude com a IA</span>
-      <a class="btn btn-ghost" style="margin-left:auto;padding:7px 14px" href="${url}" target="_blank">Abrir em nova aba ↗</a>
-    </div>
-    <iframe src="${url}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
-  </div>`;
-  res.type('html').send(_acPage(al, 'IA Melodias e Riffs', corpo, 'ia'));
-});
 app.get('/area/aula/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   try {
-    if (_acTermoPendente(al)) return res.redirect('/area/termo');
     const aula = db.prepare(`SELECT * FROM academy_aulas WHERE id=?`).get(String(req.params.id)) as any;
     if (!aula) return res.status(404).type('html').send('Aula não encontrada.');
     const mod = db.prepare(`SELECT * FROM academy_modulos WHERE id=?`).get(aula.modulo_id) as any;
@@ -12570,22 +11529,14 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     }).join('');
 
     const dmodo = curso.duvida_modo || 'professor';
-    let fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
-    let modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
+    const fab = dmodo === 'off' ? '' : `<button class="fab" onclick="document.getElementById('md').classList.add('open')">💬 Dúvida nesta aula?</button>`;
+    const modal = dmodo === 'off' ? '' : `<div class="modal" id="md"><div class="bx">
       <h3 style="margin:0 0 10px">Sua dúvida nesta aula</h3>
       <textarea id="qtx" class="fld" rows="4" placeholder="Escreva sua dúvida..."></textarea>
       <div style="display:flex;gap:10px;margin-top:14px"><button class="btn btn-ghost" onclick="document.getElementById('md').classList.remove('open')">Cancelar</button>
       <button class="btn btn-g" onclick="acEnviarDuvida('${aula.id}','${curso.id}')">Enviar</button></div>
       <div id="qok" style="display:none;color:#9ff0c0;margin-top:12px">✅ Dúvida enviada! O professor vai responder.</div>
     </div></div>`;
-    // [IA 26/10] curso com dúvida_modo='ia' → abre o tutor de IA embutido (gaveta), em vez do modal do professor
-    if (dmodo === 'ia') {
-      fab = `<button class="fab" onclick="document.getElementById('iad').classList.add('open')">🎹 Falar com a IA</button>`;
-      modal = `<div class="modal" id="iad"><div class="bx" style="max-width:720px;width:100%;height:82vh;padding:0;display:flex;flex-direction:column;overflow:hidden">
-        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #26262f"><b style="flex:1;color:#e7c86a">🎹 IA Melodias e Riffs</b><a class="btn btn-ghost" style="padding:6px 12px" href="${_acIaUrl(al, 'app.html')}" target="_blank">Nova aba ↗</a><button class="btn btn-ghost" style="padding:6px 12px" onclick="document.getElementById('iad').classList.remove('open')">Fechar</button></div>
-        <iframe src="${_acIaUrl(al, 'app.html')}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
-      </div></div>`;
-    }
 
     // [B.15] player de ÁUDIO inline embaixo do vídeo (modo audiolivro) — toca dentro da plataforma
     const audioUrl = (aula as any).audio_url || '';
@@ -12667,7 +11618,7 @@ const _acChecaConclusaoCurso = (alunoId: string, cursoId: string) => {
     const tot = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(cursoId, cursoId) as any).n;
     if (!tot) return;
     const feitas = (db.prepare(`SELECT COUNT(*) n FROM academy_progresso WHERE aluno_id=? AND curso_id=? AND visto=1`).get(alunoId, cursoId) as any).n;
-    if (feitas >= tot) { _acPontuar(alunoId, 'concluiu_curso', cursoId); _acLog(alunoId, 'concluiu_curso', cursoId); try { _acCertificadoEmail(alunoId, cursoId); } catch { /* cert e-mail best-effort */ } }
+    if (feitas >= tot) { _acPontuar(alunoId, 'concluiu_curso', cursoId); _acLog(alunoId, 'concluiu_curso', cursoId); }
   } catch {}
 };
 
@@ -12812,84 +11763,6 @@ app.get('/academy/aluno/:id', (req: any, res: any) => {
 // admin: definir/gerar senha do aluno
 app.post('/academy/aluno/senha', (req: any, res: any) => {
   try { const b = req.body || {}; const senha = String(b.senha || Math.random().toString(36).slice(2, 10)); db.prepare(`UPDATE academy_matriculas SET senha_hash=? WHERE id=?`).run(_acHash(senha), b.id); _ndOk(res, { senha }); } catch (e) { _ndErr(res, e); }
-});
-// [migracao-senha 25/10] admin DEFINE senha (fica VISIVEL pro admin) + senha em massa = CPF (so digitos).
-app.post('/academy/aluno/senha-def', (req: any, res: any) => {
-  try { const b = req.body || {}; const senha = String(b.senha || '').trim(); if (!b.id || !senha) return _ndErr(res, 'id e senha obrigatorios'); db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash(senha), senha, b.id); _acLog(String(b.id), 'senha_definida', ''); _ndOk(res, { ok: true, senha }); } catch (e) { _ndErr(res, e); }
-});
-app.post('/academy/senha/padrao-cpf', (req: any, res: any) => {
-  try {
-    const b = req.body || {}; const sobrescrever = !!b.sobrescrever;
-    const rows = db.prepare(`SELECT id, cpf FROM academy_matriculas WHERE cpf IS NOT NULL AND cpf<>''`).all() as any[];
-    const semCpf = (db.prepare(`SELECT COUNT(*) n FROM academy_matriculas WHERE cpf IS NULL OR cpf=''`).get() as any).n;
-    const upd = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`);
-    const jaTem = db.prepare(`SELECT senha_plana, senha_hash FROM academy_matriculas WHERE id=?`);
-    let def = 0, pulados = 0, curtos = 0;
-    const tx = db.transaction((lista: any[]) => {
-      for (const r of lista) {
-        const cpf = String(r.cpf || '').replace(/\D/g, '');
-        if (cpf.length < 3) { curtos++; continue; }
-        const cur = jaTem.get(r.id) as any;
-        if (!sobrescrever && cur && (cur.senha_plana || cur.senha_hash)) { pulados++; continue; }
-        upd.run(_acHash(cpf), cpf, r.id); def++;
-      }
-    });
-    tx(rows);
-    _ndOk(res, { definidos: def, pulados, cpf_invalido: curtos, sem_cpf: semCpf });
-  } catch (e) { _ndErr(res, e); }
-});
-// [migracao-ia 25/10] registra ACESSO DE IA (IA Mentoria) por aluno via email, com validade (data YYYY-MM-DD | 6meses | 1ano | vitalicio). ADD-ONLY. Nao cria aluno.
-app.post('/academy/importar/ia', (req: any, res: any) => {
-  try {
-    const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
-    let add = 0, atual = 0, naoachou = 0;
-    const tx = db.transaction((rows: any[]) => {
-      for (const r of rows) {
-        const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
-        const al = db.prepare(`SELECT id FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
-        if (!al) { naoachou++; continue; }
-        const val = String(r.validade || 'vitalicio');
-        const ex = db.prepare(`SELECT id FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='ia'`).get(al.id) as any;
-        if (ex) { db.prepare(`UPDATE academy_acesso SET validade=? WHERE id=?`).run(val, ex.id); atual++; }
-        else { db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'ia', 'ia', val, agora()); add++; }
-      }
-    });
-    tx(linhas);
-    _ndOk(res, { adicionados: add, atualizados: atual, nao_encontrados: naoachou, total: linhas.length });
-  } catch (e) { _ndErr(res, e); }
-});
-// [migracao-cred 25/10] seta CPF + senha=CPF (so digitos) por EMAIL, em lote. ADD-ONLY, nao cria aluno, idempotente (so preenche vazio salvo sobrescrever).
-app.post('/academy/importar/credencial', (req: any, res: any) => {
-  try {
-    const b = req.body || {}; const sobre = !!b.sobrescrever;
-    const linhas: any[] = Array.isArray(b.linhas) ? b.linhas : [];
-    let cpfSet = 0, senhaSet = 0, naoachou = 0;
-    const tx = db.transaction((rows: any[]) => {
-      for (const r of rows) {
-        const email = String(r.email || '').trim().toLowerCase();
-        const cpf = String(r.cpf || '').replace(/\D/g, '');
-        if (!email || cpf.length < 3) continue;
-        const al = db.prepare(`SELECT id, cpf, senha_hash, senha_plana FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
-        if (!al) { naoachou++; continue; }
-        if (sobre || !al.cpf) { db.prepare(`UPDATE academy_matriculas SET cpf=? WHERE id=?`).run(cpf, al.id); cpfSet++; }
-        if (sobre || !(al.senha_plana || al.senha_hash)) { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash(cpf), cpf, al.id); senhaSet++; }
-      }
-    });
-    tx(linhas);
-    _ndOk(res, { cpf_set: cpfSet, senha_set: senhaSet, nao_encontrados: naoachou, total: linhas.length });
-  } catch (e) { _ndErr(res, e); }
-});
-// [migracao-senha-fixa 26/10] define a MESMA senha pra TODOS os alunos (migracao simples). ADD-ONLY. sobrescrever=false so preenche quem nao tem senha.
-app.post('/academy/senha/padrao-fixa', (req: any, res: any) => {
-  try {
-    const b = req.body || {}; const senha = String(b.senha || '').trim(); const sobre = !!b.sobrescrever;
-    if (senha.length < 4) return _ndErr(res, 'senha muito curta (min 4)');
-    const h = _acHash(senha);
-    let r: any;
-    if (sobre) r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=?`).run(h, senha);
-    else r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE (senha_hash IS NULL OR senha_hash='') AND (senha_plana IS NULL OR senha_plana='')`).run(h, senha);
-    _ndOk(res, { definidos: r.changes, senha });
-  } catch (e) { _ndErr(res, e); }
 });
 // admin: gerar/retornar magic link do aluno
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
@@ -13096,106 +11969,6 @@ app.get('/area/certificado/:cursoId', (req: any, res: any) => {
     res.type('html').send(_acPage(al, 'Certificado', corpo));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
-
-
-// ============================================================================
-// [aluno-sumido] Reengajamento: aluno sem acessar a area ha X dias recebe um e-mail
-// chamando de volta. Nasce DESLIGADO (email_sumido_ativo!='1'). Dispara 1x/dia, e nao
-// repete pro mesmo aluno dentro do periodo (coluna email_sumido_em).
-// [certificado] E-mail automatico com o certificado quando o aluno conclui o curso.
-// Nasce DESLIGADO (email_cert_ativo!='1'). Envia 1x por (aluno,curso) (dedup via academy_logs).
-// Ambos reaproveitam a fila de e-mail (_emailFilaEnfileirar + _tickEmail). Projeto 'teclado'.
-// ============================================================================
-function _acCertificadoEmail(alunoId: string, cursoId: string): void {
-  try {
-    if (pubFlag('email_cert_ativo','0') !== '1') return;
-    const ja = db.prepare(`SELECT 1 FROM academy_logs WHERE aluno_id=? AND tipo='cert_email' AND detalhe=? LIMIT 1`).get(alunoId, cursoId);
-    if (ja) return;
-    const al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(alunoId) as any;
-    const email = (al && al.email) ? String(al.email).trim() : '';
-    const telChk = (al && al.telefone) ? String(al.telefone).replace(/\D/g, '') : '';
-    if ((!email || !email.includes('@')) && telChk.length < 8) return;
-    const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(cursoId) as any;
-    const nomeCurso = curso ? String(curso.nome || '') : '';
-    const nomeAluno = String((al && al.nome) || 'Aluno');
-    const hoje = new Date().toLocaleDateString('pt-BR');
-    const link = (PUBLIC_BASE_URL || '') + '/area/certificado/' + cursoId;
-    const assuntoCfg = String((CONFIG as any).emailCertAssunto || '').trim();
-    const assunto = (assuntoCfg || 'Seu certificado — {curso} \u{1F3C6}').replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso);
-    const introCfg = String((CONFIG as any).emailCertHtml || '').trim();
-    const intro = introCfg
-      ? introCfg.replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso).replace(/\r?\n/g, '<br>')
-      : `Parabéns, ${esc(nomeAluno)}! Você concluiu o curso <b>${esc(nomeCurso)}</b>. Aqui está o seu certificado.`;
-    const cert = `<div style="max-width:620px;margin:0 auto;background:linear-gradient(135deg,#14140f,#1c1a12);border:2px solid #e7c86a;border-radius:16px;padding:40px;text-align:center;color:#fff">`
-      + `<div style="color:#e7c86a;font-weight:800;letter-spacing:.2em;font-size:13px">MELODIAS E RIFFS</div>`
-      + `<div style="font-size:12px;color:#aa9b6a;margin-bottom:22px">A Escola do Músico Cristão</div>`
-      + `<div style="font-size:14px;color:#cfcfd8">Certificamos que</div>`
-      + `<div style="font-size:26px;font-weight:800;margin:8px 0">${esc(nomeAluno)}</div>`
-      + `<div style="font-size:14px;color:#cfcfd8">concluiu o curso</div>`
-      + `<div style="font-size:19px;font-weight:700;color:#e7c86a;margin:8px 0">${esc(nomeCurso)}</div>`
-      + `<div style="color:#8a8a96;font-size:12px;margin-top:18px">${esc(hoje)} · Prof. Ezequias</div></div>`;
-    const html = `<div style="font:16px/1.6 system-ui,Arial;color:#141a21;max-width:640px;margin:0 auto">`
-      + `<p style="margin:0 0 16px">${intro}</p>${cert}`
-      + `<p style="text-align:center;margin:22px 0 0"><a href="${link}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Ver e baixar o certificado (PDF)</a></p>`
-      + `<p style="color:#889;font-size:13px;text-align:center;margin:14px 0 0">Dica: na página do certificado, toque em "Imprimir / Salvar PDF".</p></div>`;
-    if (email && email.includes('@')) _emailFilaEnfileirar('teclado', email, assunto, html, {});
-    const tel = (al && al.telefone) ? String(al.telefone).replace(/\D/g, '') : '';
-    const wtextoCfg = String((CONFIG as any).emailCertWtexto || '').trim();
-    if (tel.length >= 8) {
-      const wmsg = (wtextoCfg
-        ? wtextoCfg.replace(/\{nome\}/g, nomeAluno).replace(/\{curso\}/g, nomeCurso)
-        : `Parab\u00e9ns, ${nomeAluno}! \u{1F3C6} Voc\u00ea concluiu o curso *${nomeCurso}*. Seu certificado est\u00e1 aqui: ${link}`);
-      _wppFilaEnfileirar('teclado', tel, wmsg, {});
-    }
-    _acLog(alunoId, 'cert_email', cursoId);
-  } catch { /* best-effort */ }
-}
-app.get('/email/cert', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1', assunto: String((CONFIG as any).emailCertAssunto || ''), html: String((CONFIG as any).emailCertHtml || ''), wtexto: String((CONFIG as any).emailCertWtexto || '') }); });
-app.post('/email/cert/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_cert_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_cert_ativo','0')==='1' }); });
-app.post('/email/cert/config', (req, res) => { const b = req.body || {}; if (b.assunto !== undefined) salvarConfigPermanente('emailCertAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailCertHtml', String(b.html || '')); if (b.wtexto !== undefined) salvarConfigPermanente('emailCertWtexto', String(b.wtexto || '')); res.json({ ok: true }); });
-
-function _tickEmailSumido(): void {
-  try {
-    if (pubFlag('email_sumido_ativo','0') !== '1') return;
-    const nowBRT = new Date(Date.now() - 3 * 3600000);
-    const hojeStr = `${nowBRT.getUTCFullYear()}-${String(nowBRT.getUTCMonth()+1).padStart(2,'0')}-${String(nowBRT.getUTCDate()).padStart(2,'0')}`;
-    if (pubFlag('email_sumido_ultimo','') === hojeStr) return;
-    const dias = Math.max(1, Number((CONFIG as any).emailSumidoDias) || 15);
-    const lim = new Date(Date.now() - dias * 86400000).toISOString();
-    const rows = db.prepare(`SELECT id,nome,email,telefone FROM academy_matriculas WHERE ((email IS NOT NULL AND email<>'') OR (telefone IS NOT NULL AND telefone<>'')) AND ultimo_acesso IS NOT NULL AND ultimo_acesso<>'' AND ultimo_acesso < ? AND (email_sumido_em IS NULL OR email_sumido_em < ?) LIMIT 100`).all(lim, lim) as any[];
-    const assuntoCfg = String((CONFIG as any).emailSumidoAssunto || '').trim();
-    const htmlCfg = String((CONFIG as any).emailSumidoHtml || '').trim();
-    const wtextoCfg = String((CONFIG as any).emailSumidoWtexto || '').trim();
-    const base = (PUBLIC_BASE_URL || '') + '/area';
-    for (const r of rows) {
-      const email = String(r.email || '').trim();
-      const tel = String(r.telefone || '').replace(/\D/g, '');
-      const nm = String(r.nome || '').trim();
-      let mandou = false;
-      if (email.includes('@')) {
-      const assunto = (assuntoCfg || 'Sentimos sua falta na Melodias e Riffs \u{1F3B6}').replace(/\{nome\}/g, nm);
-      const corpo = htmlCfg
-        ? htmlCfg.replace(/\{nome\}/g, nm).replace(/\r?\n/g, '<br>')
-        : `Oi ${esc(nm || '')}! Faz um tempinho que você não aparece na sua área de aluno. Que tal voltar e continuar de onde parou? Tem conteúdo esperando por você. \u{1F3B9}`;
-      const html = `<div style="font:16px/1.6 system-ui,Arial;color:#141a21;max-width:600px;margin:0 auto">`
-        + `<p style="margin:0 0 16px">${corpo}</p>`
-        + `<p style="text-align:center;margin:22px 0 0"><a href="${base}" style="background:#e7c86a;color:#14140f;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:10px;display:inline-block">Voltar para as aulas</a></p></div>`;
-      _emailFilaEnfileirar('teclado', email, assunto, html, {}); mandou = true;
-      }
-      if (tel.length >= 8 && wtextoCfg) { _wppFilaEnfileirar('teclado', tel, wtextoCfg.replace(/\{nome\}/g, nm), {}); mandou = true; }
-      if (!mandou) continue;
-      try { db.prepare(`UPDATE academy_matriculas SET email_sumido_em=? WHERE id=?`).run(agora(), r.id); } catch { /* */ }
-      try { _acLog(r.id, 'email_sumido', ''); } catch { /* */ }
-    }
-    setPubFlag('email_sumido_ultimo', hojeStr);
-  } catch { /* best-effort */ }
-}
-setInterval(() => { try { _tickEmailSumido(); } catch { /* */ } }, 60 * 60000); // checa 1x/hora; dispara no max 1x/dia
-app.get('/email/sumido', (_req, res) => { res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1', dias: Number((CONFIG as any).emailSumidoDias) || 15, assunto: String((CONFIG as any).emailSumidoAssunto || ''), html: String((CONFIG as any).emailSumidoHtml || ''), wtexto: String((CONFIG as any).emailSumidoWtexto || '') }); });
-app.post('/email/sumido/flag', (req, res) => { const on = ((req.body||{}).on===true||(req.body||{}).on==='1'||(req.body||{}).on===1||(req.body||{}).on==='on'); setPubFlag('email_sumido_ativo', on?'1':'0'); res.json({ ok: true, ativo: pubFlag('email_sumido_ativo','0')==='1' }); });
-app.post('/email/sumido/config', (req, res) => { const b = req.body || {}; if (b.dias !== undefined) salvarConfigPermanente('emailSumidoDias', Math.max(1, Number(b.dias) || 15)); if (b.assunto !== undefined) salvarConfigPermanente('emailSumidoAssunto', String(b.assunto || '')); if (b.html !== undefined) salvarConfigPermanente('emailSumidoHtml', String(b.html || '')); if (b.wtexto !== undefined) salvarConfigPermanente('emailSumidoWtexto', String(b.wtexto || '')); res.json({ ok: true }); });
-app.post('/email/sumido/enviar-agora', (_req, res) => { try { setPubFlag('email_sumido_ultimo',''); _tickEmailSumido(); res.json({ ok: true }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-
 
 // FAQ (admin): editar as perguntas frequentes do aluno
 app.get('/academy/faq', (_req: any, res: any) => { try { _ndOk(res, { faq: _ndJson(pubFlag('academy_faq', ''), []) }); } catch (e) { _ndErr(res, e); } });
@@ -13915,1225 +12688,6 @@ app.get('/academy/audio-push/lista', (req: any, res: any) => {
     res.type('text/plain').send(rows.map((r) => r.id + ',' + r.video_ref).join('\n'));
   } catch (e: any) { res.status(500).type('text/plain').send(String((e && e.message) || e)); }
 });
-
-// ===================== [+seguranca-camada3] VIGIA DE PRODUÇÃO (monitor + auto-cura segura + alerta) =====================
-// Com a CAMADA 1 o CONFIG já sobrevive a deploy. A vigia é a rede 24/7: no boot e a cada 5min confere os
-// sinais vitais, AUTO-CURA o que é seguro (re-semeia o fluxo "dedilhados" se sumir) e AVISA no WhatsApp
-// quando algo está vermelho (número padrão offline, fila travada, fluxo sumiu). NÃO liga/desliga agente
-// sozinho (pra não brigar com mudança intencional sua). Tudo best-effort — nunca quebra o motor.
-try { db.exec(`CREATE TABLE IF NOT EXISTS log_vigia ( id TEXT PRIMARY KEY, criado_em TEXT, item TEXT, status TEXT, detalhe TEXT )`); } catch { /* ja existe */ }
-const _vigiaUltimoAlerta: Record<string, number> = {};
-function _vigiaPodeAlertar(item: string): boolean {
-  const ag = Date.now(); const ult = _vigiaUltimoAlerta[item] || 0;
-  if (ag - ult < 60 * 60 * 1000) return false; // máx 1 alerta por item por hora
-  _vigiaUltimoAlerta[item] = ag; return true;
-}
-async function _vigiaAlerta(item: string, msg: string): Promise<void> {
-  try {
-    try { db.prepare(`INSERT INTO log_vigia(id,criado_em,item,status,detalhe) VALUES(?,?,?,?,?)`).run(randomUUID(), agora(), item, 'alerta', msg); } catch { /* */ }
-    if (!_vigiaPodeAlertar(item)) return;
-    const instTeclado = ((CONFIG as any).numeroPadrao || {}).teclado || _RECUP_DED_INST;
-    await enviarTexto('teclado' as Projeto, '5516981518794', '⚠️ Motor: ' + msg, instTeclado).catch(() => { /* */ });
-  } catch { /* nunca quebra */ }
-}
-// [+seguranca-estado-desejado 28/10] ALERTA de desvio da config dos agentes (habilitados/canalIg/modo/numeroPadrao teclado).
-// Se um deploy (ou qualquer coisa) mudar/zerar esses campos sem ser você, o vigia AVISA no WhatsApp. Só ALERTA, nao restaura
-// (pra nao brigar com mudanca intencional). O "estado desejado" e um snapshot que VOCE define quando a config esta certa
-// (POST /saude/estado-desejado/salvar); enquanto nao houver snapshot, nao alerta (zero falso-positivo). Tabela no engine.db
-// (sobrevive a deploy). ADITIVO.
-try { db.exec(`CREATE TABLE IF NOT EXISTS estado_desejado ( chave TEXT PRIMARY KEY, valor TEXT NOT NULL, atualizado_em TEXT NOT NULL DEFAULT (datetime('now')) )`); } catch { /* ja existe */ }
-function _estadoAgentesAtual(): any {
-  const proj = ['baixo', 'violao', 'teclado', 'comunidade'];
-  const hab = (CONFIG as any).agentesHabilitados || {};
-  const cig = (CONFIG as any).canalIg || {};
-  const modo = (CONFIG as any).agenteModoWa || {};
-  const out: any = { agentesHabilitados: {}, canalIg: {}, agenteModoWa: {}, numeroPadraoTeclado: String(((CONFIG as any).numeroPadrao || {}).teclado || '') };
-  for (const p of proj) { out.agentesHabilitados[p] = !!hab[p]; out.canalIg[p] = String(cig[p] || ''); out.agenteModoWa[p] = String(modo[p] || ''); }
-  return out;
-}
-function _estadoDesejadoLer(): any | null {
-  try { const r = db.prepare(`SELECT valor FROM estado_desejado WHERE chave='AGENTES'`).get() as any; return r && r.valor ? JSON.parse(r.valor) : null; } catch { return null; }
-}
-function _estadoDesejadoSalvar(obj: any): void {
-  try { db.prepare(`INSERT INTO estado_desejado(chave,valor,atualizado_em) VALUES('AGENTES',?,datetime('now')) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em`).run(JSON.stringify(obj)); } catch { /* */ }
-}
-function _estadoAgentesDrift(): string[] {
-  const des = _estadoDesejadoLer(); if (!des) return []; // sem snapshot = nao alerta
-  const at = _estadoAgentesAtual(); const d: string[] = [];
-  for (const p of ['baixo', 'violao', 'teclado', 'comunidade']) {
-    if (des.agentesHabilitados && des.agentesHabilitados[p] !== undefined && (!!des.agentesHabilitados[p]) !== (!!at.agentesHabilitados[p])) d.push('agente ' + p + ' habilitado=' + at.agentesHabilitados[p] + ' (desejado ' + des.agentesHabilitados[p] + ')');
-    if (des.canalIg && des.canalIg[p] !== undefined && String(des.canalIg[p]) !== String(at.canalIg[p])) d.push('canalIg ' + p + '=' + (at.canalIg[p] || 'off') + ' (desejado ' + (des.canalIg[p] || 'off') + ')');
-    if (des.agenteModoWa && des.agenteModoWa[p] !== undefined && String(des.agenteModoWa[p]) !== String(at.agenteModoWa[p])) d.push('modo ' + p + '=' + (at.agenteModoWa[p] || '-') + ' (desejado ' + des.agenteModoWa[p] + ')');
-  }
-  if (des.numeroPadraoTeclado !== undefined && String(des.numeroPadraoTeclado) !== String(at.numeroPadraoTeclado)) d.push('numeroPadrao teclado=' + (at.numeroPadraoTeclado || 'vazio') + ' (desejado ' + (des.numeroPadraoTeclado || 'vazio') + ')');
-  return d;
-}
-app.get('/saude/estado-desejado', (_req, res) => { try { res.json({ ok: true, desejado: _estadoDesejadoLer(), atual: _estadoAgentesAtual(), drift: _estadoAgentesDrift() }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-app.post('/saude/estado-desejado/salvar', (_req, res) => { try { const snap = _estadoAgentesAtual(); _estadoDesejadoSalvar(snap); res.json({ ok: true, desejado: snap }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-function _saudeProducao(): any {
-  const r: any = { ok: true, itens: {} };
-  try {
-    const temDed = (CONFIG.entregaFluxoProduto || []).some((f) => String(f.chave || '').toLowerCase() === 'dedilhados');
-    r.itens.entregaDedilhados = temDed ? 'ok' : 'vermelho';
-    r.itens.agentesHabilitados = (CONFIG as any).agentesHabilitados || {};
-    r.itens.canalIg = (CONFIG as any).canalIg || {};
-    const instT = ((CONFIG as any).numeroPadrao || {}).teclado || '';
-    const nT = instT ? (db.prepare(`SELECT status FROM numeros WHERE instancia=?`).get(instT) as any) : null;
-    r.itens.numeroPadraoTeclado = { instancia: instT, status: nT ? nT.status : 'nao_cadastrado' };
-    const atrasados = (db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE status IN ('pendente','camp_pend','cmp_multi','cmp_mmk') AND agendado_para < ?`).get(new Date(Date.now() - 10 * 60000).toISOString()) as any)?.n || 0;
-    r.itens.filaAtrasada = Number(atrasados);
-    r.itens.presencaSimulada = _presencaLigada();
-    r.itens.estadoAgentesDrift = _estadoAgentesDrift(); // [+seguranca-estado-desejado] vazio=ok; lista=desvio do estado definido
-    r.ok = temDed && Number(atrasados) < 50;
-  } catch (e: any) { r.ok = false; r.erro = String(e?.message || e); }
-  return r;
-}
-async function vigiaProducao(): Promise<void> {
-  try {
-    const s = _saudeProducao();
-    if (s.itens && s.itens.entregaDedilhados === 'vermelho') {
-      try { seedFluxoDedilhados(); } catch { /* */ }
-      const agoraTem = (CONFIG.entregaFluxoProduto || []).some((f) => String(f.chave || '').toLowerCase() === 'dedilhados');
-      await _vigiaAlerta('entrega-dedilhados', agoraTem ? 'o fluxo de entrega "dedilhados" tinha sumido e foi RESTAURADO automaticamente.' : 'o fluxo "dedilhados" sumiu e NÃO consegui restaurar — confira no app.');
-    }
-    const nT = s.itens && s.itens.numeroPadraoTeclado;
-    if (nT && nT.instancia && nT.status !== 'conectado') {
-      await _vigiaAlerta('numero-teclado-offline', 'o número padrão do Teclado (' + nT.instancia + ') está ' + (nT.status || 'offline') + '. Reconecte pelo QR no app.');
-    }
-    if (s.itens && Number(s.itens.filaAtrasada) >= 50) {
-      await _vigiaAlerta('fila-travada', Number(s.itens.filaAtrasada) + ' mensagens estão atrasadas na fila. Pode ter número desconectado ou worker parado.');
-    }
-    try { const drift = _estadoAgentesDrift(); if (drift.length) { await _vigiaAlerta('config-agentes-drift', 'a config dos agentes saiu do estado definido: ' + drift.join('; ') + '. (Pode ter sido um deploy.) Confira/reaplique no app.'); } } catch { /* */ }
-    try { db.prepare(`INSERT INTO log_vigia(id,criado_em,item,status,detalhe) VALUES(?,?,?,?,?)`).run(randomUUID(), agora(), 'checkup', s.ok ? 'ok' : 'atencao', JSON.stringify(s.itens || {})); } catch { /* */ }
-  } catch { /* nunca quebra */ }
-}
-app.get('/saude/producao', (_req, res) => { res.json({ ok: true, saude: _saudeProducao() }); });
-app.get('/saude/vigia-log', (req, res) => { try { const n = Math.min(200, Number(req.query.limite || 50)); res.json({ ok: true, itens: db.prepare(`SELECT * FROM log_vigia ORDER BY criado_em DESC LIMIT ?`).all(n) }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-setInterval(() => { vigiaProducao().catch(() => { /* */ }); }, 5 * 60 * 1000);
-setTimeout(() => { vigiaProducao().catch(() => { /* */ }); }, 20000); // 1º check ~20s após o boot
-
-// ===================== [+obs] AO VIVO PELO OBS — ingest RTMP (nginx-rtmp) -> multistream (stream copy) =====================
-// O OBS do Ezequias empurra 2 sinais (h/v) pro nginx-rtmp (serviço novo no docker-compose). Quando um sinal
-// começa a publicar, o nginx-rtmp chama /obs/on_publish; o motor sobe 1 ffmpeg COPY por destino marcado, do
-// ingest local pras redes (leve, tempo real). Reconecta sozinho. Prévia = HLS do nginx-rtmp. Tudo add-only.
-const OBS_PUBLIC_RTMP = process.env.OBS_PUBLIC_RTMP || 'rtmp://live.melodiaseriffs.com.br/live';
-const OBS_INGEST_BASE = process.env.OBS_INGEST_BASE || 'rtmp://rtmp:1935/live'; // nome do serviço nginx-rtmp na rede docker
-const OBS_HLS_BASE = process.env.OBS_HLS_BASE || 'https://live.melodiaseriffs.com.br/hls';
-const OBS_HOOK_TOKEN = process.env.OBS_HOOK_TOKEN || ENGINE_API_KEY || 'obs-hook';
-try { db.exec(`CREATE TABLE IF NOT EXISTS obs_sinal ( id TEXT PRIMARY KEY, stream_key TEXT, label TEXT, atualizado_em TEXT )`); } catch { /* ja existe */ }
-try { db.exec(`CREATE TABLE IF NOT EXISTS obs_rota ( id TEXT PRIMARY KEY, sinal TEXT, plataforma TEXT, instrumento TEXT, nome TEXT, rtmp_base TEXT, stream_key TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT, atualizado_em TEXT )`); } catch { /* ja existe */ }
-function _obsChaveNova(p: string): string { return 'mr-' + p + '-' + randomUUID().replace(/-/g, '').slice(0, 10); }
-function _obsSeed(): void {
-  for (const par of [['h', 'HORIZONTAL (16:9)'], ['v', 'VERTICAL (9:16)']] as [string, string][]) {
-    const ex = db.prepare(`SELECT id FROM obs_sinal WHERE id=?`).get(par[0]) as any;
-    if (!ex) db.prepare(`INSERT INTO obs_sinal(id,stream_key,label,atualizado_em) VALUES(?,?,?,?)`).run(par[0], _obsChaveNova(par[0]), par[1], agora());
-  }
-}
-_obsSeed();
-function _obsSinais(): any[] { return db.prepare(`SELECT * FROM obs_sinal ORDER BY id`).all() as any[]; }
-function _obsSinalPorKey(key: string): string | null { const r = db.prepare(`SELECT id FROM obs_sinal WHERE stream_key=?`).get(String(key)) as any; return r ? r.id : null; }
-function _obsRotas(sinal?: string): any[] { return sinal ? (db.prepare(`SELECT * FROM obs_rota WHERE sinal=? ORDER BY plataforma`).all(sinal) as any[]) : (db.prepare(`SELECT * FROM obs_rota ORDER BY sinal, plataforma`).all() as any[]); }
-function _obsDestFull(r: any): string { const base = String(r.rtmp_base || '').replace(/\/+$/, ''); const key = String(r.stream_key || ''); return base ? (base + '/' + key) : ''; }
-const _obsRelays: Map<string, Array<{ id: string; child: any; tentativas: number; vivo: boolean; dest: string }>> = new Map();
-const _obsPublicando: Record<string, { desde: string }> = {};
-function _obsFfmpegCopy(input: string, outFull: string): any {
-  // relay de um sinal JÁ codificado pelo OBS: só COPIA (sem recodificar) -> leve, tempo real.
-  const child = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'warning', '-i', input, '-c', 'copy', '-f', 'flv', outFull], { stdio: ['ignore', 'ignore', 'pipe'] });
-  let tail = ''; try { child.stderr.on('data', (d: any) => { tail = (tail + String(d)).slice(-800); }); } catch { /* */ }
-  (child as any)._tail = () => tail;
-  return child;
-}
-function _obsPararRelay(sinal: string): void {
-  const arr = _obsRelays.get(sinal) || [];
-  for (const r of arr) { r.vivo = false; try { r.child.kill('SIGKILL'); } catch { /* */ } }
-  _obsRelays.set(sinal, []);
-  delete _obsPublicando[sinal];
-}
-function _obsIniciarRelay(sinal: string): void {
-  _obsPararRelay(sinal);
-  _obsPublicando[sinal] = { desde: agora() };
-  const sk = (db.prepare(`SELECT stream_key FROM obs_sinal WHERE id=?`).get(sinal) as any)?.stream_key;
-  if (!sk) return;
-  const input = OBS_INGEST_BASE + '/' + sk;
-  const rotas = _obsRotas(sinal).filter((r: any) => Number(r.ativo) === 1 && _obsDestFull(r));
-  const arr: Array<{ id: string; child: any; tentativas: number; vivo: boolean; dest: string }> = [];
-  for (const r of rotas) {
-    const dest = _obsDestFull(r);
-    const spawnRelay = (tent: number) => {
-      const child = _obsFfmpegCopy(input, dest);
-      const item = { id: r.id, child, tentativas: tent, vivo: true, dest };
-      child.on('exit', () => {
-        if (!item.vivo || !_obsPublicando[sinal]) return; // parada intencional
-        if (tent >= 20) { _vigiaAlerta('obs-relay-' + r.id, 'o repasse do sinal ' + sinal + ' pra ' + (r.nome || r.plataforma) + ' caiu e parou de reconectar.').catch(() => { /* */ }); return; }
-        setTimeout(() => { if (_obsPublicando[sinal]) { const novo = spawnRelay(tent + 1); const idx = arr.findIndex((x) => x.id === r.id); if (idx >= 0) arr[idx] = novo; } }, 3000);
-      });
-      return item;
-    };
-    arr.push(spawnRelay(0));
-  }
-  _obsRelays.set(sinal, arr);
-}
-app.get('/obs/config', (_req, res) => {
-  const sinais = _obsSinais().map((s: any) => ({ id: s.id, label: s.label, streamKey: s.stream_key, rtmpUrl: OBS_PUBLIC_RTMP, hls: OBS_HLS_BASE + '/' + s.stream_key + '.m3u8', publicando: !!_obsPublicando[s.id] }));
-  res.json({ ok: true, ingestUrl: OBS_PUBLIC_RTMP, hlsBase: OBS_HLS_BASE, sinais, rotas: _obsRotas(), plataformas: ['youtube', 'facebook', 'instagram', 'tiktok', 'custom'], instrumentos: PROJETOS });
-});
-app.post('/obs/rota', (req, res) => {
-  try {
-    const b = req.body || {}; const sinal = String(b.sinal || ''); if (sinal !== 'h' && sinal !== 'v') return res.json({ ok: false, erro: 'sinal_invalido' });
-    const id = String(b.id || '') || randomUUID();
-    const ex = db.prepare(`SELECT id FROM obs_rota WHERE id=?`).get(id) as any;
-    if (ex) db.prepare(`UPDATE obs_rota SET sinal=?,plataforma=?,instrumento=?,nome=?,rtmp_base=?,stream_key=?,canal_id=?,ativo=?,atualizado_em=? WHERE id=?`).run(sinal, String(b.plataforma || 'custom'), String(b.instrumento || ''), String(b.nome || ''), String(b.rtmp_base || ''), String(b.stream_key || ''), String(b.canal_id || ''), b.ativo === false ? 0 : 1, agora(), id);
-    else db.prepare(`INSERT INTO obs_rota(id,sinal,plataforma,instrumento,nome,rtmp_base,stream_key,canal_id,ativo,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, sinal, String(b.plataforma || 'custom'), String(b.instrumento || ''), String(b.nome || ''), String(b.rtmp_base || ''), String(b.stream_key || ''), String(b.canal_id || ''), b.ativo === false ? 0 : 1, agora(), agora());
-    if (_obsPublicando[sinal]) _obsIniciarRelay(sinal); // aplica na hora se estiver no ar
-    res.json({ ok: true, id });
-  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
-});
-app.post('/obs/rota/remover', (req, res) => { try { const id = String((req.body || {}).id || ''); const r = db.prepare(`SELECT sinal FROM obs_rota WHERE id=?`).get(id) as any; db.prepare(`DELETE FROM obs_rota WHERE id=?`).run(id); if (r && _obsPublicando[r.sinal]) _obsIniciarRelay(r.sinal); res.json({ ok: true }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-app.post('/obs/sinal/regenerar', (req, res) => { try { const sinal = String((req.body || {}).sinal || ''); if (sinal !== 'h' && sinal !== 'v') return res.json({ ok: false, erro: 'sinal_invalido' }); const nk = _obsChaveNova(sinal); db.prepare(`UPDATE obs_sinal SET stream_key=?,atualizado_em=? WHERE id=?`).run(nk, agora(), sinal); res.json({ ok: true, streamKey: nk }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
-app.get('/obs/status', (_req, res) => { const out: any = { ok: true, sinais: {} }; for (const s of _obsSinais()) { const arr = _obsRelays.get(s.id) || []; out.sinais[s.id] = { publicando: !!_obsPublicando[s.id], desde: _obsPublicando[s.id]?.desde || null, relays: arr.map((r: any) => ({ id: r.id, vivo: r.vivo, tentativas: r.tentativas })) }; } res.json(out); });
-app.post('/obs/parar', (req, res) => { const sinal = String((req.body || {}).sinal || ''); if (sinal) { _obsPararRelay(sinal); } else { _obsPararRelay('h'); _obsPararRelay('v'); } res.json({ ok: true }); });
-// webhooks do nginx-rtmp (sem x-api-key; valida token na query). nginx manda 'name'=chave no corpo (form).
-app.post('/obs/on_publish', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (!sinal) return res.status(404).send('chave desconhecida'); _obsIniciarRelay(sinal); console.log('[obs] on_publish sinal', sinal); return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
-app.post('/obs/on_publish_done', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (sinal) { _obsPararRelay(sinal); console.log('[obs] on_publish_done sinal', sinal); } return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
-// [+obs-comentarios] Comentários do YouTube ao vivo (ler + responder + resposta em massa). Reaproveita o OAuth das lives.
-try { db.exec(`ALTER TABLE obs_rota ADD COLUMN canal_id TEXT`); } catch { /* ja existe */ }
-const _ytLiveChatCache: Record<string, { liveChatId: string; ts: number }> = {};
-const _obsCmtBuf: Array<{ id: string; rede: string; canal_id: string; autor: string; texto: string; ts: string }> = [];
-const _obsCmtPage: Record<string, string> = {};
-const _obsCmtSeen: Set<string> = new Set();
-async function _ytFetch(token: string, url: string, init?: any): Promise<any> {
-  const r = await fetch(url, { ...(init || {}), headers: { Authorization: 'Bearer ' + token, ...(init && init.body ? { 'Content-Type': 'application/json' } : {}) } });
-  const t = await r.text(); let j: any = {}; try { j = t ? JSON.parse(t) : {}; } catch { j = { raw: t }; }
-  if (!r.ok) throw new Error('YT ' + r.status + ': ' + String((j && j.error && j.error.message) || t).slice(0, 200));
-  return j;
-}
-async function _ytLiveChatId(canalId: string, token: string): Promise<string> {
-  const c = _ytLiveChatCache[canalId]; if (c && Date.now() - c.ts < 60000) return c.liveChatId;
-  const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveBroadcasts?part=snippet&broadcastStatus=active&broadcastType=all&mine=true&maxResults=1');
-  const lc = (j && j.items && j.items[0] && j.items[0].snippet && j.items[0].snippet.liveChatId) || '';
-  _ytLiveChatCache[canalId] = { liveChatId: lc, ts: Date.now() };
-  return lc;
-}
-async function _obsPollYouTube(): Promise<void> {
-  const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
-  const vistos = new Set<string>();
-  for (const r of rotas) {
-    if (vistos.has(r.canal_id)) continue; vistos.add(r.canal_id);
-    try {
-      const token = await pbYtTokenLives(r.canal_id);
-      const lc = await _ytLiveChatId(r.canal_id, token); if (!lc) continue;
-      const pg = _obsCmtPage[lc] ? ('&pageToken=' + encodeURIComponent(_obsCmtPage[lc])) : '';
-      const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet,authorDetails&liveChatId=' + encodeURIComponent(lc) + '&maxResults=50' + pg);
-      _obsCmtPage[lc] = (j && j.nextPageToken) || _obsCmtPage[lc];
-      for (const it of ((j && j.items) || [])) {
-        const id = 'yt:' + it.id; if (_obsCmtSeen.has(id)) continue; _obsCmtSeen.add(id);
-        _obsCmtBuf.push({ id, rede: 'youtube', canal_id: r.canal_id, autor: (it.authorDetails && it.authorDetails.displayName) || '', texto: (it.snippet && it.snippet.displayMessage) || '', ts: (it.snippet && it.snippet.publishedAt) || agora() });
-      }
-    } catch { /* best-effort por canal */ }
-  }
-  if (_obsCmtBuf.length > 200) _obsCmtBuf.splice(0, _obsCmtBuf.length - 200);
-  if (_obsCmtSeen.size > 2000) _obsCmtSeen.clear();
-}
-app.get('/obs/comentarios', async (_req, res) => {
-  try { await _obsPollYouTube(); } catch { /* */ }
-  const itens = [..._obsCmtBuf].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(0, 80);
-  res.json({ ok: true, itens, redesPostar: ['youtube'], nota: 'Facebook/Instagram/TikTok: leitura/resposta em etapa futura.' });
-});
-app.post('/obs/responder', async (req, res) => {
-  try {
-    const b = req.body || {}; const texto = String(b.texto || '').trim(); if (!texto) return res.json({ ok: false, erro: 'texto_vazio' });
-    const alvo = String(b.alvo || 'todas');
-    const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
-    const canais = alvo === 'todas' ? Array.from(new Set(rotas.map((r) => r.canal_id))) : [alvo];
-    let n = 0; const erros: string[] = [];
-    for (const canalId of canais) {
-      try {
-        const token = await pbYtTokenLives(String(canalId));
-        const lc = await _ytLiveChatId(String(canalId), token); if (!lc) { erros.push(canalId + ': sem live ativa'); continue; }
-        await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveChat/messages?part=snippet', { method: 'POST', body: JSON.stringify({ snippet: { liveChatId: lc, type: 'textMessageEvent', textMessageDetails: { messageText: texto } } }) });
-        n++;
-      } catch (e: any) { erros.push(canalId + ': ' + String(e && e.message || e).slice(0, 80)); }
-    }
-    res.json({ ok: n > 0, enviados: n, erros });
-  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
-});
-app.get('/obs/canais-youtube', (_req, res) => {
-  try {
-    const rows = db.prepare(`SELECT id, nome, projeto FROM canais_publicacao WHERE ativo=1 ORDER BY projeto, nome`).all() as any[];
-    const out = rows.filter((c) => db.prepare(`SELECT 1 FROM oauth_tokens_pub WHERE canal_id=? AND plataforma IN ('youtube_lives','youtube') LIMIT 1`).get(c.id)).map((c) => ({ canal_id: c.id, nome: c.nome, projeto: c.projeto }));
-    res.json({ ok: true, canais: out });
-  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
-});
-console.log('[+obs] rotas /obs/* carregadas (ao vivo pelo OBS).');
-// [+obs-audiencia] Audiencia ao vivo dos canais YouTube (espectadores agora + curtidas + pico). ADITIVO, so-leitura. Reaproveita _ytFetch, pbYtTokenLives, _ytLiveChatCache, _obsRotas.
-const _ytBroadcastCache: Record<string, { videoId: string; ts: number }> = {};
-const _obsAudPico: Record<string, number> = {};
-let _obsAudCache: { ts: number; dados: any } | null = null;
-async function _ytVideoAoVivo(canalId: string, token: string): Promise<string> {
-  const c = _ytBroadcastCache[canalId]; if (c && Date.now() - c.ts < 60000) return c.videoId;
-  const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/liveBroadcasts?part=id,snippet&broadcastStatus=active&broadcastType=all&mine=true&maxResults=1');
-  const it = (j && j.items && j.items[0]) || null;
-  const vid = (it && it.id) || '';
-  const lc = (it && it.snippet && it.snippet.liveChatId) || '';
-  if (lc) _ytLiveChatCache[canalId] = { liveChatId: lc, ts: Date.now() }; // aproveita e alimenta o cache do chat
-  _ytBroadcastCache[canalId] = { videoId: vid, ts: Date.now() };
-  return vid;
-}
-async function _obsAudiencia(): Promise<any> {
-  if (_obsAudCache && Date.now() - _obsAudCache.ts < 9000) return _obsAudCache.dados; // cache ~10s (economiza cota)
-  const rotas = (_obsRotas().filter((r: any) => r.plataforma === 'youtube' && Number(r.ativo) === 1 && r.canal_id)) as any[];
-  const vistos = new Set<string>();
-  const canais: any[] = [];
-  let total = 0;
-  for (const r of rotas) {
-    if (vistos.has(r.canal_id)) continue; vistos.add(r.canal_id);
-    let nome = String(r.nome || '').replace(/^YouTube\s+/i, '') || String(r.canal_id);
-    try { const row = db.prepare(`SELECT nome FROM canais_publicacao WHERE id=?`).get(r.canal_id) as any; if (row && row.nome) nome = row.nome; } catch { /* */ }
-    const item: any = { canal_id: r.canal_id, nome, agora: null, curtidas: null, pico: 0, aovivo: false };
-    try {
-      const token = await pbYtTokenLives(r.canal_id);
-      const vid = await _ytVideoAoVivo(r.canal_id, token);
-      if (vid) {
-        const j = await _ytFetch(token, 'https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails,statistics&id=' + encodeURIComponent(vid));
-        const v = (j && j.items && j.items[0]) || null;
-        const cv = v && v.liveStreamingDetails && v.liveStreamingDetails.concurrentViewers;
-        const lk = v && v.statistics && v.statistics.likeCount;
-        item.agora = (cv === undefined || cv === null) ? null : Number(cv);
-        item.curtidas = (lk === undefined || lk === null) ? null : Number(lk);
-        item.aovivo = item.agora !== null;
-        item.pico = _obsAudPico[vid] || 0;
-        if (item.agora && item.agora > item.pico) { _obsAudPico[vid] = item.agora; item.pico = item.agora; }
-        if (item.agora) total += item.agora;
-      }
-    } catch (e: any) { item.erro = String(e && e.message || e).slice(0, 80); }
-    canais.push(item);
-  }
-  const dados = { ok: true, canais, total, ts: agora() };
-  _obsAudCache = { ts: Date.now(), dados };
-  return dados;
-}
-app.get('/obs/audiencia', async (_req, res) => {
-  try { const d = await _obsAudiencia(); res.json(d); } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
-});
-console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo YouTube).');
-
-// ===================== [+painel-trafego] Painel web de Trafego (link protegido, ao vivo) =====================
-// ADITIVO. Inserido antes do app.listen. Reaproveita: app, db, CONFIG, salvarConfig, fetch, randomBytes,
-// ENGINE_API_KEY, PUBLIC_BASE_URL. NAO remove nada. Puxa os dados reais de ads do Worker
-// (DEBRIEF_BASE_URL + DEBRIEF_TOKEN no .env), agrega por PRODUTO (palavra-chave do nome da campanha)
-// e serve uma pagina SO-LEITURA em /painel/trafego?k=<token>. Todos os produtos num painel so.
-(() => {
-  try {
-    const DBF_BASE = (process.env.DEBRIEF_BASE_URL || '').replace(/\/+$/, '');
-    const DBF_TOKEN = process.env.DEBRIEF_TOKEN || '';
-    // token secreto do link: gera 1x e guarda no CONFIG (sobrevive a deploy via config_runtime)
-    try {
-      if (!(CONFIG as any).painelTrafegoToken) {
-        (CONFIG as any).painelTrafegoToken = randomBytes(18).toString('hex');
-        try { salvarConfig(); } catch { /* best-effort */ }
-      }
-    } catch { /* ignore */ }
-    const PNL_TOKEN = (): string => {
-      let t = String((CONFIG as any).painelTrafegoToken || '');
-      if (!t) { // [+fix-token] gera na hora se estiver vazio (ex.: após um reload que limpou) e persiste
-        t = randomBytes(18).toString('hex');
-        (CONFIG as any).painelTrafegoToken = t;
-        try { salvarConfig(); } catch { /* best-effort */ }
-      }
-      return t;
-    };
-    const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
-    const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
-
-    const _pnlProduto = (nome: string): string => {
-      const t = String(nome || '').toLowerCase();
-      if (/dedilhad/.test(t)) return 'Dedilhados';
-      if (/teclad/.test(t)) return 'Teclado';
-      if (/baix/.test(t)) return 'Baixo';
-      if (/viol/.test(t)) return 'Violao';
-      if (/harpa|comunidade/.test(t)) return 'Harpa';
-      return 'Outros';
-    };
-    let _pnlContasCache: Record<string,string> | null = null; let _pnlContasTs = 0;
-    const _pnlContasMap = async (): Promise<Record<string,string>> => {
-      try {
-        if (_pnlContasCache && (Date.now() - _pnlContasTs < 300000)) return _pnlContasCache;
-        if (!DBF_BASE || !DBF_TOKEN) return {};
-        const r = await fetch(DBF_BASE + '/api/custos/ads/contas', { headers: { Authorization: 'Bearer ' + DBF_TOKEN } });
-        const j: any = await r.json();
-        const m: Record<string,string> = {};
-        for (const c of ((j && j.contas) || [])) { if (c && c.account_id) m[String(c.account_id)] = String(c.nome || c.apelido || c.account_id); }
-        _pnlContasCache = m; _pnlContasTs = Date.now();
-        return m;
-      } catch { return {}; }
-    };
-
-    const _pnlDados = async (dias: number, deOpt?: string, ateOpt?: string): Promise<any> => {
-      if (!DBF_BASE || !DBF_TOKEN) return { ok: false, erro: 'SEM_TOKEN' };
-      const fmt = (d: Date): string => d.toISOString().slice(0, 10);
-      const _rangeOk = (s: any): boolean => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
-      let deStr2 = _rangeOk(deOpt) ? String(deOpt) : '';
-      let ateStr2 = _rangeOk(ateOpt) ? String(ateOpt) : '';
-      if (deStr2 && ateStr2 && deStr2 > ateStr2) { const _t = deStr2; deStr2 = ateStr2; ateStr2 = _t; }
-      const ateD = ateStr2 ? new Date(ateStr2 + 'T12:00:00Z') : new Date();
-      const deD = deStr2 ? new Date(deStr2 + 'T12:00:00Z') : new Date(Date.now() - (dias - 1) * 86400000);
-      const deFinal = deStr2 || fmt(deD);
-      const ateFinal = ateStr2 || fmt(ateD);
-      const url = DBF_BASE + '/api/custos/ads/roas?de=' + deFinal + '&ate=' + ateFinal;
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 20000);
-      let anuncios: any[] = [];
-      try {
-        const r = await fetch(url, { headers: { Authorization: 'Bearer ' + DBF_TOKEN }, signal: ctrl.signal });
-        if (!r.ok) return { ok: false, erro: 'WORKER_' + r.status };
-        const j: any = await r.json();
-        anuncios = (j && j.anuncios) || [];
-      } catch (e: any) {
-        return { ok: false, erro: 'FETCH_' + (e && e.message ? e.message : 'erro') };
-      } finally { clearTimeout(to); }
-
-      const porProd: Record<string, any> = {};
-      for (const a of anuncios) {
-        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
-        const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 });
-        p.gasto += (a.gasto_centavos || 0) / 100;
-        p.vendas += (a.vendas || 0);
-        p.fat += (a.fat_centavos || 0) / 100;
-        p.leads += (a.leads || 0);
-        p.cliques += (a.cliques || 0);
-        p.impressoes += (a.impressoes || 0);
-        p.ic += (a.ic || 0);
-      }
-      const tx = taxaPct();
-      const im = impPct();
-      const enrich = (p: any): any => {
-        const taxaV = p.fat * tx / 100;
-        const impV = p.gasto * im / 100;
-        const lucro = p.fat - taxaV - impV - p.gasto;
-        return {
-          produto: p.produto, gasto: p.gasto, vendas: p.vendas, fat: p.fat, leads: p.leads,
-          cliques: p.cliques, impressoes: p.impressoes, ic: p.ic || 0, cpic: (p.ic || 0) > 0 ? p.gasto / (p.ic || 1) : 0,
-          roas: p.gasto > 0 ? p.fat / p.gasto : 0,
-          cpa: p.vendas > 0 ? p.gasto / p.vendas : 0,
-          ticket: p.vendas > 0 ? p.fat / p.vendas : 0,
-          taxaPlataforma: taxaV, impostoMeta: impV, lucro,
-          margem: p.fat > 0 ? lucro / p.fat * 100 : 0,
-        };
-      };
-      const lista = Object.keys(porProd).map((k) => enrich(porProd[k])).sort((a, b) => b.fat - a.fat);
-      const tot: any = { produto: 'Todos', gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 };
-      for (const k of Object.keys(porProd)) { const p = porProd[k]; tot.gasto += p.gasto; tot.vendas += p.vendas; tot.fat += p.fat; tot.leads += p.leads; tot.cliques += p.cliques; tot.impressoes += p.impressoes; tot.ic += (p.ic || 0); }
-      const total = enrich(tot);
-      const mapaContas = await _pnlContasMap();
-      const _contasSet: Record<string, string> = {};
-      const ads = (anuncios || []).map((a: any) => {
-        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
-        const gasto = (a.gasto_centavos || 0) / 100; const fat = (a.fat_centavos || 0) / 100;
-        const taxaV = fat * tx / 100; const impV = gasto * im / 100;
-        const conta = String(a.ad_account_id || '');
-        const contaNome = mapaContas[conta] || (conta ? ('Conta ' + conta.replace('act_', '')) : '(sem conta)');
-        if (conta) _contasSet[conta] = contaNome;
-        return { produto: prod, conta, contaNome, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: a.vendas || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, ic: a.ic || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
-      });
-      const contas = Object.keys(_contasSet).map((id) => ({ id, nome: _contasSet[id] })).sort((aa, bb) => aa.nome.localeCompare(bb.nome));
-      return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista, ads, contas };
-    };
-
-    // JSON (publico, protegido por ?k=)
-    app.get('/painel/trafego/dados', async (req: any, res: any) => {
-      if (!PNL_TOKEN() || String(req.query.k || '') !== PNL_TOKEN()) return res.status(403).json({ ok: false, erro: 'acesso' });
-      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 14));
-      const deQ = req.query.de ? String(req.query.de) : undefined;
-      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
-      try { res.json(await _pnlDados(dias, deQ, ateQ)); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
-    });
-    // [+mcp-trafego] leitura via MCP (x-api-key) — mesmos dados do painel, sem token de link
-    app.get('/trafego/dados', async (req: any, res: any) => {
-      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false, erro: 'acesso' });
-      const dias = Math.min(90, Math.max(1, Number(req.query.dias) || 1));
-      const deQ = req.query.de ? String(req.query.de) : undefined;
-      const ateQ = req.query.ate ? String(req.query.ate) : undefined;
-      try { res.json(await _pnlDados(dias, deQ, ateQ)); }
-      catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-    });
-    // token/link do painel (so admin: x-api-key)
-    app.get('/painel/token', (req: any, res: any) => {
-      if (String(req.headers['x-api-key'] || '') !== ENGINE_API_KEY) return res.status(403).json({ ok: false });
-      res.json({ ok: true, token: PNL_TOKEN(), link: (PUBLIC_BASE_URL || '') + '/painel/trafego?k=' + PNL_TOKEN(), temWorker: !!(DBF_BASE && DBF_TOKEN), taxaPct: taxaPct(), impostoPct: impPct() });
-    });
-    // pagina HTML
-    app.get('/painel/trafego', (req: any, res: any) => {
-      if (!PNL_TOKEN() || String(req.query.k || '') !== PNL_TOKEN()) {
-        return res.status(403).type('html').send('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;background:#0e0f14;color:#eee;padding:48px;text-align:center">Link invalido ou expirado.</body>');
-      }
-      res.type('html').send(_pnlHtml());
-    });
-
-    const _pnlHtml = (): string => {
-      return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
-        + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-        + '<title>Trafego Pago — Melodias e Riffs</title>'
-        + '<style>'
-        + ':root{--bg:#0e0f14;--card:#171922;--fg:#f2f3f7;--mut:#9a9eae;--line:#262a36;--ac:#9a84ff;--acs:#241f3d;--gr:#36c892;--grs:#12271f;--rd:#ff7a6e;--rds:#2c1613;--am:#f0ad4e;--ams:#2a2112;--chip:#20232e}'
-        + '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}'
-        + '.wrap{max-width:1000px;margin:0 auto;padding:18px 16px 54px}'
-        + '.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}'
-        + '.brand{display:flex;gap:10px;align-items:center}.logo{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#9a84ff,#b58bff);display:grid;place-items:center;font-size:19px}'
-        + 'h1{font-size:17px;margin:0;letter-spacing:-.2px}.sub{font-size:12px;color:var(--mut);margin-top:2px}'
-        + '.ctl{display:flex;gap:7px;flex-wrap:wrap;align-items:center}'
-        + '.sel{background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--fg);font-size:12.5px;font-weight:600;padding:8px 10px}'
-        + '.btn{background:var(--acs);border:1px solid var(--ac);color:var(--ac);border-radius:10px;font-size:12.5px;font-weight:700;padding:8px 11px;cursor:pointer}'
-        + '.btn2{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;font-size:12.5px;font-weight:700;padding:8px 11px;cursor:pointer}'
-        + '.dt{padding:7px 9px;color-scheme:dark;max-width:150px}.dsep{color:var(--mut);font-size:12px;align-self:center}'
-        + '.tabs{display:flex;gap:7px;overflow-x:auto;padding-bottom:4px;margin-bottom:12px;-webkit-overflow-scrolling:touch}'
-        + '.tab{flex:none;background:var(--card);border:1px solid var(--line);color:var(--mut);border-radius:999px;font-size:12.5px;font-weight:700;padding:7px 13px;cursor:pointer;white-space:nowrap}'
-        + '.tab.on{background:var(--acs);border-color:var(--ac);color:var(--ac)}'
-        + '.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}'
-        + '@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}}'
-        + '.kpi{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:12px 13px}'
-        + '.kpi .l{font-size:11px;color:var(--mut);font-weight:600}.kpi .v{font-size:20px;font-weight:800;letter-spacing:-.4px;margin-top:6px;line-height:1}'
-        + '.mg{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border-radius:10px;overflow:hidden;margin-top:2px}@media(max-width:560px){.mg{grid-template-columns:1fr 1fr}}'
-        + '.mi{background:var(--card);padding:11px 12px}.mi .l{font-size:10.5px;color:var(--mut);font-weight:600}.mi .v{font-size:15.5px;font-weight:800;margin-top:4px;letter-spacing:-.2px}'
-        + '.panel{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:15px 16px;margin-bottom:12px}'
-        + '.panel h2{font-size:13.5px;margin:0 0 12px}'
-        + '.line{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px dashed var(--line)}.line:last-of-type{border-bottom:0}'
-        + '.line .tag{font-size:13px;font-weight:600}.line .pct{font-size:10.5px;color:var(--mut);background:var(--chip);padding:2px 7px;border-radius:999px;margin-left:7px}'
-        + '.line .vv{font-size:14.5px;font-weight:800;white-space:nowrap}.minus .vv{color:var(--rd)}'
-        + '.res{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;background:var(--grs);border:1px solid var(--gr);border-radius:12px;padding:13px 14px}'
-        + '.res .l{font-size:13px;font-weight:700;color:var(--gr)}.res .big{font-size:21px;font-weight:800;color:var(--gr);line-height:1;text-align:right}.res .mar{font-size:11px;color:var(--mut);margin-top:3px}'
-        + 'table{width:100%;border-collapse:collapse;font-size:12px}th{text-align:left;color:var(--mut);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.3px;padding:8px 7px;border-bottom:1px solid var(--line)}'
-        + 'td{padding:9px 7px;border-bottom:1px solid var(--line)}th.n,td.n{text-align:right;white-space:nowrap}tr:last-child td{border-bottom:0}.cre{font-weight:700}'
-        + '.pos{color:var(--gr)}.neg{color:var(--rd)}'
-        + '.note{font-size:11px;color:var(--mut);background:var(--chip);border-radius:10px;padding:9px 11px;margin-top:11px;line-height:1.5}'
-        + '.foot{font-size:11px;color:var(--mut);text-align:center;margin-top:18px}'
-        + '.err{background:var(--ams);border:1px solid var(--am);color:var(--am);border-radius:12px;padding:14px;font-size:13px;font-weight:600;text-align:center}'
-        + '.sk{opacity:.45}'
-        + '.px{overflow-x:auto}'
-        + 'td.cmp{color:var(--mut);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
-        + '</style></head><body><div class="wrap">'
-        + '<div class="top"><div class="brand"><div class="logo">🎹</div><div><h1>Trafego Pago</h1><div class="sub">Melodias e Riffs · ao vivo</div></div></div>'
-        + '<div class="ctl"><button class="btn2" id="qhoje">Hoje</button><button class="btn2" id="qontem">Ontem</button><select class="sel" id="dias"><option value="7">7 dias</option><option value="14" selected>14 dias</option><option value="30">30 dias</option></select><input type="date" class="sel dt" id="de"><span class="dsep">→</span><input type="date" class="sel dt" id="ate">'
-        + '<select class="sel" id="conta"><option value="__all">Todas as contas</option></select>'
-        + '<button class="btn" id="rec">Atualizar</button></div></div>'
-        + '<div class="tabs" id="tabs"></div>'
-        + '<div id="body"></div>'
-        + '<div class="foot" id="foot">Carregando…</div>'
-        + '</div><script>'
-        + '(function(){'
-        + 'var K=new URLSearchParams(location.search).get("k")||"";'
-        + 'var DADOS=null,SEL="Todos";'
-        + 'function brl(n){try{return (n||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"})}catch(e){return "R$ "+(n||0).toFixed(2)}}'
-        + 'function num(n){try{return Math.round(n||0).toLocaleString("pt-BR")}catch(e){return String(Math.round(n||0))}}'
-        + 'function x(n){return (n||0).toFixed(2).replace(".",",")}'
-        + 'function pct(n){return (n||0).toFixed(1).replace(".",",")+"%"}'
-        + 'function esc(s){return String(s==null?"":s).replace(/[&<>]/g,function(c){return c==="&"?"&amp;":c==="<"?"&lt;":"&gt;"})}'
-        + 'function achaProd(nome){if(nome==="Todos")return DADOS.total;var a=DADOS.produtos||[];for(var i=0;i<a.length;i++){if(a[i].produto===nome)return a[i]}return DADOS.total}'
-        + 'function render(){'
-        + 'var tabs=document.getElementById("tabs");var body=document.getElementById("body");'
-        + 'if(!DADOS||!DADOS.ok){'
-        + 'tabs.innerHTML="";'
-        + 'if(DADOS&&DADOS.erro==="SEM_TOKEN"){body.innerHTML="<div class=err>Falta ligar os dados do Meta no motor.<br><span style=\\"font-weight:500\\">(DEBRIEF_BASE_URL + DEBRIEF_TOKEN no .env — o Ezequias faz 1x no deploy)</span></div>";}'
-        + 'else{body.innerHTML="<div class=err>Nao consegui carregar os dados agora."+(DADOS&&DADOS.erro?"<br><span style=\\"font-weight:500\\">("+esc(DADOS.erro)+")</span>":"")+"</div>";}'
-        + 'return;}'
-        + 'popConta();'
-        + 'var nomes=["Todos"];for(var i=0;i<DADOS.produtos.length;i++){nomes.push(DADOS.produtos[i].produto);}'
-        + 'var th="";for(var j=0;j<nomes.length;j++){th+="<div class=\\"tab"+(nomes[j]===SEL?" on":"")+"\\" data-p=\\""+esc(nomes[j])+"\\">"+esc(nomes[j])+"</div>";}tabs.innerHTML=th;'
-        + 'var tabsEls=tabs.querySelectorAll(".tab");for(var t=0;t<tabsEls.length;t++){tabsEls[t].onclick=function(){SEL=this.getAttribute("data-p");render();};}'
-        + 'var p=achaProd(SEL);'
-        + 'var html="";'
-        + 'html+="<div class=grid>";'
-        + 'html+=kpi("Faturamento",brl(p.fat));'
-        + 'html+=kpi("Vendas",num(p.vendas));'
-        + 'html+=kpi("Investido (ads)",brl(p.gasto));'
-        + 'html+=kpi("ROAS",x(p.roas)+"x");'
-        + 'html+=kpi("Ticket medio",brl(p.ticket));'
-        + 'html+=kpi("CPA",brl(p.cpa));'
-        + 'html+="</div>";'
-        + 'var _ctr=p.impressoes>0?(p.cliques/p.impressoes*100):0;var _cpc=p.cliques>0?(p.gasto/p.cliques):0;var _cpm=p.impressoes>0?(p.gasto/p.impressoes*1000):0;var _cpl=p.leads>0?(p.gasto/p.leads):0;var _cpic=(p.ic||0)>0?(p.gasto/p.ic):0;'
-        + 'html+="<div class=panel><h2>\u{1F4C8} Metricas de anuncio</h2><div class=mg>";'
-        + 'html+=mi("Cliques",num(p.cliques))+mi("Impressoes",num(p.impressoes))+mi("CTR",pct(_ctr))+mi("CPC",brl(_cpc))+mi("CPM",brl(_cpm))+mi("Leads",num(p.leads))+mi("CPL",brl(_cpl))+mi("IC",num(p.ic||0))+mi("CPIC",brl(_cpic));'
-        + 'html+="</div></div>";'
-        + 'html+="<div class=panel><h2>💰 Resultado real — o que sobra ("+esc(SEL)+")</h2>";'
-        + 'html+=lin("Faturamento bruto","",brl(p.fat),false);'
-        + 'html+=lin("Taxa da plataforma","LastLink · "+x(DADOS.taxaPct)+"%","− "+brl(p.taxaPlataforma),true);'
-        + 'html+=lin("Imposto do Meta","sobre ads · "+x(DADOS.impostoPct)+"%","− "+brl(p.impostoMeta),true);'
-        + 'html+=lin("Investido em anuncios","Gerenciador","− "+brl(p.gasto),true);'
-        + 'html+="<div class=res><div class=l>✅ Lucro liquido</div><div><div class=big>"+brl(p.lucro)+"</div><div class=mar>Margem "+pct(p.margem)+" · "+num(p.cliques)+" cliques · "+num(p.impressoes)+" impressoes</div></div></div>";'
-        + 'html+="<div class=note>O Gerenciador mostra o gasto, mas a fatura do Meta vem com imposto por cima — por isso a gente separa, pra ver o lucro de verdade. As % de taxa/imposto se ajustam no motor.</div>";'
-        + 'html+="</div>";'
-        + 'html+="<div class=panel style=\\"overflow-x:auto\\"><h2>Por produto</h2><table><thead><tr><th>Produto</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Faturamento</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
-        + 'for(var r=0;r<DADOS.produtos.length;r++){var q=DADOS.produtos[r];html+="<tr><td class=cre>"+esc(q.produto)+"</td><td class=n>"+brl(q.gasto)+"</td><td class=n>"+num(q.vendas)+"</td><td class=n>"+brl(q.fat)+"</td><td class=n>"+x(q.roas)+"x</td><td class=\\"n "+(q.lucro>=0?"pos":"neg")+"\\">"+brl(q.lucro)+"</td></tr>";}'
-        + 'html+="</tbody></table></div>";'
-        + 'var _adsAll=adsDoSel();var _ads=adsFiltrados();'
-        + 'if(_adsAll&&_adsAll.length){var _ctsL=agrupaConta(_adsAll);if(_ctsL.length>1){html+="<div class=panel><h2>Por conta de anuncio ("+esc(SEL)+")</h2><div class=px><table><thead><tr><th>Conta</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Fat.</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";for(var cj=0;cj<_ctsL.length;cj++){var ct=_ctsL[cj];html+="<tr><td class=cre>"+esc(ct.conta)+"</td><td class=n>"+brl(ct.gasto)+"</td><td class=n>"+num(ct.vendas)+"</td><td class=n>"+brl(ct.fat)+"</td><td class=n>"+x(ct.roas)+"x</td><td class=n><span class="+(ct.lucro>=0?"pos":"neg")+">"+brl(ct.lucro)+"</span></td></tr>";}html+="</tbody></table></div></div>";}}'
-        + 'if(_ads&&_ads.length){var _camps=agrupaCamp(_ads);'
-        + 'html+="<div class=panel><h2>Por campanha ("+esc(SEL)+")</h2><div class=px><table><thead><tr><th>Campanha</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Fat.</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
-        + 'for(var ci=0;ci<_camps.length;ci++){var c=_camps[ci];html+="<tr><td class=cre>"+esc(c.campanha)+"</td><td class=n>"+brl(c.gasto)+"</td><td class=n>"+num(c.vendas)+"</td><td class=n>"+brl(c.fat)+"</td><td class=n>"+x(c.roas)+"x</td><td class=n><span class="+(c.lucro>=0?"pos":"neg")+">"+brl(c.lucro)+"</span></td></tr>";}'
-        + 'html+="</tbody></table></div></div>";'
-        + 'html+="<div class=panel><h2>Por criativo (anuncio)</h2><div class=px><table><thead><tr><th>Anuncio</th><th>Campanha</th><th>Conta</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>IC</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
-        + 'var _ao=_ads.slice().sort(function(a,b){return b.gasto-a.gasto;});'
-        + 'for(var ai=0;ai<_ao.length;ai++){var d=_ao[ai];html+="<tr><td class=cre>"+esc(d.ad)+"</td><td class=cmp>"+esc(d.campanha)+"</td><td class=cmp>"+esc(d.contaNome)+"</td><td class=n>"+brl(d.gasto)+"</td><td class=n>"+num(d.vendas)+"</td><td class=n>"+num(d.ic||0)+"</td><td class=n>"+x(d.roas)+"x</td><td class=n><span class="+(d.lucro>=0?"pos":"neg")+">"+brl(d.lucro)+"</span></td></tr>";}'
-        + 'html+="</tbody></table></div></div>";}'
-        + 'body.innerHTML=html;' 
-        + '}'
-        + 'function kpi(l,v){return "<div class=kpi><div class=l>"+esc(l)+"</div><div class=v>"+v+"</div></div>";}'
-        + 'function mi(l,v){return "<div class=mi><div class=l>"+esc(l)+"</div><div class=v>"+v+"</div></div>";}'
-        + 'function adsDoSel(){var a=(DADOS&&DADOS.ads)||[];if(SEL==="Todos")return a;var o=[];for(var i=0;i<a.length;i++){if(a[i].produto===SEL)o.push(a[i]);}return o;}'
-        + 'function contaSel(){var e=document.getElementById("conta");return e?e.value:"__all";}'
-        + 'function adsFiltrados(){var a=adsDoSel();var cf=contaSel();if(cf&&cf!=="__all")a=a.filter(function(x){return x.conta===cf;});return a;}'
-        + 'function agrupaConta(ads){var m={},ord=[];for(var i=0;i<ads.length;i++){var c=ads[i].contaNome||"(sem conta)";if(!m[c]){m[c]={conta:c,gasto:0,vendas:0,fat:0,lucro:0};ord.push(c);}var g=m[c];g.gasto+=ads[i].gasto;g.vendas+=ads[i].vendas;g.fat+=ads[i].fat;g.lucro+=ads[i].lucro;}var out=[];for(var k=0;k<ord.length;k++){var gg=m[ord[k]];gg.roas=gg.gasto>0?gg.fat/gg.gasto:0;out.push(gg);}out.sort(function(a,b){return b.gasto-a.gasto;});return out;}'
-        + 'function popConta(){var e=document.getElementById("conta");if(!e||!DADOS||!DADOS.contas)return;var cur=e.value;var h="<option value=__all>Todas as contas</option>";for(var i=0;i<DADOS.contas.length;i++){h+="<option value="+esc(DADOS.contas[i].id)+">"+esc(DADOS.contas[i].nome)+"</option>";}e.innerHTML=h;if(cur)e.value=cur;}'
-        + 'function agrupaCamp(ads){var m={},ord=[];for(var i=0;i<ads.length;i++){var c=ads[i].campanha;if(!m[c]){m[c]={campanha:c,gasto:0,vendas:0,fat:0,lucro:0};ord.push(c);}var g=m[c];g.gasto+=ads[i].gasto;g.vendas+=ads[i].vendas;g.fat+=ads[i].fat;g.lucro+=ads[i].lucro;}var out=[];for(var k=0;k<ord.length;k++){var gg=m[ord[k]];gg.roas=gg.gasto>0?gg.fat/gg.gasto:0;out.push(gg);}out.sort(function(a,b){return b.gasto-a.gasto;});return out;}'
-        + 'function lin(tag,pc,v,minus){return "<div class=\\"line"+(minus?" minus":"")+"\\"><div><span class=tag>"+esc(tag)+"</span>"+(pc?"<span class=pct>"+esc(pc)+"</span>":"")+"</div><div class=vv>"+v+"</div></div>";}'
-        + 'function carregar(){'
-        + 'var dias=document.getElementById("dias").value;'
-        + 'var _de=document.getElementById("de").value;var _ate=document.getElementById("ate").value;'
-        + 'var _q="/painel/trafego/dados?k="+encodeURIComponent(K);'
-        + 'if(_de&&_ate){_q+="&de="+_de+"&ate="+_ate;}else if(_de){_q+="&de="+_de+"&ate="+_de;}else if(_ate){_q+="&de="+_ate+"&ate="+_ate;}else{_q+="&dias="+dias;}'
-        + 'var foot=document.getElementById("foot");foot.textContent="Atualizando…";'
-        + 'fetch(_q).then(function(r){return r.json();}).then(function(j){'
-        + 'DADOS=j;render();'
-        + 'if(j&&j.ok){var h=new Date();foot.textContent="Atualizado "+h.getHours()+":"+("0"+h.getMinutes()).slice(-2)+" · periodo "+j.de+" a "+j.ate+" · atualiza sozinho a cada 60s";}else{foot.textContent="";}'
-        + '}).catch(function(){DADOS={ok:false,erro:"rede"};render();foot.textContent="";});'
-        + '}'
-        + 'document.getElementById("rec").onclick=carregar;'
-        + 'document.getElementById("dias").onchange=function(){document.getElementById("de").value="";document.getElementById("ate").value="";carregar();};'
-        + 'document.getElementById("de").onchange=carregar;document.getElementById("ate").onchange=carregar;'
-        + 'var _ec=document.getElementById("conta");if(_ec)_ec.onchange=render;'
-        + 'function _ymd(d){return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);}'
-        + 'function _setR(a,b){document.getElementById("de").value=a;document.getElementById("ate").value=b;carregar();}'
-        + 'document.getElementById("qhoje").onclick=function(){var h=new Date();_setR(_ymd(h),_ymd(h));};'
-        + 'document.getElementById("qontem").onclick=function(){var o=new Date(Date.now()-86400000);_setR(_ymd(o),_ymd(o));};'
-        + 'carregar();setInterval(carregar,60000);'
-        + '})();'
-        + '</script></body></html>';
-    };
-
-    console.log('[painel-trafego] bloco carregado; worker=', (DBF_BASE && DBF_TOKEN) ? 'ok' : 'FALTA-ENV', 'token=', PNL_TOKEN() ? 'ok' : '-');
-  } catch (e: any) { console.log('[painel-trafego] erro no bloco (seguindo):', e && e.message ? e.message : e); }
-})();
-// ===================== [+painel-trafego] fim =====================
-
-// ============================================================================
-// [jornada-regua 27/10] RÉGUA DO WEBINÁRIO "Jornada Tecladista – Chamado para Servir"
-// ----------------------------------------------------------------------------
-// ADITIVO. Não altera nada que já existe; só acrescenta tabelas, um agendador,
-// um enviador próprio (WhatsApp pelo número do webinário) e rotas públicas /j/...
-//
-// Como funciona:
-//  - Quem se inscreve no formulário da página (/p/jornada-tecladista-webinario)
-//    vira um INSCRITO com Dia 1 = hoje (antes das 21h) ou amanhã (21h em diante).
-//  - Cada inscrito recebe links SÓ DELE: /j/a1|a2|a3/<token> (sala da aula, com
-//    o horário certo dele, gravação nos prazos e % assistido) e /j/oferta/<token>
-//    (link de compra que respeita os prazos dele) e /j/video/<token>.
-//  - Um agendador (1x por minuto) decide cada mensagem (WhatsApp + e-mail) pelo
-//    dia/horário de cada pessoa e pelo quanto ela assistiu; quem compra para de
-//    receber venda e ganha a mensagem de pós-venda (+ apostila se pagou até
-//    23h59 do Dia 3 na 1ª participação).
-//  - NASCE DESLIGADO: só roda com pub_kv jornada_ativo='1' (POST /jornada/ativar).
-//  - Textos aprovados pelo Ezequias em 27/10 (doc "Jornada Tecladista – Mensagens
-//    do Webinário", aba "Como chega (versão final)").
-// ============================================================================
-{
-  const JW: any = (globalThis as any).__wbJornada || {};
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS jornada_inscritos (
-      id TEXT PRIMARY KEY, contato_id TEXT, projeto TEXT, telefone TEXT, email TEXT, nome TEXT,
-      inscrito_em TEXT, dia1 TEXT, token TEXT UNIQUE, repeticao INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'ativo', comprou_em TEXT, compra_id TEXT, ganhou_apostila INTEGER DEFAULT 0,
-      resposta_id TEXT, criado_em TEXT
-    );
-    CREATE TABLE IF NOT EXISTS jornada_envios (
-      id TEXT PRIMARY KEY, inscrito_id TEXT, chave TEXT, canal TEXT, status TEXT,
-      tipo TEXT, texto TEXT, url TEXT, legenda TEXT, para TEXT, detalhe TEXT,
-      agendado_para TEXT, criado_em TEXT, enviado_em TEXT, tentativas INTEGER DEFAULT 0,
-      UNIQUE (inscrito_id, chave, canal)
-    );
-    CREATE INDEX IF NOT EXISTS ix_jornada_envios_fila ON jornada_envios(status, canal, agendado_para);
-    CREATE INDEX IF NOT EXISTS ix_jornada_insc_contato ON jornada_inscritos(contato_id);
-  `);
-  try { db.exec(`ALTER TABLE jornada_envios ADD COLUMN instancia TEXT`); } catch { /* já existe */ }
-
-  // ---------------- configuração (padrão no código; ajuste fino via pub_kv 'jornada_cfg' JSON) ----------------
-  const JCFG_PADRAO: any = {
-    projeto: 'teclado',
-    instancia: 'EquipeMelodiasERiffs-Suporte2TECLADO',          // WhatsApp 98212-3953 (todas as mensagens da régua)
-    instanciaSuporte: 'Teclado-suporte',                          // WhatsApp (16) 99640-1030: SÓ a mensagem de pós-venda
-    formId: '69d8db36-54cb-4959-b20c-327371fa3080',               // formulário da página de inscrição
-    slugs: { a1: 'jornada-tecladista-aula-1-9d47', a2: 'jornada-tecladista-aula-2-6195', a3: 'jornada-tecladista-aula-3-ca21' },
-    dur: { a1: 5595, a2: 5283, a3: 8620 },                       // duração das aulas (s)
-    hora: '21:00',
-    ofertaSeg: 7005,                                              // momento da oferta na Aula 3 (s)
-    viuOfertaPct: 81,                                             // 7005/8620 ≈ 81%
-    checkout: 'https://clkdmg.site/pay/oferta-de-black-antecipada-teclado-gospel',
-    produtoMatch: ['black antecipada'],                           // como reconhecer a compra da oferta (nome do produto)
-    plataforma: 'https://melodiaseriffs.cademi.com.br',
-    suporte: '(16) 99640-1030',
-    videoPublico: 'https://motor.melodiaseriffs.com.br/media/17a391081214c88c.mp4',
-    videoEnvio: 'http://engine:8080/media/17a391081214c88c.mp4',  // a Evolution busca pela rede interna
-    paginaInscricao: 'https://motor.melodiaseriffs.com.br/p/jornada-tecladista-webinario',
-    envioIntervaloMs: 3000,
-  };
-  function jcfg(): any { let o: any = {}; try { o = JSON.parse(pubFlag('jornada_cfg', '{}') || '{}'); } catch { o = {}; } return { ...JCFG_PADRAO, ...o }; }
-  const jAtivo = (): boolean => pubFlag('jornada_ativo', '0') === '1';
-  // [+links-dominio 27/10] os links pessoais (aulas/oferta/vídeo) podem sair no domínio do instrumento: cfg.baseLinks (via POST /jornada/cfg).
-  // Sem baseLinks fica igual a antes. Linha anterior: const jBase = (): string => String(PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
-  const jBase = (): string => String(jcfg().baseLinks || PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
-
-  // ---------------- tempo (Brasília = UTC-3, sem horário de verão) ----------------
-  const BRT_MS = 3 * 3600000;
-  const jDataBRT = (ms: number): string => new Date(ms - BRT_MS).toISOString().slice(0, 10);
-  const jHoraBRT = (ms: number): number => new Date(ms - BRT_MS).getUTCHours() + new Date(ms - BRT_MS).getUTCMinutes() / 60;
-  function jEm(dia1: string, dia: number, hhmm: string): number {
-    const [y, m, d] = dia1.split('-').map(Number); const [hh, mm] = hhmm.split(':').map(Number);
-    return Date.UTC(y, m - 1, d + (dia - 1), hh, mm, 0) + BRT_MS;
-  }
-  function jDia1Para(ms: number): string {
-    const h = jHoraBRT(ms); const hoje = jDataBRT(ms);
-    if (h < 21) return hoje;
-    return jDataBRT(ms + 86400000);
-  }
-  const jAulaN = (k: string): number => (k === 'a1' ? 1 : k === 'a2' ? 2 : 3);
-  function jInicioAula(ins: any, k: string): number { return jEm(ins.dia1, jAulaN(k), jcfg().hora); }
-  function jFimAula(ins: any, k: string): number { return jInicioAula(ins, k) + (Number(jcfg().dur[k]) || 5400) * 1000; }
-  const jFimApostila = (ins: any): number => jEm(ins.dia1, 3, '23:59') + 59000;
-  const jFimOferta = (ins: any): number => jEm(ins.dia1, 5, '23:59') + 59000;
-  // gravação: de cada aula até 18h do dia seguinte + as 3 juntas das 9h do Dia 4 às 9h do Dia 5 (Aula 3 fica até 9h do Dia 5)
-  function jJanelaGravacao(ins: any, k: string, now: number): boolean {
-    const fim = jFimAula(ins, k);
-    const ate = k === 'a3' ? jEm(ins.dia1, 5, '09:00') : jEm(ins.dia1, jAulaN(k) + 1, '18:00');
-    if (now >= fim && now < ate) return true;
-    return now >= jEm(ins.dia1, 4, '09:00') && now < jEm(ins.dia1, 5, '09:00');
-  }
-
-  // ---------------- presença / compra ----------------
-  function jPct(k: string, lead: string): number {
-    if (lead === 'teste') return Number((globalThis as any).__jornadaPctTeste) || 0; // cenário do /jornada/teste
-    try { const r = db.prepare(`SELECT MAX(pct) m FROM webinario_presenca WHERE slug=? AND lead=?`).get(jcfg().slugs[k], lead) as any; return Number(r && r.m) || 0; } catch { return 0; }
-  }
-  function jEntrouDesde(k: string, lead: string, desdeMs: number): boolean {
-    try { return !!db.prepare(`SELECT 1 FROM webinario_presenca WHERE slug=? AND lead=? AND ultimo_ping>=? LIMIT 1`).get(jcfg().slugs[k], lead, new Date(desdeMs).toISOString()); } catch { return false; }
-  }
-  const jNaSala = (k: string, lead: string): boolean => jEntrouDesde(k, lead, Date.now() - 120000);
-  const jFaixa = (pct: number): string => (pct < 10 ? 'nao' : pct < 50 ? 'menos' : 'mais');
-  function jAchaCompra(ins: any): any {
-    try {
-      const pats: string[] = (jcfg().produtoMatch || []).map((s: any) => String(s).toLowerCase());
-      const rows = db.prepare(`SELECT t.id,t.produto,t.status,t.criado_em,t.contato_id,c.email,c.telefone FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND t.criado_em>=? ORDER BY t.criado_em ASC LIMIT 2000`).all(String(ins.inscrito_em || '')) as any[];
-      const tel9 = String(ins.telefone || '').replace(/\D/g, '').slice(-9); const em = String(ins.email || '').toLowerCase().trim();
-      for (const r of rows) {
-        const prod = String(r.produto || '').toLowerCase();
-        if (pats.length && !pats.some((p) => prod.includes(p))) continue;
-        const mesmo = (r.contato_id && r.contato_id === ins.contato_id)
-          || (em && String(r.email || '').toLowerCase().trim() === em)
-          || (tel9.length === 9 && String(r.telefone || '').replace(/\D/g, '').slice(-9) === tel9);
-        if (mesmo) return r;
-      }
-    } catch { /* */ }
-    return null;
-  }
-
-  // Já é aluno? (compra liquidada da oferta em qualquer data, pelo contato, e-mail ou final do telefone)
-  function jJaCliente(contatoId: string, telefone: string, email: any): any {
-    try {
-      const pats: string[] = (jcfg().produtoMatch || []).map((s: any) => String(s).toLowerCase());
-      const tel9 = String(telefone || '').replace(/\D/g, '').slice(-9); const em = String(email || '').toLowerCase().trim();
-      const rows = db.prepare(`SELECT t.id,t.produto,t.criado_em FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND (t.contato_id=? OR (?<>'' AND lower(trim(c.email))=?) OR (length(?)=9 AND c.telefone LIKE '%'||?)) ORDER BY t.criado_em DESC LIMIT 50`)
-        .all(contatoId || '', em, em, tel9, tel9) as any[];
-      for (const r of rows) { const prod = String(r.produto || '').toLowerCase(); if (!pats.length || pats.some((p) => prod.includes(p))) return r; }
-    } catch { /* */ }
-    return null;
-  }
-
-  // ---------------- textos ----------------
-  function jPrimeiroNome(n: any): string { const s = String(n || '').trim().split(/\s+/)[0] || ''; return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : ''; }
-  const jCap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
-  function jVars(ins: any, envioMs: number): any {
-    const b = jBase(); const t = ins.token; const cfg = jcfg();
-    const quando = jDataBRT(envioMs) === ins.dia1 ? 'hoje' : 'amanhã';
-    return {
-      nome: jPrimeiroNome(ins.nome), quando,
-      link_a1: b + '/j/a1/' + t, link_a2: b + '/j/a2/' + t, link_a3: b + '/j/a3/' + t,
-      link_oferta: b + '/j/oferta/' + t, link_video: b + '/j/video/' + t,
-      plataforma: cfg.plataforma, suporte: cfg.suporte,
-    };
-  }
-  function jFill(tpl: string, v: any): string {
-    let t = String(tpl || '');
-    if (!v.nome) {
-      t = t.replace(/(^|\n)\{nome\},\s*([a-zà-ú])/g, (_m: string, a: string, c: string) => a + c.toUpperCase());
-      t = t.replace(/,\s*\{nome\}/g, '').replace(/\{nome\},?\s*/g, '');
-    }
-    return t.replace(/\{nome\}/g, v.nome).replace(/\{Quando\}/g, jCap(v.quando)).replace(/\{quando\}/g, v.quando)
-      .replace(/\{link_a1\}/g, v.link_a1).replace(/\{link_a2\}/g, v.link_a2).replace(/\{link_a3\}/g, v.link_a3)
-      .replace(/\{link_oferta\}/g, v.link_oferta).replace(/\{link_video\}/g, v.link_video)
-      .replace(/\{plataforma\}/g, v.plataforma).replace(/\{suporte\}/g, v.suporte);
-  }
-  function jEmailHtml(blocos: any[], v: any): string {
-    const corpo = blocos.map((b: any) => {
-      if (typeof b === 'string') return '<p style="margin:0 0 16px;font-size:16px;line-height:1.55;color:#1f2a35">' + esc(jFill(b, v)).replace(/\n/g, '<br>') + '</p>';
-      return '<p style="margin:22px 0;text-align:center"><a href="' + esc(jFill(b.u, v)) + '" style="display:inline-block;background:#F1541A;color:#ffffff;text-decoration:none;font-weight:700;font-size:17px;padding:14px 26px;border-radius:12px">' + esc(jFill(b.b, v)) + '</a></p>';
-    }).join('');
-    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
-      + '<body style="margin:0;background:#f6f4ee;padding:24px 12px"><div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;padding:28px 24px;font-family:Arial,Helvetica,sans-serif">'
-      + corpo
-      + '<hr style="border:0;border-top:1px solid #eeeeee;margin:24px 0 12px"><div style="font-size:12px;color:#8a8a8a;text-align:center;line-height:1.5">Melodias e Riffs – A Escola do Músico Cristão<br>Você recebe este e-mail porque se inscreveu na Jornada Tecladista – Chamado para Servir.</div>'
-      + '</div></body></html>';
-  }
-
-  const PE = 'Professor Ezequias';
-  // ofertas (repetidas em várias mensagens)
-  const OF_WA = 'De ~R$ 1.500~ por apenas *R$ 597 à vista* ou *12x de R$ 59,70*.';
-  // Cada mensagem: k = chave; q = quando ({t:'rel',min} | {t:'dia',d,h} | {t:'compra'}); g = tolerância (min) p/ atraso;
-  // wa(ctx) -> {texto} | {tipo:'video',url,legenda} | null ; em(ctx) -> {assunto, blocos} | null ; ok(ctx) -> bool
-  const MSGS: any[] = [
-    // ======================= DIA 1 =======================
-    { k: 'm01', q: { t: 'rel', min: 0 }, g: 600,
-      wa: () => ({ texto: '{nome}, sua vaga na *Jornada Tecladista – Chamado para Servir* está garantida! ✅\n\n📅 *Aula 1: {quando} às 21h* (horário de Brasília)\nO link da sala chega aqui neste número na hora da aula.\n\n📌 Salve este contato para não perder nenhum aviso.\n\nSe ainda não tem teclado, assista do mesmo jeito: só deixe um caderno por perto.\n\n' + PE }),
-      em: () => ({ assunto: 'Sua vaga está garantida – Aula 1 {quando} às 21h', blocos: ['Olá, {nome}!', 'Que alegria ter você na Jornada Tecladista – Chamado para Servir.', 'A Aula 1 acontece {quando} às 21h, horário de Brasília. O link da sala vai chegar no seu WhatsApp e aqui no e-mail na hora da aula.', 'Para aproveitar melhor:\n• Reserve as 21h: a aula começa pontualmente.\n• Deixe o teclado por perto. Se ainda não tiver, assista mesmo assim.\n• Tenha um caderno para anotar.', 'Nos vemos lá!', PE + '\nMelodias e Riffs – A Escola do Músico Cristão'] }) },
-    { k: 'm01b', q: { t: 'video10' }, g: 180,
-      wa: () => ({ tipo: 'video', url: jcfg().videoEnvio, legenda: '{nome}, antes da primeira aula quero te apresentar algumas pessoas.\n\nSão alunos que, como você, sonhavam em tocar teclado na igreja. Muitos já tinham tentado YouTube, professor particular e até aula só de partitura, sem sair do lugar. Alguns conheceram o método numa jornada de aulas como esta que você vai fazer.\n\nHoje eles tocam na igreja: um começou com 9 dias de estudo; outros, com 2 e 3 meses.\n\nAssiste com calma, são 6 minutinhos. {Quando} às 21h é a sua vez de dar o primeiro passo.' }),
-      em: () => ({ assunto: 'Antes da Aula 1, conheça quem já toca na igreja', blocos: ['{nome}, enquanto a Aula 1 não chega, separei um vídeo curto com alguns alunos.', 'Tem quem tentou sozinho por dois anos, quem desistiu de aulas que só ensinavam partitura e quem achava que juntar as duas mãos era um sonho impossível. Todos queriam a mesma coisa que você: tocar na igreja.', 'E chegaram lá. Um deles começou a tocar com 9 dias de estudo; outros, com 2 e 3 meses.', { b: 'Assistir ao vídeo (6 minutos)', u: '{link_video}' }, 'Te espero {quando} às 21h.\n' + PE] }) },
-    { k: 'm02', q: { t: 'dia', d: 1, h: '20:00' }, g: 50,
-      wa: () => ({ texto: '{nome}, falta *1 hora*! ⏰\n\nHoje às 21h começa a Aula 1 da Jornada Tecladista. Já vai separando o teclado e o caderno.\n\nÀs 21h em ponto eu te mando o link aqui.' }),
-      em: () => ({ assunto: 'Daqui a 1 hora: Aula 1', blocos: ['{nome}, às 21h começa o primeiro passo da Jornada Tecladista.', 'Essa aula é para quem sonha em tocar na igreja, mesmo começando do zero. Chegue alguns minutos antes para entrar com calma.', 'O link chega no seu WhatsApp e aqui no e-mail às 21h.', PE] }) },
-    { k: 'm03', q: { t: 'dia', d: 1, h: '21:00' }, g: 40,
-      wa: () => ({ texto: '🎹 *Começou!* A Aula 1 já está rolando.\n\nEntra agora pelo seu link:\n{link_a1}\n\nO link é só seu, não precisa passar para ninguém.' }),
-      em: () => ({ assunto: 'A Aula 1 começou – entre agora', blocos: ['{nome}, a aula já começou.', { b: 'Entrar na Aula 1', u: '{link_a1}' }, 'Se o botão não abrir, copie este endereço no navegador:\n{link_a1}'] }) },
-    { k: 'm04', q: { t: 'dia', d: 1, h: '21:15' }, g: 20,
-      ok: (c: any) => !jEntrouDesde('a1', c.ins.contato_id, jInicioAula(c.ins, 'a1') - 900000),
-      wa: () => ({ texto: '{nome}, a Aula 1 começou há 15 minutos e ainda dá tempo de acompanhar. Entra pelo seu link:\n{link_a1}' }) },
-    // ======================= DIA 2 =======================
-    { k: 'm05_07', q: { t: 'dia', d: 2, h: '09:00' }, g: 120,
-      wa: (c: any) => {
-        const f = jFaixa(jPct('a1', c.ins.contato_id));
-        if (f === 'nao') return { texto: '{nome}, ontem foi a Aula 1 da Jornada Tecladista e senti sua falta por lá.\n\nA boa notícia: a gravação fica no ar *até hoje às 18h*.\n\nAssiste antes da Aula 2 de hoje à noite, porque uma aula puxa a outra:\n{link_a1}' };
-        if (f === 'menos') return { texto: '{nome}, você começou a Aula 1 ontem mas não chegou até o fim, né?\n\nVale muito terminar antes de hoje à noite: a Aula 2 continua de onde a primeira parou.\n\nA gravação fica no ar *até as 18h*:\n{link_a1}' };
-        return { texto: '{nome}, que bom que você ficou com a gente na Aula 1! 🙌\n\n*Hoje às 21h tem a Aula 2*, e ela continua exatamente de onde paramos. Te espero lá.' };
-      },
-      em: (c: any) => {
-        const f = jFaixa(jPct('a1', c.ins.contato_id));
-        if (f === 'nao') return { assunto: 'A gravação da Aula 1 sai do ar às 18h', blocos: ['{nome}, não conseguiu assistir à Aula 1 ontem? Sem problema: a gravação está liberada para você, mas só até hoje às 18h.', 'As aulas são em sequência. A Aula 2, hoje às 21h, continua exatamente de onde a primeira parou.', { b: 'Assistir à Aula 1', u: '{link_a1}' }, PE] };
-        if (f === 'menos') return { assunto: 'Faltou um pedaço da Aula 1', blocos: ['{nome}, você começou a Aula 1, mas parou antes do final.', 'O que vem na Aula 2 depende do que foi mostrado na primeira, então separe um tempinho hoje para assistir ao restante. A gravação fica no ar até as 18h.', { b: 'Assistir à Aula 1', u: '{link_a1}' }] };
-        return { assunto: 'Hoje às 21h: Aula 2', blocos: ['{nome}, obrigado por ter ficado com a gente na Aula 1.', 'Hoje às 21h vem a Aula 2, partindo exatamente de onde paramos. Se quiser rever algum trecho antes, a gravação da Aula 1 fica no ar até as 18h.', { b: 'Rever a Aula 1', u: '{link_a1}' }, PE] };
-      } },
-    { k: 'm08', q: { t: 'dia', d: 2, h: '16:00' }, g: 90,
-      ok: (c: any) => jPct('a1', c.ins.contato_id) < 50,
-      wa: () => ({ texto: '{nome}, a gravação da Aula 1 sai do ar *às 18h*, daqui a 2 horas. Depois disso não dá para reabrir.\n\nAinda dá tempo:\n{link_a1}' }),
-      em: () => ({ assunto: 'Últimas 2 horas da Aula 1', blocos: ['{nome}, às 18h a gravação da Aula 1 sai do ar.', 'Se você quer acompanhar a Aula 2 hoje sem se perder, este é o momento.', { b: 'Assistir agora', u: '{link_a1}' }] }) },
-    { k: 'm09', q: { t: 'dia', d: 2, h: '20:00' }, g: 50,
-      wa: () => ({ texto: '{nome}, daqui a *1 hora* começa a Aula 2! ⏰\n\nÀs 21h eu te mando o link aqui. Separa o teclado e o caderno.' }),
-      em: () => ({ assunto: 'Aula 2 hoje às 21h', blocos: ['{nome}, hoje às 21h tem a Aula 2 da Jornada Tecladista.', 'O link chega no seu WhatsApp e aqui no e-mail na hora. Chegue uns minutinhos antes!'] }) },
-    { k: 'm10', q: { t: 'dia', d: 2, h: '21:00' }, g: 40,
-      wa: () => ({ texto: '🎹 *A Aula 2 começou!*\n\nEntra pelo seu link:\n{link_a2}' }),
-      em: () => ({ assunto: 'A Aula 2 começou', blocos: ['{nome}, a Aula 2 já está acontecendo.', { b: 'Entrar na Aula 2', u: '{link_a2}' }] }) },
-    { k: 'm11', q: { t: 'dia', d: 2, h: '21:15' }, g: 20,
-      ok: (c: any) => !jEntrouDesde('a2', c.ins.contato_id, jInicioAula(c.ins, 'a2') - 900000),
-      wa: () => ({ texto: '{nome}, a Aula 2 começou há 15 minutos. Entra agora que ainda dá tempo:\n{link_a2}' }) },
-    // ======================= DIA 3 =======================
-    { k: 'm12', q: { t: 'dia', d: 3, h: '09:00' }, g: 120,
-      wa: (c: any) => {
-        const f = jFaixa(jPct('a2', c.ins.contato_id));
-        if (f === 'nao') return { texto: '{nome}, ontem teve a Aula 2 e você não conseguiu entrar.\n\nA gravação fica no ar *até hoje às 18h*:\n{link_a2}\n\nAssiste antes das 21h, porque hoje é a terceira e última aula, e ela fecha tudo o que começamos.' };
-        if (f === 'menos') return { texto: '{nome}, faltou um pedaço da Aula 2.\n\nTermina hoje, *até as 18h*, para chegar com tudo em dia na última aula:\n{link_a2}' };
-        return { texto: '{nome}, *hoje às 21h é a última aula* da Jornada Tecladista.\n\nÉ nela que eu mostro o caminho completo para você tocar na igreja com segurança. Não falta!' };
-      },
-      em: (c: any) => {
-        const f = jFaixa(jPct('a2', c.ins.contato_id));
-        if (f !== 'mais') return { assunto: 'A gravação da Aula 2 sai do ar às 18h', blocos: ['{nome}, hoje às 21h acontece a Aula 3, a última da Jornada Tecladista.', 'A gravação da Aula 2 fica no ar só até as 18h. As aulas são em sequência, então vale assistir antes.', { b: 'Assistir à Aula 2', u: '{link_a2}' }] };
-        return { assunto: 'Hoje é a última aula', blocos: ['{nome}, hoje às 21h acontece a Aula 3, a última da Jornada Tecladista.', 'Obrigado por ter ficado até aqui. Hoje eu fecho a jornada mostrando o caminho completo. Te espero às 21h.', PE] };
-      } },
-    { k: 'm13', q: { t: 'dia', d: 3, h: '16:00' }, g: 90,
-      ok: (c: any) => jPct('a2', c.ins.contato_id) < 50,
-      wa: () => ({ texto: '{nome}, a gravação da Aula 2 sai do ar *às 18h*.\n\nAinda dá tempo antes da última aula de hoje:\n{link_a2}' }),
-      em: () => ({ assunto: 'Aula 2 sai do ar em 2 horas', blocos: ['{nome}, às 18h a gravação da Aula 2 deixa de ficar disponível. Hoje às 21h tem a última aula.', { b: 'Assistir à Aula 2', u: '{link_a2}' }] }) },
-    { k: 'm14', q: { t: 'dia', d: 3, h: '20:00' }, g: 50,
-      wa: () => ({ texto: '{nome}, às 21h começa a *última aula* da Jornada Tecladista.\n\nNo final eu vou abrir uma *condição especial* só para quem participou das aulas. Fica até o fim! 🎁' }),
-      em: () => ({ assunto: 'Às 21h: a última aula (fique até o fim)', blocos: ['{nome}, hoje termina a Jornada Tecladista.', 'Na Aula 3 eu junto tudo o que vimos e mostro o caminho completo para tocar na igreja com segurança. No final, abro uma condição especial para quem participou.', 'O link chega às 21h.', PE] }) },
-    { k: 'm15', q: { t: 'dia', d: 3, h: '21:00' }, g: 40,
-      wa: () => ({ texto: '🎹 *A última aula começou!*\n\nEntra pelo seu link:\n{link_a3}' }),
-      em: () => ({ assunto: 'A Aula 3 começou', blocos: ['{nome}, a última aula já está acontecendo.', { b: 'Entrar na Aula 3', u: '{link_a3}' }] }) },
-    { k: 'm16', q: { t: 'dia', d: 3, h: '21:15' }, g: 20,
-      ok: (c: any) => !jEntrouDesde('a3', c.ins.contato_id, jInicioAula(c.ins, 'a3') - 900000),
-      wa: () => ({ texto: '{nome}, a Aula 3 começou há 15 minutos. É a última, entra agora:\n{link_a3}' }) },
-    { k: 'm17', q: { t: 'dia', d: 3, h: '22:57' }, g: 25, venda: true,
-      ok: (c: any) => jNaSala('a3', c.ins.contato_id),
-      wa: (c: any) => ({ texto: '{nome}, aqui está o link da condição que acabei de mostrar na aula:\n{link_oferta}\n\n*Curso e Mentoria de Teclado Gospel* com *2 anos de acesso*\n' + OF_WA
-        + (c.ins.repeticao ? '\n\nE você tem *7 dias de garantia incondicional*: se não for para você, devolvo 100% do valor.' : '\n\n🎁 E só até as *23h59 de hoje*: a apostila física do curso vai junto, com frete grátis.\n\nPara garantir a apostila, pague no Pix ou no cartão (o boleto demora para compensar).') }),
-      em: (c: any) => ({ assunto: c.ins.repeticao ? 'Sua condição especial' : 'Sua condição especial (apostila só até 23h59)', blocos: ['{nome}, como prometi, aqui está a condição para quem participou da Jornada Tecladista:',
-        '• Curso e Mentoria de Teclado Gospel, do zero ao avançado, com 2 anos de acesso: você paga o primeiro ano e o segundo é presente\n• Curso Como Tocar de Ouvido junto\n• Acompanhamento comigo todos os dias no grupo do WhatsApp e mentorias ao vivo toda semana\n• Garantia incondicional de 7 dias',
-        'De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70. Uma economia de mais de R$ 900.',
-        ...(c.ins.repeticao ? [] : ['Até as 23h59 de hoje, você ainda recebe a apostila física do curso em casa, com frete grátis para todo o Brasil. No Pix ou no cartão a confirmação é na hora; no boleto não dá tempo de garantir a apostila.']),
-        { b: 'Quero minha vaga', u: '{link_oferta}' }, PE] }) },
-    { k: 'm18', q: { t: 'dia', d: 3, h: '23:30' }, g: 20, venda: true,
-      ok: (c: any) => !c.ins.repeticao && jPct('a3', c.ins.contato_id) >= Number(jcfg().viuOfertaPct || 81),
-      wa: () => ({ texto: '{nome}, faltam *30 minutos* para acabar o bônus da apostila física com frete grátis.\n\nCurso e Mentoria de ~R$ 1.500~ por *R$ 597*, e a apostila vai junto só até as *23h59*. Depois disso ela não entra mais.\n\nSe você quer garantir:\n{link_oferta}' }),
-      em: () => ({ assunto: '30 minutos para a apostila', blocos: ['{nome}, às 23h59 encerra o bônus da apostila física.', 'O Curso e Mentoria de R$ 1.500 por apenas R$ 597 continua por mais 2 dias, mas a apostila é só hoje.', { b: 'Garantir agora', u: '{link_oferta}' }] }) },
-    // ======================= DIA 4 =======================
-    { k: 'm19', q: { t: 'dia', d: 4, h: '09:00' }, g: 120, todos: true,
-      wa: (c: any) => {
-        const links = '▶️ Aula 1: {link_a1}\n▶️ Aula 2: {link_a2}\n▶️ Aula 3: {link_a3}';
-        if (c.comprou) return { texto: '{nome}, liberei as gravações das 3 aulas da Jornada Tecladista por 24 horas, *até amanhã às 9h*, caso queira rever:\n\n' + links };
-        const viu = jPct('a3', c.ins.contato_id) >= 10;
-        const abre = viu ? '{nome}, como prometido, liberei as gravações das 3 aulas da Jornada Tecladista, mas só por 24 horas, *até amanhã às 9h*:'
-          : '{nome}, você não conseguiu ver a última aula, e foi nela que eu mostrei o caminho completo. Liberei as gravações das 3 aulas, mas só por 24 horas, *até amanhã às 9h*:';
-        return { texto: abre + '\n\n' + links + '\n\nNa Aula 3 eu falo de um prazo até 23h59: era o da apostila física, que já encerrou.\n\nO Curso e Mentoria de ~R$ 1.500~ por *R$ 597 à vista ou 12x de R$ 59,70* continua só *até amanhã às 23h59*:\n{link_oferta}' };
-      },
-      em: (c: any) => {
-        if (c.comprou) return { assunto: 'As 3 aulas liberadas – até amanhã às 9h', blocos: ['{nome}, as gravações da Jornada Tecladista estão liberadas até amanhã às 9h, caso queira rever.', { b: 'Aula 1', u: '{link_a1}' }, { b: 'Aula 2', u: '{link_a2}' }, { b: 'Aula 3', u: '{link_a3}' }] };
-        return { assunto: 'As 3 aulas liberadas – só até amanhã às 9h', blocos: ['{nome}, as gravações da Jornada Tecladista estão liberadas até amanhã às 9h. Depois disso saem do ar.', { b: 'Aula 1', u: '{link_a1}' }, { b: 'Aula 2', u: '{link_a2}' }, { b: 'Aula 3, com a condição especial', u: '{link_a3}' },
-          'Um aviso importante: na Aula 3 eu falo de um prazo até 23h59. Ele valia para a apostila física, que já encerrou.',
-          'A condição do Curso e Mentoria, com 2 anos de acesso, de R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70, continua só até amanhã às 23h59.',
-          { b: 'Ver a condição', u: '{link_oferta}' }, PE] };
-      } },
-    { k: 'm20', q: { t: 'dia', d: 4, h: '14:00' }, g: 120, venda: true,
-      em: () => ({ assunto: '35 anos tentando, 1 mês para tocar na igreja', blocos: ['{nome}, na Aula 3 eu contei a história da Ruth.', 'Ela tentou aprender teclado por 35 anos: estudou quando criança, depois de casada, até nos Estados Unidos. Nada funcionou, e ela estava pronta para desistir. Entrou no curso em dezembro e, em janeiro, estava tocando na igreja.', 'O que mudou não foi talento. Foi acompanhamento: em vez de uma aula por semana, ela teve 30 dias de dúvidas respondidas por mim, no grupo do WhatsApp.', 'É esse acompanhamento que você leva no Curso e Mentoria, por 2 anos, junto com o curso Como Tocar de Ouvido. De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70, só até amanhã às 23h59.', 'E com 7 dias de garantia: se não for para você, devolvo seu dinheiro.', { b: 'Quero começar', u: '{link_oferta}' }, PE] }) },
-    { k: 'm21', q: { t: 'dia', d: 4, h: '19:00' }, g: 90, venda: true,
-      wa: () => ({ texto: '{nome}, algumas dúvidas que sempre aparecem:\n\n❓ *"Não tenho tempo."*\nPor isso o acesso é de 2 anos: dá para estudar no seu ritmo.\n\n❓ *"E se eu não conseguir?"*\nVocê tem 7 dias de garantia e a minha resposta no grupo todos os dias.\n\n❓ *"Sou católico, serve para mim?"*\nServe: tem um módulo só de músicas católicas, além dos louvores evangélicos.\n\nO Curso e Mentoria de ~R$ 1.500~ por *R$ 597* vai só *até amanhã às 23h59*:\n{link_oferta}\n\nE lembra: as gravações saem do ar amanhã às 9h.' }),
-      em: () => ({ assunto: '"Será que é para mim?"', blocos: ['{nome}, se você ainda está em dúvida, talvez seja uma destas:', '• Idade: a Norma, de 64 anos, e a Zilda, de 74, já tocam na igreja, e temos alunos de 80 anos estudando. A Zilda começou no círculo de oração e o pastor pediu para ela tocar também à noite.\n• Tempo: são 2 anos de acesso, para estudar com calma.\n• Tecnologia: tem aplicativo próprio e uma equipe de suporte para ajudar com senha e acesso.\n• Igreja: tem repertório de louvores evangélicos e também de músicas católicas.\n• Risco: 7 dias de garantia incondicional.', 'De R$ 1.500 por apenas R$ 597. Essa condição encerra amanhã às 23h59.', { b: 'Garantir minha vaga', u: '{link_oferta}' }, PE] }) },
-    // ======================= DIA 5 =======================
-    { k: 'm22', q: { t: 'dia', d: 5, h: '08:00' }, g: 50, venda: true,
-      ok: (c: any) => jPct('a3', c.ins.contato_id) < Number(jcfg().viuOfertaPct || 81),
-      wa: () => ({ texto: '{nome}, *às 9h* as gravações da Jornada Tecladista saem do ar.\n\nSe você ainda não viu o final da Aula 3, é agora:\n{link_a3}\n\nE hoje é o último dia do Curso e Mentoria de ~R$ 1.500~ por *R$ 597*: encerra às 23h59.' }),
-      em: () => ({ assunto: 'As gravações saem do ar às 9h', blocos: ['{nome}, daqui a pouco as aulas deixam de ficar disponíveis.', 'No final da Aula 3 está o caminho completo e a condição especial: Curso e Mentoria de R$ 1.500 por apenas R$ 597, que vale só até hoje às 23h59.', { b: 'Assistir à Aula 3', u: '{link_a3}' }] }) },
-    { k: 'm23', q: { t: 'dia', d: 5, h: '12:00' }, g: 120, venda: true,
-      wa: () => ({ texto: '{nome}, *hoje é o último dia*. ⏳\n\nÀs 23h59 encerra a condição do *Curso e Mentoria de Teclado Gospel*: 2 anos de acesso, curso Como Tocar de Ouvido junto e acompanhamento comigo todos os dias.\n\n' + OF_WA + '\n\nDepois das 23h59, essa condição fecha para você.\n\nSe o seu sonho é tocar na igreja, não deixa para o ano que vem:\n{link_oferta}\n\n' + PE }),
-      em: () => ({ assunto: 'Último dia: encerra hoje às 23h59', blocos: ['{nome}, é hoje.', 'À meia-noite encerra a condição especial da Jornada Tecladista. Depois disso, o link deixa de funcionar para você.', 'O que você leva:\n• Curso e Mentoria de Teclado Gospel, do zero ao avançado, com 2 anos de acesso\n• Curso Como Tocar de Ouvido\n• Minha resposta no grupo do WhatsApp todos os dias e mentorias ao vivo toda semana\n• 7 dias de garantia incondicional', 'De R$ 1.500 por apenas R$ 597 à vista ou 12x de R$ 59,70. Uma economia de mais de R$ 900, só até as 23h59.', { b: 'Garantir minha vaga', u: '{link_oferta}' }, PE] }) },
-    { k: 'm24', q: { t: 'dia', d: 5, h: '18:00' }, g: 90, venda: true,
-      em: () => ({ assunto: 'Faltam 6 horas', blocos: ['{nome}, faltam 6 horas. Às 23h59 encerra o Curso e Mentoria de R$ 1.500 por R$ 597.', 'Se a dúvida é "será que eu consigo?", lembra que você tem 7 dias para conhecer tudo por dentro: as aulas, o grupo, as mentorias. Se não for para você, devolvo seu dinheiro e continuamos irmãos em Cristo.', { b: 'Quero entrar agora', u: '{link_oferta}' }, PE] }) },
-    { k: 'm25', q: { t: 'dia', d: 5, h: '22:00' }, g: 30, venda: true,
-      wa: () => ({ texto: '{nome}, faltam *2 horas*. ⏳\n\nÀs 23h59 encerra o Curso e Mentoria de ~R$ 1.500~ por *R$ 597*, e o link deixa de funcionar.\n\nÉ a sua última chance de entrar com essa condição:\n{link_oferta}\n\nNo Pix ou no cartão a confirmação é na hora.' }),
-      em: () => ({ assunto: 'Encerra à meia-noite', blocos: ['{nome}, são as últimas 2 horas.', 'Depois das 23h59, o Curso e Mentoria de R$ 1.500 por R$ 597 fecha para você.', { b: 'Entrar agora', u: '{link_oferta}' }] }) },
-    // ======================= DIA 6 =======================
-    { k: 'm26', q: { t: 'dia', d: 6, h: '10:00' }, g: 180, venda: true,
-      em: () => ({ assunto: 'A condição encerrou', blocos: ['{nome}, a condição especial da Jornada Tecladista encerrou ontem à meia-noite.', 'Obrigado por ter participado das aulas. Continue praticando o que você aprendeu, e conte comigo nos conteúdos que eu publico nas redes.', 'Que Deus abençoe sua caminhada na música.\n' + PE] }) },
-  ];
-  // pós-venda (dispara quando a compra da oferta é reconhecida) — sai do NÚMERO DE SUPORTE (1030), assinatura "Equipe Melodias e Riffs"
-  const POS_VENDA: any = { k: 'pos_venda', instancia: () => jcfg().instanciaSuporte,
-    wa: (c: any) => ({ texto: '{nome}, parabéns pela decisão! 🎉\n\nSua inscrição no *Curso e Mentoria de Teclado Gospel* está confirmada. Boas-vindas à família Melodias e Riffs!\n\n📲 *Acesso ao curso:* {plataforma}\nEntre com o e-mail que você usou na compra. Os dados de acesso também chegam no seu e-mail (se não encontrar, confira a caixa de spam).\n\n🛟 *Este é o número de suporte ao aluno.* Salve este contato: sempre que precisar de ajuda com acesso, aulas ou qualquer dúvida, é por aqui que a nossa equipe te atende.\n\n📬 Ao longo da semana você vai receber uma sequência de mensagens com mais informações e o link do grupo do WhatsApp dos alunos. É só aguardar!'
-      + (c.ins.ganhou_apostila ? '\n\n🎁 E você garantiu a *apostila física* com frete grátis!\nPara a gente enviar, responda esta mensagem com seu endereço completo:\n• Rua e número\n• Complemento (se tiver)\n• Bairro\n• Cidade e estado\n• CEP' : '')
-      + '\n\nEquipe Melodias e Riffs' }),
-    em: (c: any) => ({ assunto: 'Sua inscrição está confirmada – Curso e Mentoria de Teclado Gospel', blocos: ['{nome}, parabéns pela decisão!', 'Sua inscrição no Curso e Mentoria de Teclado Gospel está confirmada. Boas-vindas à família Melodias e Riffs!',
-      'Para acessar o curso, entre na plataforma com o e-mail que você usou na compra. Os dados de acesso chegam em outro e-mail, separado deste (se não encontrar, confira a caixa de spam).', { b: 'Acessar a plataforma', u: '{plataforma}' },
-      'Suporte ao aluno pelo WhatsApp: {suporte}. Salve esse número: sempre que precisar de ajuda com acesso, aulas ou qualquer dúvida, é por ele que a nossa equipe te atende.',
-      'Ao longo da semana você vai receber uma sequência de mensagens com mais informações e o link do grupo do WhatsApp dos alunos. É só aguardar!',
-      ...(c.ins.ganhou_apostila ? ['Você também garantiu a apostila física com frete grátis! Para a gente enviar, mande seu endereço completo pelo WhatsApp de suporte, {suporte}: rua, número, complemento, bairro, cidade, estado e CEP.'] : []),
-      'Equipe Melodias e Riffs'] }) };
-
-  // ---------------- agendamento de cada mensagem ----------------
-  function jQuandoMs(m: any, ins: any): number | null {
-    const insMs = Date.parse(ins.inscrito_em);
-    if (m.q.t === 'rel') return insMs + (Number(m.q.min) || 0) * 60000;
-    if (m.q.t === 'dia') return jEm(ins.dia1, m.q.d, m.q.h);
-    if (m.q.t === 'video10') {
-      const t = insMs + 10 * 60000; const h = jHoraBRT(t);
-      if (jDataBRT(t) === ins.dia1 && h >= 20.5) return null;            // já é a noite da Aula 1: não manda o vídeo
-      if (h >= 22.5) return Date.parse(jDataBRT(t + 86400000) + 'T12:00:00.000Z'); // 9h BRT do dia seguinte
-      if (h < 8) return Date.parse(jDataBRT(t) + 'T12:00:00.000Z');                 // 9h BRT do mesmo dia
-      return t;
-    }
-    return null;
-  }
-  function jRegistra(ins: any, chave: string, canal: string, status: string, extra: any = {}): void {
-    try {
-      db.prepare(`INSERT OR IGNORE INTO jornada_envios(id,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(randomUUID(), ins.id, chave, canal, status, extra.tipo || null, extra.texto || null, extra.url || null, extra.legenda || null, extra.para || null, extra.detalhe || null, extra.agendado_para || agora(), agora(), extra.instancia || null);
-    } catch { /* */ }
-  }
-  const jJaFeito = (ins: any, chave: string): boolean => !!db.prepare(`SELECT 1 FROM jornada_envios WHERE inscrito_id=? AND chave=? LIMIT 1`).get(ins.id, chave);
-  function jEnfileira(ins: any, m: any, ctx: any, agoraMs: number): void {
-    const v = jVars(ins, agoraMs);
-    let algum = false;
-    if (m.wa && ins.telefone) {
-      const w = m.wa(ctx);
-      if (w) {
-        const inst = m.instancia ? m.instancia() : null;
-        if (w.tipo === 'video') jRegistra(ins, m.k, 'wa', 'pendente', { tipo: 'video', url: w.url, legenda: jFill(w.legenda, v), para: ins.telefone, instancia: inst });
-        else jRegistra(ins, m.k, 'wa', 'pendente', { tipo: 'texto', texto: jFill(w.texto, v), para: ins.telefone, instancia: inst });
-        algum = true;
-      }
-    }
-    if (m.em && ins.email && String(ins.email).includes('@')) {
-      const e = m.em(ctx);
-      if (e) {
-        try {
-          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
-            .run(randomUUID(), String(ins.projeto || jcfg().projeto), String(ins.email).trim(), jFill(e.assunto, v), jEmailHtml(e.blocos, v), 'pendente', agora(), null, null);
-          jRegistra(ins, m.k, 'email', 'enviado', { para: ins.email, detalhe: 'na fila de e-mail' });
-          algum = true;
-        } catch (er: any) { jRegistra(ins, m.k, 'email', 'falhou', { detalhe: String(er?.message || er).slice(0, 200) }); }
-      }
-    }
-    if (!algum) jRegistra(ins, m.k, 'nada', 'pulado', { detalhe: 'sem canal/variante' });
-  }
-
-  // ---------------- inscrição (lê as respostas do formulário) ----------------
-  function jNovoToken(): string {
-    for (let i = 0; i < 20; i++) { const t = randomBytes(5).toString('base64').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6); if (t.length >= 5 && !db.prepare(`SELECT 1 FROM jornada_inscritos WHERE token=?`).get(t)) return t; }
-    return randomUUID().replace(/-/g, '').slice(0, 8);
-  }
-  function jInscrever(dados: { contatoId: string; telefone: string; nome?: string; email?: string; quandoMs?: number; respostaId?: string; dia1?: string }): any {
-    const cfg = jcfg(); const quandoMs = dados.quandoMs || Date.now();
-    const anteriores = db.prepare(`SELECT * FROM jornada_inscritos WHERE contato_id=? ORDER BY inscrito_em DESC`).all(dados.contatoId) as any[];
-    const ativo = anteriores.find((a) => jEm(a.dia1, 7, '00:00') > quandoMs && a.status !== 'cancelado');
-    if (ativo) return { ok: true, ja: true, inscrito: ativo };
-    const ins: any = { id: randomUUID(), contato_id: dados.contatoId, projeto: cfg.projeto, telefone: String(dados.telefone || '').replace(/\D/g, ''), email: dados.email || null, nome: dados.nome || null,
-      inscrito_em: new Date(quandoMs).toISOString(), dia1: dados.dia1 || jDia1Para(quandoMs), token: jNovoToken(), repeticao: anteriores.length, status: 'ativo', resposta_id: dados.respostaId || null };
-    // Quem JÁ é aluno (comprou numa jornada anterior ou já tem a compra da oferta) assiste às aulas normalmente, mas não recebe mensagens de venda nem pós-venda de novo.
-    const jaAluno: any = anteriores.find((a) => a.status === 'comprou') || jJaCliente(ins.contato_id, ins.telefone, ins.email);
-    if (jaAluno) { ins.status = 'comprou'; ins.comprou_em = jaAluno.comprou_em || jaAluno.criado_em || null; ins.compra_id = jaAluno.compra_id || jaAluno.id || null; }
-    db.prepare(`INSERT INTO jornada_inscritos(id,contato_id,projeto,telefone,email,nome,inscrito_em,dia1,token,repeticao,status,resposta_id,criado_em,comprou_em,compra_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(ins.id, ins.contato_id, ins.projeto, ins.telefone, ins.email, ins.nome, ins.inscrito_em, ins.dia1, ins.token, ins.repeticao, ins.status, ins.resposta_id, agora(), ins.comprou_em || null, ins.compra_id || null);
-    try { aplicarTag(cfg.projeto, ins.contato_id, 'jornada-inscrito'); if (ins.repeticao) aplicarTag(cfg.projeto, ins.contato_id, 'jornada-repeticao'); } catch { /* */ }
-    return { ok: true, inscrito: ins };
-  }
-  function jLerFormulario(): void {
-    const cfg = jcfg(); const desde = pubFlag('jornada_form_desde', '');
-    if (!desde) return;
-    const rows = db.prepare(`SELECT * FROM formulario_respostas WHERE formulario_id=? AND criado_em>? ORDER BY criado_em ASC LIMIT 200`).all(cfg.formId, desde) as any[];
-    for (const r of rows) {
-      try {
-        if (r.contato_id) {
-          let d: any = {}; try { d = JSON.parse(r.dados || '{}'); } catch { d = {}; }
-          const c = db.prepare(`SELECT * FROM contatos WHERE id=?`).get(r.contato_id) as any;
-          jInscrever({ contatoId: r.contato_id, telefone: (c && c.telefone) || String(d.whatsapp || d.telefone || ''), nome: (d.nome || (c && c.nome) || ''), email: (d.email || (c && c.email) || ''), quandoMs: Date.parse(r.criado_em) || Date.now(), respostaId: r.id });
-        }
-      } catch (e: any) { console.log('[jornada] inscrição erro', e?.message || e); }
-      setPubFlag('jornada_form_desde', String(r.criado_em));
-    }
-  }
-
-  // ---------------- compras ----------------
-  function jChecarCompras(agoraMs: number): void {
-    const lista = db.prepare(`SELECT * FROM jornada_inscritos WHERE status='ativo' AND inscrito_em>=?`).all(new Date(agoraMs - 12 * 86400000).toISOString()) as any[];
-    for (const ins of lista) {
-      const t = jAchaCompra(ins); if (!t) continue;
-      const compraMs = Date.parse(t.criado_em) || agoraMs;
-      const ganhou = !ins.repeticao && compraMs <= jFimApostila(ins) ? 1 : 0;
-      db.prepare(`UPDATE jornada_inscritos SET status='comprou', comprou_em=?, compra_id=?, ganhou_apostila=? WHERE id=?`).run(t.criado_em, t.id, ganhou, ins.id);
-      ins.status = 'comprou'; ins.comprou_em = t.criado_em; ins.ganhou_apostila = ganhou;
-      try { aplicarTag(ins.projeto, ins.contato_id, 'jornada-comprou'); if (ganhou) aplicarTag(ins.projeto, ins.contato_id, 'ganhou-apostila'); } catch { /* */ }
-      if (!jJaFeito(ins, POS_VENDA.k)) jEnfileira(ins, POS_VENDA, { ins, comprou: true }, agoraMs);
-      console.log('[jornada] compra reconhecida', { inscrito: ins.id, apostila: !!ganhou });
-    }
-  }
-
-  // ---------------- etiquetas pós-aula (% assistido) ----------------
-  function jEtiquetas(ins: any, agoraMs: number): void {
-    for (const k of ['a1', 'a2', 'a3']) {
-      const chave = 'tag_' + k;
-      if (agoraMs < jEm(ins.dia1, jAulaN(k) + 1, '08:50') || jJaFeito(ins, chave)) continue;
-      const pct = jPct(k, ins.contato_id); const f = jFaixa(pct);
-      const tag = 'jornada-aula' + jAulaN(k) + '-' + (f === 'nao' ? 'nao-assistiu' : f === 'menos' ? 'menos50' : 'mais50');
-      try { aplicarTag(ins.projeto, ins.contato_id, tag); if (k === 'a3' && pct >= Number(jcfg().viuOfertaPct || 81)) aplicarTag(ins.projeto, ins.contato_id, 'jornada-viu-oferta'); } catch { /* */ }
-      jRegistra(ins, chave, 'tag', 'enviado', { detalhe: tag + ' (' + pct + '%)' });
-    }
-  }
-
-  // Decide as mensagens de UM inscrito num instante. dry=true: só diz o que faria (não grava nem envia).
-  function jDecidir(ins: any, agoraMs: number, dry: boolean): any[] {
-    const out: any[] = [];
-    const comprou = ins.status === 'comprou';
-    const insMs = Date.parse(ins.inscrito_em);
-    for (const m of MSGS) {
-      if (!dry && jJaFeito(ins, m.k)) continue;
-      const t = jQuandoMs(m, ins);
-      const quando = t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ');
-      const pula = (motivo: string): void => { out.push({ k: m.k, quando, acao: 'pula', motivo }); if (!dry) jRegistra(ins, m.k, 'nada', 'pulado', { detalhe: motivo }); };
-      if (t === null) { pula('não se aplica (horário)'); continue; }
-      if (t > agoraMs) { out.push({ k: m.k, quando, acao: 'futuro' }); continue; }
-      if (m.q.t !== 'rel' && t < insMs) { pula('antes da inscrição'); continue; }
-      if (agoraMs - t > (Number(m.g) || 60) * 60000) { pula('atrasada (sistema fora do ar?)'); continue; }
-      if (comprou && m.venda) { pula('já comprou'); continue; }
-      const ctx = { ins, comprou };
-      let ok = true; try { ok = m.ok ? !!m.ok(ctx) : true; } catch { ok = false; }
-      if (!ok) { pula('condição não atendida'); continue; }
-      if (dry) {
-        let wa: any = null; let em: any = null; const v = jVars(ins, agoraMs);
-        try { const w = m.wa ? m.wa(ctx) : null; wa = w ? (w.tipo === 'video' ? { video: w.url, legenda: jFill(w.legenda, v) } : jFill(w.texto, v)) : null; } catch { wa = null; }
-        try { const e = m.em ? m.em(ctx) : null; em = e ? jFill(e.assunto, v) : null; } catch { em = null; }
-        out.push({ k: m.k, quando, acao: 'envia', whatsapp: wa, email_assunto: em });
-      } else { jEnfileira(ins, m, ctx, agoraMs); out.push({ k: m.k, quando, acao: 'envia' }); }
-    }
-    return out;
-  }
-
-  // ---------------- o agendador ----------------
-  let jRodando = false;
-  function jTick(): void {
-    if (!jAtivo() || jRodando) return; jRodando = true;
-    try {
-      const agoraMs = Date.now();
-      jLerFormulario();
-      jChecarCompras(agoraMs);
-      const lista = db.prepare(`SELECT * FROM jornada_inscritos WHERE status IN ('ativo','comprou') AND dia1>=?`).all(jDataBRT(agoraMs - 7 * 86400000)) as any[];
-      for (const ins of lista) {
-        jEtiquetas(ins, agoraMs);
-        jDecidir(ins, agoraMs, false);
-        if (agoraMs > jEm(ins.dia1, 7, '00:00') && ins.status === 'ativo') db.prepare(`UPDATE jornada_inscritos SET status='encerrado' WHERE id=?`).run(ins.id);
-      }
-    } catch (e: any) { console.log('[jornada] tick erro', e?.message || e); }
-    finally { jRodando = false; }
-  }
-  setInterval(jTick, 60000);
-
-  // ---------------- enviador próprio do WhatsApp (número do webinário, ritmo de 4–7s) ----------------
-  let jEnviando = false;
-  async function jTickEnvio(): Promise<void> {
-    if (jEnviando) return; jEnviando = true;
-    try {
-      const it = db.prepare(`SELECT * FROM jornada_envios WHERE canal='wa' AND status='pendente' AND agendado_para<=? ORDER BY agendado_para ASC LIMIT 1`).get(agora()) as any;
-      if (!it) return;
-      const cfg = jcfg();
-      try {
-        const inst = String(it.instancia || cfg.instancia);
-        if ((it.tipo || 'texto') === 'texto') await enviarTexto(cfg.projeto as any, String(it.para), String(it.texto || ''), inst);
-        else await enviarMidia(cfg.projeto as any, String(it.para), String(it.tipo), String(it.url || ''), String(it.legenda || ''), inst);
-        db.prepare(`UPDATE jornada_envios SET status='enviado', enviado_em=? WHERE id=?`).run(agora(), it.id);
-      } catch (e: any) {
-        const t = (Number(it.tentativas) || 0) + 1;
-        db.prepare(`UPDATE jornada_envios SET tentativas=?, status=?, detalhe=?, agendado_para=? WHERE id=?`).run(t, t >= 3 ? 'falhou' : 'pendente', String(e?.message || e).slice(0, 300), new Date(Date.now() + 60000).toISOString(), it.id);
-      }
-    } finally { jEnviando = false; }
-  }
-  // ritmo: espera cfg.envioIntervaloMs (padrão 3s) + 0–2s entre um envio e outro (+ o "digitando…" do enviarTexto)
-  (function jLoopEnvio(): void { setTimeout(async () => { try { await jTickEnvio(); } catch { /* */ } jLoopEnvio(); }, (Number(jcfg().envioIntervaloMs) || 3000) + Math.floor(Math.random() * 2000)); })();
-
-  // ---------------- páginas públicas /j/... ----------------
-  const jPagina = (titulo: string, texto: string, botao?: { t: string; u: string }): string => '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(titulo) + '</title></head>'
-    + '<body style="margin:0;background:#283D50;color:#fff;font-family:Arial,Helvetica,sans-serif;display:grid;place-items:center;min-height:100vh;padding:18px;box-sizing:border-box"><div style="max-width:520px;text-align:center">'
-    + '<h1 style="font-size:26px;margin:0 0 12px">' + esc(titulo) + '</h1><p style="font-size:17px;line-height:1.5;color:#e9eef3">' + esc(texto) + '</p>'
-    + (botao ? '<a href="' + esc(botao.u) + '" style="display:inline-block;margin-top:14px;background:#F1541A;color:#fff;text-decoration:none;font-weight:700;padding:14px 26px;border-radius:12px">' + esc(botao.t) + '</a>' : '')
-    + '</div></body></html>';
-  const jPorToken = (t: string): any => db.prepare(`SELECT * FROM jornada_inscritos WHERE token=?`).get(String(t || '').toLowerCase()) as any;
-
-  app.get('/j/:tipo/:token', (req: any, res: any) => {
-    try {
-      const tipo = String(req.params.tipo || ''); const ins = jPorToken(req.params.token); const cfg = jcfg();
-      if (!ins) return res.redirect(302, cfg.paginaInscricao);
-      const now = Date.now();
-      if (tipo === 'oferta') {
-        try { db.prepare(`INSERT INTO jornada_envios(id,inscrito_id,chave,canal,status,detalhe,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), ins.id, 'clique_oferta_' + now, 'clique', 'enviado', 'clique no link da oferta', agora()); } catch { /* */ }
-        if (now <= jFimOferta(ins)) {
-          const sep = cfg.checkout.includes('?') ? '&' : '?';
-          return res.redirect(302, cfg.checkout + sep + 'utm_source=webinario&utm_medium=whatsapp-email&utm_campaign=jornada-tecladista&utm_content=' + encodeURIComponent(ins.token));
-        }
-        const dl = jDataBRT(jFimOferta(ins)).split('-').reverse().slice(0, 2).join('/');
-        return res.type('html').send(jPagina('Essa condição encerrou', 'A condição especial da Jornada Tecladista era válida até ' + dl + ', às 23h59. Obrigado por ter participado das aulas!'));
-      }
-      if (tipo === 'video') return res.type('html').send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quem já toca na igreja</title></head><body style="margin:0;background:#111;display:grid;place-items:center;min-height:100vh"><video src="' + esc(cfg.videoPublico) + '" controls playsinline style="width:100%;max-width:960px;max-height:100vh"></video></body></html>');
-      if (!['a1', 'a2', 'a3'].includes(tipo)) return res.redirect(302, cfg.paginaInscricao);
-      if (!req.query.lead) return res.redirect(302, '/j/' + tipo + '/' + ins.token + '?lead=' + encodeURIComponent(ins.contato_id));
-      if (!JW.wbGet || !JW.wbConfigPublico || !JW.wbRoomHtml) return res.status(500).send('sala indisponível');
-      const wb = JW.wbGet(cfg.slugs[tipo]); if (!wb) return res.status(404).send('aula não encontrada');
-      const ini = jInicioAula(ins, tipo); const fim = jFimAula(ins, tipo); const dur = Math.round((fim - ini) / 1000);
-      const c: any = JW.wbConfigPublico(wb);
-      c.ofertas = (c.ofertas || []).map((o: any) => ({ ...o, url: jBase() + '/j/oferta/' + ins.token }));
-      if (now < fim) {
-        // antes da aula dele: contagem regressiva; durante: "ao vivo" sincronizado com o horário dele
-        c.agenda = { tipo: 'diario', estado: now < ini ? 'antes' : 'ao_vivo', inicio_ms: ini, fim_ms: fim, duracao: dur };
-      } else if (jJanelaGravacao(ins, tipo, now)) {
-        c.agenda = { tipo: 'aberto', estado: 'ao_vivo', inicio_ms: now, fim_ms: 0, duracao: dur };
-        c.chat_real = false; c.popups = false;
-      } else {
-        const n = jAulaN(tipo);
-        return res.type('html').send(jPagina('A gravação da Aula ' + n + ' saiu do ar', 'As gravações ficaram disponíveis por tempo limitado. Fique de olho no seu WhatsApp: as próximas mensagens trazem tudo o que você precisa.'));
-      }
-      c.server_now = now;
-      const cfgJson = JSON.stringify(c).replace(/</g, '\\u003c');
-      return res.type('html').send(JW.wbRoomHtml(cfgJson, String(wb.slug), String(wb.nome || 'Jornada Tecladista')));
-    } catch (e: any) { return res.status(500).send('erro: ' + String(e?.message || e)); }
-  });
-
-  // ---------------- painel (x-api-key) ----------------
-  app.get('/jornada/status', (_req: any, res: any) => {
-    try {
-      const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM jornada_inscritos GROUP BY status`).all();
-      const envios = db.prepare(`SELECT canal, status, COUNT(*) n FROM jornada_envios GROUP BY canal, status`).all();
-      const apostila = db.prepare(`SELECT nome, telefone, email, comprou_em FROM jornada_inscritos WHERE ganhou_apostila=1 ORDER BY comprou_em DESC LIMIT 200`).all();
-      res.json({ ok: true, ativo: jAtivo(), form_desde: pubFlag('jornada_form_desde', ''), cfg: jcfg(), inscritos: porStatus, envios, ganhadores_apostila: apostila });
-    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-  app.post('/jornada/ativar', (req: any, res: any) => {
-    const b = req.body || {}; const on = !!b.ativo;
-    setPubFlag('jornada_ativo', on ? '1' : '0');
-    if (on && (b.desde || !pubFlag('jornada_form_desde', ''))) setPubFlag('jornada_form_desde', String(b.desde || agora()));
-    res.json({ ok: true, ativo: jAtivo(), form_desde: pubFlag('jornada_form_desde', '') });
-  });
-  app.post('/jornada/cfg', (req: any, res: any) => {
-    try { const atual = (() => { try { return JSON.parse(pubFlag('jornada_cfg', '{}') || '{}'); } catch { return {}; } })(); setPubFlag('jornada_cfg', JSON.stringify({ ...atual, ...(req.body || {}) })); res.json({ ok: true, cfg: jcfg() }); }
-    catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-  app.get('/jornada/inscritos', (req: any, res: any) => {
-    const lim = Math.min(500, Number(req.query.limite) || 50);
-    const rows = (db.prepare(`SELECT * FROM jornada_inscritos ORDER BY inscrito_em DESC LIMIT ?`).all(lim) as any[]).map((i) => ({ ...i, pct: { a1: jPct('a1', i.contato_id), a2: jPct('a2', i.contato_id), a3: jPct('a3', i.contato_id) }, links: jVars(i, Date.now()) }));
-    res.json({ ok: true, inscritos: rows });
-  });
-  app.get('/jornada/envios', (req: any, res: any) => {
-    const id = String(req.query.inscrito || '');
-    const rows = id ? db.prepare(`SELECT * FROM jornada_envios WHERE inscrito_id=? ORDER BY criado_em ASC`).all(id) : db.prepare(`SELECT * FROM jornada_envios ORDER BY criado_em DESC LIMIT 200`).all();
-    res.json({ ok: true, envios: rows });
-  });
-  // inscrição manual (teste): {telefone, nome, email, dia1?}
-  app.post('/jornada/inscrever', (req: any, res: any) => {
-    try {
-      const b = req.body || {}; const cfg = jcfg(); const tel = String(b.telefone || '').replace(/\D/g, '');
-      if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
-      const cid = upsertContato(cfg.projeto, tel, b.nome || undefined, b.email || undefined, 'jornada-manual');
-      res.json(jInscrever({ contatoId: cid, telefone: tel, nome: b.nome, email: b.email, dia1: b.dia1 }));
-    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-  app.post('/jornada/cancelar', (req: any, res: any) => {
-    const b = req.body || {};
-    const r = db.prepare(`UPDATE jornada_inscritos SET status='cancelado' WHERE id=? OR token=? OR telefone=?`).run(String(b.id || '-'), String(b.token || '-'), String(b.telefone || '-').replace(/\D/g, ''));
-    db.prepare(`UPDATE jornada_envios SET status='cancelado' WHERE status='pendente' AND inscrito_id IN (SELECT id FROM jornada_inscritos WHERE status='cancelado')`).run();
-    res.json({ ok: true, alterados: r.changes });
-  });
-  // TESTE: manda AGORA uma (ou todas) as mensagens pra um número/e-mail de teste, sem mexer nos inscritos.
-  // body: {telefone, email?, nome?, chaves?: ['m01',...] | 'todas', cenario?: {faixa:'nao'|'menos'|'mais', comprou?:bool, repeticao?:bool, apostila?:bool}}
-  app.post('/jornada/teste', (req: any, res: any) => {
-    try {
-      const b = req.body || {}; const tel = String(b.telefone || '').replace(/\D/g, '');
-      if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
-      const cen = b.cenario || {};
-      const agoraMs = Date.now();
-      const ins: any = { id: 'teste-' + randomUUID().slice(0, 8), contato_id: 'teste', projeto: jcfg().projeto, telefone: tel, email: b.email || null, nome: b.nome || 'Teste', inscrito_em: new Date(agoraMs).toISOString(), dia1: jDia1Para(agoraMs), token: 'teste', repeticao: cen.repeticao ? 1 : 0, ganhou_apostila: cen.apostila ? 1 : 0 };
-      const faixaPct = cen.faixa === 'nao' ? 0 : cen.faixa === 'menos' ? 30 : 90;
-      (globalThis as any).__jornadaPctTeste = faixaPct;
-      const todas = !b.chaves || b.chaves === 'todas';
-      const lista = [...MSGS, POS_VENDA].filter((m) => todas || (Array.isArray(b.chaves) && b.chaves.includes(m.k)));
-      let n = 0; let atraso = 0;
-      for (const m of lista) {
-        const ctx: any = { ins, comprou: !!cen.comprou };
-        const v = jVars(ins, agoraMs);
-        if (m.wa) { const w = (() => { try { return m.wa(ctx); } catch { return null; } })(); if (w) {
-          const id = randomUUID(); atraso += 6000;
-          db.prepare(`INSERT INTO jornada_envios(id,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-            .run(id, ins.id, m.k, 'wa', 'pendente', w.tipo === 'video' ? 'video' : 'texto', w.tipo === 'video' ? null : jFill(w.texto, v), w.tipo === 'video' ? w.url : null, w.tipo === 'video' ? jFill(w.legenda, v) : null, tel, 'TESTE', new Date(agoraMs + atraso).toISOString(), agora(), m.instancia ? m.instancia() : null);
-          n++; } }
-        if (m.em && b.email) { const e = (() => { try { return m.em(ctx); } catch { return null; } })(); if (e) {
-          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), jcfg().projeto, String(b.email), '[TESTE ' + m.k + '] ' + jFill(e.assunto, v), jEmailHtml(e.blocos, v), 'pendente', agora(), null, null);
-          n++; } }
-      }
-      res.json({ ok: true, enfileiradas: n, obs: 'WhatsApp sai pelo número do webinário a cada ~6s; e-mails pela fila (até 5 a cada 20s). Links de teste usam o token "teste" (não abrem sala).' });
-    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-
-  // SIMULAR (não envia nada): o que a régua faria pra um inscrito num instante. body: {inscrito|token, agora?: ISO, pct?: {a1,a2,a3}}
-  app.post('/jornada/simular', (req: any, res: any) => {
-    try {
-      const b = req.body || {};
-      const ins = db.prepare(`SELECT * FROM jornada_inscritos WHERE id=? OR token=?`).get(String(b.inscrito || '-'), String(b.token || '-')) as any;
-      if (!ins) return res.json({ ok: false, erro: 'inscrito não encontrado' });
-      const agoraMs = b.agora ? Date.parse(String(b.agora)) : Date.now();
-      // cronograma completo (horário de Brasília) + decisão no instante pedido
-      const cronograma = MSGS.map((m: any) => { const t = jQuandoMs(m, ins); return { k: m.k, quando: t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ') }; });
-      res.json({ ok: true, inscrito: { id: ins.id, dia1: ins.dia1, token: ins.token, status: ins.status, repeticao: ins.repeticao }, prazos: { apostila: new Date(jFimApostila(ins) - BRT_MS).toISOString().slice(0, 16), oferta: new Date(jFimOferta(ins) - BRT_MS).toISOString().slice(0, 16) }, cronograma, decisao: jDecidir(ins, agoraMs, true) });
-    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
-  });
-
-  console.log('[jornada] régua do webinário carregada; ativo=', jAtivo());
-}
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
