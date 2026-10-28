@@ -5614,6 +5614,56 @@ app.get('/pub/youtube/sessao-nuvem', (_req, res) => {
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// [+yt-browser-nuvem 28/10] TESTE do navegador invisível na nuvem: publica UM vídeo pelo Studio
+// usando a sessão do cofre. require() LAZY: o Playwright só carrega quando este endpoint é chamado,
+// então o boot do engine nunca depende dele. Protegido pela ENGINE_API_KEY (middleware global).
+// body: { projeto, arquivo (caminho no servidor) | url (http(s) p/ baixar p/ /tmp), titulo, descricao?, thumbnailPath?, privacy?, snaps? }
+app.post('/pub/youtube/testar-navegador', async (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '').trim().toLowerCase();
+  if (!['teclado', 'baixo', 'violao', 'comunidade'].includes(projeto)) {
+    return res.status(400).json({ ok: false, erro: 'projeto_invalido (use teclado|baixo|violao|comunidade)' });
+  }
+  let arquivo = String(b.arquivo || '').trim();
+  const titulo = String(b.titulo || '').trim();
+  if (!titulo) return res.status(400).json({ ok: false, erro: 'titulo_obrigatorio' });
+  let baixadoTmp: string | null = null;
+  try {
+    // Se vier URL em vez de caminho local, baixa pro /tmp pra testar (só http/https).
+    if (!arquivo && b.url && /^https?:\/\//i.test(String(b.url))) {
+      const url = String(b.url);
+      baixadoTmp = '/tmp/yt-teste-' + Date.now() + '.mp4';
+      await new Promise<void>((resolve, reject) => {
+        const mod = url.toLowerCase().startsWith('https') ? require('https') : require('http');
+        const out = fs.createWriteStream(baixadoTmp as string);
+        mod.get(url, (r: any) => {
+          if (r.statusCode && r.statusCode >= 400) { reject(new Error('download HTTP ' + r.statusCode)); return; }
+          r.pipe(out);
+          out.on('finish', () => out.close(() => resolve()));
+        }).on('error', reject);
+      });
+      arquivo = baixadoTmp;
+    }
+    if (!arquivo) return res.status(400).json({ ok: false, erro: 'informe arquivo (caminho no servidor) ou url' });
+
+    const mod = require('./yt-browser-nuvem');
+    const r = await mod.publicarYoutubeNuvem({
+      projeto,
+      arquivo,
+      titulo,
+      descricao: b.descricao ? String(b.descricao) : '',
+      thumbnailPath: b.thumbnailPath ? String(b.thumbnailPath) : '',
+      privacy: b.privacy === 'private' || b.privacy === 'unlisted' ? b.privacy : 'public',
+      snaps: !!b.snaps
+    });
+    res.json(r);
+  } catch (e: any) {
+    res.status(500).json({ ok: false, erro: String(e?.message || e) });
+  } finally {
+    if (baixadoTmp) { try { fs.unlinkSync(baixadoTmp); } catch { /* ok */ } }
+  }
+});
+
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
   try {
