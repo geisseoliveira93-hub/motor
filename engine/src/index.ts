@@ -5666,6 +5666,35 @@ app.post('/pub/youtube/testar-navegador', async (req, res) => {
   }
 });
 
+// [+proxy-residencial 28/10] Lista de proxies residenciais (aparelhos de casa via Tailscale) que a
+// nuvem usa pra sair pelo IP de casa no YouTube. Ordem = prioridade (failover). Guardado em /data.
+app.post('/pub/youtube/proxies', (req, res) => {
+  try {
+    const b = req.body || {};
+    const lista = Array.isArray(b.lista) ? b.lista : (Array.isArray(b) ? b : []);
+    const limpa = lista
+      .filter((p: any) => p && p.host && p.port)
+      .map((p: any) => ({ nome: String(p.nome || (p.host + ':' + p.port)), host: String(p.host), port: Number(p.port), usuario: p.usuario ? String(p.usuario) : undefined, senha: p.senha ? String(p.senha) : undefined }));
+    fs.writeFileSync(YT_SESS_DIR + '/_proxies.json', JSON.stringify({ lista: limpa, salvoEm: agora() }));
+    res.json({ ok: true, total: limpa.length, nomes: limpa.map((p: any) => p.nome) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/proxies', (_req, res) => {
+  try {
+    let d: any = { lista: [] };
+    try { d = JSON.parse(fs.readFileSync(YT_SESS_DIR + '/_proxies.json', 'utf8')); } catch { /* vazio */ }
+    const lista = (d.lista || []).map((p: any) => ({ nome: p.nome, host: p.host, port: p.port, temAuth: !!p.usuario }));
+    res.json({ ok: true, lista, salvoEm: d.salvoEm || null });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/proxies/testar', async (_req, res) => {
+  try {
+    const mod: any = await import('./yt-browser-nuvem');
+    const st = await mod.statusProxies();
+    res.json({ ok: true, proxies: st, algumOnline: st.some((p: any) => p.online) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
   try {

@@ -25,6 +25,7 @@
 
 import { chromium } from 'playwright';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
 
 const USER_AGENT_DEFAULT =
@@ -32,6 +33,72 @@ const USER_AGENT_DEFAULT =
 
 const YT_SESS_DIR = '/data/yt-sessions';
 const SNAP_DIR = YT_SESS_DIR + '/_snaps';
+const PROXY_FILE = YT_SESS_DIR + '/_proxies.json';
+
+// [+proxy-residencial 28/10] Lista de proxies residenciais (os aparelhos de casa, via Tailscale),
+// em ordem de prioridade. A nuvem testa um a um e usa o PRIMEIRO que estiver online (failover).
+export interface ProxyNode { nome?: string; host: string; port: number; usuario?: string; senha?: string }
+
+function lerProxies(): ProxyNode[] {
+  try {
+    const d = JSON.parse(fs.readFileSync(PROXY_FILE, 'utf8'));
+    const lista = Array.isArray(d) ? d : (d && Array.isArray(d.lista) ? d.lista : []);
+    return lista.filter((p: any) => p && p.host && p.port).map((p: any) => ({
+      nome: p.nome || (p.host + ':' + p.port),
+      host: String(p.host), port: Number(p.port),
+      usuario: p.usuario || undefined, senha: p.senha || undefined
+    }));
+  } catch { return []; }
+}
+
+// Testa se um proxy está vivo E funcionando: abre CONNECT até www.google.com:443 por ele e
+// espera o "200 Connection Established". Timeout curto. Resolve true/false (nunca lança).
+function testarProxy(p: ProxyNode, timeoutMs = 6000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let feito = false;
+    const fim = (ok: boolean) => { if (!feito) { feito = true; try { sock.destroy(); } catch { /* ok */ } resolve(ok); } };
+    const sock = net.connect(p.port, p.host);
+    sock.setTimeout(timeoutMs);
+    sock.on('timeout', () => fim(false));
+    sock.on('error', () => fim(false));
+    sock.on('connect', () => {
+      let linha = 'CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\n';
+      if (p.usuario) linha += 'Proxy-Authorization: Basic ' + Buffer.from((p.usuario || '') + ':' + (p.senha || '')).toString('base64') + '\r\n';
+      linha += '\r\n';
+      sock.write(linha);
+    });
+    let buf = '';
+    sock.on('data', (d) => {
+      buf += d.toString('latin1');
+      if (buf.indexOf('\r\n\r\n') !== -1) fim(/^HTTP\/1\.[01]\s+200/i.test(buf));
+    });
+  });
+}
+
+// Testa TODOS os proxies da lista (diagnóstico). Retorna [{nome,host,port,online}].
+export async function statusProxies(): Promise<any[]> {
+  const lista = lerProxies();
+  const out: any[] = [];
+  for (const p of lista) {
+    const online = await testarProxy(p).catch(() => false);
+    out.push({ nome: p.nome, host: p.host, port: p.port, temAuth: !!p.usuario, online });
+  }
+  return out;
+}
+
+// Escolhe o 1º proxy online da lista. Retorna {node, playwright} ou null (sem lista / nenhum online).
+export async function escolherProxy(): Promise<{ node: ProxyNode; playwright: any } | null> {
+  const lista = lerProxies();
+  if (!lista.length) return null;
+  for (const p of lista) {
+    const ok = await testarProxy(p).catch(() => false);
+    if (ok) {
+      const auth = p.usuario ? { username: p.usuario, password: p.senha || '' } : {};
+      return { node: p, playwright: { server: 'http://' + p.host + ':' + p.port, ...auth } };
+    }
+  }
+  return null;
+}
 
 export interface PublicarNuvemPayload {
   projeto: string; // teclado | baixo | violao | comunidade
@@ -50,6 +117,7 @@ export interface PublicarNuvemResposta {
   motivoFalha?: 'sessao_expirada' | 'sem_sessao' | 'arquivo_inexistente' | 'ui_mudou' | 'outro';
   duracaoMs: number;
   screenshots?: string[];
+  proxyUsado?: string | null;
 }
 
 function logI(msg: string, extra?: any): void {
@@ -135,11 +203,27 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
       .catch(() => false);
   }
 
+  let proxyUsado: string | null = null;
   try {
-    browser = await chromium.launch({
+    // [+proxy-residencial] Escolhe o proxy residencial online (sai pelo IP de casa). Se há lista
+    // configurada mas NENHUM está online, aborta com erro claro (não arrisca o IP de datacenter).
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) {
+      return { ok: false, erro: 'Nenhum aparelho de casa (proxy residencial) está online agora. Ligue um PC/celular da lista e tente de novo.', motivoFalha: 'outro', duracaoMs: Date.now() - start, screenshots };
+    }
+    const launchOpts: any = {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
+    };
+    if (escolhido) {
+      launchOpts.proxy = escolhido.playwright;
+      proxyUsado = escolhido.node.nome || escolhido.node.host;
+      logI('usando proxy residencial', { proxy: proxyUsado });
+    } else {
+      logW('SEM proxy residencial configurado — saindo pelo IP do servidor (datacenter); o Google provavelmente vai recusar');
+    }
+    browser = await chromium.launch(launchOpts);
     ctx = await browser.newContext({
       storageState: sess.storageState,
       userAgent: sess.userAgent || USER_AGENT_DEFAULT,
@@ -165,7 +249,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     await snap('01-studio-home');
 
     if (/accounts\.google\.com/.test(page.url())) {
-      return { ok: false, erro: 'Sessão YT expirou (redirecionou pro login do Google). Pode ser desafio de IP de datacenter — talvez precise de proxy residencial BR.', motivoFalha: 'sessao_expirada', duracaoMs: Date.now() - start, screenshots };
+      return { ok: false, erro: 'Sessão YT expirou (redirecionou pro login do Google). Pode ser desafio de IP de datacenter — talvez precise de proxy residencial BR.', motivoFalha: 'sessao_expirada', duracaoMs: Date.now() - start, screenshots, proxyUsado };
     }
 
     // Criar → Enviar vídeos
@@ -184,7 +268,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     await snap('01b-dialog-upload');
 
     if (/accounts\.google\.com/.test(page.url())) {
-      return { ok: false, erro: 'Sessão YT expirou. Reconecte/exporte a sessão de novo.', motivoFalha: 'sessao_expirada', duracaoMs: Date.now() - start, screenshots };
+      return { ok: false, erro: 'Sessão YT expirou. Reconecte/exporte a sessão de novo.', motivoFalha: 'sessao_expirada', duracaoMs: Date.now() - start, screenshots, proxyUsado };
     }
 
     // ETAPA 2: upload do arquivo
@@ -583,12 +667,12 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     }
 
     await delayHumano(1500, 3000);
-    return { ok: true, postUrl: videoUrl, duracaoMs: Date.now() - start, screenshots };
+    return { ok: true, postUrl: videoUrl, duracaoMs: Date.now() - start, screenshots, proxyUsado };
   } catch (e) {
     const msg = (e as Error).message;
     logW('erro publicando', { projeto, erro: msg });
     try { await snap('erro-final'); } catch { /* ok */ }
-    return { ok: false, erro: msg, motivoFalha: 'ui_mudou', duracaoMs: Date.now() - start, screenshots };
+    return { ok: false, erro: msg, motivoFalha: 'ui_mudou', duracaoMs: Date.now() - start, screenshots, proxyUsado };
   } finally {
     try { if (ctx) await ctx.close(); } catch { /* ignore */ }
     try { if (browser) await browser.close(); } catch { /* ignore */ }
