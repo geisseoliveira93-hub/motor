@@ -5584,6 +5584,36 @@ app.post('/pub/cancelar-reels-teste', (req, res) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
 
+// [+yt-browser-nuvem 28/10] FUNDAÇÃO do YouTube via navegador invisível na nuvem (INERTE — nada usa ainda).
+// Recebe a sessão (storageState) logada do YouTube Studio capturada no PC e guarda em /data (volume persistente),
+// por projeto. É o cofre que o upload por Playwright no servidor vai usar depois. Protegido pela ENGINE_API_KEY.
+const YT_SESS_DIR = '/data/yt-sessions';
+try { fs.mkdirSync(YT_SESS_DIR, { recursive: true }); } catch { /* ok */ }
+app.post('/pub/youtube/sessao-nuvem', (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || '').trim().toLowerCase();
+    if (!projeto) return res.status(400).json({ ok: false, erro: 'projeto_obrigatorio' });
+    const storageState = b.storageState;
+    if (!storageState || typeof storageState !== 'object') return res.status(400).json({ ok: false, erro: 'storageState_obrigatorio' });
+    const dados = { projeto, channelId: b.channelId || null, userAgent: b.userAgent || null, storageState, salvoEm: agora() };
+    fs.writeFileSync(YT_SESS_DIR + '/' + projeto + '.json', JSON.stringify(dados));
+    res.json({ ok: true, projeto, cookies: Array.isArray(storageState.cookies) ? storageState.cookies.length : 0 });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/sessao-nuvem', (_req, res) => {
+  try {
+    const out: any = {};
+    for (const p of ['teclado', 'baixo', 'violao', 'comunidade']) {
+      try {
+        const d = JSON.parse(fs.readFileSync(YT_SESS_DIR + '/' + p + '.json', 'utf8'));
+        out[p] = { temSessao: true, channelId: d.channelId || null, salvoEm: d.salvoEm || null, cookies: Array.isArray(d.storageState?.cookies) ? d.storageState.cookies.length : 0 };
+      } catch { out[p] = { temSessao: false }; }
+    }
+    res.json({ ok: true, sessoes: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
   try {
