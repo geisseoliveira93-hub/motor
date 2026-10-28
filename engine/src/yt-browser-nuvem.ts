@@ -38,7 +38,7 @@ const USER_AGENT_DEFAULT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36';
 
 const YT_SESS_DIR = '/data/yt-sessions';
-const SNAP_DIR = YT_SESS_DIR + '/_snaps';
+const SNAP_DIR = '/data/media/yt-snaps'; // servido publicamente em /media/yt-snaps/ (pra conferir os prints por link)
 const PROXY_FILE = YT_SESS_DIR + '/_proxies.json';
 
 // [+proxy-residencial 28/10] Lista de proxies residenciais (os aparelhos de casa, via Tailscale),

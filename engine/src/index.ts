@@ -5618,52 +5618,67 @@ app.get('/pub/youtube/sessao-nuvem', (_req, res) => {
 // usando a sessão do cofre. require() LAZY: o Playwright só carrega quando este endpoint é chamado,
 // então o boot do engine nunca depende dele. Protegido pela ENGINE_API_KEY (middleware global).
 // body: { projeto, arquivo (caminho no servidor) | url (http(s) p/ baixar p/ /tmp), titulo, descricao?, thumbnailPath?, privacy?, snaps? }
+// [+async 28/10] O teste roda em SEGUNDO PLANO (o fluxo demora minutos: upload + verificação do YT).
+// POST inicia e volta na hora; GET .../resultado devolve o último resultado. Os prints saem como URLs
+// públicas (/media/yt-snaps/..) pra conferência visual.
+let _ytUltimoTeste: any = null;
+function _ytSnapsUrls(arr: any[]): string[] {
+  const base = String(process.env.PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/$/, '');
+  return (arr || []).map((p: string) => base + '/media/yt-snaps/' + String(p).split('/').pop());
+}
 app.post('/pub/youtube/testar-navegador', async (req, res) => {
   const b = req.body || {};
   const projeto = String(b.projeto || '').trim().toLowerCase();
   if (!['teclado', 'baixo', 'violao', 'comunidade'].includes(projeto)) {
     return res.status(400).json({ ok: false, erro: 'projeto_invalido (use teclado|baixo|violao|comunidade)' });
   }
-  let arquivo = String(b.arquivo || '').trim();
   const titulo = String(b.titulo || '').trim();
   if (!titulo) return res.status(400).json({ ok: false, erro: 'titulo_obrigatorio' });
-  let baixadoTmp: string | null = null;
-  try {
-    // Se vier URL em vez de caminho local, baixa pro /tmp pra testar (só http/https).
-    if (!arquivo && b.url && /^https?:\/\//i.test(String(b.url))) {
-      const url = String(b.url);
-      baixadoTmp = '/tmp/yt-teste-' + Date.now() + '.mp4';
-      const _httpsMod: any = await import('node:https');
-      const _httpMod: any = await import('node:http');
-      const _dl: any = url.toLowerCase().startsWith('https') ? (_httpsMod.default || _httpsMod) : (_httpMod.default || _httpMod);
-      await new Promise<void>((resolve, reject) => {
-        const out = fs.createWriteStream(baixadoTmp as string);
-        _dl.get(url, (r: any) => {
-          if (r.statusCode && r.statusCode >= 400) { reject(new Error('download HTTP ' + r.statusCode)); return; }
-          r.pipe(out);
-          out.on('finish', () => out.close(() => resolve()));
-        }).on('error', reject);
-      });
-      arquivo = baixadoTmp;
-    }
-    if (!arquivo) return res.status(400).json({ ok: false, erro: 'informe arquivo (caminho no servidor) ou url' });
-
-    const mod: any = await import('./yt-browser-nuvem');
-    const r = await mod.publicarYoutubeNuvem({
-      projeto,
-      arquivo,
-      titulo,
-      descricao: b.descricao ? String(b.descricao) : '',
-      thumbnailPath: b.thumbnailPath ? String(b.thumbnailPath) : '',
-      privacy: b.privacy === 'private' || b.privacy === 'unlisted' ? b.privacy : 'public',
-      snaps: !!b.snaps
-    });
-    res.json(r);
-  } catch (e: any) {
-    res.status(500).json({ ok: false, erro: String(e?.message || e) });
-  } finally {
-    if (baixadoTmp) { try { fs.unlinkSync(baixadoTmp); } catch { /* ok */ } }
+  if (_ytUltimoTeste && _ytUltimoTeste.status === 'rodando') {
+    return res.status(409).json({ ok: false, erro: 'ja_rodando', desde: _ytUltimoTeste.inicio });
   }
+  _ytUltimoTeste = { status: 'rodando', inicio: agora(), projeto, titulo };
+  res.json({ ok: true, iniciado: true, projeto, titulo });
+  // ---- roda em segundo plano (não trava a resposta) ----
+  (async () => {
+    let arquivo = String(b.arquivo || '').trim();
+    let baixadoTmp: string | null = null;
+    try {
+      if (!arquivo && b.url && /^https?:\/\//i.test(String(b.url))) {
+        const url = String(b.url);
+        baixadoTmp = '/tmp/yt-teste-' + Date.now() + '.mp4';
+        const _httpsMod: any = await import('node:https');
+        const _httpMod: any = await import('node:http');
+        const _dl: any = url.toLowerCase().startsWith('https') ? (_httpsMod.default || _httpsMod) : (_httpMod.default || _httpMod);
+        await new Promise<void>((resolve, reject) => {
+          const out = fs.createWriteStream(baixadoTmp as string);
+          _dl.get(url, (r: any) => {
+            if (r.statusCode && r.statusCode >= 400) { reject(new Error('download HTTP ' + r.statusCode)); return; }
+            r.pipe(out);
+            out.on('finish', () => out.close(() => resolve()));
+          }).on('error', reject);
+        });
+        arquivo = baixadoTmp;
+      }
+      if (!arquivo) { _ytUltimoTeste = { status: 'erro', erro: 'informe arquivo ou url', projeto, titulo, fim: agora() }; return; }
+      const mod: any = await import('./yt-browser-nuvem');
+      const r = await mod.publicarYoutubeNuvem({
+        projeto, arquivo, titulo,
+        descricao: b.descricao ? String(b.descricao) : '',
+        thumbnailPath: b.thumbnailPath ? String(b.thumbnailPath) : '',
+        privacy: b.privacy === 'private' || b.privacy === 'unlisted' ? b.privacy : 'public',
+        snaps: !!b.snaps
+      });
+      _ytUltimoTeste = { status: r && r.ok ? 'ok' : 'falhou', projeto, titulo, fim: agora(), ...r, snapsUrls: _ytSnapsUrls(r && r.screenshots) };
+    } catch (e: any) {
+      _ytUltimoTeste = { status: 'erro', erro: String(e?.message || e), projeto, titulo, fim: agora() };
+    } finally {
+      if (baixadoTmp) { try { fs.unlinkSync(baixadoTmp); } catch { /* ok */ } }
+    }
+  })();
+});
+app.get('/pub/youtube/testar-navegador/resultado', (_req, res) => {
+  res.json({ ok: true, resultado: _ytUltimoTeste });
 });
 
 // [+proxy-residencial 28/10] Lista de proxies residenciais (aparelhos de casa via Tailscale) que a
