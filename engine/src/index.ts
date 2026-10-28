@@ -259,6 +259,8 @@ type FluxoPasso = {
   janela?: { de?: string; ate?: string };
   // (opcional) tag a aplicar neste passo (p/ passos de ação futuros). Hoje o seed não usa.
   tag?: string;
+  // [+webinario-dedilhados 28/10] pular este passo se a pessoa JÁ se inscreveu no webinário (Jornada). Checado na HORA do envio.
+  pularSeInscrito?: boolean;
 };
 // Um fluxo por PRODUTO: casa pelo id OU por um pedaço do nome do produto, e entrega
 // o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
@@ -390,7 +392,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS fluxos_entrega (
 )`);
 // [entrega-janela/acompanhamento] colunas ADITIVAS na fila_envio: janela de horário por passo +
 // identificação do fluxo/passo (p/ a aba "Campanhas ativas": contadores, histórico, reenviar).
-for (const col of ['janela_de TEXT', 'janela_ate TEXT', 'fluxo_chave TEXT', 'passo INTEGER']) {
+for (const col of ['janela_de TEXT', 'janela_ate TEXT', 'fluxo_chave TEXT', 'passo INTEGER', 'pular_se_inscrito INTEGER DEFAULT 0']) {
   try { db.exec(`ALTER TABLE fila_envio ADD COLUMN ${col}`); } catch { /* já existe */ }
 }
 // HH:MM no fuso America/Sao_Paulo.
@@ -828,12 +830,21 @@ async function enviarPasso(projeto: Projeto, para: string, passo: FluxoPasso, no
 
 /** Enfileira um FLUXO (vários passos com delay) pra um contato. O worker manda no ritmo,
  * respeitando o delay de cada passo (agendado_para). Preenche {nome} em texto/legenda. */
+// [+webinario-dedilhados 28/10] a pessoa já se inscreveu no webinário (Jornada)? Casa pelos últimos 8 dígitos do telefone.
+function _jornadaInscrito(telefone: string): boolean {
+  try {
+    const t = String(telefone || '').replace(/\D/g, ''); if (t.length < 8) return false;
+    const fim = t.slice(-8);
+    const r = db.prepare(`SELECT 1 FROM jornada_inscritos WHERE status!='cancelado' AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + fim);
+    return !!r;
+  } catch { return false; }
+}
 function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome, instancia?: string, chave?: string) {
   // [num-escolha] instancia opcional: grava o número de envio na fila; o tickFila respeita.
   // [entrega-janela/acompanhamento] grava também janela_de/ate (janela de horário) + fluxo_chave/passo (p/ Campanhas ativas).
   const ins = db.prepare(
-    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,janela_de,janela_ate,fluxo_chave,passo)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO fila_envio(id,projeto,para,is_grupo,texto,tipo,url,legenda,status,instancia,agendado_para,criado_em,janela_de,janela_ate,fluxo_chave,passo,pular_se_inscrito)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   );
   let acumulado = 0;
   const tx = db.transaction(() => {
@@ -845,7 +856,7 @@ function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], n
       const legenda = tipo === 'texto' ? '' : preencheNome(p.texto || p.legenda || '', nome, opts);
       ins.run(randomUUID(), projeto, para, 0, texto, tipo, p.url || null, legenda || null,
         'pendente', instancia || null, emSegundos(acumulado), agora(),
-        (p.janela?.de || null), (p.janela?.ate || null), (chave || null), idx);
+        (p.janela?.de || null), (p.janela?.ate || null), (chave || null), idx, (p.pularSeInscrito ? 1 : 0));
       idx++;
     }
   });
@@ -1536,6 +1547,7 @@ function normalizaFluxo(f: any): FluxoPasso[] {
     // [entrega-janela] janela de horário opcional por passo (HH:MM, fuso SP)
     janela: (p?.janela && (p.janela.de || p.janela.ate)) ? { de: String(p.janela.de || ''), ate: String(p.janela.ate || '') } : undefined,
     tag: p?.tag != null ? String(p.tag) : undefined,
+    pularSeInscrito: !!p?.pularSeInscrito, // [+webinario-dedilhados] pular passo se já inscrito no webinário
   }));
 }
 
@@ -3725,6 +3737,9 @@ async function tickFila() {
       // pro próximo início da janela em vez de enviar. Não conta como falha.
       if (item.janela_de && item.janela_ate && !_dentroJanela(item.janela_de, item.janela_ate)) {
         db.prepare(`UPDATE fila_envio SET agendado_para=? WHERE id=?`).run(_proximaJanelaISO(item.janela_de), item.id);
+      } else if (Number(item.pular_se_inscrito) === 1 && _jornadaInscrito(item.para)) {
+        // [+webinario-dedilhados] a pessoa já se inscreveu no webinário → não manda o lembrete (marca pulado).
+        db.prepare(`UPDATE fila_envio SET status='pulado' WHERE id=?`).run(item.id);
       } else {
       try {
         const tipo = item.tipo || 'texto';
