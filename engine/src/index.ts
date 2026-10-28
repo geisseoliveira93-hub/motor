@@ -13850,6 +13850,40 @@ async function _vigiaAlerta(item: string, msg: string): Promise<void> {
     await enviarTexto('teclado' as Projeto, '5516981518794', '⚠️ Motor: ' + msg, instTeclado).catch(() => { /* */ });
   } catch { /* nunca quebra */ }
 }
+// [+seguranca-estado-desejado 28/10] ALERTA de desvio da config dos agentes (habilitados/canalIg/modo/numeroPadrao teclado).
+// Se um deploy (ou qualquer coisa) mudar/zerar esses campos sem ser você, o vigia AVISA no WhatsApp. Só ALERTA, nao restaura
+// (pra nao brigar com mudanca intencional). O "estado desejado" e um snapshot que VOCE define quando a config esta certa
+// (POST /saude/estado-desejado/salvar); enquanto nao houver snapshot, nao alerta (zero falso-positivo). Tabela no engine.db
+// (sobrevive a deploy). ADITIVO.
+try { db.exec(`CREATE TABLE IF NOT EXISTS estado_desejado ( chave TEXT PRIMARY KEY, valor TEXT NOT NULL, atualizado_em TEXT NOT NULL DEFAULT (datetime('now')) )`); } catch { /* ja existe */ }
+function _estadoAgentesAtual(): any {
+  const proj = ['baixo', 'violao', 'teclado', 'comunidade'];
+  const hab = (CONFIG as any).agentesHabilitados || {};
+  const cig = (CONFIG as any).canalIg || {};
+  const modo = (CONFIG as any).agenteModoWa || {};
+  const out: any = { agentesHabilitados: {}, canalIg: {}, agenteModoWa: {}, numeroPadraoTeclado: String(((CONFIG as any).numeroPadrao || {}).teclado || '') };
+  for (const p of proj) { out.agentesHabilitados[p] = !!hab[p]; out.canalIg[p] = String(cig[p] || ''); out.agenteModoWa[p] = String(modo[p] || ''); }
+  return out;
+}
+function _estadoDesejadoLer(): any | null {
+  try { const r = db.prepare(`SELECT valor FROM estado_desejado WHERE chave='AGENTES'`).get() as any; return r && r.valor ? JSON.parse(r.valor) : null; } catch { return null; }
+}
+function _estadoDesejadoSalvar(obj: any): void {
+  try { db.prepare(`INSERT INTO estado_desejado(chave,valor,atualizado_em) VALUES('AGENTES',?,datetime('now')) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em`).run(JSON.stringify(obj)); } catch { /* */ }
+}
+function _estadoAgentesDrift(): string[] {
+  const des = _estadoDesejadoLer(); if (!des) return []; // sem snapshot = nao alerta
+  const at = _estadoAgentesAtual(); const d: string[] = [];
+  for (const p of ['baixo', 'violao', 'teclado', 'comunidade']) {
+    if (des.agentesHabilitados && des.agentesHabilitados[p] !== undefined && (!!des.agentesHabilitados[p]) !== (!!at.agentesHabilitados[p])) d.push('agente ' + p + ' habilitado=' + at.agentesHabilitados[p] + ' (desejado ' + des.agentesHabilitados[p] + ')');
+    if (des.canalIg && des.canalIg[p] !== undefined && String(des.canalIg[p]) !== String(at.canalIg[p])) d.push('canalIg ' + p + '=' + (at.canalIg[p] || 'off') + ' (desejado ' + (des.canalIg[p] || 'off') + ')');
+    if (des.agenteModoWa && des.agenteModoWa[p] !== undefined && String(des.agenteModoWa[p]) !== String(at.agenteModoWa[p])) d.push('modo ' + p + '=' + (at.agenteModoWa[p] || '-') + ' (desejado ' + des.agenteModoWa[p] + ')');
+  }
+  if (des.numeroPadraoTeclado !== undefined && String(des.numeroPadraoTeclado) !== String(at.numeroPadraoTeclado)) d.push('numeroPadrao teclado=' + (at.numeroPadraoTeclado || 'vazio') + ' (desejado ' + (des.numeroPadraoTeclado || 'vazio') + ')');
+  return d;
+}
+app.get('/saude/estado-desejado', (_req, res) => { try { res.json({ ok: true, desejado: _estadoDesejadoLer(), atual: _estadoAgentesAtual(), drift: _estadoAgentesDrift() }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+app.post('/saude/estado-desejado/salvar', (_req, res) => { try { const snap = _estadoAgentesAtual(); _estadoDesejadoSalvar(snap); res.json({ ok: true, desejado: snap }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
 function _saudeProducao(): any {
   const r: any = { ok: true, itens: {} };
   try {
@@ -13863,6 +13897,7 @@ function _saudeProducao(): any {
     const atrasados = (db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE status IN ('pendente','camp_pend','cmp_multi','cmp_mmk') AND agendado_para < ?`).get(new Date(Date.now() - 10 * 60000).toISOString()) as any)?.n || 0;
     r.itens.filaAtrasada = Number(atrasados);
     r.itens.presencaSimulada = _presencaLigada();
+    r.itens.estadoAgentesDrift = _estadoAgentesDrift(); // [+seguranca-estado-desejado] vazio=ok; lista=desvio do estado definido
     r.ok = temDed && Number(atrasados) < 50;
   } catch (e: any) { r.ok = false; r.erro = String(e?.message || e); }
   return r;
@@ -13882,6 +13917,7 @@ async function vigiaProducao(): Promise<void> {
     if (s.itens && Number(s.itens.filaAtrasada) >= 50) {
       await _vigiaAlerta('fila-travada', Number(s.itens.filaAtrasada) + ' mensagens estão atrasadas na fila. Pode ter número desconectado ou worker parado.');
     }
+    try { const drift = _estadoAgentesDrift(); if (drift.length) { await _vigiaAlerta('config-agentes-drift', 'a config dos agentes saiu do estado definido: ' + drift.join('; ') + '. (Pode ter sido um deploy.) Confira/reaplique no app.'); } } catch { /* */ }
     try { db.prepare(`INSERT INTO log_vigia(id,criado_em,item,status,detalhe) VALUES(?,?,?,?,?)`).run(randomUUID(), agora(), 'checkup', s.ok ? 'ok' : 'atencao', JSON.stringify(s.itens || {})); } catch { /* */ }
   } catch { /* nunca quebra */ }
 }
