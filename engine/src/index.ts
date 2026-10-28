@@ -5566,6 +5566,23 @@ app.post('/pub/reagendar', (req, res) => {
   try { const b = req.body || {}; db.prepare(`UPDATE fila_publicacao SET data_agendada=?, status='agendado', atualizado_em=? WHERE id=?`).run(String(b.data_agendada || agora()), agora(), String(b.id || '')); res.json({ ok: true }); }
   catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+// [+cancelar-reels-teste 28/10] ADITIVO: cancela em lote os AGENDADOS de "Reels de teste" (onedrive_ref com
+// Reels-de-teste) que na nuvem viram reel normal e duplicam no Instagram. Reversível via /pub/reagendar.
+// body: { dry?:true } só conta sem cancelar; { projeto? } restringe (teclado/baixo/violao/comunidade).
+// Protegido pela ENGINE_API_KEY (rota /pub/cancelar-* não está no allowlist).
+app.post('/pub/cancelar-reels-teste', (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = b.projeto ? String(b.projeto) : '';
+    const w: string[] = ["status='agendado'", "onedrive_ref LIKE '%Reels-de-teste%'"]; const a: any[] = [];
+    if (projeto) { w.push('projeto=?'); a.push(projeto); }
+    const cond = w.join(' AND ');
+    const n = (db.prepare(`SELECT COUNT(*) n FROM fila_publicacao WHERE ${cond}`).get(...a) as any)?.n || 0;
+    if (b.dry) return res.json({ ok: true, dry: true, encontrados: n });
+    const r = db.prepare(`UPDATE fila_publicacao SET status='cancelado', atualizado_em=? WHERE ${cond}`).run(agora(), ...a);
+    res.json({ ok: true, cancelados: (r as any).changes, encontrados: n });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
 
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
