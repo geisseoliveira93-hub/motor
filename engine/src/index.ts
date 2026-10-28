@@ -5633,10 +5633,12 @@ app.post('/pub/youtube/testar-navegador', async (req, res) => {
     if (!arquivo && b.url && /^https?:\/\//i.test(String(b.url))) {
       const url = String(b.url);
       baixadoTmp = '/tmp/yt-teste-' + Date.now() + '.mp4';
+      const _httpsMod: any = await import('node:https');
+      const _httpMod: any = await import('node:http');
+      const _dl: any = url.toLowerCase().startsWith('https') ? (_httpsMod.default || _httpsMod) : (_httpMod.default || _httpMod);
       await new Promise<void>((resolve, reject) => {
-        const mod = url.toLowerCase().startsWith('https') ? require('https') : require('http');
         const out = fs.createWriteStream(baixadoTmp as string);
-        mod.get(url, (r: any) => {
+        _dl.get(url, (r: any) => {
           if (r.statusCode && r.statusCode >= 400) { reject(new Error('download HTTP ' + r.statusCode)); return; }
           r.pipe(out);
           out.on('finish', () => out.close(() => resolve()));
@@ -5646,7 +5648,7 @@ app.post('/pub/youtube/testar-navegador', async (req, res) => {
     }
     if (!arquivo) return res.status(400).json({ ok: false, erro: 'informe arquivo (caminho no servidor) ou url' });
 
-    const mod = require('./yt-browser-nuvem');
+    const mod: any = await import('./yt-browser-nuvem');
     const r = await mod.publicarYoutubeNuvem({
       projeto,
       arquivo,
