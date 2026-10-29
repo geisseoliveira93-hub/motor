@@ -1701,6 +1701,21 @@ app.post('/flows/recup/disparar', (req, res) => {
     const b = req.body || {};
     const telefone = String(b.telefone || '').replace(/\D/g, '');
     if (!telefone) return res.status(400).json({ ok: false, erro: 'telefone_obrigatorio' });
+    // [+recup-teste-projeto 29/10] ADITIVO: com body.projeto (baixo/violao/teclado/comunidade), dispara a recuperação
+    // GENÉRICA daquele projeto (CONFIG.recuperacaoFluxo[projeto]) com a chave 'recuperacao-<projeto>' e a instância certa.
+    // Serve pra TESTAR/forçar a recuperação de qualquer instrumento. Sem projeto = comportamento antigo (dedilhados).
+    {
+      const _projTeste = (b.projeto && String(b.projeto).trim()) ? String(b.projeto).trim().toLowerCase() : '';
+      if (_projTeste) {
+        const _fluxoP = ((CONFIG.recuperacaoFluxo as any) || {})[_projTeste];
+        if (!Array.isArray(_fluxoP) || !_fluxoP.length) return res.status(400).json({ ok: false, erro: 'sem_fluxo_recuperacao_para_' + _projTeste });
+        const _nomeP = b.nome ? String(b.nome) : undefined;
+        const _instP = (b.instancia && String(b.instancia).trim()) ? String(b.instancia).trim() : (((((CONFIG as any).numeroRecuperacao) || {})[_projTeste]) || undefined);
+        const _cidP = upsertContato(_projTeste, telefone, _nomeP, undefined, 'recup-manual');
+        enfileirarFluxo(_projTeste as Projeto, telefone, _fluxoP, _primeiroNomeBonito(_nomeP), undefined, _instP, 'recuperacao-' + _projTeste);
+        return res.json({ ok: true, enfileirado: true, projeto: _projTeste, instancia: _instP || null, chave: 'recuperacao-' + _projTeste, contatoId: _cidP });
+      }
+    }
     const inst = (b.instancia && String(b.instancia).trim()) ? String(b.instancia).trim() : _RECUP_DED_INST;
     const nome = b.nome ? String(b.nome) : undefined;
     const cid = upsertContato('teclado', telefone, nome, undefined, 'recup-manual');
