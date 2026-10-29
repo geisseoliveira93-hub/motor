@@ -266,7 +266,7 @@ type FluxoPasso = {
 // o fluxo escolhido. Serve pra "integrar o fluxo à entrega do produto que eu quiser".
 // chamarPeloNome: liga/desliga o uso do nome da pessoa na mensagem (padrão: ligado).
 // nomeFallback: o que usar no lugar do nome quando NÃO há nome (ou quando está desligado).
-type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[]; chamarPeloNome?: boolean; nomeFallback?: string; instancia?: string; pausado?: boolean };
+type FluxoProduto = { chave: string; porId?: boolean; projeto?: Projeto; fluxo: FluxoPasso[]; chamarPeloNome?: boolean; nomeFallback?: string; instancia?: string; pausado?: boolean; agente?: string };
 
 type Config = {
   // Mapa de produto (id OU nome, em minúsculas) -> projeto.
@@ -285,6 +285,7 @@ type Config = {
   // um fluxo pro projeto, ele é usado NO LUGAR da mensagem simples de entrega/recuperação.
   entregaFluxo?: Partial<Record<Projeto, FluxoPasso[]>>;
   recuperacaoFluxo?: Partial<Record<Projeto, FluxoPasso[]>>;
+  recuperacaoFluxoProduto?: FluxoProduto[];
   // (Opcional) FLUXOS por PRODUTO (ex.: um low-ticket que entrega o ebook direto no WhatsApp).
   // Tem prioridade sobre o fluxo do projeto. Casa pelo nome (padrão) ou por id (porId:true).
   entregaFluxoProduto?: FluxoProduto[];
@@ -443,6 +444,41 @@ function sincronizarFluxosEntregaBoot(): void {
   } catch (e: any) { console.log('[entrega-perm] erro no boot (seguindo sem travar):', e?.message || e); }
 }
 sincronizarFluxosEntregaBoot();
+
+// ===== [recup-produto] Recuperação POR PRODUTO (espelha fluxos_entrega). ADITIVO. =====
+db.exec(`CREATE TABLE IF NOT EXISTS fluxos_recuperacao (
+  chave TEXT NOT NULL,
+  por_id INTEGER NOT NULL DEFAULT 0,
+  dados TEXT NOT NULL,
+  atualizado_em TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (chave, por_id)
+)`);
+function persistirFluxoRecup(fp: FluxoProduto): void {
+  try {
+    db.prepare(
+      `INSERT INTO fluxos_recuperacao(chave, por_id, dados, atualizado_em)
+       VALUES(?, ?, ?, datetime('now'))
+       ON CONFLICT(chave, por_id) DO UPDATE SET dados = excluded.dados, atualizado_em = excluded.atualizado_em`
+    ).run(fp.chave, fp.porId ? 1 : 0, JSON.stringify(fp));
+  } catch { /* best-effort */ }
+}
+function removerFluxoRecupDb(chave: string): void {
+  try { db.prepare(`DELETE FROM fluxos_recuperacao WHERE lower(chave) = lower(?)`).run(chave); } catch { /* best-effort */ }
+}
+function sincronizarFluxosRecupBoot(): void {
+  try {
+    const rows = db.prepare(`SELECT dados FROM fluxos_recuperacao`).all() as { dados: string }[];
+    if (rows.length) {
+      const daTabela: FluxoProduto[] = [];
+      for (const r of rows) { try { daTabela.push(JSON.parse(r.dados) as FluxoProduto); } catch { /* ignora */ } }
+      if (daTabela.length) { CONFIG.recuperacaoFluxoProduto = daTabela; console.log('[recup-perm] recuperações por produto carregadas da tabela:', daTabela.length); }
+    } else if (Array.isArray(CONFIG.recuperacaoFluxoProduto) && CONFIG.recuperacaoFluxoProduto.length) {
+      for (const fp of CONFIG.recuperacaoFluxoProduto) persistirFluxoRecup(fp);
+    }
+  } catch { /* best-effort */ }
+}
+sincronizarFluxosRecupBoot();
+// ===== fim [recup-produto] =====
 
 // ----------------------- [entrega-tags] Ignorar teste + Tags automáticas de compra (padrão Sellflux) -----------------------
 const LINK_CADEMI_GENERICO = 'https://melodiaseriffs.cademi.com.br';
@@ -637,6 +673,52 @@ function _handoffRecupDedilhados(projeto: string, contatoId: string, telefone: s
     const _ct = db.prepare(`SELECT nome FROM contatos WHERE id=?`).get(contatoId) as any;
     processarMensagemAgente(projeto, String(telefone), String(ultimaMsg || ''), (_ct && _ct.nome) || undefined, contatoId, { instancia: instancia || undefined, ativacaoManual: true }).catch(() => { /* */ });
   } catch { /* best-effort: handoff nunca quebra o webhook */ }
+}
+
+// [recup-produto] handoff genérico: lead respondeu na recuperação por produto -> cancela pendentes + agente assume
+function _recupProdutoChaves(): string[] {
+  return (CONFIG.recuperacaoFluxoProduto || []).map((f) => String(f.chave || '').toLowerCase()).filter(Boolean);
+}
+function _recupProdutoPendenteChave(telefone: string): string | null {
+  try {
+    const chaves = _recupProdutoChaves();
+    if (!chaves.length) return null;
+    const rows = db.prepare(`SELECT DISTINCT fluxo_chave FROM fila_envio WHERE para=? AND status='pendente' AND fluxo_chave IS NOT NULL`).all(String(telefone)) as any[];
+    for (const r of rows) { const fc = String(r.fluxo_chave || '').toLowerCase(); if (fc && chaves.includes(fc)) return fc; }
+    return null;
+  } catch { return null; }
+}
+function _recupProdutoCancelarPendentes(telefone: string, chave: string): number {
+  try { return Number((db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE para=? AND fluxo_chave=? AND status='pendente'`).run(String(telefone), String(chave)) as any)?.changes || 0); } catch { return 0; }
+}
+function _handoffRecupProduto(projeto: string, contatoId: string, telefone: string, ultimaMsg: string, chave: string, instancia?: string): void {
+  try {
+    const fp = (CONFIG.recuperacaoFluxoProduto || []).find((f) => String(f.chave || '').toLowerCase() === String(chave).toLowerCase());
+    const nomeAgente = fp && fp.agente ? String(fp.agente) : '';
+    if (!nomeAgente) return;
+    const a = (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE projeto=? AND lower(nome)=lower(?) LIMIT 1`).get(projeto, nomeAgente) as any)
+      || (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE lower(nome)=lower(?) LIMIT 1`).get(nomeAgente) as any);
+    if (!a) return;
+    try { db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(contatoId, a.id, 'handoff-recup-produto', agora()); } catch { /* */ }
+    try { const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(contatoId) as any; if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id); } catch { /* */ }
+    const _ct = db.prepare(`SELECT nome FROM contatos WHERE id=?`).get(contatoId) as any;
+    processarMensagemAgente(projeto, String(telefone), String(ultimaMsg || ''), (_ct && _ct.nome) || undefined, contatoId, { instancia: instancia || undefined, ativacaoManual: true }).catch(() => { /* */ });
+  } catch { /* best-effort: handoff nunca quebra o webhook */ }
+}
+
+// [vol2] entrega automática do order bump Vol 2 (baixo) — só quem comprou a oferta 299c395a
+const _VOL2_OFERTA_TAG = 'oferta-299c395a-702d-4bec-aa34-9d4aa6926c0b';
+const _VOL2_CHAVE = 'combo-baixo-vol2';
+function _entregarVol2SeComprou(projeto: string, telefone: string, nome: string | undefined, tagsAplicadas: string[]): void {
+  try {
+    if (projeto !== 'baixo') return;
+    const casou = (tagsAplicadas || []).some((t) => String(t || '').toLowerCase().includes(_VOL2_OFERTA_TAG));
+    if (!casou) return;
+    const fp = (CONFIG.entregaFluxoProduto || []).find((f) => String(f.chave || '').toLowerCase() === _VOL2_CHAVE);
+    if (!fp || !Array.isArray(fp.fluxo) || !fp.fluxo.length) return;
+    try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave=? LIMIT 1`).get(String(telefone), _VOL2_CHAVE)) return; } catch { /* */ }
+    enfileirarFluxo(projeto as Projeto, String(telefone), fp.fluxo, nome, { chamarPeloNome: fp.chamarPeloNome, nomeFallback: fp.nomeFallback }, fp.instancia || undefined, _VOL2_CHAVE);
+  } catch { /* best-effort: nunca quebra a entrega padrão */ }
 }
 
 // ===================== [+combo-baixo 29/10] Fluxo do botão WhatsApp "Combo de Cifras" do Baixo =====================
@@ -853,6 +935,38 @@ async function _simularPresenca(inst: string, para: string, modo: 'composing' | 
 }
 
 /** Envia texto por um número do projeto (pega o 1º conectado como padrão). */
+// [utm-dinamico] pega o utm/fbclid salvos no contato (por telefone) — mais recente com utm_source
+function _utmDoContatoTel(projeto: string, telefone: string): any | null {
+  try {
+    const t = String(telefone || '').replace(/\D/g, ''); if (!t) return null;
+    let c = db.prepare(`SELECT utm_source,utm_campaign,utm_medium,utm_content,utm_term,utm_fbclid,utm_gclid FROM contatos WHERE projeto=? AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','')=? AND utm_source IS NOT NULL AND utm_source<>'' ORDER BY criado_em DESC LIMIT 1`).get(projeto, t) as any;
+    if (!c) { const fim = t.slice(-8); c = db.prepare(`SELECT utm_source,utm_campaign,utm_medium,utm_content,utm_term,utm_fbclid,utm_gclid FROM contatos WHERE projeto=? AND utm_source IS NOT NULL AND utm_source<>'' AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? ORDER BY criado_em DESC LIMIT 1`).get(projeto, '%' + fim) as any; }
+    return (c && c.utm_source) ? c : null;
+  } catch { return null; }
+}
+// [utm-dinamico] reescreve os links de checkout da LastLink no texto com o utm do lead (override). Sem utm salvo -> texto intacto.
+function _tracarCheckoutUTM(projeto: string, telefone: string, texto: string): string {
+  try {
+    const s = String(texto || '');
+    if (!/lastlink\.com/i.test(s) || !/checkout/i.test(s)) return s;
+    const utm = _utmDoContatoTel(projeto, telefone);
+    if (!utm) return s;
+    return s.replace(/https?:\/\/[^\s]*lastlink\.com[^\s]*/gi, (raw) => {
+      const m = raw.match(/^(.*?)([)\].,;!?]*)$/); const url0 = m ? m[1] : raw; const tail = m ? m[2] : '';
+      try {
+        const u = new URL(url0);
+        if (utm.utm_source) u.searchParams.set('utm_source', String(utm.utm_source));
+        if (utm.utm_medium) u.searchParams.set('utm_medium', String(utm.utm_medium));
+        if (utm.utm_campaign) u.searchParams.set('utm_campaign', String(utm.utm_campaign));
+        if (utm.utm_content) u.searchParams.set('utm_content', String(utm.utm_content));
+        if (utm.utm_term) u.searchParams.set('utm_term', String(utm.utm_term));
+        if (utm.utm_fbclid) u.searchParams.set('fbclid', String(utm.utm_fbclid));
+        if (utm.utm_gclid) u.searchParams.set('gclid', String(utm.utm_gclid));
+        return u.toString() + tail;
+      } catch { return raw; }
+    });
+  } catch { return texto; }
+}
 async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string) {
   // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
   const inst = instancia || numeroConectado(projeto)?.instancia;
@@ -1649,6 +1763,7 @@ app.get('/flows', (_req, res) => {
     entregaFluxoProduto: CONFIG.entregaFluxoProduto || [],
     entregaFluxo: CONFIG.entregaFluxo || {},
     recuperacaoFluxo: CONFIG.recuperacaoFluxo || {},
+    recuperacaoFluxoProduto: CONFIG.recuperacaoFluxoProduto || [],
   });
 });
 
@@ -1688,12 +1803,14 @@ app.post('/flows/recuperacao-produto', (req, res) => {
   if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
   const item: any = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
     chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined),
-    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined) };
+    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined),
+    agente: (b.agente != null && String(b.agente).trim() ? String(b.agente).trim() : undefined) };
   const lista = (CONFIG as any).recuperacaoFluxoProduto || [];
   const i = lista.findIndex((f: any) => String(f.chave).toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
   if (i >= 0) lista[i] = item; else lista.push(item);
   (CONFIG as any).recuperacaoFluxoProduto = lista;
   salvarConfig();
+  persistirFluxoRecup(item as FluxoProduto); // [recup-perm] grava na tabela (sobrevive ao deploy)
   res.json({ ok: true, total: lista.length, item });
 });
 app.post('/flows/recuperacao-produto/remover', (req, res) => {
@@ -1702,6 +1819,7 @@ app.post('/flows/recuperacao-produto/remover', (req, res) => {
   const antes = ((CONFIG as any).recuperacaoFluxoProduto || []).length;
   (CONFIG as any).recuperacaoFluxoProduto = ((CONFIG as any).recuperacaoFluxoProduto || []).filter((f: any) => String(f.chave).toLowerCase() !== chave);
   salvarConfig();
+  removerFluxoRecupDb(chave); // [recup-perm] remove também da tabela
   res.json({ ok: true, removidos: antes - ((CONFIG as any).recuperacaoFluxoProduto || []).length });
 });
 
@@ -3635,6 +3753,13 @@ app.post('/webhook/evolution', (req, res) => {
             else if (_recupDedPendentes(telefone) > 0) { _recupDedCancelarPendentes(telefone); _handoffRecupDedilhados(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela msg 2/3 + passa pro agente
           } catch { /* best-effort: nunca quebra o webhook */ }
         }
+        // [recup-produto] lead respondeu numa recuperação por produto -> cancela pendentes + agente assume
+        if (!ehGrupo) {
+          try {
+            const _chaveRec = _recupProdutoPendenteChave(telefone);
+            if (_chaveRec) { _recupProdutoCancelarPendentes(telefone, _chaveRec); _handoffRecupProduto(projeto, cid, telefone, texto, _chaveRec, String(ev.instance || '')); }
+          } catch { /* best-effort: nunca quebra o webhook */ }
+        }
         // [+combo-baixo 29/10] gatilho por FRASE do botão WhatsApp do Baixo + PARADA automática (só baixo, 1-a-1, nunca grupo)
         if (!ehGrupo && projeto === 'baixo') {
           try {
@@ -3842,6 +3967,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         // [tags-auto] tags da trilha do produto principal (low-ticket / qualificar-24h / comprou-low-*).
         try { for (const tg of _produtoTags(p.produtoId, p.produtoNome)) aplicarTag(projeto, cid, tg); } catch { /* best-effort */ }
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        try { _entregarVol2SeComprou(projeto, p.telefone, p.nome, tagsCompraAuto(provider, b, p)); } catch { /* vol2 best-effort */ }
         // [+vendas-recuperacao 29/10] se essa venda veio de quem estava em recuperação, registra com a origem (whatsapp/checkout).
         try { _registrarVendaRecuperacao(provider, p, projeto); } catch { /* best-effort: nunca quebra a entrega */ }
         // [motor2] Trilha por produto + order bump/upsell. INERTE até pubFlag('motor2_ativo')==='1'.
@@ -4031,7 +4157,7 @@ async function tickFila() {
         const tipo = item.tipo || 'texto';
         // [num-escolha] respeita o número de envio gravado na fila (item.instancia); sem ele, usa o padrão do projeto.
         if (tipo === 'texto') {
-          await enviarTexto(item.projeto, item.para, item.texto || '', item.instancia || undefined);
+          await enviarTexto(item.projeto, item.para, _tracarCheckoutUTM(item.projeto, item.para, item.texto || ''), item.instancia || undefined);
         } else {
           await enviarMidia(item.projeto, item.para, tipo, item.url || '', item.legenda || '', item.instancia || undefined);
         }
@@ -4657,7 +4783,7 @@ async function processarMensagemAgente(projeto: string, telefone: string, texto:
       if (conteudo) {
         historico.push({ role: 'assistant', content: conteudo });
         respostasEnviadas.push(conteudo);
-        if (!teste && !(opts && opts.naoEnviar)) { try { await enviarTexto(projeto as any, telefone, conteudo, (opts && opts.instancia) ? String(opts.instancia) : undefined); } catch (e) { console.log('[agente] enviarTexto falhou', e); } }
+        if (!teste && !(opts && opts.naoEnviar)) { try { await enviarTexto(projeto as any, telefone, _tracarCheckoutUTM(projeto, telefone, conteudo), (opts && opts.instancia) ? String(opts.instancia) : undefined); } catch (e) { console.log('[agente] enviarTexto falhou', e); } }
       }
       break; // sem tool_calls => fim do turno
     }
