@@ -8316,7 +8316,16 @@ async function pbPostarItem(item: any): Promise<void> {
   const formato = String(item.formato || 'vertical');
   const titulo = item.titulo || (item.arquivo_nome ? item.arquivo_nome.replace(/\.[^.]+$/, '') : 'Sem título');
   const descYt = item.descricao || '';
-  const captionSocial = item.descricao_social || item.descricao || '';
+  let captionSocial = item.descricao_social || item.descricao || '';
+  // [+legenda-social-nuvem 29/10] Se o item veio SEM legenda própria, usa o template social do canal
+  // (descricao_social_template) — igual o app faz no IG/FB/TikTok. Corrige os posts que saíam sem legenda.
+  if (!String(item.descricao_social || '').trim()) {
+    try {
+      const _cNuvem = pbCanal(canalId);
+      const _tplSocial = _cNuvem && _cNuvem.descricao_social_template ? String(_cNuvem.descricao_social_template).trim() : '';
+      if (_tplSocial) captionSocial = _tplSocial;
+    } catch { /* mantém o fallback antigo */ }
+  }
   const ehVertical = (formato === 'vertical' || formato === 'reels' || formato === 'stories');
 
   // baixa a mídia principal (carrossel é pasta -> trata à parte)
