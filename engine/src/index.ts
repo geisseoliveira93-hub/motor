@@ -11327,6 +11327,26 @@ async function _tgrFinalizar(chatId: any, pend: any): Promise<void> {
     try { _rclone(['copyto', src, _odRemotePath(rel)], { timeoutMs: 600000 }); oks.push(rel); }
     catch (e: any) { errs.push(inst.nome + ': ' + String((e && e.message) || e).slice(0, 80)); }
   }
+  // [+tg-story-autopost 29/10] ADITIVO: story recebido pelo Telegram -> posta no Instagram Stories na hora,
+  // direto da nuvem (reusa a fila do publicador e o uploader de IG Stories ja testado). 1 item por instrumento,
+  // prioridade alta pra nao esperar atras da fila, data=agora. So Instagram (FB Stories ainda nao suportado = PULAR).
+  if (tipo.k === 'story' && oks.length) {
+    const _tgCanalStory: Record<string, string> = { tec: 'teclado', bax: 'baixo', vio: 'violao', har: 'comunidade' };
+    let _nStory = 0;
+    for (const inst of instrs) {
+      const relS = `${inst.pasta}/${tipo.pasta}/${nome}`;
+      if (!oks.includes(relS)) continue;
+      const canalS = _tgCanalStory[inst.k] || '';
+      if (!canalS) continue;
+      try {
+        const idS = 'tgstory-' + Date.now() + '-' + inst.k + '-' + Math.random().toString(36).slice(2, 7);
+        db.prepare(`INSERT INTO fila_publicacao(id,canal_id,projeto,onedrive_ref,onedrive_item_id,arquivo_nome,thumb_ref,formato,plataformas_json,titulo,descricao,descricao_social,data_agendada,status,prioridade,trial_reels,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(idS, canalS, canalS, relS, null, nome, null, 'stories', JSON.stringify(['instagram']), '', '', '', new Date().toISOString(), 'agendado', 5, 0, agora(), agora());
+        _nStory++;
+      } catch { /* */ }
+    }
+    if (_nStory > 0) await _tgrSend(chatId, `📸 Coloquei pra postar no <b>Instagram Stories</b> agora (${_nStory} ${_nStory === 1 ? 'conta' : 'contas'}). Sai em instantes.`);
+  }
   try { if (tmpNosso) fs.unlinkSync(tmpNosso); } catch { /* */ }
   try { if (tmpTexto) fs.unlinkSync(tmpTexto); } catch { /* */ }
   try { if (baixado.localPath) fs.unlinkSync(baixado.localPath); } catch { /* */ }
