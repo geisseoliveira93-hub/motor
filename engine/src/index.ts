@@ -2363,7 +2363,28 @@ app.post('/vendas-recuperacao/reconciliar', (req, res) => {
           .run(id, String(r.pedido || ''), String(r.projeto || ''), String(r.produto || ''), bucket, tel, Number(r.valor || 0), origem, '', String(r.provider || ''), String(r.criado_em || agora()), cl);
       }
     }
-    res.json({ ok: true, dry: !confirmar, dias, candidatos: rows.length, achadas_recuperacao: achadas.length, jaExistia, naoRecup, semTelefone, achadas });
+    // [+manual 29/10] registro MANUAL por pedido — quando o dono confirma a origem que o log automático não captou.
+    // Só com confirmar:true. body.manuais = [{ pedido, origem?('whatsapp'|'checkout'), valor? }]. Puxa a venda de transacoes.
+    const manuaisOut: any[] = [];
+    if (confirmar && Array.isArray(b.manuais)) {
+      for (const m of b.manuais) {
+        try {
+          const ped = String((m && m.pedido) || '').trim(); if (!ped) continue;
+          const orig = (String((m && m.origem) || 'whatsapp').toLowerCase() === 'checkout') ? 'checkout' : 'whatsapp';
+          const t = db.prepare(`SELECT tr.id pedido, tr.projeto, tr.produto, tr.valor, tr.provider, tr.criado_em, c.telefone telefone FROM transacoes tr LEFT JOIN contatos c ON c.id=tr.contato_id WHERE tr.id=? LIMIT 1`).get(ped) as any;
+          if (!t) { manuaisOut.push({ pedido: ped, erro: 'transacao_nao_encontrada' }); continue; }
+          const id = String(t.provider || '') + ':' + String(t.pedido || '');
+          if (db.prepare(`SELECT 1 FROM vendas_recuperacao WHERE id=? LIMIT 1`).get(id) as any) { manuaisOut.push({ pedido: ped, status: 'ja_existia' }); continue; }
+          const bucket = _recProdutoBucket(String(t.produto || '') || String(t.projeto || ''));
+          let cl = ''; try { cl = new Date(new Date(String(t.criado_em)).getTime() - 3 * 3600000).toISOString().slice(0, 10); } catch { cl = String(t.criado_em || '').slice(0, 10); }
+          const valor = (m && m.valor !== undefined) ? Number(m.valor) : Number(t.valor || 0);
+          db.prepare(`INSERT OR IGNORE INTO vendas_recuperacao(id,pedido,projeto,produto,produto_bucket,telefone,valor,origem,fluxo_chave,provider,criado_em,criado_local) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(id, String(t.pedido || ''), String(t.projeto || ''), String(t.produto || ''), bucket, String(t.telefone || ''), valor, orig, 'manual', String(t.provider || ''), String(t.criado_em || agora()), cl);
+          manuaisOut.push({ pedido: ped, bucket, valor, origem: orig, criado_local: cl, status: 'inserido' });
+        } catch (e: any) { manuaisOut.push({ pedido: String((m && m.pedido) || ''), erro: String(e && e.message || e) }); }
+      }
+    }
+    res.json({ ok: true, dry: !confirmar, dias, candidatos: rows.length, achadas_recuperacao: achadas.length, jaExistia, naoRecup, semTelefone, achadas, manuais: manuaisOut });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
