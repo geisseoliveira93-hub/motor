@@ -1867,12 +1867,26 @@ app.get('/flows/motor', (_req, res) => {
       ],
       fluxo: _recupDedFluxoAtual(),
     };
+    // [+fixo-combo-baixo 29/10] expõe o fluxo fixo do COMBO DE CIFRAS BAIXO (botão "pack do baixista")
+    // pra ele aparecer como card no construtor de fluxos do app (igual o fixo do dedilhados).
+    const fixoCombo = {
+      chave: _COMBO_BX_CHAVE, kind: 'fixo',
+      titulo: 'Combo de Cifras Baixo — Botão WhatsApp', projeto: 'baixo',
+      instancia: _COMBO_BX_INST, trigger: _COMBO_BX_FRASE, tag: _COMBO_BX_TAG,
+      agente: _COMBO_BX_AGENTE, checkout: _COMBO_BX_CKT,
+      editado: false,
+      stops: [
+        { ic: '✋', t: 'Se a pessoa RESPONDER', d: 'Cancela as mensagens pendentes e passa pro agente "' + _COMBO_BX_AGENTE + '".' },
+        { ic: '🛒', t: 'Se a pessoa COMPRAR', d: 'Cancela as mensagens pendentes na hora.' },
+      ],
+      fluxo: _comboBxFluxoAtual(),
+    };
     res.json({
       ok: true,
       produto: (CONFIG.entregaFluxoProduto || []),
       entregaProjeto: (CONFIG.entregaFluxo || {}),
       recuperacaoProjeto: (CONFIG.recuperacaoFluxo || {}),
-      fixos: [fixoDed],
+      fixos: [fixoDed, fixoCombo],
       presencaSimulada: _presencaLigada(),
     });
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
