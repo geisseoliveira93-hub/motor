@@ -2774,8 +2774,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS webhook_pagamento_log (id TEXT PRIMARY
 // [+vendas-recuperacao 29/10] registra a venda que foi recuperada (pessoa estava num fluxo de recuperação e comprou),
 // com a ORIGEM (whatsapp = recebeu nossa mensagem de recuperação; checkout = estava em recuperação mas voltou sozinho).
 // Só ADICIONA — a tabela transacoes continua intacta; isto é uma camada paralela só pra atribuição/painel.
-try { db.exec(`CREATE TABLE IF NOT EXISTS vendas_recuperacao (id TEXT PRIMARY KEY, pedido TEXT, projeto TEXT, produto TEXT, produto_bucket TEXT, telefone TEXT, valor REAL DEFAULT 0, origem TEXT, fluxo_chave TEXT, provider TEXT, criado_em TEXT)`); } catch { /* existe */ }
+try { db.exec(`CREATE TABLE IF NOT EXISTS vendas_recuperacao (id TEXT PRIMARY KEY, pedido TEXT, projeto TEXT, produto TEXT, produto_bucket TEXT, telefone TEXT, valor REAL DEFAULT 0, origem TEXT, fluxo_chave TEXT, provider TEXT, criado_em TEXT, criado_local TEXT)`); } catch { /* existe */ }
+try { db.exec(`ALTER TABLE vendas_recuperacao ADD COLUMN criado_local TEXT`); } catch { /* existe */ }
 try { db.exec(`CREATE INDEX IF NOT EXISTS ix_vrec_criado ON vendas_recuperacao(criado_em)`); } catch { /* existe */ }
+try { db.exec(`CREATE INDEX IF NOT EXISTS ix_vrec_local ON vendas_recuperacao(criado_local)`); } catch { /* existe */ }
+// data-calendário de Brasília (UTC-3, sem horário de verão no Brasil) no formato YYYY-MM-DD — pro filtro do painel bater com o "Hoje" que o Ezequias vê.
+function _dataBrasilia(): string { try { return new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10); } catch { return agora().slice(0, 10); } }
 // bucket de produto igual ao do painel (_pnlProduto), mas top-level pra usar no webhook também.
 function _recProdutoBucket(nome: string): string {
   const t = String(nome || '').toLowerCase();
@@ -2803,8 +2807,8 @@ function _registrarVendaRecuperacao(provider: string, p: any, projeto: string) {
     const prodNome = String(p.produtoNome || p.produto || '');
     const bucket = _recProdutoBucket(prodNome || projeto);
     const id = String(provider || '') + ':' + String(p.pedido || randomUUID());
-    db.prepare(`INSERT OR IGNORE INTO vendas_recuperacao(id,pedido,projeto,produto,produto_bucket,telefone,valor,origem,fluxo_chave,provider,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, String(p.pedido || ''), projeto, prodNome, bucket, tel, Number(p.valor || 0), origem, '', provider, agora());
+    db.prepare(`INSERT OR IGNORE INTO vendas_recuperacao(id,pedido,projeto,produto,produto_bucket,telefone,valor,origem,fluxo_chave,provider,criado_em,criado_local) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, String(p.pedido || ''), projeto, prodNome, bucket, tel, Number(p.valor || 0), origem, '', provider, agora(), _dataBrasilia());
   } catch { /* best-effort: nunca quebra a entrega */ }
 }
 function _utmDoPayload(b: any): any {
@@ -14887,9 +14891,9 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       // do que a Meta atribui — sem dupla contagem. A seção "Vendas de recuperação" do painel mostra o detalhe.
       const _recByProd: Record<string, any> = {};
       try {
-        const _deISO = deFinal + 'T00:00:00';
-        const _ateISO = ateFinal + 'T23:59:59';
-        const _rrows = db.prepare(`SELECT produto_bucket b, origem, COUNT(*) n, COALESCE(SUM(valor),0) v FROM vendas_recuperacao WHERE criado_em>=? AND criado_em<=? GROUP BY produto_bucket, origem`).all(_deISO, _ateISO) as any[];
+        // filtra pela DATA DE BRASÍLIA (criado_local, YYYY-MM-DD) — bate com o "Hoje"/período que o Ezequias vê.
+        // Fallback p/ linhas antigas sem criado_local: usa os 10 primeiros chars de criado_em (data UTC).
+        const _rrows = db.prepare(`SELECT produto_bucket b, origem, COUNT(*) n, COALESCE(SUM(valor),0) v FROM vendas_recuperacao WHERE COALESCE(criado_local, substr(criado_em,1,10)) >= ? AND COALESCE(criado_local, substr(criado_em,1,10)) <= ? GROUP BY produto_bucket, origem`).all(deFinal, ateFinal) as any[];
         for (const r of _rrows) {
           const b = String(r.b || 'Outros');
           const o = _recByProd[b] || (_recByProd[b] = { total: 0, wa: 0, ck: 0, fat: 0 });
