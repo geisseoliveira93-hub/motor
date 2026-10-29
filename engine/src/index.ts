@@ -2325,6 +2325,40 @@ app.post('/transacao', (req, res) => {
   res.json({ ok: true, id });
 });
 app.post('/transacao/remover', (req, res) => { db.prepare(`DELETE FROM transacoes WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true }); });
+// [+vendas-recuperacao 29/10] Reconciliação: re-escaneia vendas APROVADAS (status 'liquidada') recentes e registra em
+// vendas_recuperacao as que estavam em fluxo de recuperação, com a origem detectada (whatsapp/checkout) e a DATA ORIGINAL.
+// Idempotente (não duplica por provider:pedido). Serve pra BACKFILL das vendas antigas e p/ cobrir eventual falha de webhook.
+// SEM confirmar => DRY-RUN (só mostra o que acharia, não grava). Com { confirmar:true } => grava de verdade.
+app.post('/vendas-recuperacao/reconciliar', (req, res) => {
+  try {
+    const b = req.body || {};
+    const dias = Math.min(120, Math.max(1, Number(b.dias) || 7));
+    const confirmar = b.confirmar === true;
+    const minValor = (b.minValor !== undefined) ? Number(b.minValor) : 0.01; // ignora linhas de valor 0 (dupes/bumps)
+    const desde = new Date(Date.now() - dias * 86400000).toISOString();
+    const rows = db.prepare(`SELECT tr.id pedido, tr.projeto, tr.produto, tr.valor, tr.provider, tr.criado_em, c.telefone telefone
+      FROM transacoes tr LEFT JOIN contatos c ON c.id=tr.contato_id
+      WHERE tr.status='liquidada' AND tr.criado_em>=? AND tr.valor>=? ORDER BY tr.criado_em DESC LIMIT 3000`).all(desde, minValor) as any[];
+    const achadas: any[] = []; let semTelefone = 0, naoRecup = 0, jaExistia = 0;
+    for (const r of rows) {
+      const tel = String(r.telefone || '').trim(); if (!tel) { semTelefone++; continue; }
+      const emRecup = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') LIMIT 1`).get(tel) as any;
+      if (!emRecup) { naoRecup++; continue; }
+      const id = String(r.provider || '') + ':' + String(r.pedido || '');
+      if (db.prepare(`SELECT 1 FROM vendas_recuperacao WHERE id=? LIMIT 1`).get(id) as any) { jaExistia++; continue; }
+      let origem = 'checkout';
+      try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') AND status='enviado' LIMIT 1`).get(tel) as any) origem = 'whatsapp'; } catch { /* */ }
+      const bucket = _recProdutoBucket(String(r.produto || '') || String(r.projeto || ''));
+      let cl = ''; try { cl = new Date(new Date(String(r.criado_em)).getTime() - 3 * 3600000).toISOString().slice(0, 10); } catch { cl = String(r.criado_em || '').slice(0, 10); }
+      achadas.push({ pedido: String(r.pedido || ''), projeto: String(r.projeto || ''), bucket, telefone: (tel.length > 8 ? tel.slice(0, 4) + '...' + tel.slice(-4) : tel), valor: Number(r.valor || 0), origem, criado_em: r.criado_em, criado_local: cl, produto: String(r.produto || '').slice(0, 45) });
+      if (confirmar) {
+        db.prepare(`INSERT OR IGNORE INTO vendas_recuperacao(id,pedido,projeto,produto,produto_bucket,telefone,valor,origem,fluxo_chave,provider,criado_em,criado_local) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(id, String(r.pedido || ''), String(r.projeto || ''), String(r.produto || ''), bucket, tel, Number(r.valor || 0), origem, '', String(r.provider || ''), String(r.criado_em || agora()), cl);
+      }
+    }
+    res.json({ ok: true, dry: !confirmar, dias, candidatos: rows.length, achadas_recuperacao: achadas.length, jaExistia, naoRecup, semTelefone, achadas });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
 
 // ---- Relatorios / Dashboards (numeros reais dos dados do motor) ----
 app.get('/relatorios/resumo', (req, res) => {
