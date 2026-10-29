@@ -2342,12 +2342,19 @@ app.post('/vendas-recuperacao/reconciliar', (req, res) => {
     const achadas: any[] = []; let semTelefone = 0, naoRecup = 0, jaExistia = 0;
     for (const r of rows) {
       const tel = String(r.telefone || '').trim(); if (!tel) { semTelefone++; continue; }
-      const emRecup = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') LIMIT 1`).get(tel) as any;
-      if (!emRecup) { naoRecup++; continue; }
+      const compra = String(r.criado_em || '');
+      // PORTA: recup_enviada (recuperação disparada por carrinho perdido, ANTES da compra) OU fluxo de botão de recuperação.
+      const g1 = db.prepare(`SELECT MIN(criado_em) m FROM recup_enviada WHERE telefone=? AND projeto=? AND criado_em<=?`).get(tel, String(r.projeto || ''), compra) as any;
+      const temRE = !!(g1 && g1.m);
+      const g2 = temRE ? false : !!db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave IN ('combo-baixo-botao','recuperacao-dedilhados-botao') LIMIT 1`).get(tel);
+      if (!temRE && !g2) { naoRecup++; continue; }
       const id = String(r.provider || '') + ':' + String(r.pedido || '');
       if (db.prepare(`SELECT 1 FROM vendas_recuperacao WHERE id=? LIMIT 1`).get(id) as any) { jaExistia++; continue; }
       let origem = 'checkout';
-      try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') AND status='enviado' LIMIT 1`).get(tel) as any) origem = 'whatsapp'; } catch { /* */ }
+      try {
+        if (temRE) { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND status='enviado' AND criado_em>=? AND criado_em<=? LIMIT 1`).get(tel, String(g1.m), compra) as any) origem = 'whatsapp'; }
+        else { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave IN ('combo-baixo-botao','recuperacao-dedilhados-botao') AND status='enviado' LIMIT 1`).get(tel) as any) origem = 'whatsapp'; }
+      } catch { /* */ }
       const bucket = _recProdutoBucket(String(r.produto || '') || String(r.projeto || ''));
       let cl = ''; try { cl = new Date(new Date(String(r.criado_em)).getTime() - 3 * 3600000).toISOString().slice(0, 10); } catch { cl = String(r.criado_em || '').slice(0, 10); }
       achadas.push({ pedido: String(r.pedido || ''), projeto: String(r.projeto || ''), bucket, telefone: (tel.length > 8 ? tel.slice(0, 4) + '...' + tel.slice(-4) : tel), valor: Number(r.valor || 0), origem, criado_em: r.criado_em, criado_local: cl, produto: String(r.produto || '').slice(0, 45) });
@@ -2828,15 +2835,23 @@ function _recProdutoBucket(nome: string): string {
 function _registrarVendaRecuperacao(provider: string, p: any, projeto: string) {
   try {
     const tel = String(p && p.telefone || '').trim(); if (!tel) return;
-    // estava em recuperação? (qualquer fluxo 'recuperacao*' ou o combo do baixo, qualquer status — inclusive já cancelado pela entrega)
-    const emRecup = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') LIMIT 1`).get(tel) as any;
-    if (!emRecup) return; // venda normal (não veio de recuperação) — não registra aqui
-    // origem: se alguma mensagem de recuperação JÁ FOI ENVIADA pra ela (ou foi pro agente) => veio pelo WhatsApp;
-    // senão (entrou em recuperação mas comprou antes da gente mandar) => voltou pelo checkout.
+    // PORTA "estava em recuperação": marca autoritativa recup_enviada (gravada SÓ quando a recuperação dispara no
+    // webhook de carrinho perdido — nunca na entrega), OU fluxo de BOTÃO de recuperação (combo baixo / dedilhados botão).
+    const g1 = db.prepare(`SELECT MIN(criado_em) m FROM recup_enviada WHERE telefone=? AND projeto=?`).get(tel, projeto) as any;
+    const temRecupEnviada = !!(g1 && g1.m);
+    const g2 = temRecupEnviada ? false : !!db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave IN ('combo-baixo-botao','recuperacao-dedilhados-botao') LIMIT 1`).get(tel);
+    if (!temRecupEnviada && !g2) return; // venda normal (não veio de recuperação) — não registra aqui
+    // ORIGEM: WhatsApp se uma mensagem foi ENVIADA pra ela depois que a recuperação começou (nossa mensagem fez voltar);
+    // senão (abandonou e voltou sozinho antes da gente mandar) => checkout.
     let origem = 'checkout';
     try {
-      const enviou = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') AND status='enviado' LIMIT 1`).get(tel) as any;
-      if (enviou) origem = 'whatsapp';
+      if (temRecupEnviada) {
+        const enviou = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND status='enviado' AND criado_em>=? LIMIT 1`).get(tel, String(g1.m)) as any;
+        if (enviou) origem = 'whatsapp';
+      } else {
+        const enviou = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave IN ('combo-baixo-botao','recuperacao-dedilhados-botao') AND status='enviado' LIMIT 1`).get(tel) as any;
+        if (enviou) origem = 'whatsapp';
+      }
     } catch { /* */ }
     const prodNome = String(p.produtoNome || p.produto || '');
     const bucket = _recProdutoBucket(prodNome || projeto);
