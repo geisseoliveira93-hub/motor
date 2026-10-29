@@ -639,6 +639,67 @@ function _handoffRecupDedilhados(projeto: string, contatoId: string, telefone: s
   } catch { /* best-effort: handoff nunca quebra o webhook */ }
 }
 
+// ===================== [+combo-baixo 29/10] Fluxo do botão WhatsApp "Combo de Cifras" do Baixo =====================
+// Clone do fluxo do Dedilhados, pro Baixo (Pack do Baixista Iniciante). A FRASE-GATILHO no WhatsApp do Baixo ->
+// aplica tag -> dispara vídeo/áudio + oferta -> e PARA na hora se a pessoa RESPONDER (cancela pendentes + handoff
+// pro agente) ou COMPRAR (cancela pendentes). Mídia no OneDrive (Disparos WhatsApp/...), resolvida pra /media na
+// hora de montar o fluxo. PERMANENTE (fixo no código, sobrevive a deploy) e SEPARADO do CONFIG genérico.
+const _COMBO_BX_CHAVE = 'combo-baixo-botao';
+const _COMBO_BX_TAG = 'lead-combo-baixo-botao';
+const _COMBO_BX_FRASE = 'pack do baixista'; // comparado sem acento e em minúsculo
+const _COMBO_BX_INST = 'Baixo'; // número do Baixo
+const _COMBO_BX_AGENTE = 'Combo de Cifras Baixo';
+const _COMBO_BX_CKT = 'https://lastlink.com/p/C351BD2F3/checkout-payment';
+const _COMBO_BX_VIDEO_OD = 'Disparos WhatsApp/Videos/video-recuperacao-combo-baixo.mp4';
+const _COMBO_BX_AUDIO_OD = 'Disparos WhatsApp/Audios/audio-recuperacao-combo-baixo.ogg';
+const _COMBO_BX_FLUXO: FluxoPasso[] = [
+  { tipo: 'texto', delaySegundos: 0, texto: 'Oi! Que bom que você veio pela página do Pack do Baixista Iniciante 😊\nFiz esse vídeo rapidinho pra te mostrar por dentro o que você recebe.\nDá uma olhada com calma 👇' },
+  { tipo: 'video', delaySegundos: 3, legenda: '', ...( { od: _COMBO_BX_VIDEO_OD } as any) },
+  { tipo: 'texto', delaySegundos: 3, texto: 'Resumindo o que você leva 👇\n\n🎸 200 cifras simplificadas e corrigidas (100 da Harpa Cristã + 100 do Gospel)\n🎵 4 vídeo aulas dos ritmos mais usados nos louvores\n🎁 Bônus: a aula "Guia do Zero", pra você já sair tocando seu primeiro louvor\n\nTudo com acesso vitalício — é seu pra sempre, estuda no seu ritmo 🙏🏼\n\nE tá com a promoção: de R$97 por R$37 à vista, pagamento único.\n\n👉 Pra garantir o seu: ' + _COMBO_BX_CKT + '\n\nQualquer dúvida é só me chamar aqui 😊' },
+  { tipo: 'audio', delaySegundos: 10800, ...( { od: _COMBO_BX_AUDIO_OD } as any) }, // ~3h depois
+  { tipo: 'texto', delaySegundos: 3, texto: '{nome}, deixa eu tirar as dúvidas mais comuns antes de você decidir 😊\n\n❓ "Sou iniciante, nunca toquei" — é feito pra quem tá começando do zero; tem a aula Guia do Zero que já te faz tocar o primeiro louvor.\n❓ "Não tenho muito tempo" — é no seu ritmo e o acesso é vitalício, estuda quando der.\n❓ "É pra tocar na igreja?" — sim, as cifras são de louvores da Harpa e do Gospel e os ritmos são os mais usados no culto.\n\nE você ainda tem 7 dias de garantia: se não curtir, devolvo todo o valor, sem complicação.\n\n👉 ' + _COMBO_BX_CKT },
+  { tipo: 'texto', delaySegundos: 86400, janela: { de: '08:00', ate: '22:00' }, texto: 'Oi {nome}! Passando só pra lembrar que a promoção do Pack do Baixista (de R$97 por R$37) ainda tá de pé por aqui 🎸\n\nSe tá querendo tocar os louvores da igreja com mais firmeza, esse é o empurrãozinho pra começar hoje mesmo 😊\n\n👉 Garante agora o seu acesso: ' + _COMBO_BX_CKT }, // 1 dia depois, só 08-22h
+];
+// Fluxo ATUAL do combo baixo: override salvo (se houver) OU o padrão fixo; resolve od -> url (/media) na hora.
+function _comboBxFluxoAtual(): FluxoPasso[] {
+  const base = _fixoOverrideGet(_COMBO_BX_CHAVE) || _COMBO_BX_FLUXO;
+  return base.map((p) => {
+    const pod = (p as any).od || (p as any).onedrive;
+    if (p.tipo && p.tipo !== 'texto' && pod && !String(p.url || '').trim()) {
+      try { return { ...p, url: _odBaixarPub(String(pod)) }; } catch { return { ...p }; }
+    }
+    return p;
+  });
+}
+function _comboBxPendentes(telefone: string): number {
+  try { return Number((db.prepare(`SELECT COUNT(*) n FROM fila_envio WHERE para=? AND fluxo_chave=? AND status='pendente'`).get(String(telefone), _COMBO_BX_CHAVE) as any)?.n || 0); } catch { return 0; }
+}
+function _comboBxCancelarPendentes(telefone: string): number {
+  try { return Number((db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE para=? AND fluxo_chave=? AND status='pendente'`).run(String(telefone), _COMBO_BX_CHAVE) as any)?.changes || 0); } catch { return 0; }
+}
+function _iniciarComboBaixo(projeto: string, contatoId: string, telefone: string, nomeBruto?: string): boolean {
+  try {
+    // DEDUP "passa 1 vez": já tem a tag OU já existe qualquer mensagem desse fluxo p/ esse número
+    if (_contatoTemTagNome(projeto, contatoId, _COMBO_BX_TAG)) return false;
+    try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave=? LIMIT 1`).get(String(telefone), _COMBO_BX_CHAVE) as any) return false; } catch { /* */ }
+    aplicarTag(projeto, contatoId, _COMBO_BX_TAG);
+    try { rodarAutomacoes(projeto, 'tag_adicionada', { contatoId, telefone, tag: _COMBO_BX_TAG }).catch(() => { /* */ }); } catch { /* */ }
+    enfileirarFluxo(projeto as Projeto, String(telefone), _comboBxFluxoAtual(), _primeiroNomeBonito(nomeBruto), { chamarPeloNome: true, nomeFallback: '' }, _COMBO_BX_INST, _COMBO_BX_CHAVE);
+    return true;
+  } catch { return false; }
+}
+function _handoffComboBaixo(projeto: string, contatoId: string, telefone: string, ultimaMsg: string, instancia?: string): void {
+  try {
+    const a = (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE projeto=? AND lower(nome)=lower(?) LIMIT 1`).get(projeto, _COMBO_BX_AGENTE) as any)
+      || (db.prepare(`SELECT id,projeto,nome FROM agentes_ia WHERE lower(nome)=lower(?) LIMIT 1`).get(_COMBO_BX_AGENTE) as any);
+    if (!a) return; // agente não encontrado -> não faz handoff (não quebra nada)
+    try { db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(contatoId, a.id, 'handoff-combo-baixo', agora()); } catch { /* */ }
+    try { const ac = db.prepare(`SELECT id FROM agente_conversas WHERE contato_id=? ORDER BY atualizado_em DESC LIMIT 1`).get(contatoId) as any; if (ac) db.prepare(`UPDATE agente_conversas SET status='ativo', atualizado_em=? WHERE id=?`).run(agora(), ac.id); } catch { /* */ }
+    const _ct = db.prepare(`SELECT nome FROM contatos WHERE id=?`).get(contatoId) as any;
+    processarMensagemAgente(projeto, String(telefone), String(ultimaMsg || ''), (_ct && _ct.nome) || undefined, contatoId, { instancia: instancia || undefined, ativacaoManual: true }).catch(() => { /* */ });
+  } catch { /* best-effort: handoff nunca quebra o webhook */ }
+}
+
 
 /** Descobre o projeto de um pagamento pelo produto (id, nome).
  * Ordem (do mais confiável pro mais genérico):
@@ -911,6 +972,9 @@ try { db.exec(`CREATE INDEX IF NOT EXISTS ix_recup_env ON recup_enviada(telefone
 async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string, produtoId?: string, produtoNome?: string): Promise<'fluxo' | 'mensagem'> {
   // [+recup-dedilhados] se a compra é do dedilhados, cancela o fluxo de recuperação pendente (não cobrar quem já comprou)
   try { if (/dedilhado/i.test(`${produtoId || ''} ${produtoNome || ''}`)) _recupDedCancelarPendentes(String(telefone || '')); } catch { /* best-effort */ }
+  // [+recup-cancela-projeto 29/10] ao COMPRAR, cancela a recuperação pendente DO PROJETO ('recuperacao-<projeto>') e, no Baixo, o fluxo do botão combo — não cobrar/empurrar quem já comprou
+  try { db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE para=? AND fluxo_chave=? AND status='pendente'`).run(String(telefone || ''), 'recuperacao-' + projeto); } catch { /* best-effort */ }
+  try { if (projeto === 'baixo') db.prepare(`UPDATE fila_envio SET status='cancelado' WHERE para=? AND fluxo_chave=? AND status='pendente'`).run(String(telefone || ''), 'combo-baixo-botao'); } catch { /* best-effort */ }
   // Fluxo do PRODUTO (traz junto as opções de "chamar pelo nome"); senão fluxo por projeto.
   const fpProduto = produtoFluxoMatch(produtoId, produtoNome);
   // [campanhas-ativas] fluxo PAUSADO: novo comprador NÃO entra (não dispara nada deste produto).
@@ -958,7 +1022,8 @@ async function dispararRecuperacao(projeto: Projeto, telefone: string, nome?: st
   const fpRec = _recupProdutoMatch(produtoId, produtoNome);
   if (fpRec) { enfileirarFluxo(projeto, telefone, fpRec.fluxo, nome, { chamarPeloNome: fpRec.chamarPeloNome, nomeFallback: fpRec.nomeFallback }, fpRec.instancia || instRecup, fpRec.chave); return 'fluxo'; }
   const fluxo = CONFIG.recuperacaoFluxo?.[projeto];
-  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome, undefined, instRecup); return 'fluxo'; }
+  // [+recup-chave-projeto 29/10] marca a recuperação genérica com fluxo_chave 'recuperacao-<projeto>' (p/ acompanhar e cancelar por instrumento)
+  if (Array.isArray(fluxo) && fluxo.length) { enfileirarFluxo(projeto, telefone, fluxo, nome, undefined, instRecup, 'recuperacao-' + projeto); return 'fluxo'; }
   await enviarTexto(projeto, telefone, preenche(CONFIG.recuperacao[projeto], nome), instRecup).catch(() => {});
   return 'mensagem';
 }
@@ -1697,6 +1762,22 @@ app.post('/flows/produto/pausar', (req, res) => {
 });
 
 // [acompanhamento] Contadores por fluxo (p/ a aba "Campanhas ativas"): na fila / enviados / falhas por fluxo.
+// [+rotulo-fluxo 29/10] nome legível de cada fluxo_chave pra tela de acompanhamento (fallback: a própria chave bonitinha)
+function _rotuloFluxo(chave: string): string {
+  const k = String(chave || '');
+  const mapa: Record<string, string> = {
+    'recuperacao-dedilhados-botao': 'Recuperação Dedilhados (botão)',
+    'combo-baixo-botao': 'Combo de Cifras Baixo (botão)',
+    'recuperacao-teclado': 'Recuperação Teclado',
+    'recuperacao-baixo': 'Recuperação Baixo',
+    'recuperacao-violao': 'Recuperação Violão',
+    'recuperacao-comunidade': 'Recuperação Comunidade',
+    'dedilhados': 'Entrega Dedilhados',
+  };
+  if (mapa[k]) return mapa[k];
+  const bonito = k.replace(/[-_]+/g, ' ').trim();
+  return bonito ? bonito.charAt(0).toUpperCase() + bonito.slice(1) : k;
+}
 app.get('/flows/acompanhamento', (req, res) => {
   try {
     const projeto = String((req.query.projeto as string) || '').trim();
@@ -1706,7 +1787,7 @@ app.get('/flows/acompanhamento', (req, res) => {
     const map: Record<string, any> = {};
     for (const r of rows) {
       const k = String(r.fluxo_chave);
-      const o = map[k] || (map[k] = { chave: k, projeto: r.projeto, fila: 0, enviados: 0, falhas: 0, total: 0 });
+      const o = map[k] || (map[k] = { chave: k, rotulo: _rotuloFluxo(k), projeto: r.projeto, fila: 0, enviados: 0, falhas: 0, total: 0 });
       const n = Number(r.n || 0); o.total += n;
       if (r.status === 'enviado') o.enviados += n;
       else if (r.status === 'falhou') o.falhas += n;
@@ -3401,6 +3482,13 @@ app.post('/webhook/evolution', (req, res) => {
           try {
             if (_normFrase(texto).includes(_RECUP_DED_FRASE)) { _iniciarRecupDedilhados(projeto, cid, telefone, data.pushName); } // a FRASE inicia o fluxo (dedup 1x)
             else if (_recupDedPendentes(telefone) > 0) { _recupDedCancelarPendentes(telefone); _handoffRecupDedilhados(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela msg 2/3 + passa pro agente
+          } catch { /* best-effort: nunca quebra o webhook */ }
+        }
+        // [+combo-baixo 29/10] gatilho por FRASE do botão WhatsApp do Baixo + PARADA automática (só baixo, 1-a-1, nunca grupo)
+        if (!ehGrupo && projeto === 'baixo') {
+          try {
+            if (_normFrase(texto).includes(_COMBO_BX_FRASE)) { _iniciarComboBaixo(projeto, cid, telefone, data.pushName); } // a FRASE inicia o fluxo (dedup 1x)
+            else if (_comboBxPendentes(telefone) > 0) { _comboBxCancelarPendentes(telefone); _handoffComboBaixo(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela restante + passa pro agente
           } catch { /* best-effort: nunca quebra o webhook */ }
         }
       }
