@@ -900,6 +900,17 @@ function _jornadaInscrito(telefone: string): boolean {
     return !!r;
   } catch { return false; }
 }
+// [wbr 29/10] a pessoa já se inscreveu num webinário genérico (régua wbr)? Casa pelos últimos 8 dígitos do telefone, no MESMO projeto.
+function _wbrInscrito(telefone: string, projeto?: string): boolean {
+  try {
+    const t = String(telefone || '').replace(/\D/g, ''); if (t.length < 8) return false;
+    const fim = t.slice(-8); const pj = String(projeto || '').trim();
+    const r = pj
+      ? db.prepare(`SELECT 1 FROM wbr_inscritos WHERE status!='cancelado' AND projeto=? AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get(pj, '%' + fim)
+      : db.prepare(`SELECT 1 FROM wbr_inscritos WHERE status!='cancelado' AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + fim);
+    return !!r;
+  } catch { return false; }
+}
 function enfileirarFluxo(projeto: Projeto, para: string, passos: FluxoPasso[], nome?: string, opts?: OpcoesNome, instancia?: string, chave?: string) {
   // [num-escolha] instancia opcional: grava o número de envio na fila; o tickFila respeita.
   // [entrega-janela/acompanhamento] grava também janela_de/ate (janela de horário) + fluxo_chave/passo (p/ Campanhas ativas).
@@ -1141,6 +1152,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/media/')) return next(); // etapa21: mídia baixada do OneDrive, servida pra Evolution buscar (URL interna da rede docker)
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
   if (req.path.startsWith('/j/')) return next();      // [jornada 27/10] links pessoais do webinário (sala/oferta/vídeo), validados pelo token
+  if (req.path.startsWith('/r/')) return next();      // [wbr 29/10] links pessoais da régua de webinário genérica (/r/:funil/:aula|oferta/:token), validados pelo token
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   if (req.path.startsWith('/w-media/')) return next(); // [+webinario-storage] serve o vídeo próprio do webinário (OneDrive) pro player, sem x-api-key
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
@@ -4011,8 +4023,8 @@ async function tickFila() {
       // pro próximo início da janela em vez de enviar. Não conta como falha.
       if (item.janela_de && item.janela_ate && !_dentroJanela(item.janela_de, item.janela_ate)) {
         db.prepare(`UPDATE fila_envio SET agendado_para=? WHERE id=?`).run(_proximaJanelaISO(item.janela_de), item.id);
-      } else if (Number(item.pular_se_inscrito) === 1 && _jornadaInscrito(item.para)) {
-        // [+webinario-dedilhados] a pessoa já se inscreveu no webinário → não manda o lembrete (marca pulado).
+      } else if (Number(item.pular_se_inscrito) === 1 && (_jornadaInscrito(item.para) || _wbrInscrito(item.para, item.projeto))) {
+        // [+webinario-dedilhados / wbr] a pessoa já se inscreveu no webinário (Jornada OU régua genérica) → não manda o lembrete (marca pulado).
         db.prepare(`UPDATE fila_envio SET status='pulado' WHERE id=?`).run(item.id);
       } else {
       try {
@@ -15854,6 +15866,502 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
   });
 
   console.log('[jornada] régua do webinário carregada; ativo=', jAtivo());
+}
+
+// ============================================================================
+// [wbr 29/10] RÉGUA DE WEBINÁRIO GENÉRICA (multi-funil, 100% configurável no banco)
+// ----------------------------------------------------------------------------
+// ADITIVO. Espelha a mecânica da Jornada (acima), mas tudo vem de wbr_funis.cfg_json:
+// config, aulas, mensagens (DADOS, sem texto no código). Vários funis por "chave".
+// Nasce DESLIGADO e SEM funil. Links pessoais em /r/:funil/:aula|oferta/:token.
+// Novos funis (Baixo, Violão...) saem só por config, sem deploy.
+// ============================================================================
+{
+  const WJW: any = (globalThis as any).__wbJornada || {};
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wbr_funis (
+      chave TEXT PRIMARY KEY, cfg_json TEXT, ativo INTEGER DEFAULT 0, form_desde TEXT, criado_em TEXT, atualizado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS wbr_inscritos (
+      id TEXT PRIMARY KEY, funil TEXT, contato_id TEXT, projeto TEXT, telefone TEXT, email TEXT, nome TEXT,
+      inscrito_em TEXT, dia1 TEXT, token TEXT UNIQUE, repeticao INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'ativo', comprou_em TEXT, compra_id TEXT, ganhou_apostila INTEGER DEFAULT 0,
+      resposta_id TEXT, criado_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS wbr_envios (
+      id TEXT PRIMARY KEY, funil TEXT, inscrito_id TEXT, chave TEXT, canal TEXT, status TEXT,
+      tipo TEXT, texto TEXT, url TEXT, legenda TEXT, para TEXT, detalhe TEXT, instancia TEXT,
+      agendado_para TEXT, criado_em TEXT, enviado_em TEXT, tentativas INTEGER DEFAULT 0,
+      UNIQUE (inscrito_id, chave, canal)
+    );
+    CREATE INDEX IF NOT EXISTS ix_wbr_envios_fila ON wbr_envios(status, canal, agendado_para);
+    CREATE INDEX IF NOT EXISTS ix_wbr_insc_fc ON wbr_inscritos(funil, contato_id);
+  `);
+
+  // ---------------- funil (config no banco) ----------------
+  const wFunilRow = (funil: string): any => db.prepare(`SELECT * FROM wbr_funis WHERE chave=?`).get(String(funil)) as any;
+  function wCfg(funil: string): any { const r = wFunilRow(funil); if (!r) return null; let o: any = {}; try { o = JSON.parse(r.cfg_json || '{}'); } catch { o = {}; } return o; }
+
+  // ---------------- tempo (Brasília = UTC-3) ----------------
+  const BRT_MS = 3 * 3600000;
+  const wDataBRT = (ms: number): string => new Date(ms - BRT_MS).toISOString().slice(0, 10);
+  const wHoraBRT = (ms: number): number => new Date(ms - BRT_MS).getUTCHours() + new Date(ms - BRT_MS).getUTCMinutes() / 60;
+  function wEm(dia1: string, dia: number, hhmm: string): number {
+    const [y, m, d] = String(dia1).split('-').map(Number); const [hh, mm] = String(hhmm || '00:00').split(':').map(Number);
+    return Date.UTC(y, m - 1, d + (dia - 1), hh, mm, 0) + BRT_MS;
+  }
+
+  // ---------------- aulas / links ----------------
+  const wBase = (cfg: any): string => String((cfg && cfg.baseLinks) || PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
+  const wAulas = (cfg: any): any[] => (Array.isArray(cfg && cfg.aulas) && cfg.aulas.length ? cfg.aulas : [{ k: 'a1', slug: '', dur: 5400 }]);
+  const wAula = (cfg: any, k: string): any => wAulas(cfg).find((a: any) => a.k === k) || null;
+  const wAulaN = (cfg: any, k: string): number => { const i = wAulas(cfg).findIndex((a: any) => a.k === k); return i >= 0 ? i + 1 : 1; };
+  const wPrimeiraAula = (cfg: any): any => wAulas(cfg)[0] || { k: 'a1' };
+  const wUltimaAula = (cfg: any): any => { const a = wAulas(cfg); return a[a.length - 1] || { k: 'a1' }; };
+  function wDia1Para(cfg: any, ms: number): string { const h = wHoraBRT(ms); const hh = Number(String(cfg.hora || '21:00').split(':')[0]); return h < hh ? wDataBRT(ms) : wDataBRT(ms + 86400000); }
+  const wInicioAula = (cfg: any, ins: any, k: string): number => wEm(ins.dia1, wAulaN(cfg, k), cfg.hora || '21:00');
+  const wFimAula = (cfg: any, ins: any, k: string): number => wInicioAula(cfg, ins, k) + (Number((wAula(cfg, k) || {}).dur) || 5400) * 1000;
+  const wFimOferta = (cfg: any, ins: any): number => { const o = cfg.ofertaFim || { dia: 3, hora: '23:59' }; return wEm(ins.dia1, Number(o.dia) || 3, o.hora || '23:59') + 59000; };
+  function wJanelaGravacao(cfg: any, ins: any, k: string, now: number): boolean { const fim = wFimAula(cfg, ins, k); const g = cfg.gravacao || { ateDia: 3, ateHora: '09:00' }; const ate = wEm(ins.dia1, Number(g.ateDia) || 3, g.ateHora || '09:00'); return now >= fim && now < ate; }
+
+  // ---------------- presença / compra ----------------
+  function wPct(cfg: any, k: string, lead: string): number {
+    if (lead === 'teste') return Number((globalThis as any).__wbrPctTeste) || 0;
+    const a = wAula(cfg, k); if (!a || !a.slug) return 0;
+    try { const r = db.prepare(`SELECT MAX(pct) m FROM webinario_presenca WHERE slug=? AND lead=?`).get(a.slug, lead) as any; return Number(r && r.m) || 0; } catch { return 0; }
+  }
+  function wEntrouDesde(cfg: any, k: string, lead: string, desdeMs: number): boolean {
+    const a = wAula(cfg, k); if (!a || !a.slug) return false;
+    try { return !!db.prepare(`SELECT 1 FROM webinario_presenca WHERE slug=? AND lead=? AND ultimo_ping>=? LIMIT 1`).get(a.slug, lead, new Date(desdeMs).toISOString()); } catch { return false; }
+  }
+  const wNaSala = (cfg: any, k: string, lead: string): boolean => wEntrouDesde(cfg, k, lead, Date.now() - 120000);
+  const wFaixa = (pct: number): string => (pct < 10 ? 'nao' : pct < 50 ? 'menos' : 'mais');
+  function wAchaCompra(cfg: any, ins: any): any {
+    try {
+      const pats: string[] = (cfg.produtoMatch || []).map((s: any) => String(s).toLowerCase());
+      const rows = db.prepare(`SELECT t.id,t.produto,t.status,t.criado_em,t.contato_id,c.email,c.telefone FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND t.projeto=? AND t.criado_em>=? ORDER BY t.criado_em ASC LIMIT 2000`).all(String(cfg.projeto || ''), String(ins.inscrito_em || '')) as any[];
+      const tel9 = String(ins.telefone || '').replace(/\D/g, '').slice(-9); const em = String(ins.email || '').toLowerCase().trim();
+      for (const r of rows) {
+        const prod = String(r.produto || '').toLowerCase();
+        if (pats.length && !pats.some((p) => prod.includes(p))) continue;
+        const mesmo = (r.contato_id && r.contato_id === ins.contato_id) || (em && String(r.email || '').toLowerCase().trim() === em) || (tel9.length === 9 && String(r.telefone || '').replace(/\D/g, '').slice(-9) === tel9);
+        if (mesmo) return r;
+      }
+    } catch { /* */ }
+    return null;
+  }
+  function wJaCliente(cfg: any, contatoId: string, telefone: string, email: any): any {
+    try {
+      const pats: string[] = (cfg.produtoMatch || []).map((s: any) => String(s).toLowerCase());
+      const tel9 = String(telefone || '').replace(/\D/g, '').slice(-9); const em = String(email || '').toLowerCase().trim();
+      const rows = db.prepare(`SELECT t.id,t.produto,t.criado_em FROM transacoes t LEFT JOIN contatos c ON c.id=t.contato_id WHERE t.status='liquidada' AND t.projeto=? AND (t.contato_id=? OR (?<>'' AND lower(trim(c.email))=?) OR (length(?)=9 AND c.telefone LIKE '%'||?)) ORDER BY t.criado_em DESC LIMIT 50`)
+        .all(String(cfg.projeto || ''), contatoId || '', em, em, tel9, tel9) as any[];
+      for (const r of rows) { const prod = String(r.produto || '').toLowerCase(); if (!pats.length || pats.some((p) => prod.includes(p))) return r; }
+    } catch { /* */ }
+    return null;
+  }
+
+  // ---------------- textos (placeholders) ----------------
+  function wPrimeiroNome(n: any): string { const s = String(n || '').trim().split(/\s+/)[0] || ''; return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : ''; }
+  const wCap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  function wVars(cfg: any, ins: any, envioMs: number): any {
+    const b = wBase(cfg); const t = ins.token; const funil = ins.funil;
+    const quando = wDataBRT(envioMs) === ins.dia1 ? 'hoje' : 'amanhã';
+    const v: any = { nome: wPrimeiroNome(ins.nome), quando, plataforma: cfg.plataforma || '', suporte: cfg.suporte || '', link_oferta: b + '/r/' + funil + '/oferta/' + t };
+    for (const a of wAulas(cfg)) v['link_' + a.k] = b + '/r/' + funil + '/' + a.k + '/' + t;
+    v.link_aula = v['link_' + wPrimeiraAula(cfg).k];
+    v.fim_oferta = wDataBRT(wFimOferta(cfg, ins)).split('-').reverse().slice(0, 2).join('/');
+    return v;
+  }
+  function wFill(tpl: string, v: any): string {
+    let t = String(tpl || '');
+    if (!v.nome) {
+      t = t.replace(/(^|\n)\{nome\},\s*([a-zà-ú])/g, (_m: string, a: string, c: string) => a + c.toUpperCase());
+      t = t.replace(/,\s*\{nome\}/g, '').replace(/\{nome\},?\s*/g, '');
+    }
+    t = t.replace(/\{nome\}/g, v.nome).replace(/\{Quando\}/g, wCap(v.quando)).replace(/\{quando\}/g, v.quando)
+      .replace(/\{plataforma\}/g, v.plataforma).replace(/\{suporte\}/g, v.suporte).replace(/\{fim_oferta\}/g, v.fim_oferta || '');
+    for (const key of Object.keys(v)) { if (key.indexOf('link_') === 0) t = t.split('{' + key + '}').join(String(v[key])); }
+    return t;
+  }
+  function wEmailHtml(cfg: any, blocos: any[], v: any): string {
+    const corpo = (blocos || []).map((b: any) => {
+      if (typeof b === 'string') return '<p style="margin:0 0 16px;font-size:16px;line-height:1.55;color:#1f2a35">' + esc(wFill(b, v)).replace(/\n/g, '<br>') + '</p>';
+      return '<p style="margin:22px 0;text-align:center"><a href="' + esc(wFill(b.u, v)) + '" style="display:inline-block;background:#F1541A;color:#ffffff;text-decoration:none;font-weight:700;font-size:17px;padding:14px 26px;border-radius:12px">' + esc(wFill(b.b, v)) + '</a></p>';
+    }).join('');
+    const rodape = esc(String(cfg.rodapeEmail || ('Melodias e Riffs – A Escola do Músico Cristão')));
+    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+      + '<body style="margin:0;background:#f6f4ee;padding:24px 12px"><div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:14px;padding:28px 24px;font-family:Arial,Helvetica,sans-serif">'
+      + corpo
+      + '<hr style="border:0;border-top:1px solid #eeeeee;margin:24px 0 12px"><div style="font-size:12px;color:#8a8a8a;text-align:center;line-height:1.5">' + rodape.replace(/\n/g, '<br>') + '</div>'
+      + '</div></body></html>';
+  }
+
+  // ---------------- mensagens como DADOS: resolver faixa/variante ----------------
+  function wPorFaixaPick(spec: any, ctx: any): any {
+    const pf = spec.porFaixa; const aula = pf.aula || wPrimeiraAula(ctx.cfg).k;
+    if (ctx.comprou && pf.comprou) return pf.comprou;
+    const f = wFaixa(wPct(ctx.cfg, aula, ctx.lead));
+    return pf[f] || null;
+  }
+  function wWaResolve(waSpec: any, ctx: any): any {
+    if (!waSpec) return null;
+    let s = waSpec; if (s.porFaixa) { s = wPorFaixaPick(s, ctx); if (!s) return null; }
+    if (s.tipo && s.tipo !== 'texto') return { tipo: s.tipo, url: s.url, legenda: s.legenda || '' };
+    if (typeof s.texto !== 'string') return null;
+    return { tipo: 'texto', texto: s.texto };
+  }
+  function wEmResolve(emSpec: any, ctx: any): any {
+    if (!emSpec) return null;
+    let s = emSpec; if (s.porFaixa) { s = wPorFaixaPick(s, ctx); if (!s) return null; }
+    if (!s.assunto) return null;
+    return { assunto: s.assunto, blocos: s.blocos || [] };
+  }
+  function wCond(cond: any, ctx: any): boolean {
+    if (!cond || cond === 'sempre') return true;
+    try {
+      if (cond.naoEntrou) { const k = cond.naoEntrou; return !wEntrouDesde(ctx.cfg, k, ctx.lead, wInicioAula(ctx.cfg, ctx.ins, k) - 900000); }
+      if (cond.pctMenor) { const [k, n] = cond.pctMenor; return wPct(ctx.cfg, k, ctx.lead) < Number(n); }
+      if (cond.pctMenorOferta) return wPct(ctx.cfg, cond.pctMenorOferta, ctx.lead) < Number(ctx.cfg.viuOfertaPct || 81);
+      if (cond.pctMaiorIgualOferta) return wPct(ctx.cfg, cond.pctMaiorIgualOferta, ctx.lead) >= Number(ctx.cfg.viuOfertaPct || 81);
+      if (cond.naSala) return wNaSala(ctx.cfg, cond.naSala, ctx.lead);
+      if (cond.naoRepeticao) return !ctx.ins.repeticao;
+    } catch { return false; }
+    return true;
+  }
+
+  // ---------------- agendamento de cada mensagem ----------------
+  function wQuandoMs(m: any, cfg: any, ins: any): number | null {
+    const insMs = Date.parse(ins.inscrito_em); const q = m.quando || {};
+    if (q.t === 'rel') return insMs + (Number(q.min) || 0) * 60000;
+    if (q.t === 'dia') return wEm(ins.dia1, Number(q.d) || 1, q.h || cfg.hora || '21:00');
+    if (q.t === 'antecipacao') {
+      const t = insMs + 10 * 60000; const h = wHoraBRT(t);
+      if (wDataBRT(t) === ins.dia1 && h >= 20.5) return null;
+      if (h >= 22.5) return Date.parse(wDataBRT(t + 86400000) + 'T12:00:00.000Z');
+      if (h < 8) return Date.parse(wDataBRT(t) + 'T12:00:00.000Z');
+      return t;
+    }
+    return null;
+  }
+  function wRegistra(ins: any, chave: string, canal: string, status: string, extra: any = {}): void {
+    try {
+      db.prepare(`INSERT OR IGNORE INTO wbr_envios(id,funil,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(randomUUID(), ins.funil, ins.id, chave, canal, status, extra.tipo || null, extra.texto || null, extra.url || null, extra.legenda || null, extra.para || null, extra.detalhe || null, extra.agendado_para || agora(), agora(), extra.instancia || null);
+    } catch { /* */ }
+  }
+  const wJaFeito = (ins: any, chave: string): boolean => !!db.prepare(`SELECT 1 FROM wbr_envios WHERE inscrito_id=? AND chave=? LIMIT 1`).get(ins.id, chave);
+  function wEnfileira(cfg: any, ins: any, m: any, ctx: any, agoraMs: number): void {
+    const v = wVars(cfg, ins, agoraMs); let algum = false;
+    const inst = (m.k === 'pos_venda') ? (cfg.instanciaPosVenda || cfg.instancia) : cfg.instancia;
+    if (m.wa && ins.telefone) {
+      const w = wWaResolve(m.wa, ctx);
+      if (w) {
+        if (w.tipo === 'texto') wRegistra(ins, m.k, 'wa', 'pendente', { tipo: 'texto', texto: wFill(w.texto, v), para: ins.telefone, instancia: inst });
+        else wRegistra(ins, m.k, 'wa', 'pendente', { tipo: w.tipo, url: w.url, legenda: wFill(w.legenda || '', v), para: ins.telefone, instancia: inst });
+        algum = true;
+      }
+    }
+    if (m.em && ins.email && String(ins.email).includes('@')) {
+      const e = wEmResolve(m.em, ctx);
+      if (e) {
+        try {
+          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+            .run(randomUUID(), String(cfg.projeto || 'teclado'), String(ins.email).trim(), wFill(e.assunto, v), wEmailHtml(cfg, e.blocos, v), 'pendente', agora(), cfg.emailDominioId || null, null);
+          wRegistra(ins, m.k, 'email', 'enviado', { para: ins.email, detalhe: 'na fila de e-mail' }); algum = true;
+        } catch (er: any) { wRegistra(ins, m.k, 'email', 'falhou', { detalhe: String(er?.message || er).slice(0, 200) }); }
+      }
+    }
+    if (!algum) wRegistra(ins, m.k, 'nada', 'pulado', { detalhe: 'sem canal/variante' });
+  }
+
+  // ---------------- inscrição ----------------
+  function wNovoToken(): string {
+    for (let i = 0; i < 20; i++) { const t = randomBytes(5).toString('base64').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 6); if (t.length >= 5 && !db.prepare(`SELECT 1 FROM wbr_inscritos WHERE token=?`).get(t)) return t; }
+    return randomUUID().replace(/-/g, '').slice(0, 8);
+  }
+  function wInscrever(funil: string, cfg: any, dados: any): any {
+    const quandoMs = dados.quandoMs || Date.now(); const encDia = Number(cfg.encerrarDia) || 7;
+    const anteriores = db.prepare(`SELECT * FROM wbr_inscritos WHERE funil=? AND contato_id=? ORDER BY inscrito_em DESC`).all(funil, dados.contatoId) as any[];
+    const ativo = anteriores.find((a) => wEm(a.dia1, encDia, '00:00') > quandoMs && a.status !== 'cancelado');
+    if (ativo) return { ok: true, ja: true, inscrito: ativo };
+    const ins: any = { id: randomUUID(), funil, contato_id: dados.contatoId, projeto: cfg.projeto, telefone: String(dados.telefone || '').replace(/\D/g, ''), email: dados.email || null, nome: dados.nome || null,
+      inscrito_em: new Date(quandoMs).toISOString(), dia1: dados.dia1 || wDia1Para(cfg, quandoMs), token: wNovoToken(), repeticao: anteriores.length, status: 'ativo', resposta_id: dados.respostaId || null };
+    const jaAluno: any = anteriores.find((a) => a.status === 'comprou') || wJaCliente(cfg, ins.contato_id, ins.telefone, ins.email);
+    if (jaAluno) { ins.status = 'comprou'; ins.comprou_em = jaAluno.comprou_em || jaAluno.criado_em || null; ins.compra_id = jaAluno.compra_id || jaAluno.id || null; }
+    db.prepare(`INSERT INTO wbr_inscritos(id,funil,contato_id,projeto,telefone,email,nome,inscrito_em,dia1,token,repeticao,status,resposta_id,criado_em,comprou_em,compra_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(ins.id, funil, ins.contato_id, ins.projeto, ins.telefone, ins.email, ins.nome, ins.inscrito_em, ins.dia1, ins.token, ins.repeticao, ins.status, ins.resposta_id, agora(), ins.comprou_em || null, ins.compra_id || null);
+    try { const tg = cfg.tags || {}; if (tg.inscrito) aplicarTag(cfg.projeto, ins.contato_id, tg.inscrito); if (ins.repeticao && tg.repeticao) aplicarTag(cfg.projeto, ins.contato_id, tg.repeticao); } catch { /* */ }
+    return { ok: true, inscrito: ins };
+  }
+  function wLerFormulario(funil: string, cfg: any): void {
+    const r = wFunilRow(funil); const desde = r && r.form_desde ? String(r.form_desde) : '';
+    if (!desde || !cfg.formId) return;
+    const rows = db.prepare(`SELECT * FROM formulario_respostas WHERE formulario_id=? AND criado_em>? ORDER BY criado_em ASC LIMIT 200`).all(cfg.formId, desde) as any[];
+    for (const row of rows) {
+      try {
+        if (row.contato_id) {
+          let d: any = {}; try { d = JSON.parse(row.dados || '{}'); } catch { d = {}; }
+          const c = db.prepare(`SELECT * FROM contatos WHERE id=?`).get(row.contato_id) as any;
+          wInscrever(funil, cfg, { contatoId: row.contato_id, telefone: (c && c.telefone) || String(d.whatsapp || d.telefone || ''), nome: (d.nome || (c && c.nome) || ''), email: (d.email || (c && c.email) || ''), quandoMs: Date.parse(row.criado_em) || Date.now(), respostaId: row.id });
+        }
+      } catch (e: any) { console.log('[wbr] inscrição erro', e?.message || e); }
+      db.prepare(`UPDATE wbr_funis SET form_desde=? WHERE chave=?`).run(String(row.criado_em), funil);
+    }
+  }
+
+  // ---------------- compras / etiquetas ----------------
+  function wChecarCompras(funil: string, cfg: any, agoraMs: number): void {
+    const lista = db.prepare(`SELECT * FROM wbr_inscritos WHERE funil=? AND status='ativo' AND inscrito_em>=?`).all(funil, new Date(agoraMs - 12 * 86400000).toISOString()) as any[];
+    for (const ins of lista) {
+      const t = wAchaCompra(cfg, ins); if (!t) continue;
+      db.prepare(`UPDATE wbr_inscritos SET status='comprou', comprou_em=?, compra_id=? WHERE id=?`).run(t.criado_em, t.id, ins.id);
+      ins.status = 'comprou'; ins.comprou_em = t.criado_em;
+      try { const tg = cfg.tags || {}; if (tg.comprou) aplicarTag(ins.projeto, ins.contato_id, tg.comprou); } catch { /* */ }
+      if (cfg.posVenda && !wJaFeito(ins, 'pos_venda')) wEnfileira(cfg, ins, { ...cfg.posVenda, k: 'pos_venda' }, { cfg, ins, lead: ins.contato_id, comprou: true }, agoraMs);
+      console.log('[wbr] compra reconhecida', { funil, inscrito: ins.id });
+    }
+  }
+  function wEtiquetas(cfg: any, ins: any, agoraMs: number): void {
+    const tg = cfg.tags || {}; const prefixo = tg.prefixoAula || '';
+    for (const a of wAulas(cfg)) {
+      const k = a.k; const chave = 'tag_' + k; const n = wAulaN(cfg, k);
+      if (agoraMs < wEm(ins.dia1, n + 1, '08:50') || wJaFeito(ins, chave)) continue;
+      const pct = wPct(cfg, k, ins.contato_id); const f = wFaixa(pct);
+      try {
+        if (prefixo) aplicarTag(ins.projeto, ins.contato_id, prefixo + n + '-' + (f === 'nao' ? 'nao-assistiu' : f === 'menos' ? 'menos50' : 'mais50'));
+        if (k === wUltimaAula(cfg).k && pct >= Number(cfg.viuOfertaPct || 81) && tg.viuOferta) aplicarTag(ins.projeto, ins.contato_id, tg.viuOferta);
+      } catch { /* */ }
+      wRegistra(ins, chave, 'tag', 'enviado', { detalhe: 'aula' + n + ' ' + f + ' (' + pct + '%)' });
+    }
+  }
+
+  // ---------------- decisão ----------------
+  function wDecidir(cfg: any, ins: any, agoraMs: number, dry: boolean): any[] {
+    const out: any[] = []; const comprou = ins.status === 'comprou'; const insMs = Date.parse(ins.inscrito_em); const lead = ins.contato_id;
+    for (const m of (cfg.msgs || [])) {
+      if (!dry && wJaFeito(ins, m.k)) continue;
+      const t = wQuandoMs(m, cfg, ins);
+      const quando = t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ');
+      const pula = (motivo: string): void => { out.push({ k: m.k, quando, acao: 'pula', motivo }); if (!dry) wRegistra(ins, m.k, 'nada', 'pulado', { detalhe: motivo }); };
+      if (t === null) { pula('não se aplica (horário)'); continue; }
+      if (t > agoraMs) { out.push({ k: m.k, quando, acao: 'futuro' }); continue; }
+      if ((m.quando || {}).t !== 'rel' && t < insMs) { pula('antes da inscrição'); continue; }
+      if (agoraMs - t > (Number(m.g) || 60) * 60000) { pula('atrasada (sistema fora do ar?)'); continue; }
+      if (comprou && m.venda && !m.todos) { pula('já comprou'); continue; }
+      const ctx = { cfg, ins, lead, comprou };
+      let ok = true; try { ok = wCond(m.cond, ctx); } catch { ok = false; }
+      if (!ok) { pula('condição não atendida'); continue; }
+      if (dry) {
+        let wa: any = null; let em: any = null; const v = wVars(cfg, ins, agoraMs);
+        try { const w = wWaResolve(m.wa, ctx); wa = w ? (w.tipo === 'texto' ? wFill(w.texto, v) : { tipo: w.tipo, url: w.url, legenda: wFill(w.legenda || '', v) }) : null; } catch { wa = null; }
+        try { const e = wEmResolve(m.em, ctx); em = e ? wFill(e.assunto, v) : null; } catch { em = null; }
+        out.push({ k: m.k, quando, acao: 'envia', whatsapp: wa, email_assunto: em });
+      } else { wEnfileira(cfg, ins, m, ctx, agoraMs); out.push({ k: m.k, quando, acao: 'envia' }); }
+    }
+    return out;
+  }
+
+  // ---------------- agendador (1x por minuto, TODOS os funis ativos) ----------------
+  let wRodando = false;
+  function wTick(): void {
+    if (wRodando) return; wRodando = true;
+    try {
+      const agoraMs = Date.now();
+      const funis = db.prepare(`SELECT chave FROM wbr_funis WHERE ativo=1`).all() as any[];
+      for (const fr of funis) {
+        const funil = String(fr.chave); const cfg = wCfg(funil); if (!cfg) continue;
+        try {
+          wLerFormulario(funil, cfg);
+          wChecarCompras(funil, cfg, agoraMs);
+          const encDia = Number(cfg.encerrarDia) || 7;
+          const lista = db.prepare(`SELECT * FROM wbr_inscritos WHERE funil=? AND status IN ('ativo','comprou') AND dia1>=?`).all(funil, wDataBRT(agoraMs - (encDia + 2) * 86400000)) as any[];
+          for (const ins of lista) {
+            wEtiquetas(cfg, ins, agoraMs);
+            wDecidir(cfg, ins, agoraMs, false);
+            if (agoraMs > wEm(ins.dia1, encDia, '00:00') && ins.status === 'ativo') db.prepare(`UPDATE wbr_inscritos SET status='encerrado' WHERE id=?`).run(ins.id);
+          }
+        } catch (e: any) { console.log('[wbr] tick funil erro', funil, e?.message || e); }
+      }
+    } catch (e: any) { console.log('[wbr] tick erro', e?.message || e); }
+    finally { wRodando = false; }
+  }
+  setInterval(wTick, 60000);
+
+  // ---------------- enviador WhatsApp (fila wbr_envios, instância da config) ----------------
+  let wEnviando = false;
+  async function wTickEnvio(): Promise<void> {
+    if (wEnviando) return; wEnviando = true;
+    try {
+      const it = db.prepare(`SELECT * FROM wbr_envios WHERE canal='wa' AND status='pendente' AND agendado_para<=? ORDER BY agendado_para ASC LIMIT 1`).get(agora()) as any;
+      if (!it) return;
+      const cfg = wCfg(String(it.funil)) || {};
+      try {
+        const inst = String(it.instancia || cfg.instancia || '');
+        const proj = String(cfg.projeto || 'teclado');
+        if ((it.tipo || 'texto') === 'texto') await enviarTexto(proj as any, String(it.para), String(it.texto || ''), inst);
+        else await enviarMidia(proj as any, String(it.para), String(it.tipo), String(it.url || ''), String(it.legenda || ''), inst);
+        db.prepare(`UPDATE wbr_envios SET status='enviado', enviado_em=? WHERE id=?`).run(agora(), it.id);
+      } catch (e: any) {
+        const t = (Number(it.tentativas) || 0) + 1;
+        db.prepare(`UPDATE wbr_envios SET tentativas=?, status=?, detalhe=?, agendado_para=? WHERE id=?`).run(t, t >= 3 ? 'falhou' : 'pendente', String(e?.message || e).slice(0, 300), new Date(Date.now() + 60000).toISOString(), it.id);
+      }
+    } finally { wEnviando = false; }
+  }
+  (function wLoopEnvio(): void { setTimeout(async () => { try { await wTickEnvio(); } catch { /* */ } wLoopEnvio(); }, 3000 + Math.floor(Math.random() * 2000)); })();
+
+  // ---------------- páginas / links públicos /r/... ----------------
+  const wPagina = (titulo: string, texto: string, botao?: { t: string; u: string }): string => '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(titulo) + '</title></head>'
+    + '<body style="margin:0;background:#283D50;color:#fff;font-family:Arial,Helvetica,sans-serif;display:grid;place-items:center;min-height:100vh;padding:18px;box-sizing:border-box"><div style="max-width:520px;text-align:center">'
+    + '<h1 style="font-size:26px;margin:0 0 12px">' + esc(titulo) + '</h1><p style="font-size:17px;line-height:1.5;color:#e9eef3">' + esc(texto) + '</p>'
+    + (botao ? '<a href="' + esc(botao.u) + '" style="display:inline-block;margin-top:14px;background:#F1541A;color:#fff;text-decoration:none;font-weight:700;padding:14px 26px;border-radius:12px">' + esc(botao.t) + '</a>' : '')
+    + '</div></body></html>';
+  const wPorToken = (t: string): any => db.prepare(`SELECT * FROM wbr_inscritos WHERE token=?`).get(String(t || '').toLowerCase()) as any;
+
+  app.get('/r/:funil/:aula/:token', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const tipo = String(req.params.aula || ''); const cfg = wCfg(funil);
+      if (!cfg) return res.status(404).send('funil não encontrado');
+      const ins = wPorToken(req.params.token);
+      if (!ins || ins.funil !== funil) return res.redirect(302, cfg.paginaInscricao || '/');
+      const now = Date.now();
+      if (tipo === 'oferta') {
+        try { db.prepare(`INSERT INTO wbr_envios(id,funil,inscrito_id,chave,canal,status,detalhe,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(randomUUID(), funil, ins.id, 'clique_oferta_' + now, 'clique', 'enviado', 'clique no link da oferta', agora()); } catch { /* */ }
+        if (now <= wFimOferta(cfg, ins)) {
+          let checkout = String(cfg.checkout || '');
+          const lim = Number(cfg.limiteVendasTurma) || 0;
+          if (lim > 0 && cfg.checkoutCheio) {
+            const vend = Number((db.prepare(`SELECT COUNT(*) n FROM wbr_inscritos WHERE funil=? AND dia1=? AND status='comprou'`).get(funil, ins.dia1) as any || {}).n) || 0;
+            if (vend >= lim) checkout = String(cfg.checkoutCheio);
+          }
+          const sep = checkout.includes('?') ? '&' : '?';
+          return res.redirect(302, checkout + sep + 'utm_source=webinario&utm_medium=whatsapp-email&utm_campaign=' + encodeURIComponent(cfg.utmCampaign || funil) + '&utm_content=' + encodeURIComponent(ins.token));
+        }
+        const dl = wDataBRT(wFimOferta(cfg, ins)).split('-').reverse().slice(0, 2).join('/');
+        return res.type('html').send(wPagina('Essa condição encerrou', 'A condição especial' + (cfg.nomeEvento ? ' do ' + cfg.nomeEvento : '') + ' era válida até ' + dl + ', às 23h59. Obrigado por ter participado!'));
+      }
+      const a = wAula(cfg, tipo);
+      if (!a) return res.redirect(302, cfg.paginaInscricao || '/');
+      if (!req.query.lead) return res.redirect(302, '/r/' + funil + '/' + tipo + '/' + ins.token + '?lead=' + encodeURIComponent(ins.contato_id));
+      if (!WJW.wbGet || !WJW.wbConfigPublico || !WJW.wbRoomHtml) return res.status(500).send('sala indisponível');
+      const wb = WJW.wbGet(a.slug); if (!wb) return res.status(404).send('aula não encontrada');
+      const ini = wInicioAula(cfg, ins, tipo); const fim = wFimAula(cfg, ins, tipo); const dur = Math.round((fim - ini) / 1000);
+      const c: any = WJW.wbConfigPublico(wb);
+      c.ofertas = (c.ofertas || []).map((o: any) => ({ ...o, url: wBase(cfg) + '/r/' + funil + '/oferta/' + ins.token }));
+      if (now < fim) {
+        c.agenda = { tipo: 'diario', estado: now < ini ? 'antes' : 'ao_vivo', inicio_ms: ini, fim_ms: fim, duracao: dur };
+      } else if (wJanelaGravacao(cfg, ins, tipo, now)) {
+        c.agenda = { tipo: 'aberto', estado: 'ao_vivo', inicio_ms: now, fim_ms: 0, duracao: dur };
+        c.chat_real = false; c.popups = false;
+      } else {
+        return res.type('html').send(wPagina('A gravação saiu do ar', 'As gravações ficaram disponíveis por tempo limitado. Fique de olho no seu WhatsApp: as próximas mensagens trazem tudo o que você precisa.'));
+      }
+      c.server_now = now;
+      const cfgJson = JSON.stringify(c).replace(/</g, '\\u003c');
+      return res.type('html').send(WJW.wbRoomHtml(cfgJson, String(wb.slug), String(wb.nome || cfg.nomeEvento || 'Webinário')));
+    } catch (e: any) { return res.status(500).send('erro: ' + String(e?.message || e)); }
+  });
+
+  // ---------------- painel (x-api-key) ----------------
+  app.get('/wbr/funis', (_req: any, res: any) => {
+    try {
+      const rows = db.prepare(`SELECT chave, ativo, form_desde, criado_em FROM wbr_funis ORDER BY criado_em ASC`).all() as any[];
+      const funis = rows.map((r) => { const c = wCfg(r.chave) || {}; return { chave: r.chave, ativo: Number(r.ativo) === 1, projeto: c.projeto, nomeEvento: c.nomeEvento, aulas: (c.aulas || []).length, form_desde: r.form_desde }; });
+      res.json({ ok: true, funis });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/wbr/:funil/cfg', (req: any, res: any) => {
+    const cfg = wCfg(String(req.params.funil || '')); if (!cfg) return res.json({ ok: false, erro: 'funil não existe' });
+    res.json({ ok: true, cfg });
+  });
+  app.post('/wbr/:funil/cfg', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const body = req.body || {};
+      const r = wFunilRow(funil); let cur: any = {}; if (r) { try { cur = JSON.parse(r.cfg_json || '{}'); } catch { cur = {}; } }
+      const merged: any = { ...cur, ...body };
+      if (body.msgs !== undefined) merged.msgs = body.msgs; // substitui a lista inteira
+      if (r) db.prepare(`UPDATE wbr_funis SET cfg_json=?, atualizado_em=? WHERE chave=?`).run(JSON.stringify(merged), agora(), funil);
+      else db.prepare(`INSERT INTO wbr_funis(chave,cfg_json,ativo,form_desde,criado_em,atualizado_em) VALUES(?,?,?,?,?,?)`).run(funil, JSON.stringify(merged), 0, '', agora(), agora());
+      res.json({ ok: true, cfg: merged });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/wbr/:funil/ativar', (req: any, res: any) => {
+    const funil = String(req.params.funil || ''); const b = req.body || {}; const on = !!b.on;
+    const r = wFunilRow(funil); if (!r) return res.json({ ok: false, erro: 'funil não existe' });
+    db.prepare(`UPDATE wbr_funis SET ativo=?, atualizado_em=? WHERE chave=?`).run(on ? 1 : 0, agora(), funil);
+    if (on && (b.desde || !r.form_desde)) db.prepare(`UPDATE wbr_funis SET form_desde=? WHERE chave=?`).run(String(b.desde || agora()), funil);
+    const r2 = wFunilRow(funil);
+    res.json({ ok: true, ativo: on, form_desde: r2 && r2.form_desde });
+  });
+  app.get('/wbr/:funil/status', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const r = wFunilRow(funil); if (!r) return res.json({ ok: false, erro: 'funil não existe' });
+      const porStatus = db.prepare(`SELECT status, COUNT(*) n FROM wbr_inscritos WHERE funil=? GROUP BY status`).all(funil);
+      const envios = db.prepare(`SELECT canal, status, COUNT(*) n FROM wbr_envios WHERE funil=? GROUP BY canal, status`).all(funil);
+      res.json({ ok: true, funil, ativo: Number(r.ativo) === 1, form_desde: r.form_desde, cfg: wCfg(funil), inscritos: porStatus, envios });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.get('/wbr/:funil/inscritos', (req: any, res: any) => {
+    const funil = String(req.params.funil || ''); const cfg = wCfg(funil); const lim = Math.min(500, Number(req.query.limite) || 50);
+    const rows = (db.prepare(`SELECT * FROM wbr_inscritos WHERE funil=? ORDER BY inscrito_em DESC LIMIT ?`).all(funil, lim) as any[]).map((i) => { const pct: any = {}; if (cfg) for (const a of wAulas(cfg)) pct[a.k] = wPct(cfg, a.k, i.contato_id); return { ...i, pct, links: cfg ? wVars(cfg, i, Date.now()) : {} }; });
+    res.json({ ok: true, inscritos: rows });
+  });
+  app.get('/wbr/:funil/envios', (req: any, res: any) => {
+    const funil = String(req.params.funil || ''); const id = String(req.query.inscrito || '');
+    const rows = id ? db.prepare(`SELECT * FROM wbr_envios WHERE funil=? AND inscrito_id=? ORDER BY criado_em ASC`).all(funil, id) : db.prepare(`SELECT * FROM wbr_envios WHERE funil=? ORDER BY criado_em DESC LIMIT 200`).all(funil);
+    res.json({ ok: true, envios: rows });
+  });
+  app.post('/wbr/:funil/inscrever', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const cfg = wCfg(funil); if (!cfg) return res.json({ ok: false, erro: 'funil não existe' });
+      const b = req.body || {}; const tel = String(b.telefone || '').replace(/\D/g, ''); if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
+      const cid = upsertContato(cfg.projeto, tel, b.nome || undefined, b.email || undefined, 'wbr-manual');
+      res.json(wInscrever(funil, cfg, { contatoId: cid, telefone: tel, nome: b.nome, email: b.email, dia1: b.dia1 }));
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/wbr/:funil/cancelar', (req: any, res: any) => {
+    const funil = String(req.params.funil || ''); const b = req.body || {};
+    const r = db.prepare(`UPDATE wbr_inscritos SET status='cancelado' WHERE funil=? AND (id=? OR token=? OR telefone=?)`).run(funil, String(b.id || '-'), String(b.token || '-'), String(b.telefone || '-').replace(/\D/g, ''));
+    db.prepare(`UPDATE wbr_envios SET status='cancelado' WHERE funil=? AND status='pendente' AND inscrito_id IN (SELECT id FROM wbr_inscritos WHERE funil=? AND status='cancelado')`).run(funil, funil);
+    res.json({ ok: true, alterados: r.changes });
+  });
+  app.post('/wbr/:funil/simular', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const cfg = wCfg(funil); if (!cfg) return res.json({ ok: false, erro: 'funil não existe' });
+      const b = req.body || {};
+      const ins = db.prepare(`SELECT * FROM wbr_inscritos WHERE funil=? AND (id=? OR token=?)`).get(funil, String(b.inscrito || '-'), String(b.token || '-')) as any;
+      if (!ins) return res.json({ ok: false, erro: 'inscrito não encontrado' });
+      const agoraMs = b.em ? Date.parse(String(b.em)) : Date.now();
+      const cronograma = (cfg.msgs || []).map((m: any) => { const t = wQuandoMs(m, cfg, ins); return { k: m.k, quando: t === null ? null : new Date(t - BRT_MS).toISOString().slice(0, 16).replace('T', ' ') }; });
+      res.json({ ok: true, inscrito: { id: ins.id, dia1: ins.dia1, token: ins.token, status: ins.status, repeticao: ins.repeticao }, prazos: { oferta: new Date(wFimOferta(cfg, ins) - BRT_MS).toISOString().slice(0, 16) }, cronograma, decisao: wDecidir(cfg, ins, agoraMs, true) });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+  app.post('/wbr/:funil/teste', (req: any, res: any) => {
+    try {
+      const funil = String(req.params.funil || ''); const cfg = wCfg(funil); if (!cfg) return res.json({ ok: false, erro: 'funil não existe' });
+      const b = req.body || {}; const tel = String(b.telefone || '').replace(/\D/g, ''); if (tel.length < 10) return res.json({ ok: false, erro: 'telefone inválido' });
+      const faixa = String(b.faixa || 'mais'); const agoraMs = Date.now();
+      const ins: any = { id: 'teste-' + randomUUID().slice(0, 8), funil, contato_id: 'teste', projeto: cfg.projeto, telefone: tel, email: b.email || null, nome: b.nome || 'Teste', inscrito_em: new Date(agoraMs).toISOString(), dia1: wDia1Para(cfg, agoraMs), token: 'teste', repeticao: 0 };
+      (globalThis as any).__wbrPctTeste = faixa === 'nao' ? 0 : faixa === 'menos' ? 30 : 90;
+      const comprou = faixa === 'comprou';
+      const lista = [...(cfg.msgs || []), ...(cfg.posVenda ? [{ ...cfg.posVenda, k: 'pos_venda' }] : [])];
+      let n = 0; let atraso = 0; const v = wVars(cfg, ins, agoraMs);
+      for (const m of lista) {
+        const ctx: any = { cfg, ins, lead: 'teste', comprou };
+        if (m.wa) { const w = (() => { try { return wWaResolve(m.wa, ctx); } catch { return null; } })(); if (w) {
+          atraso += 6000; const inst = (m.k === 'pos_venda') ? (cfg.instanciaPosVenda || cfg.instancia) : cfg.instancia;
+          db.prepare(`INSERT INTO wbr_envios(id,funil,inscrito_id,chave,canal,status,tipo,texto,url,legenda,para,detalhe,agendado_para,criado_em,instancia) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(randomUUID(), funil, ins.id, m.k, 'wa', 'pendente', w.tipo === 'texto' ? 'texto' : w.tipo, w.tipo === 'texto' ? ('[TESTE] ' + wFill(w.texto, v)) : null, w.tipo === 'texto' ? null : w.url, w.tipo === 'texto' ? null : ('[TESTE] ' + wFill(w.legenda || '', v)), tel, 'TESTE', new Date(agoraMs + atraso).toISOString(), agora(), inst);
+          n++; } }
+        if (m.em && b.email) { const e = (() => { try { return wEmResolve(m.em, ctx); } catch { return null; } })(); if (e) {
+          db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), String(cfg.projeto || 'teclado'), String(b.email), '[TESTE ' + m.k + '] ' + wFill(e.assunto, v), wEmailHtml(cfg, e.blocos, v), 'pendente', agora(), cfg.emailDominioId || null, null);
+          n++; } }
+      }
+      res.json({ ok: true, enfileiradas: n, obs: 'WhatsApp a cada ~6s pela instância do funil; e-mails pela fila (dominio_id do funil). Links de teste usam o token "teste" (não abrem sala).' });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+  });
+
+  console.log('[wbr] régua de webinário genérica carregada; funis=', (db.prepare(`SELECT COUNT(*) n FROM wbr_funis`).get() as any).n);
 }
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
