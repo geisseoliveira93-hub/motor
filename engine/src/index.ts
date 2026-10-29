@@ -2771,6 +2771,42 @@ try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_medium TEXT`); } catch { /*
 try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_content TEXT`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_term TEXT`); } catch { /* existe */ }
 try { db.exec(`CREATE TABLE IF NOT EXISTS webhook_pagamento_log (id TEXT PRIMARY KEY, provider TEXT, pedido TEXT, raw_json TEXT, criado_em TEXT)`); } catch { /* existe */ }
+// [+vendas-recuperacao 29/10] registra a venda que foi recuperada (pessoa estava num fluxo de recuperação e comprou),
+// com a ORIGEM (whatsapp = recebeu nossa mensagem de recuperação; checkout = estava em recuperação mas voltou sozinho).
+// Só ADICIONA — a tabela transacoes continua intacta; isto é uma camada paralela só pra atribuição/painel.
+try { db.exec(`CREATE TABLE IF NOT EXISTS vendas_recuperacao (id TEXT PRIMARY KEY, pedido TEXT, projeto TEXT, produto TEXT, produto_bucket TEXT, telefone TEXT, valor REAL DEFAULT 0, origem TEXT, fluxo_chave TEXT, provider TEXT, criado_em TEXT)`); } catch { /* existe */ }
+try { db.exec(`CREATE INDEX IF NOT EXISTS ix_vrec_criado ON vendas_recuperacao(criado_em)`); } catch { /* existe */ }
+// bucket de produto igual ao do painel (_pnlProduto), mas top-level pra usar no webhook também.
+function _recProdutoBucket(nome: string): string {
+  const t = String(nome || '').toLowerCase();
+  if (/dedilhad/.test(t)) return 'Dedilhados';
+  if (/teclad/.test(t)) return 'Teclado';
+  if (/baix/.test(t)) return 'Baixo';
+  if (/viol/.test(t)) return 'Violao';
+  if (/harpa|comunidade/.test(t)) return 'Harpa';
+  return 'Outros';
+}
+// Grava a venda recuperada SE o telefone estava num fluxo de recuperação. best-effort: nunca quebra a entrega.
+function _registrarVendaRecuperacao(provider: string, p: any, projeto: string) {
+  try {
+    const tel = String(p && p.telefone || '').trim(); if (!tel) return;
+    // estava em recuperação? (qualquer fluxo 'recuperacao*' ou o combo do baixo, qualquer status — inclusive já cancelado pela entrega)
+    const emRecup = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') LIMIT 1`).get(tel) as any;
+    if (!emRecup) return; // venda normal (não veio de recuperação) — não registra aqui
+    // origem: se alguma mensagem de recuperação JÁ FOI ENVIADA pra ela (ou foi pro agente) => veio pelo WhatsApp;
+    // senão (entrou em recuperação mas comprou antes da gente mandar) => voltou pelo checkout.
+    let origem = 'checkout';
+    try {
+      const enviou = db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND (fluxo_chave LIKE 'recuperacao%' OR fluxo_chave='combo-baixo-botao') AND status='enviado' LIMIT 1`).get(tel) as any;
+      if (enviou) origem = 'whatsapp';
+    } catch { /* */ }
+    const prodNome = String(p.produtoNome || p.produto || '');
+    const bucket = _recProdutoBucket(prodNome || projeto);
+    const id = String(provider || '') + ':' + String(p.pedido || randomUUID());
+    db.prepare(`INSERT OR IGNORE INTO vendas_recuperacao(id,pedido,projeto,produto,produto_bucket,telefone,valor,origem,fluxo_chave,provider,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, String(p.pedido || ''), projeto, prodNome, bucket, tel, Number(p.valor || 0), origem, '', provider, agora());
+  } catch { /* best-effort: nunca quebra a entrega */ }
+}
 function _utmDoPayload(b: any): any {
   const o: any = {}; if (!b || typeof b !== 'object') return o;
   const cand = [b, b.utm, b.utms, b.tracking, b.trackingParameters, b.tracking_parameters, b.checkout, b.metadata, b.custom, b.src, (b.transaction||{}), (b.order||{}), (b.data||{})];
@@ -3691,6 +3727,8 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         // [tags-auto] tags da trilha do produto principal (low-ticket / qualificar-24h / comprou-low-*).
         try { for (const tg of _produtoTags(p.produtoId, p.produtoNome)) aplicarTag(projeto, cid, tg); } catch { /* best-effort */ }
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        // [+vendas-recuperacao 29/10] se essa venda veio de quem estava em recuperação, registra com a origem (whatsapp/checkout).
+        try { _registrarVendaRecuperacao(provider, p, projeto); } catch { /* best-effort: nunca quebra a entrega */ }
         // [motor2] Trilha por produto + order bump/upsell. INERTE até pubFlag('motor2_ativo')==='1'.
         // Aplica as tags da trilha de CADA item (principal + bump + upsell), dispara os fluxos pela tag,
         // e entrega no WhatsApp os itens EXTRAS que tenham fluxo próprio (o principal já foi entregue acima).
@@ -14844,20 +14882,43 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
         p.impressoes += (a.impressoes || 0);
         p.ic += (a.ic || 0);
       }
+      // [+recup-painel 29/10] soma as vendas de RECUPERAÇÃO (do nosso sistema) por bucket de produto, no mesmo período.
+      // Essas vendas NÃO vêm atribuídas a anúncio (vieram pelo WhatsApp/checkout de recuperação), então somam por cima
+      // do que a Meta atribui — sem dupla contagem. A seção "Vendas de recuperação" do painel mostra o detalhe.
+      const _recByProd: Record<string, any> = {};
+      try {
+        const _deISO = deFinal + 'T00:00:00';
+        const _ateISO = ateFinal + 'T23:59:59';
+        const _rrows = db.prepare(`SELECT produto_bucket b, origem, COUNT(*) n, COALESCE(SUM(valor),0) v FROM vendas_recuperacao WHERE criado_em>=? AND criado_em<=? GROUP BY produto_bucket, origem`).all(_deISO, _ateISO) as any[];
+        for (const r of _rrows) {
+          const b = String(r.b || 'Outros');
+          const o = _recByProd[b] || (_recByProd[b] = { total: 0, wa: 0, ck: 0, fat: 0 });
+          o.total += Number(r.n || 0); o.fat += Number(r.v || 0);
+          if (String(r.origem) === 'whatsapp') o.wa += Number(r.n || 0); else o.ck += Number(r.n || 0);
+          if (!porProd[b]) porProd[b] = { produto: b, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 }; // bucket só-recuperação (sem anúncio)
+        }
+      } catch { /* recup painel best-effort */ }
+      const _recTotal = { total: 0, wa: 0, ck: 0, fat: 0 };
+      for (const b of Object.keys(_recByProd)) { const r = _recByProd[b]; _recTotal.total += r.total; _recTotal.wa += r.wa; _recTotal.ck += r.ck; _recTotal.fat += r.fat; }
       const tx = taxaPct();
       const im = impPct();
       const enrich = (p: any): any => {
-        const taxaV = p.fat * tx / 100;
+        const rec = (p.produto === 'Todos') ? _recTotal : (_recByProd[p.produto] || { total: 0, wa: 0, ck: 0, fat: 0 });
+        const vendasT = (p.vendas || 0) + (rec.total || 0); // vendas de anúncio + vendas de recuperação
+        const fatT = (p.fat || 0) + (rec.fat || 0);
+        const taxaV = fatT * tx / 100;
         const impV = p.gasto * im / 100;
-        const lucro = p.fat - taxaV - impV - p.gasto;
+        const lucro = fatT - taxaV - impV - p.gasto;
         return {
-          produto: p.produto, gasto: p.gasto, vendas: p.vendas, fat: p.fat, leads: p.leads,
+          produto: p.produto, gasto: p.gasto, vendas: vendasT, fat: fatT, leads: p.leads,
           cliques: p.cliques, impressoes: p.impressoes, ic: p.ic || 0, cpic: (p.ic || 0) > 0 ? p.gasto / (p.ic || 1) : 0,
-          roas: p.gasto > 0 ? p.fat / p.gasto : 0,
-          cpa: p.vendas > 0 ? p.gasto / p.vendas : 0,
-          ticket: p.vendas > 0 ? p.fat / p.vendas : 0,
+          roas: p.gasto > 0 ? fatT / p.gasto : 0,
+          cpa: vendasT > 0 ? p.gasto / vendasT : 0,
+          ticket: vendasT > 0 ? fatT / vendasT : 0,
           taxaPlataforma: taxaV, impostoMeta: impV, lucro,
-          margem: p.fat > 0 ? lucro / p.fat * 100 : 0,
+          margem: fatT > 0 ? lucro / fatT * 100 : 0,
+          recup: { total: rec.total || 0, wa: rec.wa || 0, ck: rec.ck || 0, fat: rec.fat || 0 },
+          vendasAds: p.vendas || 0, fatAds: p.fat || 0,
         };
       };
       const lista = Object.keys(porProd).map((k) => enrich(porProd[k])).sort((a, b) => b.fat - a.fat);
@@ -15016,6 +15077,11 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
         + 'html+="<div class=panel style=\\"overflow-x:auto\\"><h2>Por produto</h2><table><thead><tr><th>Produto</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Faturamento</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";'
         + 'for(var r=0;r<DADOS.produtos.length;r++){var q=DADOS.produtos[r];html+="<tr><td class=cre>"+esc(q.produto)+"</td><td class=n>"+brl(q.gasto)+"</td><td class=n>"+num(q.vendas)+"</td><td class=n>"+brl(q.fat)+"</td><td class=n>"+x(q.roas)+"x</td><td class=\\"n "+(q.lucro>=0?"pos":"neg")+"\\">"+brl(q.lucro)+"</td></tr>";}'
         + 'html+="</tbody></table></div>";'
+        // [+recup-painel 29/10] seçãozinha "Vendas de recuperação" (já somadas acima) com a origem (WhatsApp x Checkout)
+        + 'var _recL=(SEL==="Todos")?DADOS.produtos:[p];var _temRec=false;for(var rk=0;rk<_recL.length;rk++){if(_recL[rk].recup&&_recL[rk].recup.total>0){_temRec=true;break;}}'
+        + 'if(_temRec){html+="<div class=panel style=\\"border-color:var(--ac)\\"><h2>\\uD83D\\uDCAC Vendas de recuperacao <span style=\\"font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--ac);background:var(--acs);border:1px solid var(--ac);border-radius:999px;padding:3px 8px;margin-left:6px\\">ja somadas acima</span></h2>";'
+        + 'for(var rj=0;rj<_recL.length;rj++){var rp=_recL[rj];if(!rp.recup||rp.recup.total<=0)continue;html+="<div style=\\"display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid var(--line)\\"><span style=\\"flex:1;min-width:90px;font-weight:700;font-size:12.5px\\">"+esc(rp.produto)+"</span><span style=\\"font-size:10.5px;font-weight:700;color:var(--gr);background:var(--grs);border:1px solid var(--gr);border-radius:999px;padding:3px 8px;white-space:nowrap\\">\\uD83D\\uDFE2 "+num(rp.recup.wa)+" WhatsApp</span><span style=\\"font-size:10.5px;font-weight:700;color:#5aa9ff;background:#0f1d2e;border:1px solid #1f4a73;border-radius:999px;padding:3px 8px;white-space:nowrap\\">\\uD83D\\uDD35 "+num(rp.recup.ck)+" Checkout</span><span style=\\"font-size:12.5px;font-weight:800;white-space:nowrap\\">"+brl(rp.recup.fat)+"</span></div>";}'
+        + 'html+="<div class=note><b>WhatsApp</b> = comprou pelo link que o robo mandou na recuperacao. <b>Checkout</b> = tinha abandonado e voltou sozinho. Essas vendas ja estao somadas no Faturamento, nas Vendas e no Por produto acima.</div></div>";}'
         + 'var _adsAll=adsDoSel();var _ads=adsFiltrados();'
         + 'if(_adsAll&&_adsAll.length){var _ctsL=agrupaConta(_adsAll);if(_ctsL.length>1){html+="<div class=panel><h2>Por conta de anuncio ("+esc(SEL)+")</h2><div class=px><table><thead><tr><th>Conta</th><th class=n>Investido</th><th class=n>Vendas</th><th class=n>Fat.</th><th class=n>ROAS</th><th class=n>Lucro</th></tr></thead><tbody>";for(var cj=0;cj<_ctsL.length;cj++){var ct=_ctsL[cj];html+="<tr><td class=cre>"+esc(ct.conta)+"</td><td class=n>"+brl(ct.gasto)+"</td><td class=n>"+num(ct.vendas)+"</td><td class=n>"+brl(ct.fat)+"</td><td class=n>"+x(ct.roas)+"x</td><td class=n><span class="+(ct.lucro>=0?"pos":"neg")+">"+brl(ct.lucro)+"</span></td></tr>";}html+="</tbody></table></div></div>";}}'
         + 'if(_ads&&_ads.length){var _camps=agrupaCamp(_ads);'
