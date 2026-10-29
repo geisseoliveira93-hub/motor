@@ -1794,6 +1794,34 @@ app.post('/flows/produto/remover', (req, res) => {
   removerFluxoEntregaDb(chave); // [entrega-perm] remove também da tabela
   res.json({ ok: true, removidos: antes - (CONFIG.entregaFluxoProduto || []).length });
 });
+
+// [recup-produto] Cria/atualiza um fluxo de RECUPERAÇÃO por PRODUTO. (alias de /flows/recuperacao-produto; mesmo nome usado pelo app/outro chat)
+app.post('/flows/produto-recuperacao', (req, res) => {
+  const b = req.body || {};
+  const chave = String(b.chave || '').trim();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const item: any = { chave, porId: !!b.porId, projeto: b.projeto, fluxo: normalizaFluxo(b.fluxo),
+    chamarPeloNome: b.chamarPeloNome !== false, nomeFallback: (b.nomeFallback != null ? String(b.nomeFallback) : undefined),
+    instancia: (b.instancia != null && String(b.instancia).trim() ? String(b.instancia).trim() : undefined),
+    agente: (b.agente != null && String(b.agente).trim() ? String(b.agente).trim() : undefined) };
+  const lista = ((CONFIG as any).recuperacaoFluxoProduto) || [];
+  const i = lista.findIndex((f: any) => String(f.chave).toLowerCase() === chave.toLowerCase() && !!f.porId === !!b.porId);
+  if (i >= 0) lista[i] = item; else lista.push(item);
+  (CONFIG as any).recuperacaoFluxoProduto = lista;
+  salvarConfig();
+  persistirFluxoRecup(item);
+  res.json({ ok: true, total: lista.length, item });
+});
+app.post('/flows/produto-recuperacao/remover', (req, res) => {
+  const chave = String((req.body || {}).chave || '').trim().toLowerCase();
+  if (!chave) return res.status(400).json({ erro: 'chave_obrigatoria' });
+  const lista = ((CONFIG as any).recuperacaoFluxoProduto) || [];
+  const antes = lista.length;
+  (CONFIG as any).recuperacaoFluxoProduto = lista.filter((f: any) => String(f.chave).toLowerCase() !== chave);
+  salvarConfig();
+  removerFluxoRecupDb(chave);
+  res.json({ ok: true, removidos: antes - ((CONFIG as any).recuperacaoFluxoProduto).length });
+});
 // [+recup-produto 28/10] Fluxo de RECUPERAÇÃO por PRODUTO (igual ao de entrega, mas pra pagamento/carrinho perdido).
 // Persiste no CONFIG (sobrevive ao deploy via config_runtime/camada 1). Casa por nome/id do produto.
 app.get('/flows/recuperacao-produto', (_req, res) => { res.json({ ok: true, recuperacaoFluxoProduto: (CONFIG as any).recuperacaoFluxoProduto || [] }); });
