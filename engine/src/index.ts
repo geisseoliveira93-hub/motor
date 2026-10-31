@@ -1223,6 +1223,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// [fix-153 31/10] As páginas que EMBUTEM o player do YouTube (área do aluno, salas de webinário/jornada
+// e VSL) precisam enviar o referrer de ORIGEM pro YouTube validar o embed — com o 'no-referrer' global o
+// YouTube não identifica o domínio e dá "Erro 153" (o vídeo não toca, obriga a abrir no YouTube). Aqui, SÓ
+// nessas páginas, troco pra 'strict-origin-when-cross-origin' (envia só a origem, sem caminho/query = seguro).
+// Todo o resto do site segue com 'no-referrer'. ADITIVO: só sobrescreve o header nessas rotas.
+app.use((req, res, next) => {
+  const p = req.path || '';
+  if (p === '/area' || p.indexOf('/area/') === 0 || p.indexOf('/w/') === 0 || p.indexOf('/v/') === 0 || p.indexOf('/r/') === 0 || p.indexOf('/j/') === 0) {
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  }
+  next();
+});
+
 // ---- Segurança: liga/desliga a porta de entrada da importação ----
 // Quando IMPORTAR_ATIVO=false, a página e o envio de importação respondem 403.
 app.use((req, res, next) => {
