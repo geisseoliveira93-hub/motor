@@ -6118,6 +6118,94 @@ app.get('/pub/youtube/proxies/testar', async (_req, res) => {
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// [+tt-browser-nuvem 31/10] FUNDAÇÃO do TikTok via navegador invisível na nuvem (INERTE até 'tiktok' entrar
+// no allowlist pub_plataformas_nuvem). Espelha o YouTube: cofre de sessão por projeto em /data/tt-sessions,
+// e usa o MESMO proxy residencial de casa (/pub/youtube/proxies). Protegido pela ENGINE_API_KEY.
+const TT_SESS_DIR = '/data/tt-sessions';
+try { fs.mkdirSync(TT_SESS_DIR, { recursive: true }); } catch { /* ok */ }
+app.post('/pub/tiktok/sessao-nuvem', (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || '').trim().toLowerCase();
+    if (!projeto) return res.status(400).json({ ok: false, erro: 'projeto_obrigatorio' });
+    const storageState = b.storageState;
+    if (!storageState || typeof storageState !== 'object') return res.status(400).json({ ok: false, erro: 'storageState_obrigatorio' });
+    const dados = { projeto, userAgent: b.userAgent || null, storageState, salvoEm: agora() };
+    fs.writeFileSync(TT_SESS_DIR + '/' + projeto + '.json', JSON.stringify(dados));
+    res.json({ ok: true, projeto, cookies: Array.isArray(storageState.cookies) ? storageState.cookies.length : 0 });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/tiktok/sessao-nuvem', (_req, res) => {
+  try {
+    const out: any = {};
+    for (const p of ['teclado', 'baixo', 'violao', 'comunidade']) {
+      try {
+        const d = JSON.parse(fs.readFileSync(TT_SESS_DIR + '/' + p + '.json', 'utf8'));
+        out[p] = { temSessao: true, salvoEm: d.salvoEm || null, cookies: Array.isArray(d.storageState?.cookies) ? d.storageState.cookies.length : 0 };
+      } catch { out[p] = { temSessao: false }; }
+    }
+    res.json({ ok: true, sessoes: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// TESTE do navegador invisível do TikTok (igual ao YouTube): roda em SEGUNDO PLANO e os prints saem
+// como URLs públicas (/media/tt-snaps/..). body: { projeto, arquivo | url, descricao?, tipo?, privacy?, snaps? }
+let _ttUltimoTeste: any = null;
+function _ttSnapsUrls(arr: any[]): string[] {
+  const base = String(process.env.PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/$/, '');
+  return (arr || []).map((p: string) => base + '/media/tt-snaps/' + String(p).split('/').pop());
+}
+app.post('/pub/tiktok/testar-navegador', async (req, res) => {
+  const b = req.body || {};
+  const projeto = String(b.projeto || '').trim().toLowerCase();
+  if (!['teclado', 'baixo', 'violao', 'comunidade'].includes(projeto)) {
+    return res.status(400).json({ ok: false, erro: 'projeto_invalido (use teclado|baixo|violao|comunidade)' });
+  }
+  if (_ttUltimoTeste && _ttUltimoTeste.status === 'rodando') {
+    return res.status(409).json({ ok: false, erro: 'ja_rodando', desde: _ttUltimoTeste.inicio });
+  }
+  _ttUltimoTeste = { status: 'rodando', inicio: agora(), projeto };
+  res.json({ ok: true, iniciado: true, projeto });
+  (async () => {
+    let arquivo = String(b.arquivo || '').trim();
+    let baixadoTmp: string | null = null;
+    try {
+      if (!arquivo && b.url && /^https?:\/\//i.test(String(b.url))) {
+        const url = String(b.url);
+        baixadoTmp = '/tmp/tt-teste-' + Date.now() + '.mp4';
+        const _httpsMod: any = await import('node:https');
+        const _httpMod: any = await import('node:http');
+        const _dl: any = url.toLowerCase().startsWith('https') ? (_httpsMod.default || _httpsMod) : (_httpMod.default || _httpMod);
+        await new Promise<void>((resolve, reject) => {
+          const out = fs.createWriteStream(baixadoTmp as string);
+          _dl.get(url, (r: any) => {
+            if (r.statusCode && r.statusCode >= 400) { reject(new Error('download HTTP ' + r.statusCode)); return; }
+            r.pipe(out);
+            out.on('finish', () => out.close(() => resolve()));
+          }).on('error', reject);
+        });
+        arquivo = baixadoTmp;
+      }
+      if (!arquivo) { _ttUltimoTeste = { status: 'erro', erro: 'informe arquivo ou url', projeto, fim: agora() }; return; }
+      const mod: any = await import('./tt-browser-nuvem');
+      const r = await mod.publicarTiktokNuvem({
+        projeto, arquivo,
+        descricao: b.descricao ? String(b.descricao) : '',
+        tipo: b.tipo === 'carrossel' ? 'carrossel' : 'video',
+        privacy: b.privacy === 'self' ? 'self' : 'public',
+        snaps: !!b.snaps
+      });
+      _ttUltimoTeste = { status: r && r.ok ? 'ok' : 'falhou', projeto, fim: agora(), ...r, snapsUrls: _ttSnapsUrls(r && r.screenshots) };
+    } catch (e: any) {
+      _ttUltimoTeste = { status: 'erro', erro: String(e?.message || e), projeto, fim: agora() };
+    } finally {
+      if (baixadoTmp) { try { fs.unlinkSync(baixadoTmp); } catch { /* ok */ } }
+    }
+  })();
+});
+app.get('/pub/tiktok/testar-navegador/resultado', (_req, res) => {
+  res.json({ ok: true, resultado: _ttUltimoTeste });
+});
+
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
   try {
@@ -8815,7 +8903,16 @@ async function pbPostarItem(item: any): Promise<void> {
       } else if (p === 'pinterest') {
         if (formato === 'carrossel' || !midia) { resultados[p] = 'PULADO: Pinterest sem carrossel aqui'; continue; }
         r = await pbPinterestPublicar(canalId, { filePath: file, formato, titulo, descricao: captionSocial || descYt });
-      } else if (p === 'tiktok' || p === 'kwai') {
+      } else if (p === 'tiktok') {
+        // [+tt-browser-nuvem 31/10] TikTok por navegador invisível na nuvem (sai pelo IP de casa via proxy).
+        // Só chega aqui quando 'tiktok' está no allowlist pub_plataformas_nuvem (o cutover). Vídeo só;
+        // carrossel do TikTok segue no PC por enquanto.
+        if (!midia || pbIsImagem(file) || formato === 'carrossel') { resultados[p] = 'PULADO: TikTok carrossel fica no PC (nuvem = só vídeo)'; continue; }
+        const _ttmod: any = await import('./tt-browser-nuvem');
+        const _rt = await _ttmod.publicarTiktokNuvem({ projeto: canalId, arquivo: file, descricao: captionSocial, tipo: 'video', privacy: 'public' });
+        if (!_rt || !_rt.ok) throw new Error('navegador TikTok: ' + ((_rt && _rt.erro) || 'falhou') + (_rt && _rt.proxyUsado ? ' (proxy ' + _rt.proxyUsado + ')' : ''));
+        r = { id: '', url: _rt.postUrl || '' };
+      } else if (p === 'kwai') {
         resultados[p] = 'PULADO: ' + p + ' precisa do proxy BR (fase navegador)'; continue;
       } else { resultados[p] = 'PULADO: plataforma desconhecida'; continue; }
       resultados[p] = 'OK: ' + (r.url || r.id); videoIds[p] = r.id; sucessos++; tentados++;
