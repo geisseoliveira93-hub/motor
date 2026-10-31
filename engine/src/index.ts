@@ -6138,6 +6138,32 @@ app.get('/pub/conexoes', (_req, res) => {
     res.json({ ok: true, conexoes: out, resumo });
   } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
 });
+// [+saude-publicacao 31/10] Saude de PUBLICACAO por canal x plataforma, calculada nos dados REAIS da
+// nuvem (fila_publicacao do motor). O painel "X coisas precisam da sua atencao" do app lia o banco LOCAL
+// do PC (congelado desde a migracao pra nuvem) e acusava "parado ha X dias" ate em canal que publicou hoje.
+// Este endpoint devolve a verdade da nuvem pro app consumir no lugar do banco local. So leitura.
+app.get('/pub/saude-publicacao', (_req, res) => {
+  try {
+    const canais = db.prepare(`SELECT id, nome, plataformas_json FROM canais_publicacao WHERE ativo=1`).all() as any[];
+    const tAgora = Date.now();
+    const itens: any[] = [];
+    for (const c of canais) {
+      let plats: string[] = []; try { plats = JSON.parse(c.plataformas_json || '[]'); } catch { /* json corrompido */ }
+      for (const plat of plats) {
+        // ultima publicacao BEM-SUCEDIDA (worker gravou "OK:" daquela plataforma) nesse canal
+        const row = db.prepare(`SELECT MAX(COALESCE(data_movido, atualizado_em)) AS quando FROM fila_publicacao WHERE canal_id=? AND status IN ('publicado','parcial') AND resultado_por_plataforma_json LIKE ?`).get(c.id, '%"' + plat + '":"OK:%') as any;
+        const quando = (row && row.quando) ? String(row.quando) : null;
+        let diasSemSucesso: number | null = null;
+        if (quando) { const t = Date.parse(quando); if (isFinite(t)) diasSemSucesso = Math.floor((tAgora - t) / 86400000); }
+        // tem video esperando na fila pra essa plataforma?
+        const fila = db.prepare(`SELECT COUNT(*) AS c FROM fila_publicacao WHERE canal_id=? AND status='agendado' AND plataformas_json LIKE ?`).get(c.id, '%' + plat + '%') as any;
+        const temFila = !!(fila && fila.c > 0);
+        itens.push({ canalId: c.id, canalNome: c.nome, plataforma: plat, diasSemSucesso, ultimoSucesso: quando, temFila });
+      }
+    }
+    res.json({ ok: true, itens });
+  } catch (e: any) { res.json({ ok: false, erro: String(e.message || e) }); }
+});
 app.post('/pub/conexao/status', (req, res) => {
   try {
     const b = req.body || {}; const id = String(b.canal_id || '') + ':' + String(b.plataforma || '');
