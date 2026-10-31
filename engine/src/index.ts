@@ -15210,12 +15210,29 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       } catch { /* recup painel best-effort */ }
       const _recTotal = { total: 0, wa: 0, ck: 0, fat: 0 };
       for (const b of Object.keys(_recByProd)) { const r = _recByProd[b]; _recTotal.total += r.total; _recTotal.wa += r.wa; _recTotal.ck += r.ck; _recTotal.fat += r.fat; }
+      // [+lastlink-painel 31/10] A LastLink NAO e captada pelo worker (so Guru/Pagarme/Cademi).
+      // Soma as vendas APROVADAS (status 'liquidada') da LastLink que o motor ja grava em transacoes,
+      // por bucket de produto, no MESMO periodo (data de Brasilia). Exclui pedidos ja contados como
+      // recuperacao, pra NAO contar em dobro. Sem sobreposicao com o worker (que nao tem LastLink).
+      const _llByProd: Record<string, { total: number; fat: number }> = {};
+      try {
+        const _llrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE provider='lastlink' AND status='liquidada' AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? AND id NOT IN (SELECT pedido FROM vendas_recuperacao WHERE pedido IS NOT NULL) GROUP BY produto`).all(deFinal, ateFinal) as any[];
+        for (const r of _llrows) {
+          const b = _pnlProduto(r.produto || '');
+          const o = _llByProd[b] || (_llByProd[b] = { total: 0, fat: 0 });
+          o.total += Number(r.n || 0); o.fat += Number(r.v || 0);
+          if (!porProd[b]) porProd[b] = { produto: b, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 }; // bucket so-LastLink (sem anuncio)
+        }
+      } catch { /* lastlink painel best-effort */ }
+      const _llTotal = { total: 0, fat: 0 };
+      for (const b of Object.keys(_llByProd)) { const r = _llByProd[b]; _llTotal.total += r.total; _llTotal.fat += r.fat; }
       const tx = taxaPct();
       const im = impPct();
       const enrich = (p: any): any => {
         const rec = (p.produto === 'Todos') ? _recTotal : (_recByProd[p.produto] || { total: 0, wa: 0, ck: 0, fat: 0 });
-        const vendasT = (p.vendas || 0) + (rec.total || 0); // vendas de anúncio + vendas de recuperação
-        const fatT = (p.fat || 0) + (rec.fat || 0);
+        const ll = (p.produto === 'Todos') ? _llTotal : (_llByProd[p.produto] || { total: 0, fat: 0 }); // [+lastlink-painel 31/10]
+        const vendasT = (p.vendas || 0) + (rec.total || 0) + (ll.total || 0); // anúncio + recuperação + LastLink
+        const fatT = (p.fat || 0) + (rec.fat || 0) + (ll.fat || 0);
         const taxaV = fatT * tx / 100;
         const impV = p.gasto * im / 100;
         const lucro = fatT - taxaV - impV - p.gasto;
@@ -15228,6 +15245,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
           taxaPlataforma: taxaV, impostoMeta: impV, lucro,
           margem: fatT > 0 ? lucro / fatT * 100 : 0,
           recup: { total: rec.total || 0, wa: rec.wa || 0, ck: rec.ck || 0, fat: rec.fat || 0 },
+          lastlink: { total: ll.total || 0, fat: ll.fat || 0 },
           vendasAds: p.vendas || 0, fatAds: p.fat || 0,
         };
       };
