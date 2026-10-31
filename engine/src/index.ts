@@ -12901,6 +12901,12 @@ a{color:inherit;text-decoration:none}
 .card .pz{position:relative;width:210px;height:320px;border-radius:14px;overflow:hidden;background:#17171f;border:1px solid #23232c;transition:transform .2s cubic-bezier(.2,.7,.3,1),filter .2s,box-shadow .2s,outline-color .2s;outline:2px solid transparent;outline-offset:2px}
 .card{cursor:pointer}.card:hover .pz{transform:translateY(-4px) scale(1.045);filter:brightness(1.12);box-shadow:0 16px 30px -12px #000c;outline-color:#e7c86a}.cattile{transition:transform .2s,border-color .2s}.cattile:hover{transform:translateY(-3px)}
 .card .pz img{width:100%;height:100%;object-fit:cover;display:block}
+/* [layout-home 31/10] HOME em TELA CHEIA + cards MAIORES (so a home; outras telas seguem 1180px). ADITIVO. */
+.wrap.home{max-width:none;padding-left:clamp(16px,3vw,48px);padding-right:clamp(16px,3vw,48px)}
+.wrap.home .shelf h2{font-size:17px;color:#e9e9f2;font-weight:700}
+.wrap.home .card{flex:0 0 250px;width:250px}
+.wrap.home .card .pz{width:250px;height:375px}
+@media(max-width:820px){.wrap.home .card{flex:0 0 180px;width:180px}.wrap.home .card .pz{width:180px;height:270px}}
 .card .pz .lock{position:absolute;inset:0;display:grid;place-items:center;background:#000000a8;font-size:30px}
 .card .pz .pb{position:absolute;left:0;right:0;bottom:0;height:4px;background:#ffffff22}
 .card .pz .pb i{display:block;height:100%;background:#e7c86a}
@@ -12979,6 +12985,8 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 .arw.l{left:0;background:linear-gradient(90deg,#0d0d10,transparent)}
 .arw.r{right:0;background:linear-gradient(270deg,#0d0d10,transparent)}
 .railwrap:hover .arw{opacity:.95}
+/* [layout-home 31/10] setas SEMPRE visiveis em tela menor / toque (sem hover). ADITIVO. */
+@media(hover:none),(max-width:980px){.railwrap .arw{opacity:.92}}
 .ic.acspk{background:none;font-size:16px}
 `;
 const _acTop = (al: any, aba = ''): string => {
@@ -13247,7 +13255,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     const semVit = cursos.filter((c) => !c.vitrine_id && meus.has(c.id));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Seus cursos aparecerão aqui.</div>`;
-    const corpo = hero + `<div class="wrap">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS();
+    const corpo = hero + `<div class="wrap home">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS();
     res.type('html').send(_acPage(al, 'Início', corpo, 'home'));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
