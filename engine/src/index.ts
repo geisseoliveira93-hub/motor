@@ -15226,13 +15226,32 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       } catch { /* lastlink painel best-effort */ }
       const _llTotal = { total: 0, fat: 0 };
       for (const b of Object.keys(_llByProd)) { const r = _llByProd[b]; _llTotal.total += r.total; _llTotal.fat += r.fat; }
+      // [+todas-vendas 31/10] O TOTAL de vendas do painel passa a vir de `transacoes` (fonte da verdade do
+      // motor): TODAS as vendas APROVADAS (status 'liquidada'), QUALQUER plataforma — LastLink, Guru
+      // (atribuida a anuncio E organica), Pagar.me — por bucket de produto, no periodo (data Brasilia).
+      // Ja inclui as de recuperacao (que tambem estao em transacoes). O worker segue so pro GASTO e
+      // atribuicao por anuncio (vendasAds / lista de ads). ZERO dupla contagem: a venda de anuncio
+      // (p.vendas) NAO e mais somada ao total — fica so como detalhe (vendasAds).
+      const _txByProd: Record<string, { total: number; fat: number }> = {};
+      try {
+        const _txrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE status='liquidada' AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? GROUP BY produto`).all(deFinal, ateFinal) as any[];
+        for (const r of _txrows) {
+          const b = _pnlProduto(r.produto || '');
+          const o = _txByProd[b] || (_txByProd[b] = { total: 0, fat: 0 });
+          o.total += Number(r.n || 0); o.fat += Number(r.v || 0);
+          if (!porProd[b]) porProd[b] = { produto: b, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 }; // bucket sem anuncio (venda organica)
+        }
+      } catch { /* todas-vendas best-effort */ }
+      const _txTotal = { total: 0, fat: 0 };
+      for (const b of Object.keys(_txByProd)) { const r = _txByProd[b]; _txTotal.total += r.total; _txTotal.fat += r.fat; }
       const tx = taxaPct();
       const im = impPct();
       const enrich = (p: any): any => {
         const rec = (p.produto === 'Todos') ? _recTotal : (_recByProd[p.produto] || { total: 0, wa: 0, ck: 0, fat: 0 });
         const ll = (p.produto === 'Todos') ? _llTotal : (_llByProd[p.produto] || { total: 0, fat: 0 }); // [+lastlink-painel 31/10]
-        const vendasT = (p.vendas || 0) + (rec.total || 0) + (ll.total || 0); // anúncio + recuperação + LastLink
-        const fatT = (p.fat || 0) + (rec.fat || 0) + (ll.fat || 0);
+        const tx2 = (p.produto === 'Todos') ? _txTotal : (_txByProd[p.produto] || { total: 0, fat: 0 }); // [+todas-vendas 31/10]
+        const vendasT = (tx2.total || 0); // TODAS as vendas aprovadas (transacoes: LastLink+Guru+Pagarme, já inclui recuperação)
+        const fatT = (tx2.fat || 0);
         const taxaV = fatT * tx / 100;
         const impV = p.gasto * im / 100;
         const lucro = fatT - taxaV - impV - p.gasto;
