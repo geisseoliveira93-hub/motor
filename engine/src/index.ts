@@ -721,6 +721,34 @@ function _entregarVol2SeComprou(projeto: string, telefone: string, nome: string 
   } catch { /* best-effort: nunca quebra a entrega padrão */ }
 }
 
+// [vol2-fix 31/10] O gate antigo (_entregarVol2SeComprou por oferta 299c395a) casava com TODO comprador do
+// Vol1 (o 299c395a é a oferta do próprio Vol1), então todo mundo recebia 4 ebooks. A detecção correta é pela
+// LISTA de produtos do pedido: o Vol2 é um PRODUTO separado "...mais 200 cifras ... [Volume 2]". Entrega o Vol2
+// SÓ quando o bump realmente está no pedido (nos itens do webhook) OU quando o webhook é o do próprio Vol2.
+function _ehProdutoVol2(produtoId?: string, produtoNome?: string): boolean {
+  const s = (String(produtoId || '') + ' ' + String(produtoNome || '')).toLowerCase();
+  return s.includes('[volume 2]') || (s.includes('mais 200 cifras') && s.includes('volume 2'));
+}
+function _entregarVol2DoPedido(projeto: string, p: { telefone?: string; nome?: string; email?: string; produtoId?: string; produtoNome?: string }, provider: string, b: any): void {
+  try {
+    if (projeto !== 'baixo') return;
+    // 1) o pedido INCLUI o Vol2? (itens do webhook: Products[]/Bumps[]) OU o produto principal É o Vol2?
+    let temVol2 = _ehProdutoVol2(p.produtoId, p.produtoNome);
+    if (!temVol2) { try { temVol2 = _itensPagamento(provider, b).some((it) => _ehProdutoVol2(it.produtoId, it.produtoNome)); } catch { /* */ } }
+    if (!temVol2) return;
+    // 2) telefone: do webhook; se vier sem (o webhook do bump às vezes não traz), resolve pelo e-mail do comprador.
+    let telefone = String(p.telefone || '').replace(/\D/g, '');
+    if (!telefone && p.email) {
+      try { const r = db.prepare(`SELECT telefone FROM contatos WHERE projeto='baixo' AND lower(email)=lower(?) AND telefone IS NOT NULL AND telefone<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(p.email)) as any; if (r && r.telefone) telefone = String(r.telefone).replace(/\D/g, ''); } catch { /* */ }
+    }
+    if (!telefone) return; // sem telefone não dá pra entregar (não enfileira lixo)
+    const fp = (CONFIG.entregaFluxoProduto || []).find((f) => String(f.chave || '').toLowerCase() === _VOL2_CHAVE);
+    if (!fp || !Array.isArray(fp.fluxo) || !fp.fluxo.length) return;
+    try { if (db.prepare(`SELECT 1 FROM fila_envio WHERE para=? AND fluxo_chave=? LIMIT 1`).get(telefone, _VOL2_CHAVE)) return; } catch { /* */ }
+    enfileirarFluxo(projeto as Projeto, telefone, fp.fluxo, p.nome, { chamarPeloNome: fp.chamarPeloNome, nomeFallback: fp.nomeFallback }, fp.instancia || undefined, _VOL2_CHAVE);
+  } catch { /* best-effort: nunca quebra a entrega padrão */ }
+}
+
 // ===================== [+combo-baixo 29/10] Fluxo do botão WhatsApp "Combo de Cifras" do Baixo =====================
 // Clone do fluxo do Dedilhados, pro Baixo (Pack do Baixista Iniciante). A FRASE-GATILHO no WhatsApp do Baixo ->
 // aplica tag -> dispara vídeo/áudio + oferta -> e PARA na hora se a pessoa RESPONDER (cancela pendentes + handoff
@@ -1778,6 +1806,38 @@ app.get('/flows', (_req, res) => {
     recuperacaoFluxo: CONFIG.recuperacaoFluxo || {},
     recuperacaoFluxoProduto: CONFIG.recuperacaoFluxoProduto || [],
   });
+});
+
+// [vol2-fix 31/10] DIAGNÓSTICO (somente leitura): mostra como chegam os webhooks do Baixo (principal, itens
+// do pedido, e-mail/telefone, se o gate do Vol2 pegaria) — pra conferir se o bump vem no mesmo webhook ou
+// separado (sem telefone). Lê o webhook_pagamento_log. Protegido pela ENGINE_API_KEY.
+app.get('/debug/vol2-webhooks', (req, res) => {
+  try {
+    const lim = Math.min(80, Math.max(1, Number((req.query && req.query.limite) || 40)));
+    const rows = db.prepare(`SELECT provider, pedido, raw_json, criado_em FROM webhook_pagamento_log WHERE provider='lastlink' ORDER BY criado_em DESC LIMIT 400`).all() as any[];
+    const out: any[] = [];
+    for (const r of rows) {
+      let b: any = null; try { b = JSON.parse(r.raw_json); } catch { continue; }
+      const d = b?.Data || b?.data || b;
+      const principal = normalizaPagamento('lastlink', b);
+      const nomeP = String(principal.produtoNome || '').toLowerCase();
+      // só os do baixo (cifras/combo/volume) pra não poluir
+      let itens: any[] = []; try { itens = _itensPagamento('lastlink', b); } catch { /* */ }
+      const txt = (nomeP + ' ' + itens.map((i) => i.produtoNome).join(' ')).toLowerCase();
+      if (!/cifra|baixo|volume|combo/.test(txt)) continue;
+      const temVol2 = _ehProdutoVol2(principal.produtoId, principal.produtoNome) || itens.some((i) => _ehProdutoVol2(i.produtoId, i.produtoNome));
+      out.push({
+        criado_em: r.criado_em, event: b?.Event || b?.event || null, pedido: r.pedido,
+        email: principal.email || null, telefone: principal.telefone || null,
+        offerId: String(d?.Offer?.Id || d?.Offer?.id || ''),
+        principal: principal.produtoNome || null,
+        itens: itens.map((i) => i.produtoNome),
+        temVol2
+      });
+      if (out.length >= lim) break;
+    }
+    res.json({ ok: true, total: out.length, webhooks: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
 
 // Cria/atualiza um fluxo de ENTREGA por PRODUTO. body: { chave, porId?, projeto?, fluxo:[] }
@@ -4008,7 +4068,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         // [tags-auto] tags da trilha do produto principal (low-ticket / qualificar-24h / comprou-low-*).
         try { for (const tg of _produtoTags(p.produtoId, p.produtoNome)) aplicarTag(projeto, cid, tg); } catch { /* best-effort */ }
         await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
-        try { _entregarVol2SeComprou(projeto, p.telefone, p.nome, tagsCompraAuto(provider, b, p)); } catch { /* vol2 best-effort */ }
+        try { _entregarVol2DoPedido(projeto, p, provider, b); } catch { /* vol2 best-effort */ }
         // [+vendas-recuperacao 29/10] se essa venda veio de quem estava em recuperação, registra com a origem (whatsapp/checkout).
         try { _registrarVendaRecuperacao(provider, p, projeto); } catch { /* best-effort: nunca quebra a entrega */ }
         // [motor2] Trilha por produto + order bump/upsell. INERTE até pubFlag('motor2_ativo')==='1'.
