@@ -8106,6 +8106,19 @@ async function _grpDescription(instancia: string, jid: string, description: stri
 async function _grpPicture(instancia: string, jid: string, image: string) {
   return evo(`/group/updateGroupPicture/${encodeURIComponent(instancia)}?groupJid=${encodeURIComponent(jid)}`, 'POST', { image });
 }
+// [+grupos-editar-erro 01/11] Traduz o erro cru da Evolution pra um motivo LEGÍVEL (rate-limit do WhatsApp x
+// número não é admin x grupo inexistente x desconectado), em vez do "Evolution 500 Internal Server Error" cortado.
+function _grpMotivoErro(raw: any): string {
+  const s = String(raw == null ? '' : (raw.message || raw)).toLowerCase();
+  if (/rate.?over|rate.?limit|too many|\b429\b|overlimit/.test(s)) return 'limite do WhatsApp (muitas trocas seguidas) — reprocesse mais devagar';
+  if (/not-?authorized|forbidden|\b403\b|not an admin|no permission|sender is not admin|only admins/.test(s)) return 'o número não é admin desse grupo';
+  if (/item-?not-?found|\b404\b|does not exist|no such group|group not found/.test(s)) return 'grupo não encontrado (número saiu ou grupo apagado)';
+  if (/timeout|timed out|etimedout/.test(s)) return 'tempo esgotado — tente de novo';
+  if (/not connected|connection closed|connection is closed|disconnect|logged out/.test(s)) return 'número desconectado no momento';
+  let m = '';
+  try { const j = JSON.parse(String(raw == null ? '' : (raw.message || raw)).replace(/^Evolution \d+:\s*/, '')); m = (j?.response?.message) || j?.message || j?.error || ''; if (Array.isArray(m)) m = m.join('; '); } catch { /* */ }
+  return (m ? String(m) : String(raw == null ? 'erro' : (raw.message || raw))).replace(/\s+/g, ' ').slice(0, 160);
+}
 app.post('/disparo/grupos-editar', async (req, res) => {
   try {
     const p = req.body || {};
@@ -8124,9 +8137,9 @@ app.post('/disparo/grupos-editar', async (req, res) => {
     const out: any[] = [];
     for (const jid of jids) {
       const r: any = { jid };
-      if (nome != null) { try { await _grpSubject(instancia, jid, nome); r.nome = 'ok'; } catch (e: any) { r.nome = 'erro:' + String(e.message || e).slice(0, 80); } }
-      if (descricao != null) { try { await _grpDescription(instancia, jid, descricao); r.descricao = 'ok'; } catch (e: any) { r.descricao = 'erro:' + String(e.message || e).slice(0, 80); } }
-      if (fotoUrl) { try { await _grpPicture(instancia, jid, fotoUrl); r.foto = 'ok'; } catch (e: any) { r.foto = 'erro:' + String(e.message || e).slice(0, 80); } }
+      if (nome != null) { try { await _grpSubject(instancia, jid, nome); r.nome = 'ok'; } catch (e: any) { r.nome = 'erro: ' + _grpMotivoErro(e); } }
+      if (descricao != null) { try { await _grpDescription(instancia, jid, descricao); r.descricao = 'ok'; } catch (e: any) { r.descricao = 'erro: ' + _grpMotivoErro(e); } }
+      if (fotoUrl) { try { await _grpPicture(instancia, jid, fotoUrl); r.foto = 'ok'; } catch (e: any) { r.foto = 'erro: ' + _grpMotivoErro(e); } }
       out.push(r);
       if (intervalo) await new Promise((rs) => setTimeout(rs, intervalo * 1000));
     }
