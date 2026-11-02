@@ -119,6 +119,7 @@ export interface PublicarNuvemPayload {
 export interface PublicarNuvemResposta {
   ok: boolean;
   postUrl?: string;
+  rascunho?: boolean; // [+publish-fix 02/11] true = publicou o upload mas NÃO confirmou a saída do rascunho
   erro?: string;
   motivoFalha?: 'sessao_expirada' | 'sem_sessao' | 'arquivo_inexistente' | 'ui_mudou' | 'outro';
   duracaoMs: number;
@@ -636,26 +637,58 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
       throw new Error('Falha ao clicar Publicar: ' + (e as Error).message);
     }
 
+    // [+publish-fix 02/11] BUG: em vídeo LONGO a verificação do YouTube não termina a tempo; ao clicar Publicar
+    // aparece o diálogo "publicar mesmo com a verificação em andamento?". A versão antiga, se não achasse um botão
+    // com texto EXATAMENTE "Publicar", caía no #cancel-button => CANCELAVA => o vídeo ficava em RASCUNHO (e ainda
+    // assim capturava a URL do rascunho e reportava sucesso). Agora: clica SEMPRE no confirmar (#confirm-button ou
+    // botão cujo rótulo contenha "publicar"), NUNCA no cancelar; e confere se saiu do rascunho, re-tentando até 3x.
     async function confirmarPublicarMesmoAssim(): Promise<boolean> {
       return await page
         .evaluate(() => {
           const doc = (globalThis as any).document;
-          const dialogs = Array.from(doc.querySelectorAll('ytcp-confirmation-dialog'));
+          const dialogs = Array.from(doc.querySelectorAll('ytcp-confirmation-dialog, tp-yt-paper-dialog'));
           for (const d of dialogs as any[]) {
             const r = d.getBoundingClientRect ? d.getBoundingClientRect() : { width: 0, height: 0 };
             if (r.width < 10 || r.height < 10) continue;
-            const txt = d.innerText || '';
-            if (!/verifica/i.test(txt)) continue;
-            const btns = Array.from(d.querySelectorAll('ytcp-button, button'));
-            let pub = (btns as any[]).find((b) => /^\s*publicar\s*$/i.test(b.textContent || ''));
-            if (!pub) pub = d.querySelector('#cancel-button') || d.querySelector('ytcp-button#cancel-button');
-            if (pub) { pub.click(); return true; }
+            const txt = (d.innerText || '').toLowerCase();
+            if (!/verifica|publicar|publicando/.test(txt)) continue; // só o diálogo de verificação/publicação
+            // 1) botão oficial de confirmar; 2) senão, um botão cujo rótulo contenha "publicar" (NUNCA o cancelar)
+            let pub: any = d.querySelector('#confirm-button');
+            if (!pub) {
+              const cands = Array.from(d.querySelectorAll('ytcp-button, button')) as any[];
+              pub = cands.find((b) => /publicar/i.test(b.textContent || '') && b.id !== 'cancel-button') || null;
+            }
+            if (pub && pub.id !== 'cancel-button') { try { pub.click(); } catch { /* ok */ } return true; }
           }
           return false;
         })
         .catch(() => false);
     }
-    for (let tent = 0; tent < 4; tent++) {
+    // ainda NO wizard (não publicou) = radios de visibilidade ainda visíveis
+    async function aindaNoWizard(): Promise<boolean> {
+      return await page
+        .evaluate(() => {
+          const doc = (globalThis as any).document;
+          const radio = doc.querySelector('tp-yt-paper-radio-button[name="PUBLIC"], tp-yt-paper-radio-button[name="PRIVATE"], tp-yt-paper-radio-button[name="UNLISTED"]');
+          if (!radio) return false;
+          const r = radio.getBoundingClientRect ? radio.getBoundingClientRect() : { width: 0, height: 0 };
+          return r.width > 5 && r.height > 5;
+        })
+        .catch(() => false);
+    }
+    async function jaPublicou(): Promise<boolean> {
+      const okTxt = await page
+        .evaluate(() => {
+          const doc = (globalThis as any).document;
+          const t = (doc.body && doc.body.innerText) || '';
+          return /v[íi]deo publicado|publicado com sucesso|compartilhe seu v[íi]deo|enviado ao youtube|v[íi]deo enviado/i.test(t);
+        })
+        .catch(() => false);
+      if (okTxt) return true;
+      return !(await aindaNoWizard());
+    }
+    // 1ª rodada: confirma o "publicar mesmo assim"
+    for (let tent = 0; tent < 6; tent++) {
       const confirmou = await confirmarPublicarMesmoAssim();
       if (confirmou) {
         logI('diálogo "ainda verificando" — cliquei Publicar mesmo assim');
@@ -665,25 +698,24 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
       }
       await delayHumano(700, 1200);
     }
-
-    try {
-      await page.waitForFunction(
-        () => {
-          const doc = (globalThis as any).document;
-          const btn = doc.querySelector('#done-button');
-          const r = btn && btn.getBoundingClientRect ? btn.getBoundingClientRect() : null;
-          const fechou = !btn || (r && r.width < 5);
-          const txt = (doc.body && doc.body.innerText) || '';
-          const sucesso = /v[íi]deo publicado|publicado com sucesso|enviado ao youtube|v[íi]deo enviado/i.test(txt);
-          return fechou || sucesso;
-        },
-        { timeout: 60_000 }
-      );
-      await snap('09d-publicacao-confirmada');
-      logI('publicacao confirmada');
-    } catch {
-      logW('nao confirmei explicitamente a publicacao (seguindo p/ capturar URL)');
+    // confere que SAIU do rascunho; se continua no wizard, re-clica Publicar + confirma (até 3x)
+    let publicou = await jaPublicou();
+    for (let v = 0; v < 3 && !publicou; v++) {
+      logW('ainda em rascunho — re-clicando Publicar (tentativa ' + (v + 1) + ')');
+      try {
+        const okBtn = await clicarNativo('#done-button');
+        if (!okBtn) await page.click('#done-button', { timeout: 8000 });
+      } catch { /* segue */ }
+      await delayHumano(1500, 2500);
+      for (let t2 = 0; t2 < 6; t2++) {
+        if (await confirmarPublicarMesmoAssim()) { await delayHumano(1200, 2000); break; }
+        await delayHumano(700, 1200);
+      }
+      await delayHumano(2500, 4000);
+      publicou = await jaPublicou();
     }
+    if (publicou) { await snap('09d-publicacao-confirmada'); logI('publicacao confirmada (saiu do rascunho)'); }
+    else { await snap('09d-ainda-rascunho'); logW('ATENCAO: o video pode ter ficado em RASCUNHO (nao saiu do wizard)'); }
 
     // ETAPA 10: capturar URL
     logI('aguardando URL do video');
@@ -702,7 +734,7 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     }
 
     await delayHumano(1500, 3000);
-    return { ok: true, postUrl: videoUrl, duracaoMs: Date.now() - start, screenshots, proxyUsado };
+    return { ok: true, postUrl: videoUrl, rascunho: !publicou, duracaoMs: Date.now() - start, screenshots, proxyUsado };
   } catch (e) {
     const msg = (e as Error).message;
     logW('erro publicando', { projeto, erro: msg });
