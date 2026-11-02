@@ -380,19 +380,36 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
       }
     }
 
-    // ETAPA 5b: capa (thumbnail) — opcional, best-effort. Recebe caminho já pronto no servidor.
+    // ETAPA 5b: capa (thumbnail) — best-effort, mas ROBUSTO.
+    // [+capa-fix 02/11] BUG antigo: o seletor incluía '#file-loader', que é o input do VÍDEO (ytcp-uploads-file-picker).
+    // Em vídeos LONGOS (upload ainda rolando) esse input continua no DOM, então .first() pegava ELE e o setInputFiles
+    // jogava a capa no lugar errado → vídeo saía SEM capa (acontecia no Teclado/Comunidade, 15 min; nos curtos
+    // Baixo/Violão o input do vídeo já tinha sumido e pegava o certo). Agora usa SÓ o input do uploader de miniatura,
+    // espera ele aparecer (até 30s), anexa, detecta recusa do YouTube (formato/resolução/tamanho) e tenta de novo 1x.
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
-      try {
-        const inputCapa = page.locator('ytcp-thumbnail-uploader input[type="file"], #file-loader').first();
-        await inputCapa.waitFor({ state: 'attached', timeout: 15_000 });
-        await inputCapa.setInputFiles(thumbnailPath);
-        await delayHumano(2000, 3500);
-        await snap('05b-capa-anexada');
-        logI('capa anexada');
-      } catch (e) {
-        logW('não consegui anexar a capa (seguindo sem ela)', { erro: (e as Error).message });
-        await snap('05b-capa-falhou');
-      }
+      const anexarCapa = async (): Promise<'ok' | 'sem-campo' | 'recusada'> => {
+        const inputCapa = page.locator('ytcp-thumbnail-uploader input[type="file"]').first();
+        try { await inputCapa.waitFor({ state: 'attached', timeout: 30_000 }); } catch { return 'sem-campo'; }
+        try { await page.evaluate(() => { const u: any = (globalThis as any).document.querySelector('ytcp-thumbnail-uploader'); if (u && u.scrollIntoView) u.scrollIntoView({ block: 'center' }); }); } catch { /* ok */ }
+        await inputCapa.setInputFiles(thumbnailPath).catch(() => { /* segue pra verificar */ });
+        await delayHumano(2500, 4000);
+        const erroCapa = await page
+          .evaluate(() => {
+            const doc: any = (globalThis as any).document;
+            const up = doc.querySelector('ytcp-thumbnail-uploader');
+            const t = (((up && up.innerText) || '') + ' ' + (doc.body?.innerText || '')).slice(0, 6000);
+            const m = t.match(/(n[ãa]o foi poss[íi]vel[^.\n]*miniatura|miniatura[^.\n]*n[ãa]o[^.\n]*(suport|compat)|formato[^.\n]*(n[ãa]o|inv[áa]lid|incompat)|resolu[çc][ãa]o[^.\n]*(baixa|m[íi]nim)|arquivo[^.\n]*(muito grande|grande demais)|2\s*MB|m[áa]ximo de 2|invalid (image|file|format)|unsupported|too large)/i);
+            return m ? m[0].replace(/\s+/g, ' ').slice(0, 120) : '';
+          })
+          .catch(() => '');
+        if (erroCapa) { logW('YouTube recusou a capa', { motivo: erroCapa }); return 'recusada'; }
+        return 'ok';
+      };
+      let res5b = await anexarCapa();
+      if (res5b === 'sem-campo') { await delayHumano(3000, 5000); res5b = await anexarCapa(); }
+      if (res5b === 'ok') { logI('capa anexada'); await snap('05b-capa-anexada'); }
+      else if (res5b === 'recusada') { await snap('05b-capa-recusada'); }
+      else { logW('campo da capa não apareceu (seguindo sem ela)'); await snap('05b-capa-falhou'); }
     }
 
     // ETAPA 6: Not made for kids (clique nativo — atravessa o scrim)
