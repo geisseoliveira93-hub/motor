@@ -9127,6 +9127,51 @@ app.post('/pub/publicador/testar', async (req, res) => {
     res.json({ ok: true, item: item.id, resultado: depois });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
+// [+recapa 02/11] Re-aplica a CAPA (thumbnail) de vídeos JÁ publicados no YouTube que subiram SEM capa (bug antigo do
+// navegador em vídeo longo). Pega da fila os itens 'publicado' do canal com youtube + video_id do YT + thumb_ref, baixa
+// a capa do OneDrive e chama thumbnails.set via API (o escopo youtube.upload cobre). Idempotente (re-põe a MESMA capa
+// do título). body: { projeto?, ids?[], desde?(ISO, filtra atualizado_em), limite?, dry? }. Sem projeto = todos os canais.
+app.post('/pub/youtube/recapa', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = b.projeto ? String(b.projeto) : '';
+    const w: string[] = ["status='publicado'", "COALESCE(thumb_ref,'')<>''", "plataformas_json LIKE '%youtube%'", "COALESCE(video_ids_externos_json,'')<>''"];
+    const a: any[] = [];
+    if (projeto) { w.push('canal_id=?'); a.push(projeto); }
+    if (b.desde) { w.push('atualizado_em>=?'); a.push(String(b.desde)); }
+    const lim = Math.min(500, Math.max(1, Number(b.limite || 500)));
+    const itens = db.prepare(`SELECT id, canal_id, titulo, thumb_ref, video_ids_externos_json FROM fila_publicacao WHERE ${w.join(' AND ')} ORDER BY atualizado_em DESC LIMIT ${lim}`).all(...a) as any[];
+    const idsFiltro: string[] = Array.isArray(b.ids) ? b.ids.map((x: any) => String(x)) : [];
+    const alvos: any[] = [];
+    const vistos = new Set<string>();
+    for (const it of itens) {
+      if (idsFiltro.length && idsFiltro.indexOf(String(it.id)) < 0) continue;
+      let vid = '';
+      try { const v = JSON.parse(it.video_ids_externos_json || '{}'); vid = String(v.youtube || ''); } catch { /* */ }
+      if (!vid || vistos.has(vid)) continue;
+      vistos.add(vid);
+      alvos.push({ id: it.id, canal: it.canal_id, titulo: it.titulo, videoId: vid, thumb_ref: it.thumb_ref });
+    }
+    if (b.dry) return res.json({ ok: true, dry: true, total: alvos.length, alvos: alvos.map((x: any) => ({ titulo: x.titulo, videoId: x.videoId, canal: x.canal })) });
+    const result: any[] = [];
+    for (const al of alvos) {
+      try {
+        const capaFile = pbBaixarMidia(al.thumb_ref).file;
+        const token = await pbYtToken(al.canal);
+        const buf = fs.readFileSync(capaFile);
+        const ext = String(capaFile.split('.').pop() || '').toLowerCase();
+        const ct = ext === 'png' ? 'image/png' : (ext === 'webp' ? 'image/webp' : 'image/jpeg');
+        const r = await fetch(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${encodeURIComponent(al.videoId)}&uploadType=media`, {
+          method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': ct }, body: buf as any,
+        });
+        if (!r.ok) { const t = await r.text().catch(() => ''); result.push({ videoId: al.videoId, titulo: al.titulo, ok: false, erro: `${r.status}: ${String(t).slice(0, 180)}` }); }
+        else { result.push({ videoId: al.videoId, titulo: al.titulo, ok: true }); }
+      } catch (e: any) { result.push({ videoId: al.videoId, titulo: al.titulo, ok: false, erro: String(e?.message || e).slice(0, 180) }); }
+      await new Promise((rr) => setTimeout(rr, 500));
+    }
+    res.json({ ok: true, total: alvos.length, okCount: result.filter((x: any) => x.ok).length, falhas: result.filter((x: any) => !x.ok), result });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
 // lista conexões por canal/plataforma
 app.get('/pub/conexoes/listar', (_req, res) => {
   try {
