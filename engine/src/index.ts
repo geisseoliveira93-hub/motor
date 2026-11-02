@@ -13532,7 +13532,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     });
     for (const v of _ordVit) {
       // [regra antiga 23/10 — preservada como comentário]: const ehEbooks = /e-?books?/i.test(nome+categoria); if (!ehEbooks) { doV = só os do aluno }
-      const doV = cursos.filter((c) => c.vitrine_id === v.id);
+      const doV = cursos.filter((c) => c.vitrine_id === v.id && (c.publicado || meus.has(c.id)));
       const meusV = doV.filter((c) => meus.has(c.id));
       if (!meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela
       if (!doV.length) continue;
@@ -14731,7 +14731,7 @@ app.get('/area/categoria/:cat', (req: any, res: any) => {
     const prog = db.prepare(`SELECT curso_id, AVG(pct) p FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id) as any[];
     const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
     let shelves = '';
-    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap)).join('')}</div></div>`; }
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap)).join('')}</div></div>`; }
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
     const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
     res.type('html').send(_acPage(al, cat, corpo));
