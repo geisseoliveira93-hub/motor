@@ -12064,6 +12064,51 @@ app.post('/vsl/video', (req: any, res: any) => {
     _ndOk(res, { id });
   } catch (e) { _ndErr(res, e); }
 });
+// [vsl-comprimir] comprime um vídeo do OneDrive via ffmpeg DENTRO do container (reaproveita rclone+ffmpeg do ambiente). Protegido por x-api-key (fora da allowlist pública). ADITIVO. Usa o spawn/fs já importados no topo (arquivo é ESM: require() não existe aqui).
+app.post('/vsl/comprimir', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const ref = String(b.ref || '').trim();
+    if (!ref) return res.status(400).json({ erro: 'ref_obrigatorio' });
+    if (/["'$`;|&\n\r\\]/.test(ref) || ref.indexOf('..') >= 0) return res.status(400).json({ erro: 'ref_invalido' });
+    const base = String(b.base || 'Postagem Automatica');
+    if (/["'$`;|&\n\r\\]/.test(base)) return res.status(400).json({ erro: 'base_invalida' });
+    const job = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const logf = '/tmp/vsl_compress_' + job + '.log';
+    const script =
+      'set -e\n' +
+      'B=' + JSON.stringify(base) + '\n' +
+      'SRC=' + JSON.stringify(ref) + '\n' +
+      'R="onedrive:$B/$SRC"\n' +
+      'DIR=$(dirname "$SRC"); BN=$(basename "$SRC")\n' +
+      'BKP="onedrive:$B/$DIR/_ORIGINAL-$BN"\n' +
+      'echo "[vsl] inicio $(date)" > ' + logf + '\n' +
+      'if ! rclone lsf "onedrive:$B/$DIR/" 2>/dev/null | grep -qx "_ORIGINAL-$BN"; then rclone copyto "$R" "$BKP" >> ' + logf + ' 2>&1; echo "[vsl] backup feito" >> ' + logf + '; else echo "[vsl] backup ja existia" >> ' + logf + '; fi\n' +
+      'rclone copyto "$R" /tmp/vslin_' + job + '.mp4 >> ' + logf + ' 2>&1\n' +
+      'nice -n 19 ffmpeg -y -i /tmp/vslin_' + job + '.mp4 -c:v libx264 -preset veryfast -crf 25 -maxrate 2500k -bufsize 5000k -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -threads 2 /tmp/vslout_' + job + '.mp4 >> ' + logf + ' 2>&1\n' +
+      'SZ=$(stat -c%s /tmp/vslout_' + job + '.mp4)\n' +
+      'echo "[vsl] novo tamanho: $SZ bytes" >> ' + logf + '\n' +
+      'if [ "$SZ" -gt 3000000 ] && [ "$SZ" -lt 300000000 ]; then rclone copyto /tmp/vslout_' + job + '.mp4 "$R" >> ' + logf + ' 2>&1; echo "[vsl] OK trocado no OneDrive" >> ' + logf + '; else echo "[vsl] ABORTADO tamanho suspeito" >> ' + logf + '; fi\n' +
+      'rm -f /tmp/vslin_' + job + '.mp4 /tmp/vslout_' + job + '.mp4\n' +
+      'echo "[vsl] fim $(date)" >> ' + logf + '\n';
+    const child = spawn('sh', ['-lc', script], { detached: true, stdio: 'ignore' });
+    child.unref();
+    res.json({ ok: true, job: job, log: logf });
+  } catch (e: any) { res.status(500).json({ erro: String((e && e.message) || e) }); }
+});
+app.get('/vsl/comprimir/status', (req: any, res: any) => {
+  const job = String((req.query.job as any) || '').replace(/[^a-z0-9]/gi, '');
+  if (!job) return res.status(400).json({ erro: 'job_obrigatorio' });
+  const logf = '/tmp/vsl_compress_' + job + '.log';
+  try {
+    const txt = fs.readFileSync(logf, 'utf8');
+    let status = 'rodando';
+    if (/OK trocado/.test(txt)) status = 'ok';
+    else if (/ABORTADO/.test(txt)) status = 'abortado';
+    else if (/\[vsl\] fim/.test(txt)) status = 'fim';
+    res.json({ ok: true, status: status, log: txt.slice(-4000) });
+  } catch (e) { res.json({ ok: true, status: 'sem_log', log: '' }); }
+});
 // [#9 VSL upload] pré-aquecer (baixar agora) o vídeo próprio sob demanda — botão opcional no app.
 app.post('/vsl/media/preaquecer', async (req: any, res: any) => {
   try {
