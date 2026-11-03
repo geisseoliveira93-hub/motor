@@ -13575,7 +13575,7 @@ app.get('/area/curso/:id', (req: any, res: any) => {
       const feitasM = aus.filter((a) => vistos.has(a.id)).length;
       const alvoM = aus[0];
       const capaM = (m as any).capa || curso.capa || '';
-      const img = capaM ? `<img src="${esc(capaM)}" alt="">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:13px;font-weight:700">${esc(m.nome || '')}</div>`;
+      const img = capaM ? `<img src="${esc(capaM)}" alt="" loading="lazy" decoding="async">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:13px;font-weight:700">${esc(m.nome || '')}</div>`;
       const barra = aus.length ? `<div class="pb"><i style="width:${Math.round(feitasM / aus.length * 100)}%"></i></div>` : '';
       const legenda = `<div class="nm">${esc(m.nome || '')}</div><div style="font-size:12px;color:#8a8a96;margin-top:2px">${aus.length} aula${aus.length === 1 ? '' : 's'}${aus.length ? ` · ${feitasM}/${aus.length}` : ''}</div>`;
       if (!alvoM) return `<div class="card" style="cursor:default"><div class="pz">${img}</div>${legenda.replace(/\d+\/\d+/, 'em breve')}</div>`;
@@ -13667,8 +13667,8 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     const anexos = _ndJson(aula.anexos, []) as any[];
     const anexosHtml = anexos.length ? anexos.map((x: any) => `<a class="anexo" href="${esc(x.url || '#')}" target="_blank">📎 <span>${esc(x.nome || 'Arquivo')}</span>${x.tamanho ? `<span style="margin-left:auto;color:#8a8a96;font-size:12px">${esc(x.tamanho)}</span>` : ''}</a>`).join('') : '';
     const desc = aula.descricao ? `<div class="card2" style="margin:14px 0;color:#d2d2dc">${esc(aula.descricao)}</div>` : '';
-    const _coms = db.prepare(`SELECT c.*, m.nome FROM academy_comentarios c LEFT JOIN academy_matriculas m ON m.id=c.aluno_id WHERE c.aula_id=? AND c.aprovado=1 ORDER BY c.criado_em DESC LIMIT 50`).all(aula.id) as any[];
-    const comentariosHtml = `<div class="card2" style="margin-top:16px"><div style="font-weight:700;margin-bottom:8px">Comentários</div>`
+    const _coms = db.prepare(`SELECT c.*, m.nome FROM academy_comentarios c LEFT JOIN academy_matriculas m ON m.id=c.aluno_id WHERE c.aula_id=? AND c.aluno_id=? ORDER BY c.criado_em DESC LIMIT 50`).all(aula.id, al.id) as any[];
+    const comentariosHtml = `<div class="card2" style="margin-top:16px"><div style="font-weight:700;margin-bottom:8px">Meus comentários</div>`
       + `<textarea id="ctx" class="fld" rows="2" placeholder="Escreva um comentário..."></textarea>`
       + `<div style="margin-top:8px"><button class="btn btn-ghost" onclick="acComentar('${aula.id}')">Comentar</button><span id="cok" style="display:none;color:#9ff0c0;margin-left:10px">✅ Enviado (em análise)</span></div>`
       + (_coms.length ? _coms.map((c:any)=>`<div style="border-top:1px solid #1c1c24;padding:10px 0;font-size:13.5px"><b>${esc(c.nome||'Aluno')}</b><div style="color:#cfcfd8;margin-top:3px">${esc(c.texto||'')}</div></div>`).join('') : `<div style="color:#8a8a96;font-size:13px;margin-top:10px">Seja o primeiro a comentar.</div>`)
@@ -14601,19 +14601,49 @@ app.get('/area/favoritos', (req: any, res: any) => {
 });
 
 // UPLOAD de arquivo (admin): recebe base64 (dataURL) e salva em /data/media/academy, serve em /media/academy
-app.post('/academy/upload', (req: any, res: any) => {
+app.post('/academy/upload', async (req: any, res: any) => {
   try {
     const b = req.body || {};
     const data = String(b.data || '');
     const m = data.match(/^data:([^;]+);base64,(.*)$/);
     if (!m) return _ndErr(res, 'formato inválido (envie dataURL base64)');
-    const mime = m[1]; const buf = Buffer.from(m[2], 'base64');
-    const ext = (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5);
+    const mime = m[1]; let buf = Buffer.from(m[2], 'base64');
     const dir = MEDIA_DIR + '/academy';
     try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
+    let ext = (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5);
+    // [+capas-leves 03/11] reduz a imagem p/ máx 600px webp (ESM: import dinâmico, não require)
+    if (/^image\//.test(mime) && !/svg|gif/.test(mime)) {
+      try { const sharp = (await import('sharp')).default; buf = await sharp(buf).rotate().resize({ width: 600, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer(); ext = 'webp'; } catch (e) { /* se sharp falhar, salva original */ }
+    }
     const nome = randomUUID() + '.' + ext;
     fs.writeFileSync(dir + '/' + nome, buf);
     _ndOk(res, { url: (PUBLIC_BASE_URL || '') + '/media/academy/' + nome });
+  } catch (e) { _ndErr(res, e); }
+});
+
+// [+capas-leves 03/11] otimiza as capas JÁ salvas (reduz p/ máx 600px). ADITIVO.
+app.post('/academy/midia/otimizar', async (req: any, res: any) => {
+  try {
+    const sharp = (await import('sharp')).default;
+    const maxW = Number((req.body || {}).max || 600);
+    const dirs = [MEDIA_DIR + '/academy/capas', MEDIA_DIR + '/academy'];
+    let otimizadas = 0, puladas = 0, erros = 0;
+    for (const dir of dirs) {
+      let files: string[] = []; try { files = fs.readdirSync(dir); } catch { continue; }
+      for (const f of files) {
+        const fp = dir + '/' + f;
+        try {
+          if (!fs.statSync(fp).isFile() || !/\.(webp|jpe?g|png)$/i.test(f)) { puladas++; continue; }
+          const meta = await sharp(fp).metadata();
+          if ((meta.width || 0) <= maxW) { puladas++; continue; }
+          const fmt = /\.png$/i.test(f) ? 'png' : (/\.webp$/i.test(f) ? 'webp' : 'jpeg');
+          const pipe = sharp(fp).rotate().resize({ width: maxW, withoutEnlargement: true });
+          const out = await (fmt === 'png' ? pipe.png() : fmt === 'webp' ? pipe.webp({ quality: 80 }) : pipe.jpeg({ quality: 82 })).toBuffer();
+          fs.writeFileSync(fp, out); otimizadas++;
+        } catch (e) { erros++; }
+      }
+    }
+    _ndOk(res, { otimizadas, puladas, erros, maxW });
   } catch (e) { _ndErr(res, e); }
 });
 
@@ -14681,7 +14711,7 @@ const _acCardCurso = (c: any, meus: Set<string>, pmap: any): string => {
   const tem = meus.has(c.id);
   const capa = c.capa || '';
   const pct = pmap[c.id] || 0;
-  const img = capa ? `<img src="${esc(capa)}" alt="">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:12px">${esc(c.nome || '')}</div>`;
+  const img = capa ? `<img src="${esc(capa)}" alt="" loading="lazy" decoding="async">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:12px">${esc(c.nome || '')}</div>`;
   const inner = `<div class="pz"${tem ? '' : ' style="filter:grayscale(.6) brightness(.5)"'}>${img}`
     + (tem ? (pct > 0 ? `<div class="pb"><i style="width:${pct}%"></i></div>` : '') : `<div class="lock">🔒<span class="unlock">Desbloquear</span></div>`)
     + `</div><div class="nm">${esc(c.nome || '')}</div>`;
