@@ -9197,18 +9197,30 @@ app.post('/pub/youtube/recapa-navegador', async (req, res) => {
       alvos.push({ id: it.id, canal: it.canal_id, titulo: it.titulo, videoId: vid, thumb_ref: it.thumb_ref });
     }
     if (b.dry) return res.json({ ok: true, dry: true, total: alvos.length, alvos: alvos.map((x: any) => ({ titulo: x.titulo, videoId: x.videoId, canal: x.canal })) });
-    const _ytmod: any = await import('./yt-browser-nuvem');
-    const result: any[] = [];
-    for (const al of alvos) {
-      try {
-        const capaFile = pbBaixarMidia(al.thumb_ref).file;
-        const r = await _ytmod.aplicarCapaViaEdit({ projeto: al.canal, videoId: al.videoId, thumbnailPath: capaFile });
-        result.push({ videoId: al.videoId, titulo: al.titulo, ok: !!(r && r.ok), erro: (r && r.erro) || undefined });
-      } catch (e: any) { result.push({ videoId: al.videoId, titulo: al.titulo, ok: false, erro: String(e?.message || e).slice(0, 180) }); }
-      await new Promise((rr) => setTimeout(rr, 1500));
-    }
-    res.json({ ok: true, total: alvos.length, okCount: result.filter((x: any) => x.ok).length, falhas: result.filter((x: any) => !x.ok), result });
+    // ASSÍNCRONO: cada vídeo abre o Studio (~30s) -> um lote passa dos 60s da ponte. Dispara em BACKGROUND e
+    // guarda o progresso em pub_kv; acompanhar por GET /pub/youtube/recapa-navegador/status?job=<id>.
+    const job = 'recapanav-' + Date.now();
+    const _snap = (st: string, result: any[]) => { try { setPubFlag('recapanav_' + job, JSON.stringify({ status: st, projeto: projeto || 'todos', total: alvos.length, feitos: result.length, okCount: result.filter((x: any) => x.ok).length, falhas: result.filter((x: any) => !x.ok), result, atualizado: agora() })); } catch { /* */ } };
+    _snap('rodando', []);
+    res.json({ ok: true, job, total: alvos.length, status_url: '/pub/youtube/recapa-navegador/status?job=' + job });
+    (async () => {
+      const _ytmod: any = await import('./yt-browser-nuvem');
+      const result: any[] = [];
+      for (const al of alvos) {
+        try {
+          const capaFile = pbBaixarMidia(al.thumb_ref).file;
+          const r = await _ytmod.aplicarCapaViaEdit({ projeto: al.canal, videoId: al.videoId, thumbnailPath: capaFile });
+          result.push({ videoId: al.videoId, titulo: al.titulo, canal: al.canal, ok: !!(r && r.ok), erro: (r && r.erro) || undefined });
+        } catch (e: any) { result.push({ videoId: al.videoId, titulo: al.titulo, canal: al.canal, ok: false, erro: String(e?.message || e).slice(0, 180) }); }
+        _snap('rodando', result);
+        await new Promise((rr) => setTimeout(rr, 1500));
+      }
+      _snap('fim', result);
+    })().catch((e) => { try { setPubFlag('recapanav_' + job, JSON.stringify({ status: 'erro', erro: String((e as any)?.message || e) })); } catch { /* */ } });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/recapa-navegador/status', (req, res) => {
+  try { const job = String((req.query as any).job || ''); res.json(JSON.parse(pubFlag('recapanav_' + job, '{}') || '{}')); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
 // lista conexões por canal/plataforma
 app.get('/pub/conexoes/listar', (_req, res) => {
