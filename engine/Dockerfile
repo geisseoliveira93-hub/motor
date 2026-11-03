@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates ffmpeg && curl -fsSL -o /tmp/rc.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip && unzip -j /tmp/rc.zip -d /tmp/rc && mv /tmp/rc/rclone /usr/local/bin/rclone && chmod 755 /usr/local/bin/rclone && rm -rf /tmp/rc.zip /tmp/rc && rm -rf /var/lib/apt/lists/*
 COPY package.json ./
 RUN npm install --no-audit --no-fund || npm install --no-audit --no-fund
+# [+capas-leves 03/11] sharp p/ reduzir/otimizar capas no upload (/academy/upload + /academy/midia/otimizar).
+# O repo nao tem package.json versionado (ele vive so no VPS), entao instalamos o sharp aqui no build.
+RUN npm install --no-audit --no-fund sharp@0.33.5 || npm install --no-audit --no-fund sharp@0.33.5
 # [+yt-browser-nuvem 28/10] Navegador DISFARÇADO (patchright, igual ao PC) + Chromium pro "navegador
 # invisível" do YouTube na nuvem. patchright 1.61.1 = mesma versão do app no PC (evita o Google
 # detectar automação e mandar pro login). playwright fica como fallback. Baixa os dois Chromium
