@@ -13204,6 +13204,22 @@ const _acCursosDoAluno = (alunoId: string): Set<string> => {
 const _AC_IA_APP = 'https://melodias-riffs-app.pages.dev';
 const _acIaUrl = (al: any, pagina = 'inicio.html'): string =>
   _AC_IA_APP + '/' + pagina + '?email=' + encodeURIComponent(String(al && al.email || '')) + '&cuser_fname=' + encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '');
+// [+IA-aula-ctx 03/11] instrumento do curso (pelo nome/descrição) + instrumentos cuja IA de CHAT já está pronta + URL da IA de chat já com o contexto da aula. SÓ ADICIONA — não mexe no _acIaUrl acima.
+const _acCursoInst = (curso: any): string => {
+  const s = (String(curso && curso.nome || '') + ' ' + String(curso && curso.descricao || '')).toLowerCase();
+  if (/\bteclado\b|\bpiano\b/.test(s)) return 'teclado';
+  if (/\bviol[ãa]o\b|\bguitarra\b/.test(s)) return 'violao';
+  if (/\bbaixo\b|\bcontra-?baixo\b/.test(s)) return 'baixo';
+  return '';
+};
+// instrumentos cuja IA de CONVERSA já existe (hoje só teclado = app.html; adicionar 'violao'/'baixo' quando o chat deles for ao ar)
+const _AC_IA_PRONTOS = new Set<string>(['teclado']);
+const _acIaUrlAula = (al: any, inst: string, aulaCtx: string): string => {
+  let u = _acIaUrl(al, 'app.html'); // hoje a IA de chat é a de teclado (app.html)
+  if (inst) u += '&inst=' + encodeURIComponent(inst);
+  if (aulaCtx) u += '&aula=' + encodeURIComponent(aulaCtx);
+  return u;
+};
 
 // ---------- [B.2] Tema / layout da área do aluno (M|R dark) ----------
 const _acCSS = `
@@ -13757,6 +13773,36 @@ app.get('/area/aula/:id', (req: any, res: any) => {
         <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #26262f"><b style="flex:1;color:#e7c86a">🎹 IA Melodias e Riffs</b><a class="btn btn-ghost" style="padding:6px 12px" href="${_acIaUrl(al, 'app.html')}" target="_blank">Nova aba ↗</a><button class="btn btn-ghost" style="padding:6px 12px" onclick="document.getElementById('iad').classList.remove('open')">Fechar</button></div>
         <iframe src="${_acIaUrl(al, 'app.html')}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
       </div></div>`;
+    }
+    // [+IA-aula-ctx 03/11] Curso de instrumento com IA de chat pronta → o botão "Dúvida nesta aula?" abre a GAVETA da direita (estilo Cademí) com a IA DAQUELE instrumento, já com o contexto da aula. Mantém o texto do botão. SÓ ADICIONA (reatribui fab/modal, que são 'let').
+    const _iaInst = _acCursoInst(curso);
+    if (dmodo !== 'off' && (dmodo === 'ia' || _AC_IA_PRONTOS.has(_iaInst))) {
+      const _inst = _AC_IA_PRONTOS.has(_iaInst) ? _iaInst : 'teclado';
+      const _modAtual = (mods.find((m: any) => aulas.some((a: any) => a.modulo_id === m.id && a.id === aula.id)) || {}) as any;
+      const _ctxAula = (_modAtual && _modAtual.nome ? String(_modAtual.nome) + ' › ' : '') + String(aula.nome || '');
+      const _iaSrc = _acIaUrlAula(al, _inst, _ctxAula);
+      const _instLabel = _inst === 'teclado' ? 'Teclado' : (_inst === 'violao' ? 'Violão' : 'Baixo');
+      const _iaEmoji = _inst === 'teclado' ? '🎹' : '🎸';
+      fab = `<button class="fab" onclick="document.getElementById('iadrawer').classList.add('open');document.getElementById('iashade').classList.add('open')">💬 Dúvida nesta aula?</button>`;
+      modal = `<style>
+        #iashade{position:fixed;inset:0;background:#000a;z-index:60;opacity:0;pointer-events:none;transition:opacity .25s}
+        #iashade.open{opacity:1;pointer-events:auto}
+        #iadrawer{position:fixed;top:0;right:0;height:100%;width:min(440px,94vw);z-index:61;background:#0a0a0c;border-left:1px solid #26262f;box-shadow:-18px 0 50px #000c;transform:translateX(100%);transition:transform .28s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column}
+        #iadrawer.open{transform:translateX(0)}
+        #iadrawer .iadhead{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid #26262f;background:#0c0c10}
+        #iadrawer .iadav{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#2a2410,#3a3118);display:grid;place-items:center;font-size:17px;flex:none}
+        #iadrawer .iadtt{flex:1;min-width:0}#iadrawer .iadtt b{display:block;color:#e7c86a;font-size:14.5px;line-height:1.2}#iadrawer .iadtt span{display:block;color:#8a8a96;font-size:11.5px}
+        #iadrawer .iadnew,#iadrawer .iadx{width:32px;height:32px;border-radius:8px;border:1px solid #26262f;background:transparent;color:#cfcfd8;font-size:15px;cursor:pointer;flex:none;display:grid;place-items:center;text-decoration:none}
+        #iadrawer .iadctx{margin:12px 12px 0;background:#141019;border:1px solid #33264a;border-radius:10px;padding:9px 12px;font-size:12.5px;color:#d8c8ef;display:flex;gap:8px;align-items:flex-start}#iadrawer .iadctx b{color:#c9a7ff}
+        #iadrawer iframe{flex:1;width:100%;border:0;background:#0a0a0c;margin-top:12px}
+        @media(max-width:520px){#iadrawer{width:100vw}}
+      </style>
+      <div id="iashade" onclick="document.getElementById('iadrawer').classList.remove('open');this.classList.remove('open')"></div>
+      <aside id="iadrawer" aria-label="IA Melodias e Riffs">
+        <div class="iadhead"><div class="iadav">${_iaEmoji}</div><div class="iadtt"><b>IA Melodias e Riffs</b><span>Sua professora de ${_instLabel} · online 24h</span></div><a class="iadnew" href="${_iaSrc}" target="_blank" title="Abrir em nova aba">↗</a><button class="iadx" onclick="document.getElementById('iadrawer').classList.remove('open');document.getElementById('iashade').classList.remove('open')">✕</button></div>
+        <div class="iadctx">📚<div><b>Dúvida sobre esta aula:</b><br>${esc(_ctxAula)}</div></div>
+        <iframe src="${_iaSrc}" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
+      </aside>`;
     }
 
     // [B.15] player de ÁUDIO inline embaixo do vídeo (modo audiolivro) — toca dentro da plataforma
