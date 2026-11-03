@@ -733,6 +733,39 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
       await snap('10-url-nao-capturada');
     }
 
+    // [+capa-edit-fix 03/11] GARANTIA DE CAPA: a ETAPA 5b (capa durante o upload) falha em vídeo LONGO
+    // (o campo da miniatura fica instável enquanto o vídeo ainda sobe → Teclado/Violão/Comunidade saíam sem capa;
+    // Baixo processava rápido e colava). Aqui, com o vídeo JÁ publicado, abrimos a PÁGINA DE EDIÇÃO (onde só existe
+    // o input da miniatura, sem o input do vídeo) e aplicamos a capa — caminho confiável, sem cota de API.
+    // Best-effort: nunca derruba a publicação.
+    if (thumbnailPath && fs.existsSync(thumbnailPath) && videoUrl) {
+      const vidEdit = (String(videoUrl).match(/(?:youtu\.be\/|shorts\/|[?&]v=)([\w-]{6,})/) || [])[1] || '';
+      if (vidEdit) {
+        try {
+          logI('garantindo capa pela pagina de edicao', { vidEdit });
+          await page.goto('https://studio.youtube.com/video/' + vidEdit + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+          await delayHumano(2500, 4000);
+          const inputCapaEdit = page.locator('ytcp-thumbnail-uploader input[type="file"]').first();
+          await inputCapaEdit.waitFor({ state: 'attached', timeout: 30_000 });
+          await page.evaluate(() => { const u: any = (globalThis as any).document.querySelector('ytcp-thumbnail-uploader'); if (u && u.scrollIntoView) u.scrollIntoView({ block: 'center' }); }).catch(() => {});
+          await inputCapaEdit.setInputFiles(thumbnailPath).catch(() => {});
+          await delayHumano(2500, 4000);
+          const salvouCapa = await page.evaluate(() => {
+            const s: any = (globalThis as any).document.querySelector('ytcp-button#save, #save');
+            if (!s) return 'sem-botao';
+            if (s.hasAttribute('disabled')) return 'desabilitado';
+            s.click(); return 'clicou';
+          }).catch(() => 'erro');
+          await delayHumano(2500, 4500);
+          logI('capa pela edicao: ' + salvouCapa);
+          await snap('11-capa-edit-' + salvouCapa);
+        } catch (e) {
+          logW('nao consegui garantir a capa pela edicao (seguindo)', { erro: (e as Error).message });
+          try { await snap('11-capa-edit-falhou'); } catch { /* ok */ }
+        }
+      }
+    }
+
     await delayHumano(1500, 3000);
     return { ok: true, postUrl: videoUrl, rascunho: !publicou, duracaoMs: Date.now() - start, screenshots, proxyUsado };
   } catch (e) {
@@ -740,6 +773,63 @@ export async function publicarYoutubeNuvem(payload: PublicarNuvemPayload): Promi
     logW('erro publicando', { projeto, erro: msg });
     try { await snap('erro-final'); } catch { /* ok */ }
     return { ok: false, erro: msg, motivoFalha: 'ui_mudou', duracaoMs: Date.now() - start, screenshots, proxyUsado };
+  } finally {
+    try { if (ctx) await ctx.close(); } catch { /* ignore */ }
+    try { if (browser) await browser.close(); } catch { /* ignore */ }
+  }
+}
+
+// [+capa-edit-fix 03/11] Aplica a capa em UM vídeo JÁ publicado pela PÁGINA DE EDIÇÃO do Studio, via navegador
+// invisível (sem cota de API — serve quando a cota diária do YouTube estourou). Abre sessão própria (proxy +
+// storageState do canal). Reutilizada pelo endpoint /pub/youtube/recapa-navegador e disponível p/ correção em massa.
+export async function aplicarCapaViaEdit(opts: { projeto: string; videoId: string; thumbnailPath: string }): Promise<{ ok: boolean; erro?: string; detalhe?: string; proxyUsado?: string | null }> {
+  const projeto = String(opts.projeto || '').trim().toLowerCase();
+  const videoId = String(opts.videoId || '').trim();
+  const thumbnailPath = opts.thumbnailPath || '';
+  if (!projeto || !videoId) return { ok: false, erro: 'projeto/videoId obrigatórios' };
+  if (!thumbnailPath || !fs.existsSync(thumbnailPath)) return { ok: false, erro: 'capa não encontrada no servidor: ' + thumbnailPath };
+  const sess = lerSessao(projeto);
+  if (!sess) return { ok: false, erro: 'sem sessão YT na nuvem para ' + projeto };
+  let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
+  try {
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) return { ok: false, erro: 'nenhum aparelho de casa (proxy residencial) online' };
+    const launchOpts: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] };
+    if (escolhido) { launchOpts.proxy = escolhido.playwright; proxyUsado = escolhido.node.nome || escolhido.node.host; }
+    const chromium = await carregarChromium();
+    browser = await chromium.launch(launchOpts);
+    ctx = await browser.newContext({ storageState: sess.storageState, userAgent: sess.userAgent || USER_AGENT_DEFAULT, viewport: { width: 1400, height: 900 }, locale: 'pt-BR' });
+    page = await ctx.newPage();
+    try { await page.addInitScript((ua: string) => { try { const nav = (globalThis as unknown as { navigator: object }).navigator; Object.defineProperty(nav, 'userAgent', { get: () => ua }); } catch { /* ignore */ } }, sess.userAgent || USER_AGENT_DEFAULT); } catch { /* best-effort */ }
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delayHumano(2500, 4000);
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (redirecionou pro login do Google)', proxyUsado };
+    const inputCapa = page.locator('ytcp-thumbnail-uploader input[type="file"]').first();
+    try { await inputCapa.waitFor({ state: 'attached', timeout: 30_000 }); } catch { return { ok: false, erro: 'campo da miniatura não apareceu (UI mudou ou vídeo inexistente)', proxyUsado }; }
+    try { await page.evaluate(() => { const u: any = (globalThis as any).document.querySelector('ytcp-thumbnail-uploader'); if (u && u.scrollIntoView) u.scrollIntoView({ block: 'center' }); }); } catch { /* ok */ }
+    await inputCapa.setInputFiles(thumbnailPath).catch(() => { /* segue pra verificar */ });
+    await delayHumano(2500, 4000);
+    const erroCapa = await page.evaluate(() => {
+      const doc: any = (globalThis as any).document;
+      const up = doc.querySelector('ytcp-thumbnail-uploader');
+      const t = (((up && up.innerText) || '') + ' ' + (doc.body?.innerText || '')).slice(0, 6000);
+      const m = t.match(/(n[ãa]o foi poss[íi]vel[^.\n]*miniatura|formato[^.\n]*(n[ãa]o|inv[áa]lid|incompat)|2\s*MB|m[áa]ximo de 2|unsupported|too large|invalid)/i);
+      return m ? m[0].replace(/\s+/g, ' ').slice(0, 120) : '';
+    }).catch(() => '');
+    if (erroCapa) return { ok: false, erro: 'YouTube recusou a capa: ' + erroCapa, proxyUsado };
+    const salvou = await page.evaluate(() => {
+      const s: any = (globalThis as any).document.querySelector('ytcp-button#save, #save');
+      if (!s) return 'sem-botao';
+      if (s.hasAttribute('disabled')) return 'desabilitado';
+      s.click(); return 'clicou';
+    }).catch(() => 'erro');
+    await delayHumano(2500, 4500);
+    if (salvou === 'clicou') return { ok: true, detalhe: 'capa salva', proxyUsado };
+    if (salvou === 'desabilitado') return { ok: false, erro: 'botão Salvar não habilitou (a capa pode não ter sido aceita)', proxyUsado };
+    return { ok: false, erro: 'não achei o botão Salvar (' + salvou + ')', proxyUsado };
+  } catch (e: any) {
+    return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado };
   } finally {
     try { if (ctx) await ctx.close(); } catch { /* ignore */ }
     try { if (browser) await browser.close(); } catch { /* ignore */ }

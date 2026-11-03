@@ -9172,6 +9172,44 @@ app.post('/pub/youtube/recapa', async (req, res) => {
     res.json({ ok: true, total: alvos.length, okCount: result.filter((x: any) => x.ok).length, falhas: result.filter((x: any) => !x.ok), result });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
+// [+recapa-navegador 03/11] Igual ao /pub/youtube/recapa, mas aplica a capa pela PÁGINA DE EDIÇÃO via NAVEGADOR
+// invisível (SEM cota da API — pra quando a cota diária do YouTube estourou, que é o caso comum). Mesmos filtros:
+// publicado + com thumb_ref + youtube + video_id. body: { projeto?, ids?[], desde?, limite?, dry? }.
+app.post('/pub/youtube/recapa-navegador', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const projeto = b.projeto ? String(b.projeto) : '';
+    const w: string[] = ["status='publicado'", "COALESCE(thumb_ref,'')<>''", "plataformas_json LIKE '%youtube%'", "COALESCE(video_ids_externos_json,'')<>''"];
+    const a: any[] = [];
+    if (projeto) { w.push('canal_id=?'); a.push(projeto); }
+    if (b.desde) { w.push('atualizado_em>=?'); a.push(String(b.desde)); }
+    const lim = Math.min(200, Math.max(1, Number(b.limite || 100)));
+    const itens = db.prepare(`SELECT id, canal_id, titulo, thumb_ref, video_ids_externos_json FROM fila_publicacao WHERE ${w.join(' AND ')} ORDER BY atualizado_em DESC LIMIT ${lim}`).all(...a) as any[];
+    const idsFiltro: string[] = Array.isArray(b.ids) ? b.ids.map((x: any) => String(x)) : [];
+    const alvos: any[] = [];
+    const vistos = new Set<string>();
+    for (const it of itens) {
+      if (idsFiltro.length && idsFiltro.indexOf(String(it.id)) < 0) continue;
+      let vid = '';
+      try { const v = JSON.parse(it.video_ids_externos_json || '{}'); vid = String(v.youtube || ''); } catch { /* */ }
+      if (!vid || vistos.has(vid)) continue;
+      vistos.add(vid);
+      alvos.push({ id: it.id, canal: it.canal_id, titulo: it.titulo, videoId: vid, thumb_ref: it.thumb_ref });
+    }
+    if (b.dry) return res.json({ ok: true, dry: true, total: alvos.length, alvos: alvos.map((x: any) => ({ titulo: x.titulo, videoId: x.videoId, canal: x.canal })) });
+    const _ytmod: any = await import('./yt-browser-nuvem');
+    const result: any[] = [];
+    for (const al of alvos) {
+      try {
+        const capaFile = pbBaixarMidia(al.thumb_ref).file;
+        const r = await _ytmod.aplicarCapaViaEdit({ projeto: al.canal, videoId: al.videoId, thumbnailPath: capaFile });
+        result.push({ videoId: al.videoId, titulo: al.titulo, ok: !!(r && r.ok), erro: (r && r.erro) || undefined });
+      } catch (e: any) { result.push({ videoId: al.videoId, titulo: al.titulo, ok: false, erro: String(e?.message || e).slice(0, 180) }); }
+      await new Promise((rr) => setTimeout(rr, 1500));
+    }
+    res.json({ ok: true, total: alvos.length, okCount: result.filter((x: any) => x.ok).length, falhas: result.filter((x: any) => !x.ok), result });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
 // lista conexões por canal/plataforma
 app.get('/pub/conexoes/listar', (_req, res) => {
   try {
