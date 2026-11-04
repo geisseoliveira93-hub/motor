@@ -607,49 +607,63 @@ export async function publicarTiktokNuvem(payload: PublicarTtNuvemPayload): Prom
     // o tratamento do modal, e o tratador do modal exigia o texto EXATO "Publicar" — mas o botão é "Publicar agora".
     // ADITIVO (só acrescenta; o tratador antigo da ETAPA 10 fica, mas este roda primeiro e resolve).
     async function _ttConfirmarContinuarPublicando(): Promise<boolean> {
+      // [+fix-publish-tt2 04/11] CLIQUE REAL (Playwright), não dispatchEvent sintético — os botões
+      // do TikTok (React) só respondem a clique real. Espera o aviso aparecer (até ~15s) e re-clica
+      // "Publicar agora" até o aviso fechar (até ~30s no total). O 1º fix usava dispatchEvent e não pegava.
+      const seletoresConfirmar = [
+        'button:has-text("Publicar agora")', 'button:has-text("Publish now")',
+        'button:has-text("Publicar mesmo assim")', 'button:has-text("Publish anyway")',
+        'div[role="button"]:has-text("Publicar agora")', 'div[role="button"]:has-text("Publish now")'
+      ];
       let clicouAlguma = false;
-      for (let tent = 0; tent < 6; tent++) {
-        const r: any = await page.evaluate(() => {
-          const doc: any = (globalThis as any).document;
-          const win: any = doc.defaultView;
-          const txt = ((doc?.body?.innerText || '') + ' ' + (doc?.body?.textContent || '')).toLowerCase();
-          const temAviso = txt.includes('continuar publicando') || txt.includes('continue publishing') || txt.includes('publicar mesmo assim') || txt.includes('publish anyway') || txt.includes('ainda estamos verificando') || txt.includes('still checking') || txt.includes('verifica') && txt.includes('publicar agora');
-          if (!temAviso) return { modal: false };
-          const sels = ['[role="dialog"]', '[aria-modal="true"]', '[class*="Modal"]', '[class*="modal"]', '[class*="Dialog"]', '[class*="dialog"]', '[class*="Overlay"]', '[class*="overlay"]', '[class*="Popup"]', '[class*="popup"]'];
-          let modalEl: any = null;
-          for (const sel of sels) {
-            for (const el of Array.from(doc.querySelectorAll(sel)) as any[]) {
-              const t = (el.textContent || '').toLowerCase();
-              if (t.includes('continuar publicando') || t.includes('continue publishing') || t.includes('publicar mesmo assim') || t.includes('publish anyway') || t.includes('ainda estamos verificando') || t.includes('still checking')) {
-                const rr = el.getBoundingClientRect();
-                const st = win.getComputedStyle(el);
-                if (rr.width > 100 && rr.height > 60 && st.visibility !== 'hidden' && st.display !== 'none') { modalEl = el; break; }
+      let viuAviso = false;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 30_000) {
+        const temAviso = await _ttAvisoAbertoAinda();
+        if (!temAviso) {
+          if (viuAviso) break;                 // apareceu e já fechou = confirmou/publicou
+          if (Date.now() - t0 > 15_000) break; // 15s sem aviso = não vai aparecer
+          await new Promise((res) => setTimeout(res, 1500));
+          continue;
+        }
+        viuAviso = true;
+        let cliqueOk = false;
+        // 1) clique REAL do Playwright por texto do botão
+        for (const sel of seletoresConfirmar) {
+          try {
+            const loc = page.locator(sel).first();
+            if ((await loc.count().catch(() => 0)) > 0) {
+              await loc.click({ timeout: 4000, force: true });
+              cliqueOk = true; clicouAlguma = true;
+              logI('aviso "Continuar publicando?" — clique real', { sel });
+              break;
+            }
+          } catch { /* tenta o próximo seletor */ }
+        }
+        // 2) fallback: clique REAL por coordenada do botão não-cancelar dentro do diálogo
+        if (!cliqueOk) {
+          const pos: any = await page.evaluate(() => {
+            const doc: any = (globalThis as any).document;
+            const dlgs = Array.from(doc.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="odal"], [class*="ialog"], [class*="opup"], [class*="verlay"]')) as any[];
+            const ehCancelar = (t: string) => /cancelar|cancel|descartar|discard|voltar|back|rascunho|draft|revisar|review|editar|edit/i.test(t);
+            const ehConfirmar = (t: string) => /publicar|publish|continuar|continue|confirmar|confirm|agora|mesmo assim|anyway/i.test(t);
+            for (const d of dlgs) {
+              const dt = (d.textContent || '').toLowerCase();
+              if (!(dt.includes('continuar public') || dt.includes('verificando') || dt.includes('publicar agora') || dt.includes('still checking') || dt.includes('continue publish'))) continue;
+              const botoes = Array.from(d.querySelectorAll('button, [role="button"]')) as any[];
+              const alvo = botoes.find((b) => { const t = (b.textContent || '').trim(); return !!t && !ehCancelar(t) && ehConfirmar(t); });
+              if (alvo) {
+                const r = alvo.getBoundingClientRect();
+                if (r.width > 20 && r.height > 10) return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), texto: (alvo.textContent || '').trim().slice(0, 40) };
               }
             }
-            if (modalEl) break;
+            return null;
+          }).catch(() => null);
+          if (pos) {
+            try { await page.mouse.click(pos.x, pos.y); cliqueOk = true; clicouAlguma = true; logI('aviso "Continuar publicando?" — clique por coordenada', { pos }); } catch { /* ok */ }
           }
-          if (!modalEl) return { modal: true, clicou: false };
-          const ehCancelar = (t: string) => /cancelar|cancel|descartar|discard|voltar|back|rascunho|draft|revisar|review|editar|edit/i.test(t);
-          const ehConfirmar = (t: string) => /publicar|publish|continuar|continue|confirmar|confirm|agora|mesmo assim|anyway|\bsim\b|\byes\b/i.test(t);
-          const botoes = Array.from(modalEl.querySelectorAll('button, [role="button"]')) as any[];
-          const alvo = botoes.find((b) => { const t = (b.textContent || '').trim(); return !!t && !ehCancelar(t) && ehConfirmar(t); });
-          if (!alvo) return { modal: true, clicou: false };
-          try {
-            const rr = alvo.getBoundingClientRect();
-            const cx = rr.left + rr.width / 2, cy = rr.top + rr.height / 2;
-            const init: any = { bubbles: true, cancelable: true, composed: true, view: win, clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, buttons: 1, pointerType: 'mouse', pointerId: 1, isPrimary: true };
-            alvo.dispatchEvent(new win.PointerEvent('pointerdown', init));
-            alvo.dispatchEvent(new win.MouseEvent('mousedown', init));
-            alvo.dispatchEvent(new win.PointerEvent('pointerup', { ...init, buttons: 0 }));
-            alvo.dispatchEvent(new win.MouseEvent('mouseup', { ...init, buttons: 0 }));
-            alvo.dispatchEvent(new win.MouseEvent('click', { ...init, buttons: 0, detail: 1 }));
-            try { alvo.click(); } catch { /* ok */ }
-            return { modal: true, clicou: true, texto: (alvo.textContent || '').trim().slice(0, 40) };
-          } catch { return { modal: true, clicou: false }; }
-        }).catch(() => ({ modal: false }));
-        if (r && r.clicou) { clicouAlguma = true; logI('aviso "Continuar publicando?" confirmado', { texto: r.texto }); await new Promise((res) => setTimeout(res, 4000)); }
-        else if (!r || !r.modal) { break; }
-        else { await new Promise((res) => setTimeout(res, 1500)); }
+        }
+        await new Promise((res) => setTimeout(res, 4000));
       }
       return clicouAlguma;
     }
