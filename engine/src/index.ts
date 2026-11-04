@@ -3839,9 +3839,24 @@ app.post('/webhook/evolution', (req, res) => {
       const projeto = projetoDaInstancia(String(ev.instance || ''));
       const telefone = String(data.key?.remoteJid || '').replace(/@.*/, '');
       const ehGrupo = String(data.key?.remoteJid || '').includes('@g.us'); // etapa19c: NUNCA responder em GRUPOS (evita flood) — agente/automações só 1-a-1
-      const texto = data.message?.conversation || data.message?.extendedTextMessage?.text || '';
+      let texto = data.message?.conversation || data.message?.extendedTextMessage?.text || '';
       if (telefone && !data.key?.fromMe) {
         const cid = upsertContato(projeto, telefone, data.pushName);
+        // [+fbclid-wa 03/11] captura o token de atribuicao mr~ que veio do clique no botao de WhatsApp (snippet /track/snippet.js): grava fbclid/utm no contato (sem sobrescrever, COALESCE) e TIRA o token do texto ANTES de armazenar/automacao/agente. So adiciona.
+        try {
+          const _mrTok = /mr~([A-Za-z0-9_\-]+={0,2})/.exec(texto);
+          if (_mrTok) {
+            try {
+              const _mrRaw = _mrTok[1].replace(/-/g, '+').replace(/_/g, '/');
+              const _mrD = JSON.parse(Buffer.from(_mrRaw, 'base64').toString('utf8') || '{}') as any;
+              if (_mrD && (_mrD.f || _mrD.s || _mrD.c || _mrD.ct)) {
+                db.prepare(`UPDATE contatos SET utm_fbclid=COALESCE(utm_fbclid,?), utm_source=COALESCE(utm_source,?), utm_campaign=COALESCE(utm_campaign,?), utm_content=COALESCE(utm_content,?) WHERE id=?`)
+                  .run(_mrD.f || null, _mrD.s || null, _mrD.c || null, _mrD.ct || null, cid);
+              }
+            } catch { /* fbclid-wa decode best-effort */ }
+            texto = String(texto).replace(/\n*\[ref\s+mr~[A-Za-z0-9_\-]+={0,2}\]/gi, '').replace(/mr~[A-Za-z0-9_\-]+={0,2}/g, '').trim();
+          }
+        } catch { /* fbclid-wa best-effort */ }
         try { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,instancia,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, String(ev.instance||''), agora()); }
         catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
@@ -9710,6 +9725,8 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       + 'window.mrAppendUtm=function(u){try{var U=new URL(u,location.href);var q=window.__mrUtm||{};for(var k in q){if(q[k]&&!U.searchParams.get(k))U.searchParams.set(k,q[k]);}return U.toString();}catch(e){return u;}};\n'
       + 'function _mrUtmRun(){if(window.__mrUtmRan)return;window.__mrUtmRan=1;try{var q=window.__mrUtm||{};if(!Object.keys(q).length)return;var CKx=/(guru|lastlink|hotmart|kiwify|eduzz|monetizze|cakto|payt|kirvano|clkdmg|checkout|carrinho|comprar|assinar|inscrever)/i;var as=document.querySelectorAll("a[href]");for(var i=0;i<as.length;i++){var h=as[i].getAttribute("href")||"";if(CKx.test(h))as[i].setAttribute("href",window.mrAppendUtm(h));}var fs=document.querySelectorAll("form");for(var j=0;j<fs.length;j++){for(var k in q){if(!q[k])continue;var inp=document.createElement("input");inp.type="hidden";inp.name=k;inp.value=q[k];fs[j].appendChild(inp);}}}catch(e){}}\n'
       + 'if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",_mrUtmRun);else _mrUtmRun();\n'
+      + 'function _mrWaRun(){if(window.__mrWaRan)return;window.__mrWaRan=1;try{var q=window.__mrUtm||{};if(!q.fbclid)return;var _b64u=function(s){try{var b=btoa(unescape(encodeURIComponent(s)));b=b.split("+").join("-").split("/").join("_");while(b.length&&b.charAt(b.length-1)==="=")b=b.slice(0,-1);return b;}catch(e){return "";}};var _wd={f:q.fbclid||"",s:q.utm_source||"",c:q.utm_campaign||"",ct:q.utm_content||""};var _wtok="mr~"+_b64u(JSON.stringify(_wd));if(_wtok.length<=3)return;var was=document.querySelectorAll("a[href]");for(var w=0;w<was.length;w++){var wh=was[w].getAttribute("href")||"";if(wh.indexOf("wa.me/")<0&&wh.indexOf("api.whatsapp.com")<0&&wh.indexOf("whatsapp://")<0)continue;if(wh.indexOf("mr~")>=0)continue;try{var WU=new URL(wh,location.href);var _ot=WU.searchParams.get("text")||"";var _nt=_ot?(_ot+"\\n\\n[ref "+_wtok+"]"):_wtok;WU.searchParams.set("text",_nt);was[w].setAttribute("href",WU.toString());}catch(e){}}}catch(e){}}\n'
+      + 'if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",_mrWaRun);else _mrWaRun();\n'
       + 'function uuid(){return "xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx".replace(/[xy]/g,function(c){var r=Math.random()*16|0,v=c==="x"?r:(r&0x3|0x8);return v.toString(16);});}\n'
       + 'var MR_PROJ=' + JSON.stringify(projeto) + ',MR_BASE=' + JSON.stringify(base) + ';\n'
       + (metaPixel ? ('!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version="2.0";n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,"script","https://connect.facebook.net/en_US/fbevents.js");fbq("init",' + JSON.stringify(metaPixel) + ');\n') : '')
