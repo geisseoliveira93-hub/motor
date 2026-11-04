@@ -1832,7 +1832,8 @@ app.get('/debug/vol2-webhooks', (req, res) => {
         offerId: String(d?.Offer?.Id || d?.Offer?.id || ''),
         principal: principal.produtoNome || null,
         itens: itens.map((i) => i.produtoNome),
-        temVol2
+        temVol2,
+        fbclid: _fbclidDoPayload(b) || null
       });
       if (out.length >= lim) break;
     }
@@ -3148,6 +3149,20 @@ function _utmDoPayload(b: any): any {
   for (const sc of cand) { if (!sc || typeof sc !== 'object') continue; for (const k of keys) { if (!o[k] && sc[k]) o[k] = String(sc[k]).slice(0,300); } }
   return o;
 }
+// [+fbclid-checkout 03/11] extrai o fbclid do payload do webhook (checkout direto ad->pagina->checkout). A LastLink/Guru podem mandar em campos de tracking OU dentro de uma URL (src/checkout_url). Varre campos comuns e, por fim, o JSON inteiro. SÓ LEITURA.
+function _fbclidDoPayload(b: any): string {
+  try {
+    if (!b || typeof b !== 'object') return '';
+    const diretos = [b.fbclid, b.fbc, (b.utm&&b.utm.fbclid), (b.utms&&b.utms.fbclid), (b.tracking&&b.tracking.fbclid), (b.tracking_parameters&&b.tracking_parameters.fbclid), (b.metadata&&b.metadata.fbclid), (b.custom&&b.custom.fbclid), (b.checkout&&b.checkout.fbclid), (b.data&&b.data.fbclid)];
+    for (const c of diretos) { if (c && String(c).trim()) { const s = String(c).trim(); const m = s.match(/fbclid=([^&#\s"']+)/i); return m ? decodeURIComponent(m[1]) : s; } }
+    const urls = [b.src, b.Src, b.source_url, b.sourceUrl, b.checkout_url, b.checkoutUrl, b.url, b.referer, b.referrer, (b.checkout&&b.checkout.url)];
+    for (const u of urls) { if (!u) continue; const m = String(u).match(/[?&]fbclid=([^&#\s"']+)/i); if (m) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } } }
+    const raw = JSON.stringify(b);
+    let m = raw.match(/"fbclid"\s*:\s*"([^"]+)"/i); if (m && m[1]) return m[1];
+    m = raw.match(/[?&]fbclid=([^&#\s"'\\]+)/i); if (m && m[1]) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } }
+    return '';
+  } catch { return ''; }
+}
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN dominio_id TEXT`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN anexos TEXT`); } catch { /* existe */ } // [email-anexos] json [{nome,url|base64|caminho,tipo?}]
 try { db.exec(`ALTER TABLE email_fila ADD COLUMN agendado_para TEXT`); } catch { /* existe */ } // [email-agendado] envio agendado (boas-vindas/nps/upsell)
@@ -4037,6 +4052,18 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       }
       if (_u && (_u.utm_source || _u.utm_campaign)) { _utmVenda = _u; db.prepare(`UPDATE transacoes SET utm_source=?, utm_campaign=?, utm_medium=?, utm_content=?, utm_term=? WHERE id=?`).run(String(_u.utm_source||''), String(_u.utm_campaign||''), String(_u.utm_medium||''), String(_u.utm_content||''), String(_u.utm_term||''), p.pedido); }
     } catch { /* utm venda best-effort */ }
+    // [+fbclid-checkout 03/11] captura o fbclid do webhook (venda de checkout direto, sem passar pelo WhatsApp) -> salva no contato (COALESCE) e passa pro CAPI, pra a venda atribuir ao anuncio no server-side tambem. So adiciona.
+    let _fbclVenda: string | null = null;
+    try {
+      const _fb = _fbclidDoPayload(b);
+      if (_fb) {
+        _fbclVenda = _fb;
+        try {
+          if (p.telefone) { const _cidFb = upsertContato(projetoDoProduto(p.produtoId, p.produtoNome), p.telefone, p.nome, p.email, `pagamento:${provider}`); if (_cidFb) db.prepare(`UPDATE contatos SET utm_fbclid=COALESCE(utm_fbclid,?) WHERE id=?`).run(_fb, _cidFb); }
+          else if (p.email) { db.prepare(`UPDATE contatos SET utm_fbclid=COALESCE(utm_fbclid,?) WHERE lower(email)=? AND (utm_fbclid IS NULL OR utm_fbclid='')`).run(_fb, String(p.email).toLowerCase()); }
+        } catch { /* salvar fbclid no contato best-effort */ }
+      }
+    } catch { /* fbclid-checkout best-effort */ }
 
     // dedupe por pedido + CATEGORIA (a LastLink manda vários eventos por compra; e eventos de fases
     // diferentes — aguardando antes do aprovado — têm o MESMO pedido. Incluir a categoria garante que
@@ -4060,7 +4087,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
           valorCentavos: Math.round(Number(p.valor || 0) * 100),
           produto: p.produtoNome, produtoId: p.produtoId, evento: _capiEv,
           nome: (p as any).nome || null, pedido: (p as any).pedido || null,
-          utms: _utmVenda,
+          utms: _utmVenda, fbclid: _fbclVenda,
         }).catch(() => {});
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
@@ -9571,6 +9598,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
             if (_tel) _cc = db.prepare(`SELECT utm_fbclid FROM contatos WHERE projeto=? AND telefone=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(projT), _tel) as any;
             if ((!_cc || !_cc.utm_fbclid) && dados.email) _cc = db.prepare(`SELECT utm_fbclid FROM contatos WHERE lower(email)=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(dados.email).toLowerCase()) as any;
             if (_cc && _cc.utm_fbclid) _fbcP = 'fb.1.' + Date.now() + '.' + String(_cc.utm_fbclid);
+            if (!_fbcP && (dados as any).fbclid) _fbcP = 'fb.1.' + Date.now() + '.' + String((dados as any).fbclid); // [+fbclid-checkout] fbclid veio direto do webhook (checkout direto)
           } catch { /* fbc best-effort */ }
           await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, eventId: (dados as any).pedido || undefined, firstName: _fn, lastName: _ln, fbc: _fbcP, externalId: dados.email || dados.telefone || null, utms: (dados as any).utms || null }, fonte);
           return;
