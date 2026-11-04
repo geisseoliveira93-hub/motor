@@ -600,6 +600,70 @@ export async function publicarTiktokNuvem(payload: PublicarTtNuvemPayload): Prom
     logI('botão Publicar clicado', { urlAntes, viaJs: clickInterno });
     await snap('09-publicar-clicado');
 
+    // [+fix-publish-tt 04/11] Confirma SEMPRE o aviso "Continuar publicando?" (verificação em andamento)
+    // clicando no botão de CONFIRMAR ("Publicar agora" / "Publicar" / "Continuar"), NUNCA no cancelar/descartar.
+    // Espelha o fix do YouTube (confirmarPublicarMesmoAssim). Sem esse clique o vídeo NÃO publica de verdade:
+    // a versão anterior reportava "ok" FALSO porque uma confirmação por network/botão disparava antes e pulava
+    // o tratamento do modal, e o tratador do modal exigia o texto EXATO "Publicar" — mas o botão é "Publicar agora".
+    // ADITIVO (só acrescenta; o tratador antigo da ETAPA 10 fica, mas este roda primeiro e resolve).
+    async function _ttConfirmarContinuarPublicando(): Promise<boolean> {
+      let clicouAlguma = false;
+      for (let tent = 0; tent < 6; tent++) {
+        const r: any = await page.evaluate(() => {
+          const doc: any = (globalThis as any).document;
+          const win: any = doc.defaultView;
+          const txt = ((doc?.body?.innerText || '') + ' ' + (doc?.body?.textContent || '')).toLowerCase();
+          const temAviso = txt.includes('continuar publicando') || txt.includes('continue publishing') || txt.includes('publicar mesmo assim') || txt.includes('publish anyway') || txt.includes('ainda estamos verificando') || txt.includes('still checking') || txt.includes('verifica') && txt.includes('publicar agora');
+          if (!temAviso) return { modal: false };
+          const sels = ['[role="dialog"]', '[aria-modal="true"]', '[class*="Modal"]', '[class*="modal"]', '[class*="Dialog"]', '[class*="dialog"]', '[class*="Overlay"]', '[class*="overlay"]', '[class*="Popup"]', '[class*="popup"]'];
+          let modalEl: any = null;
+          for (const sel of sels) {
+            for (const el of Array.from(doc.querySelectorAll(sel)) as any[]) {
+              const t = (el.textContent || '').toLowerCase();
+              if (t.includes('continuar publicando') || t.includes('continue publishing') || t.includes('publicar mesmo assim') || t.includes('publish anyway') || t.includes('ainda estamos verificando') || t.includes('still checking')) {
+                const rr = el.getBoundingClientRect();
+                const st = win.getComputedStyle(el);
+                if (rr.width > 100 && rr.height > 60 && st.visibility !== 'hidden' && st.display !== 'none') { modalEl = el; break; }
+              }
+            }
+            if (modalEl) break;
+          }
+          if (!modalEl) return { modal: true, clicou: false };
+          const ehCancelar = (t: string) => /cancelar|cancel|descartar|discard|voltar|back|rascunho|draft|revisar|review|editar|edit/i.test(t);
+          const ehConfirmar = (t: string) => /publicar|publish|continuar|continue|confirmar|confirm|agora|mesmo assim|anyway|\bsim\b|\byes\b/i.test(t);
+          const botoes = Array.from(modalEl.querySelectorAll('button, [role="button"]')) as any[];
+          const alvo = botoes.find((b) => { const t = (b.textContent || '').trim(); return !!t && !ehCancelar(t) && ehConfirmar(t); });
+          if (!alvo) return { modal: true, clicou: false };
+          try {
+            const rr = alvo.getBoundingClientRect();
+            const cx = rr.left + rr.width / 2, cy = rr.top + rr.height / 2;
+            const init: any = { bubbles: true, cancelable: true, composed: true, view: win, clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0, buttons: 1, pointerType: 'mouse', pointerId: 1, isPrimary: true };
+            alvo.dispatchEvent(new win.PointerEvent('pointerdown', init));
+            alvo.dispatchEvent(new win.MouseEvent('mousedown', init));
+            alvo.dispatchEvent(new win.PointerEvent('pointerup', { ...init, buttons: 0 }));
+            alvo.dispatchEvent(new win.MouseEvent('mouseup', { ...init, buttons: 0 }));
+            alvo.dispatchEvent(new win.MouseEvent('click', { ...init, buttons: 0, detail: 1 }));
+            try { alvo.click(); } catch { /* ok */ }
+            return { modal: true, clicou: true, texto: (alvo.textContent || '').trim().slice(0, 40) };
+          } catch { return { modal: true, clicou: false }; }
+        }).catch(() => ({ modal: false }));
+        if (r && r.clicou) { clicouAlguma = true; logI('aviso "Continuar publicando?" confirmado', { texto: r.texto }); await new Promise((res) => setTimeout(res, 4000)); }
+        else if (!r || !r.modal) { break; }
+        else { await new Promise((res) => setTimeout(res, 1500)); }
+      }
+      return clicouAlguma;
+    }
+    // aviso ainda na tela = publicação NÃO concluída (não reportar sucesso falso)
+    async function _ttAvisoAbertoAinda(): Promise<boolean> {
+      return await page.evaluate(() => {
+        const doc: any = (globalThis as any).document;
+        const txt = ((doc?.body?.innerText || '') + ' ' + (doc?.body?.textContent || '')).toLowerCase();
+        return txt.includes('continuar publicando') || txt.includes('continue publishing') || txt.includes('publicar mesmo assim') || txt.includes('publish anyway');
+      }).catch(() => false);
+    }
+    await _ttConfirmarContinuarPublicando();
+    await snap('09b-continuar-publicando');
+
     // ETAPA 10: confirmação (network → URL → botão sumiu → toast → modal "Continuar publicando")
     await delayHumano(3000, 5000);
     let postUrl: string | undefined;
@@ -713,6 +777,17 @@ export async function publicarTiktokNuvem(payload: PublicarTtNuvemPayload): Prom
       await snap('10-sem-confirmacao');
       const urlAg = page.url();
       return { ok: false, erro: 'Publicação não confirmada em 60s. Confira em tiktok.com/tiktokstudio/manage (urlAgora=' + urlAg + ')', motivoFalha: 'outro', duracaoMs: Date.now() - start, screenshots, proxyUsado };
+    }
+
+    // [+fix-publish-tt 04/11] Guarda final: se o aviso "Continuar publicando?" ainda está na tela,
+    // o vídeo NÃO foi publicado — tenta confirmar de novo e, se persistir, reporta falha (nunca "ok" falso).
+    if (await _ttAvisoAbertoAinda()) {
+      await _ttConfirmarContinuarPublicando();
+      await new Promise((r) => setTimeout(r, 3000));
+      if (await _ttAvisoAbertoAinda()) {
+        await snap('10-nao-publicou-aviso-aberto');
+        return { ok: false, erro: 'Publicação não concluída: o aviso "Continuar publicando?" não foi confirmado (o vídeo não publicou).', motivoFalha: 'ui_mudou', duracaoMs: Date.now() - start, screenshots, proxyUsado };
+      }
     }
 
     await snap('10-publicado');
