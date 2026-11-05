@@ -14346,6 +14346,29 @@ app.post('/academy/importar/alunos', (req: any, res: any) => {
   } catch (e) { _ndErr(res, e); }
 });
 
+// [+telefones-import 05/11] Preenche o TELEFONE dos alunos (academy_matriculas) casando por EMAIL.
+// Aditivo/seguro: so preenche quando o telefone esta VAZIO (nunca sobrescreve um ja preenchido). Re-rodavel.
+// Corpo: { linhas: [ { email, telefone } ] }  (telefone ja normalizado com codigo do pais; so digitos)
+app.post('/academy/importar/telefones', (req: any, res: any) => {
+  try {
+    const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
+    let atualizados = 0, ja_tinha = 0; const nao_encontrados: string[] = [];
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
+        const tel = String(r.telefone || '').replace(/\D/g, ''); if (!tel) continue;
+        const al = db.prepare(`SELECT id, telefone FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        if (!al) { nao_encontrados.push(email); continue; }
+        if (al.telefone && String(al.telefone).trim()) { ja_tinha++; continue; }
+        db.prepare(`UPDATE academy_matriculas SET telefone=? WHERE id=?`).run(tel, al.id);
+        atualizados++;
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { atualizados, ja_tinha, nao_encontrados: nao_encontrados.length, nao_encontrados_lista: nao_encontrados.slice(0, 300), total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
+});
+
 // [ADD entregas] Importacao de ENTREGAS (relatorio Cademi aluno->produto->estado) — ADITIVO/SEGURO.
 // So ADICIONA acesso NOVO (curso que o aluno ainda nao tem) com validade 'vitalicio'; NUNCA apaga
 // nem sobrescreve acesso existente (preserva as datas reais / tempo restante). Curso ja existente
