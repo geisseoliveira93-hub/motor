@@ -5840,7 +5840,8 @@ let _campEnviando = false;
 async function tickCampanha() {
   if (_campEnviando) return; _campEnviando = true;
   try {
-    const item = db.prepare(`SELECT * FROM fila_envio WHERE status='camp_pend' AND (pausado IS NULL OR pausado=0) AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em LIMIT 1`).get(agora()) as any;
+    const LIM = new Date(Date.now() - 21600 * 1000).toISOString(); // [disparo-validade] 6h atras (ISO) — nao envia item preso ha mais de 6h
+    const item = db.prepare(`SELECT * FROM fila_envio WHERE status='camp_pend' AND (pausado IS NULL OR pausado=0) AND (agendado_para IS NULL OR agendado_para <= ?) AND (agendado_para IS NULL OR agendado_para >= ?) ORDER BY agendado_para, criado_em LIMIT 1`).get(agora(), LIM) as any;
     if (item) {
       try {
         if ((item.tipo || 'texto') === 'texto') await enviarTexto(item.projeto, item.para, item.texto || '');
@@ -5852,6 +5853,15 @@ async function tickCampanha() {
     }
   } finally { _campEnviando = false; }
 }
+// [disparo-validade] BOOT: expira itens de disparo de GRUPO presos ha mais de 6h (agendado_para vencido).
+// status 'expirado' = nao envia nem conta como falha; so sai da fila ativa. Add-only, roda 1x na subida ANTES dos tickers.
+try {
+  const _LIMboot = new Date(Date.now() - 21600 * 1000).toISOString(); // 6h atras (ISO, mesmo formato do agora())
+  const _velhos = db.prepare(`SELECT COUNT(*) n, MIN(agendado_para) maisVelho, COUNT(DISTINCT para) grupos FROM fila_envio WHERE status IN ('camp_pend','cmp_multi','cmp_mmk') AND agendado_para IS NOT NULL AND agendado_para < ?`).get(_LIMboot);
+  console.log('[disparo-validade] itens vencidos a expirar:', JSON.stringify(_velhos));
+  const _rexp = db.prepare(`UPDATE fila_envio SET status='expirado' WHERE status IN ('camp_pend','cmp_multi','cmp_mmk') AND agendado_para IS NOT NULL AND agendado_para < ?`).run(_LIMboot);
+  console.log('[disparo-validade] expirados:', _rexp.changes);
+} catch (e) { console.log('[disparo-validade] erro:', String(e)); }
 setInterval(tickCampanha, 1000);
 
 
@@ -7991,7 +8001,8 @@ let _multiBusy = false;
 async function tickCampanhaMulti() {
   if (_multiBusy) return; _multiBusy = true;
   try {
-    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_multi' AND (pausado IS NULL OR pausado=0) AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em`).all(agora()) as any[];
+    const LIM = new Date(Date.now() - 21600 * 1000).toISOString(); // [disparo-validade] 6h atras (ISO)
+    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_multi' AND (pausado IS NULL OR pausado=0) AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) AND (agendado_para IS NULL OR agendado_para >= ?) ORDER BY agendado_para, criado_em`).all(agora(), LIM) as any[];
     const porInst: Record<string, any> = {};
     for (const r of rows) { const k = r.instancia || '_'; if (!porInst[k]) porInst[k] = r; }
     const lote = Object.values(porInst) as any[];
@@ -8212,7 +8223,8 @@ let _mkBusy = false;
 async function tickCampanhaMultiMk() {
   if (_mkBusy) return; _mkBusy = true;
   try {
-    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_mmk' AND (pausado IS NULL OR pausado=0) AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) ORDER BY agendado_para, criado_em`).all(agora()) as any[];
+    const LIM = new Date(Date.now() - 21600 * 1000).toISOString(); // [disparo-validade] 6h atras (ISO)
+    const rows = db.prepare(`SELECT * FROM fila_envio WHERE status='cmp_mmk' AND (pausado IS NULL OR pausado=0) AND instancia IS NOT NULL AND (agendado_para IS NULL OR agendado_para <= ?) AND (agendado_para IS NULL OR agendado_para >= ?) ORDER BY agendado_para, criado_em`).all(agora(), LIM) as any[];
     const porInst: Record<string, any> = {};
     for (const r of rows) { const k = r.instancia || '_'; if (!porInst[k]) porInst[k] = r; }
     const lote = Object.values(porInst) as any[];
