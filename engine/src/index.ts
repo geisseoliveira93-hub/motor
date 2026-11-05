@@ -7626,6 +7626,42 @@ function livPreBaixarFonte(fonteTipo: string, fonteRef: string, capaRef?: string
 
 // serve a mídia baixada (rota liberada no middleware acima)
 app.use('/media', express.static(MEDIA_DIR));
+// [+media-cache-sweep 05/11] LIMPEZA AUTOMATICA do cache de /data/media. Os arquivos SOLTOS em MEDIA_DIR sao
+// cache do OneDrive (rebaixavel por hash sob demanda, inclusive VSL 'storage') + posters do VSL (regeraveis).
+// Aqui apagamos os que passaram de N dias (pub_kv 'media_cache_dias', padrao 3), PRESERVANDO as subpastas
+// (academy/curso, email-anexos, yt-snaps, tt-snaps, etc.) e os arquivos recentes (post/live em andamento).
+// Assim o HD nao enche sozinho. So ADICIONA; best-effort; nunca quebra a postagem/entrega.
+function _mediaCacheSweep(): { apagados: number; bytes: number; dias: number; ativo: boolean } {
+  let apagados = 0, bytes = 0, dias = 3;
+  const ativo = pubFlag('media_cache_sweep_ativo', '1') === '1';
+  try { const n = parseInt(String(pubFlag('media_cache_dias', '3')), 10); if (Number.isFinite(n) && n >= 1) dias = n; } catch { /* usa padrao */ }
+  if (!ativo) return { apagados, bytes, dias, ativo };
+  try {
+    const limite = Date.now() - dias * 86400000;
+    for (const nome of fs.readdirSync(MEDIA_DIR)) {
+      try {
+        const p = MEDIA_DIR + '/' + nome;
+        const st = fs.statSync(p);
+        if (!st.isFile()) continue;         // preserva subpastas (academy, email-anexos, snaps...)
+        if (st.mtimeMs > limite) continue;  // mantem os recentes (post/live em andamento)
+        const sz = st.size; fs.unlinkSync(p); apagados++; bytes += sz;
+      } catch { /* arquivo em uso/erro: pula */ }
+    }
+    if (apagados > 0) console.log('[media-cache-sweep] apagados ' + apagados + ' arquivos ~' + (bytes / 1073741824).toFixed(2) + 'GB (cache OneDrive, rebaixavel), >' + dias + 'd');
+  } catch (e: any) { console.log('[media-cache-sweep] erro', e && e.message || e); }
+  return { apagados, bytes, dias, ativo };
+}
+setTimeout(() => { try { _mediaCacheSweep(); } catch { /* */ } }, 180000);        // ~3min apos o boot
+setInterval(() => { try { _mediaCacheSweep(); } catch { /* */ } }, 12 * 3600000);  // a cada 12h
+// manual/status (protegidos por x-api-key — nao sao /media/*): rodar ou conferir o cache na hora
+app.post('/media-cache/limpar', (_req: any, res: any) => { try { return res.json({ ok: true, ..._mediaCacheSweep() }); } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e && e.message || e) }); } });
+app.get('/media-cache/status', (_req: any, res: any) => {
+  try {
+    let arquivos = 0, bytes = 0, subpastas = 0;
+    for (const nome of fs.readdirSync(MEDIA_DIR)) { try { const st = fs.statSync(MEDIA_DIR + '/' + nome); if (st.isFile()) { arquivos++; bytes += st.size; } else if (st.isDirectory()) subpastas++; } catch { /* */ } }
+    return res.json({ ok: true, arquivos, gb: +(bytes / 1073741824).toFixed(2), subpastas, dias: parseInt(String(pubFlag('media_cache_dias', '3')), 10) || 3, ativo: pubFlag('media_cache_sweep_ativo', '1') === '1' });
+  } catch (e: any) { return res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
 
 // [lives-barra] progresso do carregamento (pre-download) das lives -> barrinha na aba Transmissoes
 app.get('/lives/progresso', (_req, res) => {
