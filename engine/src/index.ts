@@ -14346,26 +14346,36 @@ app.post('/academy/importar/alunos', (req: any, res: any) => {
   } catch (e) { _ndErr(res, e); }
 });
 
-// [+telefones-import 05/11] Preenche o TELEFONE dos alunos (academy_matriculas) casando por EMAIL.
-// Aditivo/seguro: so preenche quando o telefone esta VAZIO (nunca sobrescreve um ja preenchido). Re-rodavel.
+// [+telefones-import 05/11] Preenche o TELEFONE dos alunos (academy_matriculas) casando por EMAIL,
+// e TAMBEM sincroniza nos contatos do disparo SO PREENCHENDO quem JA existe (nao cria contato novo).
+// Aditivo/seguro: nunca sobrescreve telefone ja preenchido. Re-rodavel.
 // Corpo: { linhas: [ { email, telefone } ] }  (telefone ja normalizado com codigo do pais; so digitos)
 app.post('/academy/importar/telefones', (req: any, res: any) => {
   try {
     const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
     let atualizados = 0, ja_tinha = 0; const nao_encontrados: string[] = [];
+    let contatos_atualizados = 0, contatos_conflito = 0;
     const tx = db.transaction((rows: any[]) => {
       for (const r of rows) {
         const email = String(r.email || '').trim().toLowerCase(); if (!email) continue;
         const tel = String(r.telefone || '').replace(/\D/g, ''); if (!tel) continue;
+        // 1) ALUNO (academy_matriculas): preenche telefone vazio, casando por email
         const al = db.prepare(`SELECT id, telefone FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
-        if (!al) { nao_encontrados.push(email); continue; }
-        if (al.telefone && String(al.telefone).trim()) { ja_tinha++; continue; }
-        db.prepare(`UPDATE academy_matriculas SET telefone=? WHERE id=?`).run(tel, al.id);
-        atualizados++;
+        if (!al) { nao_encontrados.push(email); }
+        else if (al.telefone && String(al.telefone).trim()) { ja_tinha++; }
+        else { db.prepare(`UPDATE academy_matriculas SET telefone=? WHERE id=?`).run(tel, al.id); atualizados++; }
+        // 2) CONTATOS (disparo): SO preenche quem JA existe (por email) e esta sem telefone. Nao cria novo.
+        try {
+          const cs = db.prepare(`SELECT id FROM contatos WHERE lower(email)=? AND (telefone IS NULL OR telefone='')`).all(email) as any[];
+          for (const c of cs) {
+            try { db.prepare(`UPDATE contatos SET telefone=?, atualizado_em=? WHERE id=?`).run(tel, agora(), c.id); contatos_atualizados++; }
+            catch { contatos_conflito++; }
+          }
+        } catch { /* contatos best-effort */ }
       }
     });
     tx(linhas);
-    _ndOk(res, { atualizados, ja_tinha, nao_encontrados: nao_encontrados.length, nao_encontrados_lista: nao_encontrados.slice(0, 300), total: linhas.length });
+    _ndOk(res, { atualizados, ja_tinha, nao_encontrados: nao_encontrados.length, nao_encontrados_lista: nao_encontrados.slice(0, 300), contatos_atualizados, contatos_conflito, total: linhas.length });
   } catch (e) { _ndErr(res, e); }
 });
 
