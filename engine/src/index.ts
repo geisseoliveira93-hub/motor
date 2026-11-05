@@ -757,6 +757,13 @@ function _entregarVol2DoPedido(projeto: string, p: { telefone?: string; nome?: s
 const _COMBO_BX_CHAVE = 'combo-baixo-botao';
 const _COMBO_BX_TAG = 'lead-combo-baixo-botao';
 const _COMBO_BX_FRASE = 'pack do baixista'; // comparado sem acento e em minúsculo
+// [+combo-baixo-frases 05/11] frases que ATIVAM o fluxo do combo baixo. Mantém a antiga
+// 'pack do baixista' e aceita também a do anúncio/botão novo "combo de cifras baixo".
+const _COMBO_BX_FRASES = [_COMBO_BX_FRASE, 'combo de cifras baixo'];
+function _comboBxFraseCasou(texto: any): boolean {
+  const t = _normFrase(texto);
+  return _COMBO_BX_FRASES.some((f) => t.includes(_normFrase(f)));
+}
 const _COMBO_BX_INST = 'Baixo'; // número do Baixo
 const _COMBO_BX_AGENTE = 'Combo de Cifras Baixo';
 const _COMBO_BX_CKT = 'https://lastlink.com/p/C351BD2F3/checkout-payment';
@@ -2170,7 +2177,7 @@ app.get('/flows/motor', (_req, res) => {
     const fixoCombo = {
       chave: _COMBO_BX_CHAVE, kind: 'fixo',
       titulo: 'Combo de Cifras Baixo — Botão WhatsApp', projeto: 'baixo',
-      instancia: _COMBO_BX_INST, trigger: _COMBO_BX_FRASE, tag: _COMBO_BX_TAG,
+      instancia: _COMBO_BX_INST, trigger: _COMBO_BX_FRASES.join(' | '), tag: _COMBO_BX_TAG,
       agente: _COMBO_BX_AGENTE, checkout: _COMBO_BX_CKT,
       editado: false,
       stops: [
@@ -3962,7 +3969,7 @@ app.post('/webhook/evolution', (req, res) => {
         // [+combo-baixo 29/10] gatilho por FRASE do botão WhatsApp do Baixo + PARADA automática (só baixo, 1-a-1, nunca grupo)
         if (!ehGrupo && projeto === 'baixo') {
           try {
-            if (_normFrase(texto).includes(_COMBO_BX_FRASE)) { _iniciarComboBaixo(projeto, cid, telefone, data.pushName); } // a FRASE inicia o fluxo (dedup 1x)
+            if (_comboBxFraseCasou(texto)) { _iniciarComboBaixo(projeto, cid, telefone, data.pushName); } // qualquer frase de _COMBO_BX_FRASES inicia o fluxo (dedup 1x)
             else if (_comboBxPendentes(telefone) > 0) { _comboBxCancelarPendentes(telefone); _handoffComboBaixo(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela restante + passa pro agente
           } catch { /* best-effort: nunca quebra o webhook */ }
         }
