@@ -15737,7 +15737,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       // recuperacao, pra NAO contar em dobro. Sem sobreposicao com o worker (que nao tem LastLink).
       const _llByProd: Record<string, { total: number; fat: number }> = {};
       try {
-        const _llrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE provider='lastlink' AND status='liquidada' AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? AND id NOT IN (SELECT pedido FROM vendas_recuperacao WHERE pedido IS NOT NULL) GROUP BY produto`).all(deFinal, ateFinal) as any[];
+        const _llrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE provider='lastlink' AND status='liquidada' AND valor > 0 AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? AND id NOT IN (SELECT pedido FROM vendas_recuperacao WHERE pedido IS NOT NULL) GROUP BY produto`).all(deFinal, ateFinal) as any[];
         for (const r of _llrows) {
           const b = _pnlProduto(r.produto || '');
           const o = _llByProd[b] || (_llByProd[b] = { total: 0, fat: 0 });
@@ -15755,7 +15755,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       // (p.vendas) NAO e mais somada ao total — fica so como detalhe (vendasAds).
       const _txByProd: Record<string, { total: number; fat: number }> = {};
       try {
-        const _txrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE status='liquidada' AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? GROUP BY produto`).all(deFinal, ateFinal) as any[];
+        const _txrows = db.prepare(`SELECT produto, COUNT(*) n, COALESCE(SUM(valor),0) v FROM transacoes WHERE status='liquidada' AND valor > 0 AND date(criado_em,'-3 hours') >= ? AND date(criado_em,'-3 hours') <= ? GROUP BY produto`).all(deFinal, ateFinal) as any[];
         for (const r of _txrows) {
           const b = _pnlProduto(r.produto || '');
           const o = _txByProd[b] || (_txByProd[b] = { total: 0, fat: 0 });
