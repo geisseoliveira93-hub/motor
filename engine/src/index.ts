@@ -3094,6 +3094,8 @@ try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_medium TEXT`); } catch { /*
 try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_content TEXT`); } catch { /* existe */ }
 try { db.exec(`ALTER TABLE transacoes ADD COLUMN utm_term TEXT`); } catch { /* existe */ }
 try { db.exec(`CREATE TABLE IF NOT EXISTS webhook_pagamento_log (id TEXT PRIMARY KEY, provider TEXT, pedido TEXT, raw_json TEXT, criado_em TEXT)`); } catch { /* existe */ }
+// [+ip-ua-purchase 05/11] ip/ua do toque do navegador keyado pelo fbclid cru, pra o Purchase server-side (webhook da LastLink NAO traz ip/ua do comprador) reusar e subir o EMQ. So adiciona.
+try { db.exec(`CREATE TABLE IF NOT EXISTS rastreio_toque (fbclid TEXT PRIMARY KEY, ip TEXT, ua TEXT, criado_em TEXT)`); } catch { /* existe */ }
 // [+vendas-recuperacao 29/10] registra a venda que foi recuperada (pessoa estava num fluxo de recuperação e comprou),
 // com a ORIGEM (whatsapp = recebeu nossa mensagem de recuperação; checkout = estava em recuperação mas voltou sozinho).
 // Só ADICIONA — a tabela transacoes continua intacta; isto é uma camada paralela só pra atribuição/painel.
@@ -9592,6 +9594,7 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
           let _fn: string | null = null, _ln: string | null = null;
           try { const _nm = String((dados as any).nome || '').trim(); if (_nm) { const _ps = _nm.split(/\s+/); _fn = _ps.shift() || null; _ln = _ps.length ? _ps.join(' ') : null; } } catch { /* nome best-effort */ }
           let _fbcP: string | null = null;
+          let _ipP: string | null = null, _uaP: string | null = null; // [+ip-ua-purchase 05/11]
           try {
             const _tel = dados.telefone ? String(dados.telefone).replace(/\D/g, '') : '';
             let _cc: any = null;
@@ -9599,8 +9602,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
             if ((!_cc || !_cc.utm_fbclid) && dados.email) _cc = db.prepare(`SELECT utm_fbclid FROM contatos WHERE lower(email)=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(dados.email).toLowerCase()) as any;
             if (_cc && _cc.utm_fbclid) _fbcP = 'fb.1.' + Date.now() + '.' + String(_cc.utm_fbclid);
             if (!_fbcP && (dados as any).fbclid) _fbcP = 'fb.1.' + Date.now() + '.' + String((dados as any).fbclid); // [+fbclid-checkout] fbclid veio direto do webhook (checkout direto)
+            // [+ip-ua-purchase 05/11] recupera ip/ua do ultimo toque do navegador (keyado pelo fbclid cru) pra o Purchase server-side atribuir melhor. So adiciona.
+            try {
+              const _fbclidRawP = _fbcP ? String(_fbcP).split('.').slice(3).join('.') : ((dados as any).fbclid ? String((dados as any).fbclid) : '');
+              if (_fbclidRawP) { const _tq = db.prepare(`SELECT ip, ua FROM rastreio_toque WHERE fbclid=?`).get(_fbclidRawP) as any; if (_tq) { _ipP = _tq.ip || null; _uaP = _tq.ua || null; } }
+            } catch { /* ip-ua best-effort */ }
           } catch { /* fbc best-effort */ }
-          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, eventId: (dados as any).pedido || undefined, firstName: _fn, lastName: _ln, fbc: _fbcP, externalId: dados.email || dados.telefone || null, utms: (dados as any).utms || null }, fonte);
+          await trackEnviarTudo(cfgT, eventName, { email: dados.email, telefone: dados.telefone, valorCentavos: dados.valorCentavos, produto: dados.produto, pagina: null, eventId: (dados as any).pedido || undefined, firstName: _fn, lastName: _ln, fbc: _fbcP, clientIp: _ipP, userAgent: _uaP, externalId: dados.email || dados.telefone || null, utms: (dados as any).utms || null }, fonte);
           return;
         }
       }
@@ -9781,6 +9789,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         const fbp = lerCk('_fbp') || (p.fbp || '');
         const ip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || req.socket?.remoteAddress || '');
         const ua = String(req.headers['user-agent'] || '');
+        // [+ip-ua-purchase 05/11] guarda ip/ua deste toque keyado pelo fbclid cru, pra o Purchase (webhook sem ip/ua) reusar. So adiciona.
+        try {
+          const _fbclidTq = String(p.fbclid || p.fbclid_raw || (fbc && String(fbc).indexOf('fb.') === 0 ? String(fbc).split('.').slice(3).join('.') : '') || '').trim();
+          if (_fbclidTq && (ip || ua)) db.prepare(`INSERT OR REPLACE INTO rastreio_toque(fbclid,ip,ua,criado_em) VALUES(?,?,?,?)`).run(_fbclidTq, ip || '', ua || '', agora());
+        } catch { /* rastreio_toque best-effort */ }
         const d:CapiDados = { email: p.email||null, telefone: p.telefone||p.phone||null, valorCentavos: (p.value!=null? Math.round(Number(p.value)*100): null), produto: p.content_name||p.item_name||null, pagina: b.url||null, eventId: b.event_id||undefined,
           fbc: fbc||null, fbp: fbp||null, clientIp: ip||null, userAgent: ua||null,
           firstName: p.first_name||p.fn||null, lastName: p.last_name||p.ln||null, city: p.city||p.ct||null, state: p.state||p.st||null, zip: p.zip||p.zp||null, country: p.country||null, externalId: p.external_id||p.email||null };
@@ -16806,6 +16819,8 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const t = wAchaCompra(cfg, ins); if (!t) continue;
       db.prepare(`UPDATE wbr_inscritos SET status='comprou', comprou_em=?, compra_id=? WHERE id=?`).run(t.criado_em, t.id, ins.id);
       ins.status = 'comprou'; ins.comprou_em = t.criado_em;
+      // [+wbr-trava-compra 05/11] comprou -> cancela os envios (wa/email) ainda pendentes/falhos desse inscrito, pra NAO mandar nada depois da compra. So adiciona.
+      try { db.prepare(`UPDATE wbr_envios SET status='cancelado', detalhe='comprou - cancelado automatico' WHERE inscrito_id=? AND status IN ('pendente','falhou')`).run(ins.id); } catch { /* trava-compra best-effort */ }
       try { const tg = cfg.tags || {}; if (tg.comprou) aplicarTag(ins.projeto, ins.contato_id, tg.comprou); } catch { /* */ }
       if (cfg.posVenda && !wJaFeito(ins, 'pos_venda')) wEnfileira(cfg, ins, { ...cfg.posVenda, k: 'pos_venda' }, { cfg, ins, lead: ins.contato_id, comprou: true }, agoraMs);
       console.log('[wbr] compra reconhecida', { funil, inscrito: ins.id });
@@ -16885,6 +16900,14 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const it = db.prepare(`SELECT * FROM wbr_envios WHERE canal='wa' AND status='pendente' AND agendado_para<=? ORDER BY agendado_para ASC LIMIT 1`).get(agora()) as any;
       if (!it) return;
       const cfg = wCfg(String(it.funil)) || {};
+      // [+wbr-trava-compra 05/11] rede de seguranca: se o inscrito ja comprou/cancelou/encerrou entre o agendamento e agora, NAO envia — marca o envio como cancelado e sai (o bulk-cancel roda no wChecarCompras a cada 60s; isto cobre a corrida). So adiciona.
+      try {
+        const _insEnv = db.prepare(`SELECT status FROM wbr_inscritos WHERE id=?`).get(String(it.inscrito_id || '')) as any;
+        if (_insEnv && (_insEnv.status === 'comprou' || _insEnv.status === 'cancelado' || _insEnv.status === 'encerrado')) {
+          db.prepare(`UPDATE wbr_envios SET status='cancelado', detalhe=? WHERE id=?`).run('inscrito ' + _insEnv.status + ' - envio pulado', it.id);
+          return;
+        }
+      } catch { /* trava-compra best-effort: se falhar, segue o envio normal */ }
       try {
         const inst = String(it.instancia || cfg.instancia || '');
         const proj = String(cfg.projeto || 'teclado');
