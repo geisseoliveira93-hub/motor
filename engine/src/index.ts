@@ -1955,6 +1955,21 @@ app.post('/flows/recup/disparar', (req, res) => {
     res.json({ ok: true, enfileirado: true, instancia: inst, chave: _RECUP_DED_CHAVE, contatoId: cid });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
 });
+// [+combo-baixo-manual 05/11] ATIVA o fluxo fixo do Combo de Cifras Baixo pra um numero manualmente
+// (lead que chegou com uma frase que nao casou o gatilho "pack do baixista"). Mesmo efeito do gatilho
+// automatico: enfileira a sequencia do combo + para na compra/resposta (handoff pro agente). body:
+// { telefone, nome? }. Tem o dedup "passa 1x" do proprio _iniciarComboBaixo. So ADICIONA.
+app.post('/flows/combo-baixo/iniciar', (req, res) => {
+  try {
+    const b = req.body || {};
+    const telefone = String(b.telefone || '').replace(/\D/g, '');
+    if (!telefone) return res.status(400).json({ ok: false, erro: 'telefone_obrigatorio' });
+    const nome = b.nome ? String(b.nome) : undefined;
+    const cid = upsertContato('baixo', telefone, nome, undefined, 'combo-baixo-manual');
+    const iniciado = _iniciarComboBaixo('baixo', cid, telefone, nome);
+    res.json({ ok: true, iniciado: !!iniciado, contatoId: cid, chave: _COMBO_BX_CHAVE });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
 // [+flows-cancelar 28/10] ADITIVO: cancela mensagens PENDENTES de fluxo (entrega/recuperação) por número.
 // O /disparo/fila/cancelar só mira disparo em massa (camp_pend/cmp_multi/cmp_mmk), não os 'pendente' de fluxo.
 // body: { para, chave? } — com chave cancela só aquele fluxo; sem chave cancela TODOS os pendentes do número.
