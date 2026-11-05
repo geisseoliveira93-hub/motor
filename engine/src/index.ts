@@ -15706,8 +15706,8 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
         const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
         const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 });
         p.gasto += (a.gasto_centavos || 0) / 100;
-        p.vendas += (a.vendas || 0);
-        p.fat += (a.fat_centavos || 0) / 100;
+        p.vendas += (a.vendas_meta || a.vendas || 0);
+        p.fat += ((a.fat_meta_centavos || a.fat_centavos) || 0) / 100;
         p.leads += (a.leads || 0);
         p.cliques += (a.cliques || 0);
         p.impressoes += (a.impressoes || 0);
@@ -15797,12 +15797,12 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const _contasSet: Record<string, string> = {};
       const ads = (anuncios || []).map((a: any) => {
         const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
-        const gasto = (a.gasto_centavos || 0) / 100; const fat = (a.fat_centavos || 0) / 100;
+        const gasto = (a.gasto_centavos || 0) / 100; const fat = ((a.fat_meta_centavos || a.fat_centavos) || 0) / 100;
         const taxaV = fat * tx / 100; const impV = gasto * im / 100;
         const conta = String(a.ad_account_id || '');
         const contaNome = mapaContas[conta] || (conta ? ('Conta ' + conta.replace('act_', '')) : '(sem conta)');
         if (conta) _contasSet[conta] = contaNome;
-        return { produto: prod, conta, contaNome, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: a.vendas || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, ic: a.ic || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
+        return { produto: prod, conta, contaNome, campanha: String(a.campaign_nome || '(sem campanha)'), ad: String(a.ad_nome || '(sem nome)'), gasto, vendas: (a.vendas_meta || a.vendas) || 0, fat, leads: a.leads || 0, cliques: a.cliques || 0, impressoes: a.impressoes || 0, ic: a.ic || 0, roas: gasto > 0 ? fat / gasto : 0, lucro: fat - taxaV - impV - gasto };
       });
       const contas = Object.keys(_contasSet).map((id) => ({ id, nome: _contasSet[id] })).sort((aa, bb) => aa.nome.localeCompare(bb.nome));
       return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista, ads, contas };
