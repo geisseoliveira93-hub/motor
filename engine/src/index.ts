@@ -1610,6 +1610,57 @@ app.get('/crm/contatos/count', (req, res) => {
   const r = db.prepare('SELECT COUNT(DISTINCT c.id) n FROM contatos c ' + join + ' WHERE ' + cond.join(' AND ')).get(...args) as any;
   res.json({ ok: true, total: (r && r.n) || 0 });
 });
+// [ADD planilha-sync] Lista compacta dos telefones ja existentes no projeto (1=tem email, 0=sem),
+// pra calcular o delta antes de importar em massa (nao re-empurrar o que ja esta la).
+app.get('/crm/contatos/telefones', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    const rows = db.prepare(`SELECT telefone, email FROM contatos WHERE projeto=?`).all(projeto) as any[];
+    const map: Record<string, number> = {};
+    for (const r of rows) { const t = String(r.telefone || '').trim(); if (!t) continue; map[t] = (r.email && String(r.email).trim()) ? 1 : 0; }
+    _ndOk(res, { projeto, total: rows.length, telefones: map });
+  } catch (e) { _ndErr(res, e); }
+});
+// [ADD planilha-sync] Importacao em massa de leads via JSON (idempotente). So PREENCHE o que falta:
+// se o contato ja existe (projeto+telefone), so completa nome/email vazios; se nao existe, cria.
+app.post('/crm/importar/leads-bulk', (req: any, res: any) => {
+  try {
+    const projeto = String((req.body || {}).projeto || '');
+    if (!ehProjeto(projeto)) return _ndErr(res, 'projeto_invalido');
+    const linhas: any[] = Array.isArray((req.body || {}).linhas) ? (req.body as any).linhas : [];
+    let criados = 0, email_preenchido = 0, nome_preenchido = 0, ja_ok = 0, pulados = 0, tags_aplicadas = 0;
+    const tx = db.transaction((rows: any[]) => {
+      for (const r of rows) {
+        const tel = String(r.telefone || '').replace(/\D/g, '');
+        if (!tel || tel.length < 10) { pulados++; continue; }
+        const nome = String(r.nome || '').trim();
+        const email = String(r.email || '').trim().toLowerCase();
+        const ex = db.prepare(`SELECT id, nome, email FROM contatos WHERE projeto=? AND telefone=?`).get(projeto, tel) as any;
+        let cid: string;
+        if (ex) {
+          cid = ex.id;
+          const setNome = (!ex.nome || !String(ex.nome).trim()) && !!nome;
+          const setEmail = (!ex.email || !String(ex.email).trim()) && !!email;
+          if (setNome || setEmail) {
+            db.prepare(`UPDATE contatos SET nome=COALESCE(?,nome), email=COALESCE(?,email), atualizado_em=? WHERE id=?`)
+              .run(setNome ? nome : null, setEmail ? email : null, agora(), cid);
+            if (setNome) nome_preenchido++;
+            if (setEmail) email_preenchido++;
+          } else { ja_ok++; }
+        } else {
+          cid = randomUUID();
+          db.prepare(`INSERT INTO contatos(id,projeto,telefone,nome,email,origem,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?)`)
+            .run(cid, projeto, tel, nome || null, email || null, String(r.origem || 'planilha-import'), agora(), agora());
+          criados++;
+        }
+        const tags = Array.isArray(r.tags) ? r.tags : [];
+        for (const t of tags) { const tn = String(t || '').trim(); if (tn) { try { aplicarTag(projeto, cid, tn); tags_aplicadas++; } catch { } } }
+      }
+    });
+    tx(linhas);
+    _ndOk(res, { projeto, criados, email_preenchido, nome_preenchido, ja_ok, pulados, tags_aplicadas, total: linhas.length });
+  } catch (e) { _ndErr(res, e); }
+});
 app.get('/crm/contato/:id', (req, res) => {
   const c = db.prepare(`SELECT * FROM contatos WHERE id=?`).get(req.params.id) as any;
   if (!c) return res.status(404).json({ erro: 'nao_encontrado' });
