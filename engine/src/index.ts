@@ -14929,6 +14929,29 @@ app.post('/academy/upload', async (req: any, res: any) => {
   } catch (e) { _ndErr(res, e); }
 });
 
+// [+banner-hd 05/11] UPLOAD de imagem de BANNER em ALTA (admin): igual ao /academy/upload, mas NAO encolhe pra 600px.
+// Mantem a resolucao (cap generoso) p/ o hero ficar nitido. Aceita {data: dataURL, slot?: 'desktop'|'mobile'}. ADD-ONLY.
+app.post('/academy/upload-banner', async (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const data = String(b.data || '');
+    const m = data.match(/^data:([^;]+);base64,(.*)$/);
+    if (!m) return _ndErr(res, 'formato invalido (envie dataURL base64)');
+    const mime = m[1]; let buf = Buffer.from(m[2], 'base64');
+    const dir = MEDIA_DIR + '/academy';
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
+    let ext = (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5);
+    const slot = String(b.slot || 'desktop').toLowerCase();
+    const maxW = slot === 'mobile' ? 1400 : 2400; // alta p/ banner hero (sem encolher pra 600)
+    if (/^image\//.test(mime) && !/svg|gif/.test(mime)) {
+      try { const sharp = (await import('sharp')).default; buf = await sharp(buf).rotate().resize({ width: maxW, withoutEnlargement: true }).webp({ quality: 85 }).toBuffer(); ext = 'webp'; } catch (e) { /* se sharp falhar, salva original */ }
+    }
+    const nome = 'banner-' + randomUUID() + '.' + ext;
+    fs.writeFileSync(dir + '/' + nome, buf);
+    _ndOk(res, { url: (PUBLIC_BASE_URL || '') + '/media/academy/' + nome });
+  } catch (e) { _ndErr(res, e); }
+});
+
 // [+capas-leves 03/11] otimiza as capas JÁ salvas (reduz p/ máx 600px). ADITIVO.
 app.post('/academy/midia/otimizar', async (req: any, res: any) => {
   try {
