@@ -8968,7 +8968,13 @@ app.post('/pub/youtube/tela-final', (req: any, res: any) => {
     if (_tfRodando) return res.json({ ok: false, erro: 'já tem uma aplicação de tela final rodando; aguarde terminar' });
     _tfRodando = true; _tfResultado = { status: 'rodando', projeto, videoId, molde, inicio: agora() };
     (async () => {
-      try { const mod: any = await import('./yt-browser-nuvem'); const r = await mod.aplicarTelaFinalViaEdit({ projeto, videoId, moldeId: molde, snaps: b.snaps !== false }); _tfResultado = { status: 'fim', projeto, videoId, molde, resultado: r, fim: agora() }; }
+      try {
+        let moldeTitulo = String(b.moldeTitulo || '');
+        if (!moldeTitulo) { try { const tk = await pbYtToken(projeto); const gg: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet&id=' + encodeURIComponent(molde), { headers: { Authorization: 'Bearer ' + tk } }); const gj: any = await gg.json(); moldeTitulo = (gj && gj.items && gj.items[0] && gj.items[0].snippet && gj.items[0].snippet.title) || ''; } catch { /* segue sem título */ } }
+        const mod: any = await import('./yt-browser-nuvem');
+        const r = await mod.aplicarTelaFinalViaEdit({ projeto, videoId, moldeId: molde, moldeTitulo, snaps: b.snaps !== false });
+        _tfResultado = { status: 'fim', projeto, videoId, molde, moldeTitulo, resultado: r, fim: agora() };
+      }
       catch (e: any) { _tfResultado = { status: 'erro', projeto, videoId, molde, erro: String(e?.message || e), fim: agora() }; }
       finally { _tfRodando = false; }
     })();
