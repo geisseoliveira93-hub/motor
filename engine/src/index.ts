@@ -14536,40 +14536,94 @@ app.get('/academy/envio-acesso/status', (req: any, res: any) => {
     _ndOk(res, { curso, elegiveis: elegiveis.n, enviados: enviados.n, enviados_com_whatsapp: comWa.n, faltam: faltam.n, senha_padrao: AC_ENVIO_SENHA_PADRAO, instancia: AC_ENVIO_INSTANCIA });
   } catch (e) { _ndErr(res, e); }
 });
+// FUNÇÃO reutilizável (usada pelo endpoint E pelo relógio interno). curso/limite; confirmar=false => prévia.
+function _acEnvioRodarLote(curso: string, limite: number, confirmar: boolean): any {
+  curso = String(curso || '').trim();
+  limite = Math.max(1, Math.min(500, Number(limite) || 30));
+  const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, limite) as any[];
+  const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY (padrao=1) DESC, criado_em DESC LIMIT 1`).get(AC_ENVIO_PROJETO) as any);
+  const previa: any[] = []; let enviados = 0; let comWa = 0;
+  for (const r of rows) {
+    let tok = r.token_login;
+    if (!tok && confirmar) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, r.id); }
+    const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + (tok || '<token>');
+    const tel = String(r.telefone || '').replace(/\D/g, '');
+    previa.push({ id: r.id, nome: r.nome, email: r.email, telefone: tel, tem_whatsapp: !!tel, link });
+    if (!confirmar) continue;
+    let email_ok = 0, wa_ok = 0, erro = '';
+    try {
+      db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+        .run(randomUUID(), AC_ENVIO_PROJETO, String(r.email), _acEnvioAssunto(), _acEnvioEmailHtml(r.nome || '', link), 'pendente', agora(), (dom && dom.id) || null, null);
+      email_ok = 1;
+    } catch (e: any) { erro += 'email:' + String(e?.message || e) + '; '; }
+    if (tel) {
+      try { enfileirarFluxo(AC_ENVIO_PROJETO, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto(r.nome || '', link), delaySegundos: 0 } as any], r.nome || '', undefined, AC_ENVIO_INSTANCIA, 'envio-acesso'); wa_ok = 1; comWa++; }
+      catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; }
+    }
+    db.prepare(`INSERT OR REPLACE INTO academy_envio_acesso(aluno_id,curso_id,email,telefone,email_ok,wa_ok,erro,enviado_em) VALUES(?,?,?,?,?,?,?,?)`)
+      .run(r.id, curso, String(r.email), tel, email_ok, wa_ok, erro || null, agora());
+    enviados++;
+  }
+  return { confirmar, curso, limite, candidatos: rows.length, enviados, enviados_com_whatsapp: comWa, smtp_configurado: !!dom, previa: previa.slice(0, 50) };
+}
 // RODAR 1 LOTE. body {curso, limite=30, confirmar}. Sem confirmar => PRÉVIA (não envia, não marca).
 app.post('/academy/envio-acesso/rodar', (req: any, res: any) => {
+  try { const b = req.body || {}; _ndOk(res, _acEnvioRodarLote(String(b.curso || ''), Number(b.limite) || 30, b.confirmar === true)); } catch (e) { _ndErr(res, e); }
+});
+// CONFIG do relógio interno (persiste em pub_kv -> sobrevive a deploy). GET lê, POST ajusta {ativo,limite,hora,curso}.
+const AC_ENVIO_CURSO_PADRAO = '5ea854ac-2870-4e01-a1b6-b7eb9f2bbd86'; // Curso e Mentoria de Teclado Gospel
+// seed dos padrões no boot (só se nunca setado): LIGADO, 30/dia, 15h BRT, curso Teclado Gospel
+if (pubFlag('envio_acesso_ativo', '') === '') setPubFlag('envio_acesso_ativo', '1');
+if (pubFlag('envio_acesso_limite', '') === '') setPubFlag('envio_acesso_limite', '30');
+if (pubFlag('envio_acesso_hora', '') === '') setPubFlag('envio_acesso_hora', '15');
+if (pubFlag('envio_acesso_curso', '') === '') setPubFlag('envio_acesso_curso', AC_ENVIO_CURSO_PADRAO);
+app.get('/academy/envio-acesso/config', (_req: any, res: any) => {
+  _ndOk(res, { ativo: pubFlag('envio_acesso_ativo', '1') === '1', limite: Number(pubFlag('envio_acesso_limite', '30')), hora_brt: Number(pubFlag('envio_acesso_hora', '15')), curso: pubFlag('envio_acesso_curso', AC_ENVIO_CURSO_PADRAO), ultimo_dia: pubFlag('envio_acesso_ultimo_dia', ''), instancia: AC_ENVIO_INSTANCIA, senha_padrao: AC_ENVIO_SENHA_PADRAO });
+});
+app.post('/academy/envio-acesso/config', (req: any, res: any) => {
   try {
     const b = req.body || {};
-    const curso = String(b.curso || '').trim();
-    const limite = Math.max(1, Math.min(500, Number(b.limite) || 30));
-    const confirmar = b.confirmar === true;
-    const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, limite) as any[];
-    const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY (padrao=1) DESC, criado_em DESC LIMIT 1`).get(AC_ENVIO_PROJETO) as any);
-    const previa: any[] = []; let enviados = 0; let comWa = 0;
-    for (const r of rows) {
-      let tok = r.token_login;
-      if (!tok && confirmar) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, r.id); }
-      const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + (tok || '<token>');
-      const tel = String(r.telefone || '').replace(/\D/g, '');
-      previa.push({ id: r.id, nome: r.nome, email: r.email, telefone: tel, tem_whatsapp: !!tel, link });
-      if (!confirmar) continue;
-      let email_ok = 0, wa_ok = 0, erro = '';
-      try {
-        db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
-          .run(randomUUID(), AC_ENVIO_PROJETO, String(r.email), _acEnvioAssunto(), _acEnvioEmailHtml(r.nome || '', link), 'pendente', agora(), (dom && dom.id) || null, null);
-        email_ok = 1;
-      } catch (e: any) { erro += 'email:' + String(e?.message || e) + '; '; }
-      if (tel) {
-        try { enfileirarFluxo(AC_ENVIO_PROJETO, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto(r.nome || '', link), delaySegundos: 0 } as any], r.nome || '', undefined, AC_ENVIO_INSTANCIA, 'envio-acesso'); wa_ok = 1; comWa++; }
-        catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; }
-      }
-      db.prepare(`INSERT OR REPLACE INTO academy_envio_acesso(aluno_id,curso_id,email,telefone,email_ok,wa_ok,erro,enviado_em) VALUES(?,?,?,?,?,?,?,?)`)
-        .run(r.id, curso, String(r.email), tel, email_ok, wa_ok, erro || null, agora());
-      enviados++;
-    }
-    _ndOk(res, { confirmar, curso, limite, candidatos: rows.length, enviados, enviados_com_whatsapp: comWa, smtp_configurado: !!dom, previa: previa.slice(0, 50) });
+    if (b.ativo !== undefined) setPubFlag('envio_acesso_ativo', (b.ativo === true || b.ativo === '1' || b.ativo === 1 || b.ativo === 'on') ? '1' : '0');
+    if (b.limite !== undefined) setPubFlag('envio_acesso_limite', String(Math.max(1, Math.min(500, Number(b.limite) || 30))));
+    if (b.hora !== undefined) setPubFlag('envio_acesso_hora', String(Math.max(0, Math.min(23, Number(b.hora) || 15))));
+    if (b.curso !== undefined && String(b.curso).trim()) setPubFlag('envio_acesso_curso', String(b.curso).trim());
+    _ndOk(res, { ativo: pubFlag('envio_acesso_ativo', '1') === '1', limite: Number(pubFlag('envio_acesso_limite', '30')), hora_brt: Number(pubFlag('envio_acesso_hora', '15')), curso: pubFlag('envio_acesso_curso', AC_ENVIO_CURSO_PADRAO) });
   } catch (e) { _ndErr(res, e); }
 });
+// RELATÓRIO completo (pra consultar quando quiser): totais, por dia, falhas, config + quanto falta.
+app.get('/academy/envio-acesso/relatorio', (req: any, res: any) => {
+  try {
+    const curso = String(req.query.curso || pubFlag('envio_acesso_curso', AC_ENVIO_CURSO_PADRAO)).trim();
+    const tot = db.prepare(`SELECT COUNT(*) total, SUM(email_ok) com_email, SUM(wa_ok) com_whatsapp, SUM(CASE WHEN erro IS NOT NULL AND erro<>'' THEN 1 ELSE 0 END) com_erro FROM academy_envio_acesso`).get() as any;
+    const totCurso = db.prepare(`SELECT COUNT(*) total, SUM(email_ok) com_email, SUM(wa_ok) com_whatsapp FROM academy_envio_acesso WHERE curso_id=?`).get(curso) as any;
+    const porDia = db.prepare(`SELECT substr(enviado_em,1,10) dia, COUNT(*) n, SUM(wa_ok) wa, SUM(email_ok) em FROM academy_envio_acesso GROUP BY dia ORDER BY dia DESC LIMIT 60`).all() as any[];
+    const erros = db.prepare(`SELECT email, telefone, erro, enviado_em FROM academy_envio_acesso WHERE erro IS NOT NULL AND erro<>'' ORDER BY enviado_em DESC LIMIT 30`).all() as any[];
+    const faltam = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso)`).get(curso, curso) as any;
+    _ndOk(res, {
+      config: { ativo: pubFlag('envio_acesso_ativo', '1') === '1', limite: Number(pubFlag('envio_acesso_limite', '30')), hora_brt: Number(pubFlag('envio_acesso_hora', '15')), curso, ultimo_dia: pubFlag('envio_acesso_ultimo_dia', '') },
+      geral: { total_enviados: tot.total || 0, com_email: tot.com_email || 0, com_whatsapp: tot.com_whatsapp || 0, com_erro: tot.com_erro || 0 },
+      curso: { total_enviados: totCurso.total || 0, com_email: totCurso.com_email || 0, com_whatsapp: totCurso.com_whatsapp || 0, faltam: faltam.n || 0 },
+      por_dia: porDia, erros_recentes: erros
+    });
+  } catch (e) { _ndErr(res, e); }
+});
+// RELÓGIO INTERNO: 100% no motor (VPS). Checa a cada 10min; às <hora_brt>h, 1x por dia, dispara o lote. Roda mesmo com PC/Cloud desligados.
+setInterval(() => {
+  try {
+    if (pubFlag('envio_acesso_ativo', '1') !== '1') return;
+    const nowBRT = new Date(Date.now() - 3 * 3600 * 1000); // America/Sao_Paulo (UTC-3)
+    const diaBRT = nowBRT.toISOString().slice(0, 10);
+    const horaBRT = nowBRT.getUTCHours();
+    const alvoHora = Number(pubFlag('envio_acesso_hora', '15'));
+    if (horaBRT !== alvoHora) return;
+    if (pubFlag('envio_acesso_ultimo_dia', '') === diaBRT) return; // já rodou hoje
+    setPubFlag('envio_acesso_ultimo_dia', diaBRT); // marca ANTES (evita envio duplo em sobreposição)
+    const curso = pubFlag('envio_acesso_curso', AC_ENVIO_CURSO_PADRAO);
+    const limite = Number(pubFlag('envio_acesso_limite', '30'));
+    const r = _acEnvioRodarLote(curso, limite, true);
+    console.log('[envio-acesso] lote diário disparado', diaBRT, JSON.stringify({ enviados: r.enviados, wa: r.enviados_com_whatsapp, candidatos: r.candidatos }));
+  } catch (e: any) { console.log('[envio-acesso] erro no lote diário:', String(e?.message || e)); }
+}, 10 * 60000);
 // admin: criar/matricular aluno (e conceder acesso opcional)
 app.post('/academy/matricular', (req: any, res: any) => {
   try {
