@@ -1002,7 +1002,20 @@ function _tracarCheckoutUTM(projeto: string, telefone: string, texto: string): s
     });
   } catch { return texto; }
 }
+// [+magiclink-massa] resolve {link_magico} pelo telefone do destinatario -> link de acesso SEM SENHA (gera token_login se faltar). Fallback = tela de login.
+function _linkMagicoPorTelefone(para: any): string {
+  try {
+    const dig = String(para || '').replace(/\D/g, '');
+    if (!dig) return (_AREA_URL || '') + '/area/login';
+    const al = db.prepare(`SELECT id, token_login FROM academy_matriculas WHERE telefone IS NOT NULL AND telefone<>'' AND replace(replace(replace(replace(replace(replace(telefone,'+',''),'-',''),' ',''),'(',''),')',''),'.','') LIKE ? ORDER BY length(telefone) LIMIT 1`).get('%' + dig.slice(-8)) as any;
+    if (!al) return (_AREA_URL || '') + '/area/login';
+    let tok = al.token_login;
+    if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, al.id); }
+    return (_AREA_URL || '') + '/area/entrar/' + tok;
+  } catch { return (_AREA_URL || '') + '/area/login'; }
+}
 async function enviarTexto(projeto: Projeto, para: string, texto: string, instancia?: string) {
+  if (texto && texto.indexOf('{link_magico}') >= 0) texto = texto.replace(/\{link_magico\}/g, _linkMagicoPorTelefone(para));
   // [num-escolha] instancia opcional: manda por um número específico. Sem ela, usa o padrão do projeto.
   const inst = instancia || numeroConectado(projeto)?.instancia;
   if (!inst) throw new Error(`Nenhum número conectado no projeto ${projeto}`);
@@ -14311,6 +14324,26 @@ app.post('/academy/senha/padrao-fixa', (req: any, res: any) => {
     if (sobre) r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=?`).run(h, senha);
     else r = db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE (senha_hash IS NULL OR senha_hash='') AND (senha_plana IS NULL OR senha_plana='')`).run(h, senha);
     _ndOk(res, { definidos: r.changes, senha });
+  } catch (e) { _ndErr(res, e); }
+});
+// [+magiclinks-massa] lista magic links de alunos p/ ENVIO EM MASSA (gera token_login p/ quem nao tem). Admin (x-api-key).
+// ?comAcesso=1 = so quem tem acesso a algum curso. ?curso=<id> = so de um curso. ?comTelefone=1 = so quem tem telefone.
+app.get('/academy/magiclinks', (req: any, res: any) => {
+  try {
+    const curso = String(req.query.curso || '');
+    const comAcesso = String(req.query.comAcesso || '') === '1' || !!curso;
+    const comTel = String(req.query.comTelefone || '') === '1';
+    let rows: any[];
+    if (comAcesso) {
+      rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) ORDER BY m.nome`).all(curso, curso) as any[];
+    } else {
+      rows = db.prepare(`SELECT id, nome, email, telefone, token_login FROM academy_matriculas ORDER BY nome`).all() as any[];
+    }
+    const tx = db.transaction((rs: any[]) => { for (const r of rs) { if (!r.token_login) { r.token_login = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(r.token_login, r.id); } } });
+    tx(rows);
+    let alunos = rows.map((r: any) => ({ id: r.id, nome: r.nome, email: r.email, telefone: r.telefone || '', link: (_AREA_URL || '') + '/area/entrar/' + r.token_login }));
+    if (comTel) alunos = alunos.filter((a: any) => String(a.telefone || '').replace(/\D/g, '').length >= 8);
+    _ndOk(res, { total: alunos.length, alunos });
   } catch (e) { _ndErr(res, e); }
 });
 // admin: gerar/retornar magic link do aluno
