@@ -835,3 +835,120 @@ export async function aplicarCapaViaEdit(opts: { projeto: string; videoId: strin
     try { if (browser) await browser.close(); } catch { /* ignore */ }
   }
 }
+
+// [+tela-final 07/11 Ezequias] Aplica a TELA FINAL (end screen) em UM vídeo horizontal já publicado, copiando de um
+// vídeo-MOLDE do próprio canal via "Importar do vídeo" no Studio (navegador invisível, sessão + proxy do canal).
+// O YouTube NÃO tem API de tela final — só dá pelo Studio. Molde por canal (traz "Envio mais recente" + link do combo
+// com a arte, 20s). Instrumentado com snaps em cada passo p/ diagnóstico. NÃO monta na mão (usa o molde).
+export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[] }> {
+  const projeto = String(opts.projeto || '').trim().toLowerCase();
+  const videoId = String(opts.videoId || '').trim();
+  const moldeId = String(opts.moldeId || '').trim();
+  const querSnaps = !!opts.snaps;
+  const screenshots: string[] = [];
+  if (!projeto || !videoId || !moldeId) return { ok: false, erro: 'projeto/videoId/moldeId obrigatórios' };
+  if (videoId === moldeId) return { ok: false, erro: 'videoId == moldeId (não aplicar no próprio molde)' };
+  const sess = lerSessao(projeto);
+  if (!sess) return { ok: false, erro: 'sem sessão YT na nuvem para ' + projeto };
+  let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
+  try { if (querSnaps) fs.mkdirSync(SNAP_DIR, { recursive: true }); } catch { /* ok */ }
+  async function snap(etapa: string): Promise<void> {
+    if (!querSnaps || !page) return;
+    try { const p = path.join(SNAP_DIR, projeto + '-tf-' + Date.now() + '-' + etapa + '.png'); await page.screenshot({ path: p, fullPage: false }); screenshots.push(p); } catch { /* ignore */ }
+  }
+  try {
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) return { ok: false, erro: 'nenhum aparelho de casa (proxy residencial) online', screenshots };
+    const launchOpts: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] };
+    if (escolhido) { launchOpts.proxy = escolhido.playwright; proxyUsado = escolhido.node.nome || escolhido.node.host; }
+    const chromium = await carregarChromium();
+    browser = await chromium.launch(launchOpts);
+    ctx = await browser.newContext({ storageState: sess.storageState, userAgent: sess.userAgent || USER_AGENT_DEFAULT, viewport: { width: 1400, height: 900 }, locale: 'pt-BR' });
+    page = await ctx.newPage();
+    try { await page.addInitScript((ua: string) => { try { const nav = (globalThis as unknown as { navigator: object }).navigator; Object.defineProperty(nav, 'userAgent', { get: () => ua }); } catch { /* ignore */ } }, sess.userAgent || USER_AGENT_DEFAULT); } catch { /* best-effort */ }
+
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delayHumano(4000, 6000);
+    await snap('tf-01-edit');
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (redirecionou pro login do Google)', proxyUsado, screenshots };
+
+    // clicador real por TEXTO (tenta locator; se não, mouse na bounding box) — os gatilhos Polymer do Studio só respondem a clique real
+    async function clicarTexto(textos: string[], timeoutMs = 8000): Promise<boolean> {
+      for (const t of textos) {
+        try { const loc = page.getByText(t, { exact: false }).first(); if (await loc.count()) { await loc.scrollIntoViewIfNeeded().catch(() => {}); await loc.click({ timeout: timeoutMs }).catch(() => {}); return true; } } catch { /* tenta próximo */ }
+      }
+      return false;
+    }
+    async function temTexto(re: RegExp): Promise<boolean> {
+      return await page.evaluate((src: string) => { const t = ((globalThis as any).document.body?.innerText || ''); return new RegExp(src, 'i').test(t); }, re.source).catch(() => false);
+    }
+
+    // 1) abrir o editor de TELA FINAL (card no painel). 2 tentativas (o 1º clique às vezes só foca).
+    let abriu = false;
+    for (let i = 0; i < 3 && !abriu; i++) {
+      await clicarTexto(['Tela final', 'End screen', 'Telas finais']);
+      await delayHumano(1500, 2500);
+      abriu = await temTexto(/importar do v[íi]deo|import from video|\+\s*elemento|\+\s*element/);
+      if (!abriu) await snap('tf-02-tentativa-abrir-' + (i + 1));
+    }
+    await snap('tf-02-editor-tela-final');
+    if (!abriu) return { ok: false, erro: 'não consegui abrir o editor de Tela final (UI mudou?)', proxyUsado, screenshots };
+
+    // se o vídeo JÁ tem elementos, o "Importar do vídeo" some -> considera que já tinha tela final
+    const temImportar = await temTexto(/importar do v[íi]deo|import from video/);
+    if (!temImportar) { await snap('tf-02b-ja-tinha'); return { ok: true, jaTinha: true, detalhe: 'vídeo já tinha tela final (sem botão Importar)', proxyUsado, screenshots }; }
+
+    // 2) clicar "Importar do vídeo" (precisa de 2 cliques — o 1º é absorvido)
+    await clicarTexto(['Importar do vídeo', 'Import from video']);
+    await delayHumano(900, 1500);
+    await clicarTexto(['Importar do vídeo', 'Import from video']);
+    await delayHumano(2000, 3000);
+    await snap('tf-03-grade-videos');
+
+    // 3) na grade, clicar no TÍTULO do card do MOLDE (achando pelo moldeId na thumbnail/href; clique real por mouse no título)
+    const boxTitulo = await page.evaluate((mid: string) => {
+      const doc: any = (globalThis as any).document;
+      const els = Array.from(doc.querySelectorAll('*')) as any[];
+      for (const el of els) {
+        const attr = ((el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || '') + ' ' + (() => { try { return getComputedStyle(el).backgroundImage || ''; } catch { return ''; } })();
+        if (attr.indexOf(mid) >= 0) {
+          const card = (el.closest && (el.closest('[role="option"], ytcp-ve, ytcp-video-row, #video-card, ytcp-card, tr, li') || el.parentElement)) || el;
+          // procura o título (texto mais longo clicável dentro do card)
+          let titulo: any = null; let maxLen = 0;
+          card.querySelectorAll('*').forEach((c: any) => { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8) { maxLen = tx.length; titulo = c; } } });
+          const alvo = titulo || card;
+          const r = alvo.getBoundingClientRect ? alvo.getBoundingClientRect() : null;
+          if (r && r.width > 20 && r.height > 8) return { x: r.x + Math.min(r.width / 2, 80), y: r.y + r.height / 2, txt: (alvo.innerText || '').slice(0, 60) };
+        }
+      }
+      return null;
+    }, moldeId).catch(() => null);
+    if (!boxTitulo) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde ' + moldeId + ' na grade (confira se o molde é do mesmo canal e tem tela final)', proxyUsado, screenshots }; }
+    await page.mouse.click(boxTitulo.x, boxTitulo.y);
+    await delayHumano(2000, 3000);
+    await snap('tf-04-molde-aplicado');
+
+    // 4) Salvar (topo do modal). tenta botão #save-button / texto "Salvar"
+    let salvou = false;
+    try { const s = page.locator('#save-button, ytcp-button#save-button, tp-yt-paper-button:has-text("Salvar"), ytcp-button:has-text("Salvar")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => {}); salvou = true; } } catch { /* */ }
+    if (!salvou) salvou = await clicarTexto(['Salvar', 'Save']);
+    await delayHumano(2500, 4000);
+    await snap('tf-05-salvo');
+
+    // 5) conferir: reabrir /edit e checar se a tela final agora tem elementos (Vídeo + Link)
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    await delayHumano(3000, 4500);
+    let conferido = false;
+    for (let i = 0; i < 3 && !conferido; i++) { await clicarTexto(['Tela final', 'End screen']); await delayHumano(1500, 2200); conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br/); }
+    await snap('tf-06-conferencia');
+    if (conferido) return { ok: true, detalhe: 'tela final aplicada e confirmada (molde ' + moldeId + ')', proxyUsado, screenshots };
+    return { ok: true, detalhe: 'cliquei em salvar, mas não confirmei os elementos na reabertura (revisar pelos snaps)', proxyUsado, screenshots };
+  } catch (e: any) {
+    try { await snap('tf-erro'); } catch { /* ok */ }
+    return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado, screenshots };
+  } finally {
+    try { if (ctx) await ctx.close(); } catch { /* ignore */ }
+    try { if (browser) await browser.close(); } catch { /* ignore */ }
+  }
+}
