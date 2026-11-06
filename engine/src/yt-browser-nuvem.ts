@@ -914,12 +914,12 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
       // Setar value pelo native setter + disparar input/change (Polymer não registra digitação normal).
       const achou = await page.evaluate((t: string) => {
         const doc: any = (globalThis as any).document;
-        const ehModal = (e: any) => { const ph = (((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || '')) as string).toLowerCase(); return /nos seus|seus v[íi]deos|your videos|search your videos/.test(ph); };
-        let inp: any = Array.from(doc.querySelectorAll('input,textarea')).find(ehModal);
-        if (!inp) { // fallback: input de busca DENTRO de um diálogo aberto
-          const dlgs = Array.from(doc.querySelectorAll('[role="dialog"], ytcp-dialog, tp-yt-paper-dialog, ytcp-picker-dialog')) as any[];
-          for (const d of dlgs) { const i: any = Array.from(d.querySelectorAll('input,textarea')).find((e: any) => /pesquis|search/i.test((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || ''))); if (i) { inp = i; break; } }
-        }
+        // o input do MODAL fica logo abaixo do título ("Escolha um vídeo específico"), y entre ~60 e ~220; a busca GLOBAL do Studio fica no topo (y<60). Seleciona por POSIÇÃO (o input real não tem placeholder).
+        const cands = (Array.from(doc.querySelectorAll('input[type="text"], input:not([type]), input[type="search"], textarea')) as any[])
+          .map((e: any) => { const r = e.getBoundingClientRect ? e.getBoundingClientRect() : { width: 0, height: 0, top: -1 }; return { e, r }; })
+          .filter((o: any) => o.r.width > 150 && o.r.height > 10 && o.r.top > 55 && o.r.top < 240)
+          .sort((a: any, b: any) => a.r.top - b.r.top);
+        const inp: any = cands.length ? cands[0].e : null;
         if (!inp) return false;
         try { inp.focus(); } catch { /* ok */ }
         try { const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set; set.call(inp, t); } catch { inp.value = t; }
