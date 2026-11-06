@@ -8918,6 +8918,39 @@ async function pbYtUpload(canalId: string, filePath: string, opts: { titulo: str
   return { id: result.id, url: `https://youtu.be/${result.id}` };
 }
 
+// [+rascunho-fix 07/11 Ezequias] Publica um vídeo que ficou em RASCUNHO/privado (sobe pelo navegador mas não saiu do
+// wizard) usando a API do YouTube (videos.update privacyStatus=public). É DETERMINÍSTICO e a cota é irrisória (list=1 +
+// update=50 unidades, nada a ver com o teto de upload). Não re-sobe o vídeo (não duplica). Reaproveita o OAuth do canal.
+async function pbYtPublicarRascunho(canalId: string, videoId: string): Promise<{ id: string; url: string }> {
+  if (!videoId) throw new Error('sem videoId');
+  const token = await pbYtToken(canalId);
+  // 1) lê o status atual pra preservar os demais campos (não-p/-crianças, embeddable, etc.)
+  const g: any = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=status&id=${encodeURIComponent(videoId)}`, { headers: { Authorization: `Bearer ${token}` } });
+  const gj: any = await g.json();
+  const st = (gj && gj.items && gj.items[0] && gj.items[0].status) || {};
+  const body: any = { id: videoId, status: {
+    privacyStatus: 'public',
+    selfDeclaredMadeForKids: st.selfDeclaredMadeForKids === true,
+    embeddable: st.embeddable !== false,
+    license: st.license || 'youtube',
+    publicStatsViewable: st.publicStatsViewable !== false,
+  } };
+  const u: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=status', { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!u.ok) { const et = (await u.text()).slice(0, 220); throw new Error(`videos.update ${u.status}: ${et}`); }
+  return { id: videoId, url: `https://youtu.be/${videoId}` };
+}
+// Endpoint admin: publicar um rascunho específico pela API. body {canal, videoId|url}. (x-api-key)
+app.post('/pub/youtube/publicar-rascunho', async (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const canal = String(b.canal || b.canalId || '').trim();
+    const vid = String(b.videoId || pbYtIdDaUrl(String(b.url || '')) || '').trim();
+    if (!canal || !vid) return res.json({ ok: false, erro: 'informe canal e videoId (ou url)' });
+    const r = await pbYtPublicarRascunho(canal, vid);
+    res.json({ ok: true, publicado: r });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+
 // ============================ UPLOADER — INSTAGRAM ============================
 async function pbIgPoll(igToken: string, containerId: string, maxIter = 60): Promise<void> {
   let erros = 0;
@@ -9214,7 +9247,17 @@ async function pbPostarItem(item: any): Promise<void> {
           const _ytmod: any = await import('./yt-browser-nuvem');
           const _rb = await _ytmod.publicarYoutubeNuvem({ projeto: canalId, arquivo: file, titulo, descricao: descYt, thumbnailPath: thumbFile || '', privacy: pbFlagPriv(canalId) });
           if (!_rb || !_rb.ok) throw new Error('navegador YT: ' + ((_rb && _rb.erro) || 'falhou') + (_rb && _rb.proxyUsado ? ' (proxy ' + _rb.proxyUsado + ')' : ''));
-          r = { id: pbYtIdDaUrl(_rb.postUrl) || '', url: _rb.postUrl || '' };
+          // [+rascunho-fix 07/11 Ezequias] subiu mas ficou em RASCUNHO (não saiu do wizard). Em vez de re-subir (duplicaria),
+          // PUBLICA pela API do YouTube (determinístico, cota irrisória). Só se a API também falhar é que registra RASCUNHO p/ revisar.
+          if (_rb.rascunho) {
+            const _vidR = pbYtIdDaUrl(_rb.postUrl) || '';
+            let _pubOk = false;
+            if (_vidR) { try { await pbYtPublicarRascunho(canalId, _vidR); _pubOk = true; pbLog('yt-rascunho-publicado', item.id, _vidR); } catch (ePub) { resultados[p] = 'RASCUNHO: ' + (_rb.postUrl || '') + ' (subiu em rascunho; publicar-API falhou: ' + String((ePub as any)?.message || ePub).slice(0, 120) + ')'; } }
+            if (!_pubOk) continue;
+            r = { id: _vidR, url: _rb.postUrl || '' };
+          } else {
+            r = { id: pbYtIdDaUrl(_rb.postUrl) || '', url: _rb.postUrl || '' };
+          }
         } else {
           // [guardrail-yt-limite 27/10] API OAuth: respeita o teto diário de uploads YT (cota compartilhada). Não conta como falha; o item escoa p/ outro dia.
           if (!pbYtPodePostarHoje()) { resultados[p] = 'ADIADO: limite diario YouTube (' + pbYtCountHoje() + '/' + pbYtLimiteDia() + ')'; ytAdiado = true; continue; }
