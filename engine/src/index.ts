@@ -8951,6 +8951,32 @@ app.post('/pub/youtube/publicar-rascunho', async (req: any, res: any) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 
+// [+tela-final 07/11 Ezequias] TELA FINAL (end screen) via navegador no Studio (YouTube não tem API disso).
+// Copia de um vídeo-MOLDE do próprio canal ("Importar do vídeo"): traz "Envio mais recente" + link do combo + arte.
+// Molde por canal (só teclado tem por enquanto; os outros precisam de 1 vídeo-molde com a tela final pronta).
+const AC_TF_MOLDE: any = { teclado: 'g8w2d3702Ws' };
+let _tfRodando = false; let _tfResultado: any = null;
+// POST {projeto, videoId|url, moldeId?, snaps?} — roda em background (demora ~1-3min). Acompanhar em /pub/youtube/tela-final/resultado.
+app.post('/pub/youtube/tela-final', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || b.canal || '').trim().toLowerCase();
+    const videoId = String(b.videoId || pbYtIdDaUrl(String(b.url || '')) || '').trim();
+    const molde = String(b.moldeId || AC_TF_MOLDE[projeto] || '').trim();
+    if (!projeto || !videoId) return res.json({ ok: false, erro: 'informe projeto e videoId (ou url)' });
+    if (!molde) return res.json({ ok: false, erro: 'sem molde p/ o canal ' + projeto + ' — passe moldeId (um vídeo do canal com a tela final pronta)' });
+    if (_tfRodando) return res.json({ ok: false, erro: 'já tem uma aplicação de tela final rodando; aguarde terminar' });
+    _tfRodando = true; _tfResultado = { status: 'rodando', projeto, videoId, molde, inicio: agora() };
+    (async () => {
+      try { const mod: any = await import('./yt-browser-nuvem'); const r = await mod.aplicarTelaFinalViaEdit({ projeto, videoId, moldeId: molde, snaps: b.snaps !== false }); _tfResultado = { status: 'fim', projeto, videoId, molde, resultado: r, fim: agora() }; }
+      catch (e: any) { _tfResultado = { status: 'erro', projeto, videoId, molde, erro: String(e?.message || e), fim: agora() }; }
+      finally { _tfRodando = false; }
+    })();
+    res.json({ ok: true, iniciado: true, projeto, videoId, molde });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/tela-final/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _tfRodando, resultado: _tfResultado }));
+
 // ============================ UPLOADER — INSTAGRAM ============================
 async function pbIgPoll(igToken: string, containerId: string, maxIter = 60): Promise<void> {
   let erros = 0;
