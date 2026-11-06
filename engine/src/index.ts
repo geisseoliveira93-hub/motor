@@ -13915,7 +13915,8 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
       if (hero) hero = hero.replace(/<\/div>\s*$/, _ctrlH + '</div>');
       else hero = `<div class="heroC" id="heroC" style="height:300px;background:#15151c;position:relative">${_ctrlH}</div>`;
     }
-    const cardHtml = (c: any): string => _acCardCurso(c, meus, pmap);
+    const _adm = _acEhAdmin(req); // [07/11 Ezequias] admin vê TODAS as vitrines/cursos (liberados p/ trocar banner)
+    const cardHtml = (c: any): string => _acCardCurso(c, meus, pmap, _adm);
     let shelves = '';
     const novos = cursos.filter((c) => c.criado_em && c.criado_em >= new Date(Date.now() - 30 * 864e5).toISOString());
     if (false /* [ajuste 28/10] faixa "Novidades" removida do Início a pedido do Ezequias — banner rico ocupa o topo */ && novos.length) shelves += `<div class="shelf"><h2>✨ Novidades</h2>${_acRail(novos.map(cardHtml).join(''))}</div>`;
@@ -13931,13 +13932,13 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     });
     for (const v of _ordVit) {
       // [regra antiga 23/10 — preservada como comentário]: const ehEbooks = /e-?books?/i.test(nome+categoria); if (!ehEbooks) { doV = só os do aluno }
-      const doV = cursos.filter((c) => c.vitrine_id === v.id && (c.publicado || meus.has(c.id)));
+      const doV = cursos.filter((c) => c.vitrine_id === v.id && (_adm || c.publicado || meus.has(c.id)));
       const meusV = doV.filter((c) => meus.has(c.id));
-      if (!meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela
+      if (!_adm && !meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela (admin vê todas)
       if (!doV.length) continue;
       shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(doV.map(cardHtml).join(''))}</div>`; // mostra TODOS (cadeado faz o resto)
     }
-    const semVit = cursos.filter((c) => !c.vitrine_id && meus.has(c.id));
+    const semVit = cursos.filter((c) => !c.vitrine_id && (_adm || meus.has(c.id)));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Seus cursos aparecerão aqui.</div>`;
     const corpo = hero + `<div class="wrap home">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS() + (_acEhAdmin(req) ? _AC_ADM_JS : '');
@@ -13953,7 +13954,8 @@ app.get('/area/curso/:id', (req: any, res: any) => {
   try {
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(String(req.params.id)) as any;
     if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
-    if (!_acCursosDoAluno(al.id).has(curso.id)) {
+    // [07/11 Ezequias] ADMIN entra em QUALQUER curso (mesmo sem comprar) p/ trocar o banner. Aluno normal segue o portão de acesso.
+    if (!_acEhAdmin(req) && !_acCursosDoAluno(al.id).has(curso.id)) {
       return res.type('html').send(_acPage(al, curso.nome || 'Curso',
         `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">Você ainda não tem acesso a este curso.${curso.checkout_url ? `<br><br><a class="btn btn-g" href="${esc(curso.checkout_url)}" target="_blank">Quero este curso</a>` : ''}</div></div>`));
     }
@@ -15265,17 +15267,19 @@ _acAlter(`ALTER TABLE academy_banners ADD COLUMN tamanho TEXT`);    // p | m | g
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN freq TEXT`);       // once | day | always
 
 // card de curso (destacado se tem; escuro + cadeado "Desbloquear" se não tem)
-const _acCardCurso = (c: any, meus: Set<string>, pmap: any): string => {
+const _acCardCurso = (c: any, meus: Set<string>, pmap: any, ehAdmin?: boolean): string => {
   const tem = meus.has(c.id);
+  // [07/11 Ezequias] no modo admin TODO curso abre (p/ trocar o banner), mesmo sem o admin ter comprado.
+  const abre = tem || !!ehAdmin;
   const capa = c.capa || '';
   const pct = pmap[c.id] || 0;
   const img = capa ? `<img src="${esc(capa)}" alt="" loading="lazy" decoding="async">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:12px">${esc(c.nome || '')}</div>`;
-  const inner = `<div class="pz"${tem ? '' : ' style="filter:grayscale(.6) brightness(.5)"'}>${img}`
-    + (tem ? (pct > 0 ? `<div class="pb"><i style="width:${pct}%"></i></div>` : '') : `<div class="lock">🔒<span class="unlock">Desbloquear</span></div>`)
+  const inner = `<div class="pz"${abre ? '' : ' style="filter:grayscale(.6) brightness(.5)"'}>${img}`
+    + (tem ? (pct > 0 ? `<div class="pb"><i style="width:${pct}%"></i></div>` : '') : (ehAdmin ? `<div class="lock" style="background:rgba(231,200,106,.18)">✏️<span class="unlock">Trocar banner</span></div>` : `<div class="lock">🔒<span class="unlock">Desbloquear</span></div>`))
     + `</div><div class="nm">${esc(c.nome || '')}</div>`;
-  const href = tem ? ('/area/curso/' + c.id) : (c.checkout_url ? esc(c.checkout_url) : '#');
-  const tgt = tem ? '' : ' target="_blank"';
-  return `<a class="card${tem ? '' : ' locked'}" href="${href}"${tgt}>${inner}</a>`;
+  const href = abre ? ('/area/curso/' + c.id) : (c.checkout_url ? esc(c.checkout_url) : '#');
+  const tgt = abre ? '' : ' target="_blank"';
+  return `<a class="card${abre ? '' : ' locked'}" href="${href}"${tgt}>${inner}</a>`;
 };
 // pop-up/banner na tela (X pra fechar; tamanhos p/m/g/full; frequência once/day/always)
 const _acPopupHtml = (al?: any): string => {
@@ -15318,8 +15322,9 @@ app.get('/area/categoria/:cat', (req: any, res: any) => {
     const cursos = db.prepare(`SELECT * FROM academy_cursos ORDER BY ordem, criado_em`).all() as any[];
     const prog = db.prepare(`SELECT curso_id, AVG(pct) p FROM academy_progresso WHERE aluno_id=? GROUP BY curso_id`).all(al.id) as any[];
     const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
+    const _admC = _acEhAdmin(req); // [07/11 Ezequias] admin abre qualquer curso aqui também
     let shelves = '';
-    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap)).join('')}</div></div>`; }
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap, _admC)).join('')}</div></div>`; }
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
     const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
     res.type('html').send(_acPage(al, cat, corpo));
