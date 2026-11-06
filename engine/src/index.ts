@@ -851,11 +851,18 @@ function projetoDoProduto(idOuNome: string | undefined, nome?: string): Projeto 
 
 // ----------------------- Evolution API client -----------------------
 async function evo(path: string, method = 'GET', body?: unknown) {
-  const res = await fetch(`${EVOLUTION_URL}${path}`, {
-    method,
-    headers: { 'Content-Type': 'application/json', apikey: EVOLUTION_API_KEY },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  // [fila-fix 06/11] timeout de 15s: chamada pendurada ao Evolution REJEITA em vez de travar a fila.
+  const _evoAC = new AbortController();
+  const _evoTO = setTimeout(() => { try { _evoAC.abort(); } catch { /* */ } }, 15000);
+  let res: Response;
+  try {
+    res = await fetch(`${EVOLUTION_URL}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', apikey: EVOLUTION_API_KEY },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: _evoAC.signal,
+    });
+  } finally { clearTimeout(_evoTO); }
   const txt = await res.text();
   let data: any = null;
   try { data = txt ? JSON.parse(txt) : null; } catch { data = txt; }
@@ -1299,6 +1306,36 @@ const falhasAuth = new Map<string, { n: number; ate: number }>();
 function ipDoReq(req: express.Request): string {
   return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'desconhecido';
 }
+
+// [biblia-site 06/11] subdominio biblia.melodiaseriffs.com.br serve a pagina estatica "Mapa de la Palabra"
+// (index.html + 9 imagens) DIRETO do motor, SEM x-api-key. Arquivos em engine/src/biblia-site/. ADD-ONLY.
+const BIBLIA_HOST = 'biblia.melodiaseriffs.com.br';
+const BIBLIA_DIR = (() => {
+  const c = [process.cwd() + '/src/biblia-site', process.cwd() + '/biblia-site', '/app/src/biblia-site'];
+  for (const d of c) { try { if (fs.existsSync(d + '/index.html')) return d; } catch { /* */ } }
+  return c[0];
+})();
+function _bibliaCT(f: string): string {
+  const e = (f.split('.').pop() || '').toLowerCase();
+  return e === 'html' ? 'text/html; charset=utf-8' : e === 'png' ? 'image/png' : (e === 'jpg' || e === 'jpeg') ? 'image/jpeg'
+    : e === 'webp' ? 'image/webp' : e === 'css' ? 'text/css; charset=utf-8' : e === 'js' ? 'application/javascript'
+    : e === 'svg' ? 'image/svg+xml' : e === 'ico' ? 'image/x-icon' : e === 'woff2' ? 'font/woff2' : 'application/octet-stream';
+}
+app.use((req: any, res: any, next: any) => {
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase().split(':')[0];
+  if (host !== BIBLIA_HOST) return next();
+  try {
+    let p = decodeURIComponent((req.path || '/').split('?')[0]);
+    if (p === '/' || p === '') p = '/index.html';
+    if (p.indexOf('..') >= 0) { res.status(400).send('bad'); return; }
+    const file = BIBLIA_DIR + p;
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) { res.status(404).type('html').send('<h1>404</h1>'); return; }
+    res.setHeader('Content-Type', _bibliaCT(file));
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.removeHeader('X-Frame-Options');
+    fs.createReadStream(file).pipe(res);
+  } catch (e) { res.status(500).send('erro'); }
+});
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
@@ -3866,6 +3903,19 @@ function _itensPagamento(provider: string, b: any): { produtoId: string; produto
   return out;
 }
 
+// [tags-compra 06/11] tags por item REAL comprado (principal + order bump) — so pra auditar no CRM.
+// NAO mexe nas tags -oferta- antigas; casa por id OU trecho do nome (igual entregaFluxoProduto).
+const tagsPorProduto: { match: string; tagPrincipal: string; tagBump: string }[] = [
+  { match: 'baixista',        tagPrincipal: 'baixista-pro', tagBump: 'orderbump-baixista-pro' },
+  { match: '200 cifras',      tagPrincipal: 'combo-baixo',  tagBump: 'orderbump-cifras' },
+  { match: 'ritmos e groove', tagPrincipal: 'ritmos',       tagBump: 'orderbump-ritmos' },
+];
+function _tagCompraDoItem(it: { produtoId?: string; produtoNome?: string }): { match: string; tagPrincipal: string; tagBump: string } | null {
+  const alvo = (String(it.produtoId || '') + ' ' + String(it.produtoNome || '')).toLowerCase();
+  for (const e of tagsPorProduto) { if (alvo.includes(e.match.toLowerCase())) return e; }
+  return null;
+}
+
 /** [motor2] Tags da trilha configuradas pro produto (casa por id/nome, igual à entrega). */
 function _produtoTags(produtoId?: string, produtoNome?: string): string[] {
   const alvo = `${produtoId || ''} ${produtoNome || ''}`.toLowerCase();
@@ -4201,6 +4251,31 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         try { _entregarVol2DoPedido(projeto, p, provider, b); } catch { /* vol2 best-effort */ }
         // [+vendas-recuperacao 29/10] se essa venda veio de quem estava em recuperação, registra com a origem (whatsapp/checkout).
         try { _registrarVendaRecuperacao(provider, p, projeto); } catch { /* best-effort: nunca quebra a entrega */ }
+        // [order-bump 06/11] entrega TODO produto pago do pedido (principal + bumps), INDEPENDENTE do motor2.
+        // O principal ja foi entregue acima; aqui entram os EXTRAS que tenham fluxo proprio. dispararEntrega
+        // tem dedup de 15min por fluxo_chave, e aqui pulo principal + vol2 (ja tratado) -> nunca duplica.
+        try {
+          const _itensBump = _itensPagamento(provider, b);
+          for (const it of _itensBump) {
+            const _ehPrinc = (it.produtoId && it.produtoId === String(p.produtoId || '')) ||
+                             (it.produtoNome && it.produtoNome.toLowerCase() === String(p.produtoNome || '').toLowerCase());
+            if (_ehPrinc) continue;
+            if (_ehProdutoVol2(it.produtoId, it.produtoNome)) continue;
+            if (produtoFluxoMatch(it.produtoId, it.produtoNome)) {
+              const _projIt = projetoDoProduto(it.produtoId, it.produtoNome);
+              await dispararEntrega(_projIt, p.telefone, p.nome, it.produtoId, it.produtoNome).catch(() => {});
+            }
+          }
+        } catch { /* [order-bump] best-effort: nunca quebra a entrega do principal */ }
+        // [tags-compra 06/11] tag por item REAL (principal -> tagPrincipal, bump -> tagBump). Idempotente.
+        try {
+          for (const it of _itensPagamento(provider, b)) {
+            const _e = _tagCompraDoItem(it); if (!_e) continue;
+            const _ehP = (it.produtoId && it.produtoId === String(p.produtoId || '')) ||
+                         (it.produtoNome && it.produtoNome.toLowerCase() === String(p.produtoNome || '').toLowerCase());
+            aplicarTag(projeto, cid, _ehP ? _e.tagPrincipal : _e.tagBump);
+          }
+        } catch { /* [tags-compra] best-effort */ }
         // [motor2] Trilha por produto + order bump/upsell. INERTE até pubFlag('motor2_ativo')==='1'.
         // Aplica as tags da trilha de CADA item (principal + bump + upsell), dispara os fluxos pela tag,
         // e entrega no WhatsApp os itens EXTRAS que tenham fluxo próprio (o principal já foi entregue acima).
@@ -4361,8 +4436,13 @@ app.post('/empresa/remover', (req, res) => { db.prepare(`DELETE FROM empresas WH
 
 // ----------------------- Worker de disparo (ritmo humano / anti-ban) -----------------------
 let enviando = false;
+let enviandoDesde = 0; // [fila-fix 06/11] marca quando 'enviando' ligou, p/ watchdog
 async function tickFila() {
-  if (enviando) return; enviando = true;
+  if (enviando) {
+    // [fila-fix 06/11] watchdog: se travou 'enviando' ha mais de 60s (chamada pendurada), destrava.
+    if (enviandoDesde && (Date.now() - enviandoDesde) > 60000) { enviando = false; } else return;
+  }
+  enviando = true; enviandoDesde = Date.now();
   try {
     // Pega o próximo pendente JÁ liberado (respeita o delay do passo via agendado_para).
     const item = db.prepare(
@@ -4398,7 +4478,7 @@ async function tickFila() {
       }
       }
     }
-  } finally { enviando = false; }
+  } finally { enviando = false; enviandoDesde = 0; }
 }
 // 1 envio a cada 8–15s (ritmo humano). Ajustar por número/aquecimento depois.
 setInterval(tickFila, 8000 + Math.floor(Math.random() * 7000));
@@ -13283,6 +13363,9 @@ _acAlter(`ALTER TABLE academy_cursos ADD COLUMN subtitulo TEXT`);
 _acAlter(`ALTER TABLE academy_cursos ADD COLUMN ordem INTEGER`);
 _acAlter(`ALTER TABLE academy_cursos ADD COLUMN checkout_url TEXT`);
 _acAlter(`ALTER TABLE academy_cursos ADD COLUMN duvida_modo TEXT`);   // professor | ia | off
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN capa_hero TEXT`);        // [banner-admin 06/11] banner do curso (desktop)
+_acAlter(`ALTER TABLE academy_cursos ADD COLUMN capa_hero_mobile TEXT`); // [banner-admin 06/11] banner do curso (celular)
+_acAlter(`ALTER TABLE academy_config ADD COLUMN admin_chave TEXT`);      // [banner-admin 06/11] chave do modo admin da area
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN tipo TEXT`);           // video | material
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN descricao TEXT`);
 _acAlter(`ALTER TABLE academy_aulas ADD COLUMN duracao_seg INTEGER`);
@@ -13346,6 +13429,44 @@ const _acAluno = (req: any): any => {
   try { db.prepare(`UPDATE academy_sessoes SET ultimo_uso=? WHERE token=?`).run(agora(), token); } catch {}
   return al;
 };
+// [banner-admin 06/11] MODO ADMIN da area (link secreto) + botao inline "Trocar banner" (home + cursos),
+// imagem desktop + celular, com a resolucao mostrada na tela. /area/* ja e isento de x-api-key; gate pelo cookie mr_adm.
+const RESO_DESKTOP = '1920 × 600 px';
+const RESO_MOBILE  = '1080 × 1350 px';
+function _acAdminChave(): string {
+  try {
+    const row = db.prepare(`SELECT admin_chave FROM academy_config WHERE id=1`).get() as any;
+    let k = row && row.admin_chave;
+    if (!k) {
+      k = _acToken().slice(0, 24);
+      const ex = db.prepare(`SELECT 1 FROM academy_config WHERE id=1`).get();
+      if (ex) db.prepare(`UPDATE academy_config SET admin_chave=? WHERE id=1`).run(k);
+      else db.prepare(`INSERT INTO academy_config (id, admin_chave) VALUES (1, ?)`).run(k);
+    }
+    return String(k || '');
+  } catch { return ''; }
+}
+function _acEhAdmin(req: any): boolean {
+  try { const c = _acCookie(req, 'mr_adm'); const k = _acAdminChave(); return !!k && c === k; } catch { return false; }
+}
+function _acAdminBannerCtrl(escopo: string, id: string): string {
+  const ep = escopo === 'home' ? '/area/adm/banner-home' : '/area/adm/curso-banner';
+  const dom = esc(id || 'novo');
+  const idj = JSON.stringify(String(id || ''));
+  return `<div class="admwrap">`
+    + `<button type="button" class="admbtn" onclick="var p=document.getElementById('admpnl-${dom}');if(p)p.classList.toggle('on')">\u{1F4F7} Trocar banner</button>`
+    + `<div class="admcap">Desktop: ${RESO_DESKTOP} · Celular: ${RESO_MOBILE}</div>`
+    + `<div class="admpnl" id="admpnl-${dom}">`
+    + `<label>Imagem do computador — ${RESO_DESKTOP}<input type="file" accept="image/*" class="admf-d"></label>`
+    + `<label>Imagem do celular — ${RESO_MOBILE}<input type="file" accept="image/*" class="admf-m"></label>`
+    + `<button type="button" class="admbtn save" onclick="acAdmSalvar(this,${idj},'${ep}')">Salvar banner</button>`
+    + `<span class="admmsg"></span>`
+    + `</div></div>`;
+}
+const _AC_ADM_JS = `<script>
+function _acF2b64(f){return new Promise(function(res,rej){if(!f){res('');return;}var r=new FileReader();r.onload=function(){res(r.result);};r.onerror=rej;r.readAsDataURL(f);});}
+async function acAdmSalvar(btn,id,ep){var pnl=btn.closest('.admpnl');var msg=pnl.querySelector('.admmsg');var fd=pnl.querySelector('.admf-d').files[0];var fm=pnl.querySelector('.admf-m').files[0];if(!fd&&!fm){msg.style.color='#f5b5b5';msg.textContent='Escolha ao menos 1 imagem.';return;}btn.disabled=true;msg.style.color='#ffe08a';msg.textContent='Enviando...';try{var body={id:id,curso:id,desktop:await _acF2b64(fd),mobile:await _acF2b64(fm)};var r=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});var j=await r.json();if(j&&j.ok){msg.style.color='#9ff0c0';msg.textContent='✅ Salvo! Recarregando...';setTimeout(function(){location.reload();},700);}else{msg.style.color='#f5b5b5';msg.textContent='Erro: '+((j&&(j.erro||j.error))||'falhou');btn.disabled=false;}}catch(e){msg.style.color='#f5b5b5';msg.textContent='Erro: '+e;btn.disabled=false;}}
+</script>`;
 const _acLog = (alunoId: string, tipo: string, detalhe = '') => {
   try { db.prepare(`INSERT INTO academy_logs (id,aluno_id,tipo,detalhe,ts) VALUES (?,?,?,?,?)`).run(randomUUID(), alunoId, tipo, detalhe, agora()); } catch {}
 };
@@ -13451,6 +13572,20 @@ a{color:inherit;text-decoration:none}
 .wrap.home .card{flex:0 0 250px;width:250px}
 .wrap.home .card .pz{width:250px;height:375px}
 @media(max-width:820px){.wrap.home .card{flex:0 0 180px;width:180px}.wrap.home .card .pz{width:180px;height:270px}}
+/* [banner-admin 06/11] cursos em TELA CHEIA (igual home) + banner responsivo + controles de admin */
+.wrap.cheio{max-width:none;padding-left:clamp(16px,3vw,48px);padding-right:clamp(16px,3vw,48px)}
+.coverhero .bgd,.coverhero .bgm{position:absolute;inset:0;background-size:cover;background-position:center;filter:brightness(.5)}
+.coverhero .bgm{display:none}
+@media(max-width:820px){.coverhero .bgd{display:none}.coverhero .bgm{display:block}}
+.admwrap{position:absolute;top:14px;right:14px;z-index:30;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.admbtn{background:rgba(0,0,0,.6);color:#fff;border:1px solid #ffffff66;border-radius:999px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer}
+.admbtn.save{background:#e7c86a;color:#201a08;border:0}
+.admcap{background:rgba(0,0,0,.6);color:#ffe08a;border-radius:8px;padding:4px 10px;font-size:12px;font-weight:600}
+.admpnl{display:none;flex-direction:column;gap:8px;background:#14141c;border:1px solid #2a2a34;border-radius:12px;padding:14px;margin-top:4px;min-width:260px;text-align:left;box-shadow:0 18px 40px #000a}
+.admpnl.on{display:flex}
+.admpnl label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#cfcfd8}
+.admpnl input[type=file]{font-size:12px;color:#cfcfd8}
+.admmsg{font-size:12px;min-height:14px}
 .card .pz .lock{position:absolute;inset:0;display:grid;place-items:center;background:#000000a8;font-size:30px}
 .card .pz .pb{position:absolute;left:0;right:0;bottom:0;height:4px;background:#ffffff22}
 .card .pz .pb i{display:block;height:100%;background:#e7c86a}
@@ -13774,6 +13909,12 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
       const _hcStyle = _alt0 ? ` style="height:clamp(240px, ${_alt0}vh, 760px)"` : '';
       hero = `<div class="heroC" id="heroC" data-itv="${_bItv}"${_hcStyle}>${_slides}${_hdots}</div>`;
     }
+    if (_acEhAdmin(req)) {
+      const _hid = _bannersOk.length ? String(_bannersOk[0].id || '') : '';
+      const _ctrlH = _acAdminBannerCtrl('home', _hid);
+      if (hero) hero = hero.replace(/<\/div>\s*$/, _ctrlH + '</div>');
+      else hero = `<div class="heroC" id="heroC" style="height:300px;background:#15151c;position:relative">${_ctrlH}</div>`;
+    }
     const cardHtml = (c: any): string => _acCardCurso(c, meus, pmap);
     let shelves = '';
     const novos = cursos.filter((c) => c.criado_em && c.criado_em >= new Date(Date.now() - 30 * 864e5).toISOString());
@@ -13799,7 +13940,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     const semVit = cursos.filter((c) => !c.vitrine_id && meus.has(c.id));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Seus cursos aparecerão aqui.</div>`;
-    const corpo = hero + `<div class="wrap home">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS();
+    const corpo = hero + `<div class="wrap home">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS() + (_acEhAdmin(req) ? _AC_ADM_JS : '');
     res.type('html').send(_acPage(al, 'Início', corpo, 'home'));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
@@ -13842,8 +13983,11 @@ app.get('/area/curso/:id', (req: any, res: any) => {
     const modRail = modCards
       ? `<div class="railwrap"><button class="arw l" data-d="-1" aria-label="voltar">‹</button><div class="rail">${modCards}</div><button class="arw r" data-d="1" aria-label="avançar">›</button></div>`
       : '<div class="card2">Conteúdo em breve.</div>';
-    const corpo = `<div class="wrap">
-      <div class="coverhero"><div class="bg" style="background-image:url('${esc(curso.capa || '')}')"></div>
+    const _chd = esc(curso.capa_hero || curso.capa || '');
+    const _chm = esc(curso.capa_hero_mobile || curso.capa_hero || curso.capa || '');
+    const _admCurso = _acEhAdmin(req) ? _acAdminBannerCtrl('curso', curso.id) : '';
+    const corpo = `<div class="wrap cheio">
+      <div class="coverhero"><div class="bgd" style="background-image:url('${_chd}')"></div><div class="bgm" style="background-image:url('${_chm}')"></div>${_admCurso}
         <div class="in"><div class="meta">${mods.length} módulos · ${nAulas} aulas · ${nFeitas}/${nAulas} concluídas${_acTempoCursoHtml(al.id, curso.id)}</div>
         <h1>${esc(curso.nome || '')}</h1>
         ${alvoBtn ? `<a class="btn btn-l" href="/area/aula/${alvoBtn.id}">${btnLabel}</a>` : ''}</div></div>
@@ -13853,7 +13997,7 @@ app.get('/area/curso/:id', (req: any, res: any) => {
       </div>
       <script>document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});</script>`;
     _acLog(al.id, 'abriu_curso', curso.id);
-    res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo));
+    res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo + (_acEhAdmin(req) ? _AC_ADM_JS : '')));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
 
@@ -14984,6 +15128,56 @@ app.post('/academy/upload-banner', async (req: any, res: any) => {
     _ndOk(res, { url: (PUBLIC_BASE_URL || '') + '/media/academy/' + nome });
   } catch (e) { _ndErr(res, e); }
 });
+
+// [banner-admin 06/11] rotas do modo admin da area (link secreto). /area/* ja e isento de x-api-key; gate pelo cookie mr_adm.
+app.get('/area/adm/:chave', (req: any, res: any) => {
+  const k = _acAdminChave(); const c = String(req.params.chave || '');
+  if (k && c === k) { res.setHeader('Set-Cookie', 'mr_adm=' + encodeURIComponent(k) + '; Path=/area; Max-Age=31536000; HttpOnly; SameSite=Lax'); return res.redirect('/area'); }
+  return res.status(404).type('html').send('nao encontrado');
+});
+app.get('/area/adm-sair', (_req: any, res: any) => { res.setHeader('Set-Cookie', 'mr_adm=; Path=/area; Max-Age=0; HttpOnly; SameSite=Lax'); res.redirect('/area'); });
+async function _acSalvarImgBanner(dataUrl: string, slot: string): Promise<string> {
+  const m = String(dataUrl || '').match(/^data:([^;]+);base64,(.*)$/); if (!m) return '';
+  const mime = m[1]; let buf = Buffer.from(m[2], 'base64');
+  const dir = MEDIA_DIR + '/academy'; try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ok */ }
+  let ext = (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5);
+  const maxW = slot === 'mobile' ? 1400 : 2400;
+  if (/^image\//.test(mime) && !/svg|gif/.test(mime)) {
+    try { const sharp = (await import('sharp')).default; buf = await sharp(buf).rotate().resize({ width: maxW, withoutEnlargement: true }).webp({ quality: 85 }).toBuffer(); ext = 'webp'; } catch (e) { /* salva original */ }
+  }
+  const nome = 'banner-' + randomUUID() + '.' + ext; fs.writeFileSync(dir + '/' + nome, buf);
+  return (PUBLIC_BASE_URL || '') + '/media/academy/' + nome;
+}
+app.post('/area/adm/curso-banner', async (req: any, res: any) => {
+  if (!_acEhAdmin(req)) return res.status(403).json({ ok: false, erro: 'sem permissao' });
+  try {
+    const b = req.body || {}; const cid = String(b.curso || b.id || ''); if (!cid) return res.json({ ok: false, erro: 'curso?' });
+    const ud = b.desktop ? await _acSalvarImgBanner(String(b.desktop), 'desktop') : '';
+    const um = b.mobile ? await _acSalvarImgBanner(String(b.mobile), 'mobile') : '';
+    if (ud) db.prepare(`UPDATE academy_cursos SET capa_hero=? WHERE id=?`).run(ud, cid);
+    if (um) db.prepare(`UPDATE academy_cursos SET capa_hero_mobile=? WHERE id=?`).run(um, cid);
+    res.json({ ok: true, desktop: ud, mobile: um });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/area/adm/banner-home', async (req: any, res: any) => {
+  if (!_acEhAdmin(req)) return res.status(403).json({ ok: false, erro: 'sem permissao' });
+  try {
+    const b = req.body || {}; let id = String(b.id || '');
+    const ud = b.desktop ? await _acSalvarImgBanner(String(b.desktop), 'desktop') : '';
+    const um = b.mobile ? await _acSalvarImgBanner(String(b.mobile), 'mobile') : '';
+    if (!id) { const first = db.prepare(`SELECT id FROM academy_banners WHERE status='publicado' AND (tipo IS NULL OR tipo='' OR tipo='hero') ORDER BY ordem`).get() as any; id = first && first.id; }
+    if (!id) {
+      id = randomUUID();
+      db.prepare(`INSERT INTO academy_banners (id,criado_em,nome,status,tipo,ordem,imagem,imagem_mobile) VALUES (?,?,?,?,?,?,?,?)`).run(id, agora(), 'Banner', 'publicado', 'hero', 0, ud || '', um || '');
+    } else {
+      if (ud) db.prepare(`UPDATE academy_banners SET imagem=? WHERE id=?`).run(ud, id);
+      if (um) db.prepare(`UPDATE academy_banners SET imagem_mobile=? WHERE id=?`).run(um, id);
+    }
+    res.json({ ok: true, desktop: ud, mobile: um, id });
+  } catch (e: any) { res.json({ ok: false, erro: String(e && e.message || e) }); }
+});
+// link do modo admin (protegido por x-api-key) — p/ eu pegar e entregar ao Ezequias
+app.get('/academy/area-admin-link', (_req: any, res: any) => { try { const k = _acAdminChave(); _ndOk(res, { chave: k, link: _AREA_URL + '/area/adm/' + k }); } catch (e) { _ndErr(res, e); } });
 
 // [+capas-leves 03/11] otimiza as capas JÁ salvas (reduz p/ máx 600px). ADITIVO.
 app.post('/academy/midia/otimizar', async (req: any, res: any) => {
