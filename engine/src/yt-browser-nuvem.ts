@@ -840,10 +840,11 @@ export async function aplicarCapaViaEdit(opts: { projeto: string; videoId: strin
 // vídeo-MOLDE do próprio canal via "Importar do vídeo" no Studio (navegador invisível, sessão + proxy do canal).
 // O YouTube NÃO tem API de tela final — só dá pelo Studio. Molde por canal (traz "Envio mais recente" + link do combo
 // com a arte, 20s). Instrumentado com snaps em cada passo p/ diagnóstico. NÃO monta na mão (usa o molde).
-export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[] }> {
+export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; moldeTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[] }> {
   const projeto = String(opts.projeto || '').trim().toLowerCase();
   const videoId = String(opts.videoId || '').trim();
   const moldeId = String(opts.moldeId || '').trim();
+  const moldeTitulo = String(opts.moldeTitulo || '').trim();
   const querSnaps = !!opts.snaps;
   const screenshots: string[] = [];
   if (!projeto || !videoId || !moldeId) return { ok: false, erro: 'projeto/videoId/moldeId obrigatórios' };
@@ -906,25 +907,36 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     await delayHumano(2000, 3000);
     await snap('tf-03-grade-videos');
 
-    // 3) na grade, clicar no TÍTULO do card do MOLDE (achando pelo moldeId na thumbnail/href; clique real por mouse no título)
+    // 3) na grade tem a caixa "Pesquise nos seus vídeos": busca o MOLDE pelo título e clica no 1º resultado (robusto; a grade é grande/lazy)
+    const termo = (moldeTitulo || '').trim().slice(0, 40);
+    if (termo) {
+      try {
+        const busca = page.locator('input[placeholder*="Pesquise"], input[placeholder*="Search"], input[placeholder*="esquis"], tp-yt-paper-input input, #search-input input').first();
+        if (await busca.count()) { await busca.click({ timeout: 6000 }).catch(() => {}); await busca.fill('').catch(() => {}); await busca.type(termo, { delay: 25 }).catch(async () => { await busca.fill(termo).catch(() => {}); }); await delayHumano(2800, 3800); }
+      } catch { /* segue p/ varredura */ }
+      await snap('tf-03a-busca');
+    }
+    // clica no card do MOLDE: 1º tenta pelo moldeId na thumb; senão (após a busca) o 1º card de vídeo da grade. Clique REAL por mouse no título.
     const boxTitulo = await page.evaluate((mid: string) => {
       const doc: any = (globalThis as any).document;
+      function boxDoTitulo(card: any) {
+        let titulo: any = null; let maxLen = 0;
+        card.querySelectorAll('*').forEach((c: any) => { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8) { maxLen = tx.length; titulo = c; } } });
+        const alvo = titulo || card; const r = alvo.getBoundingClientRect ? alvo.getBoundingClientRect() : null;
+        return (r && r.width > 20 && r.height > 8) ? { x: r.x + Math.min(r.width / 2, 80), y: r.y + r.height / 2, txt: (alvo.innerText || '').slice(0, 60) } : null;
+      }
+      // 1) pelo moldeId (thumb/href/bg)
       const els = Array.from(doc.querySelectorAll('*')) as any[];
       for (const el of els) {
         const attr = ((el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || '') + ' ' + (() => { try { return getComputedStyle(el).backgroundImage || ''; } catch { return ''; } })();
-        if (attr.indexOf(mid) >= 0) {
-          const card = (el.closest && (el.closest('[role="option"], ytcp-ve, ytcp-video-row, #video-card, ytcp-card, tr, li') || el.parentElement)) || el;
-          // procura o título (texto mais longo clicável dentro do card)
-          let titulo: any = null; let maxLen = 0;
-          card.querySelectorAll('*').forEach((c: any) => { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8) { maxLen = tx.length; titulo = c; } } });
-          const alvo = titulo || card;
-          const r = alvo.getBoundingClientRect ? alvo.getBoundingClientRect() : null;
-          if (r && r.width > 20 && r.height > 8) return { x: r.x + Math.min(r.width / 2, 80), y: r.y + r.height / 2, txt: (alvo.innerText || '').slice(0, 60) };
-        }
+        if (attr.indexOf(mid) >= 0) { const card = (el.closest && (el.closest('[role="option"], ytcp-ve, ytcp-video-row, #video-card, ytcp-card, tr, li') || el.parentElement)) || el; const b = boxDoTitulo(card); if (b) return b; }
       }
+      // 2) fallback: 1º card de vídeo visível da grade (y>80 p/ pular a busca/cabeçalho)
+      const cards = Array.from(doc.querySelectorAll('[role="option"], ytcp-ve, #video-card, ytcp-card')) as any[];
+      for (const card of cards) { const r = card.getBoundingClientRect ? card.getBoundingClientRect() : null; if (r && r.width > 60 && r.height > 60 && r.y > 80) { const b = boxDoTitulo(card); if (b) return b; } }
       return null;
     }, moldeId).catch(() => null);
-    if (!boxTitulo) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde ' + moldeId + ' na grade (confira se o molde é do mesmo canal e tem tela final)', proxyUsado, screenshots }; }
+    if (!boxTitulo) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', proxyUsado, screenshots }; }
     await page.mouse.click(boxTitulo.x, boxTitulo.y);
     await delayHumano(2000, 3000);
     await snap('tf-04-molde-aplicado');
