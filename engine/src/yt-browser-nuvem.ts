@@ -910,10 +910,19 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     // 3) na grade tem a caixa "Pesquise nos seus vídeos": busca o MOLDE pelo título e clica no 1º resultado (robusto; a grade é grande/lazy)
     const termo = (moldeTitulo || '').trim().slice(0, 40);
     if (termo) {
-      try {
-        const busca = page.locator('input[placeholder*="Pesquise"], input[placeholder*="Search"], input[placeholder*="esquis"], tp-yt-paper-input input, #search-input input').first();
-        if (await busca.count()) { await busca.click({ timeout: 6000 }).catch(() => {}); await busca.fill('').catch(() => {}); await busca.type(termo, { delay: 25 }).catch(async () => { await busca.fill(termo).catch(() => {}); }); await delayHumano(2800, 3800); }
-      } catch { /* segue p/ varredura */ }
+      try { const b = page.getByPlaceholder(/pesquise|search|esquis/i).first(); if (await b.count()) await b.click({ timeout: 5000 }).catch(() => {}); } catch { /* ok */ }
+      // Polymer do Studio NÃO registra digitação normal: setar value pelo native setter + disparar input/change (truque do procedimento validado)
+      await page.evaluate((t: string) => {
+        const doc: any = (globalThis as any).document;
+        const inp: any = Array.from(doc.querySelectorAll('input,textarea')).find((e: any) => /pesquise|search|esquis/i.test(((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || ''))));
+        if (!inp) return false;
+        try { const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set; set.call(inp, t); } catch { inp.value = t; }
+        inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }, termo).catch(() => false);
+      await delayHumano(900, 1400);
+      try { await page.keyboard.press('Enter'); } catch { /* ok */ }
+      await delayHumano(3000, 4200); // espera a grade filtrar
       await snap('tf-03a-busca');
     }
     // clica no card do MOLDE: 1º tenta pelo moldeId na thumb; senão (após a busca) o 1º card de vídeo da grade. Clique REAL por mouse no título.
