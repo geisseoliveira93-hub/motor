@@ -14496,6 +14496,80 @@ app.get('/academy/magiclinks', (req: any, res: any) => {
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: _AREA_URL + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
 });
+// ============================================================================
+// [+envio-acesso 07/11 Ezequias] ENVIO EM LOTE do acesso à nova área (e-mail + WhatsApp).
+// Manda pros alunos de um curso: link mágico (1 clique) + site + e-mail + senha padrão.
+// Lista de controle (academy_envio_acesso) = NUNCA manda 2x. 30/dia (configurável via limite).
+// E-mail via fila SMTP (teclado); WhatsApp via fila (instancia Teclado-suporte = 1030).
+// Nasce INERTE: só envia de verdade com confirmar:true (sem isso = PRÉVIA, não marca ninguém).
+// ============================================================================
+_acAlter(`CREATE TABLE IF NOT EXISTS academy_envio_acesso (aluno_id TEXT PRIMARY KEY, curso_id TEXT, email TEXT, telefone TEXT, email_ok INTEGER DEFAULT 0, wa_ok INTEGER DEFAULT 0, erro TEXT, enviado_em TEXT)`);
+const AC_ENVIO_SENHA_PADRAO = 'melodias123';
+const AC_ENVIO_INSTANCIA = 'Teclado-suporte'; // número final 1030
+const AC_ENVIO_PROJETO: any = 'teclado';
+function _acEnvioAssunto(): string { return 'Seu novo acesso à área de alunos da Melodias e Riffs 🎹'; }
+function _acEnvioPrimeiroNome(nome?: string): string { const n = String(nome || '').trim(); return n ? n.split(/\s+/)[0] : ''; }
+function _acEnvioEmailHtml(nome: string, link: string): string {
+  const pn = _acEnvioPrimeiroNome(nome); const ola = pn ? ('Olá, ' + esc(pn) + '!') : 'Olá!';
+  return `<div style="font:16px/1.6 system-ui,Arial,sans-serif;color:#1a1a1a;max-width:560px;margin:auto">
+    <p>${ola} Aqui é da equipe do Professor Ezequias, da <b>Melodias e Riffs</b>.</p>
+    <p>Sua área de alunos mudou de casa — agora está mais rápida, bonita e fácil de usar, com todas as suas aulas no mesmo lugar.</p>
+    <p>Para entrar, é só clicar no botão abaixo (você já entra direto, sem digitar nada):</p>
+    <p style="text-align:center;margin:26px 0"><a href="${esc(link)}" style="background:#e7c86a;color:#1a1a1a;font-weight:700;text-decoration:none;padding:14px 28px;border-radius:10px;display:inline-block">ENTRAR NA MINHA ÁREA</a></p>
+    <p>Se preferir entrar manualmente, acesse <a href="https://areadoaluno.melodiaseriffs.com.br">areadoaluno.melodiaseriffs.com.br</a> e use:</p>
+    <ul><li><b>E-mail:</b> o mesmo que você usou na compra</li><li><b>Senha:</b> ${AC_ENVIO_SENHA_PADRAO} (você pode trocar depois, dentro da área)</li></ul>
+    <p>Qualquer dúvida, é só chamar a gente no WhatsApp (16) 99640-1030.</p>
+    <p>Bons estudos, e que Deus abençoe o seu ministério! 🙌</p></div>`;
+}
+function _acEnvioWaTexto(nome: string, link: string): string {
+  const pn = _acEnvioPrimeiroNome(nome); const ola = pn ? ('Olá, ' + pn + '! 🎹') : 'Olá! 🎹';
+  return `${ola} Aqui é da equipe do Professor Ezequias (Melodias e Riffs).\n\nSua área de alunos mudou de casa — agora está mais rápida e fácil, com todas as suas aulas num lugar só.\n\nPara entrar é só clicar (você já entra direto):\n${link}\n\nSe preferir, acesse areadoaluno.melodiaseriffs.com.br com o seu e-mail da compra e a senha ${AC_ENVIO_SENHA_PADRAO}.\n\nQualquer coisa, é só responder aqui. Bons estudos! 🙌`;
+}
+// STATUS: quantos elegíveis (alunos do curso c/ e-mail), quantos já enviados, quantos faltam. (x-api-key)
+app.get('/academy/envio-acesso/status', (req: any, res: any) => {
+  try {
+    const curso = String(req.query.curso || '').trim();
+    const elegiveis = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>''`).get(curso, curso) as any;
+    const enviados = db.prepare(`SELECT COUNT(*) n FROM academy_envio_acesso WHERE (?='' OR curso_id=?)`).get(curso, curso) as any;
+    const comWa = db.prepare(`SELECT COUNT(*) n FROM academy_envio_acesso WHERE wa_ok=1 AND (?='' OR curso_id=?)`).get(curso, curso) as any;
+    const faltam = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso)`).get(curso, curso) as any;
+    _ndOk(res, { curso, elegiveis: elegiveis.n, enviados: enviados.n, enviados_com_whatsapp: comWa.n, faltam: faltam.n, senha_padrao: AC_ENVIO_SENHA_PADRAO, instancia: AC_ENVIO_INSTANCIA });
+  } catch (e) { _ndErr(res, e); }
+});
+// RODAR 1 LOTE. body {curso, limite=30, confirmar}. Sem confirmar => PRÉVIA (não envia, não marca).
+app.post('/academy/envio-acesso/rodar', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const curso = String(b.curso || '').trim();
+    const limite = Math.max(1, Math.min(500, Number(b.limite) || 30));
+    const confirmar = b.confirmar === true;
+    const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, limite) as any[];
+    const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY (padrao=1) DESC, criado_em DESC LIMIT 1`).get(AC_ENVIO_PROJETO) as any);
+    const previa: any[] = []; let enviados = 0; let comWa = 0;
+    for (const r of rows) {
+      let tok = r.token_login;
+      if (!tok && confirmar) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, r.id); }
+      const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + (tok || '<token>');
+      const tel = String(r.telefone || '').replace(/\D/g, '');
+      previa.push({ id: r.id, nome: r.nome, email: r.email, telefone: tel, tem_whatsapp: !!tel, link });
+      if (!confirmar) continue;
+      let email_ok = 0, wa_ok = 0, erro = '';
+      try {
+        db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`)
+          .run(randomUUID(), AC_ENVIO_PROJETO, String(r.email), _acEnvioAssunto(), _acEnvioEmailHtml(r.nome || '', link), 'pendente', agora(), (dom && dom.id) || null, null);
+        email_ok = 1;
+      } catch (e: any) { erro += 'email:' + String(e?.message || e) + '; '; }
+      if (tel) {
+        try { enfileirarFluxo(AC_ENVIO_PROJETO, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto(r.nome || '', link), delaySegundos: 0 } as any], r.nome || '', undefined, AC_ENVIO_INSTANCIA, 'envio-acesso'); wa_ok = 1; comWa++; }
+        catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; }
+      }
+      db.prepare(`INSERT OR REPLACE INTO academy_envio_acesso(aluno_id,curso_id,email,telefone,email_ok,wa_ok,erro,enviado_em) VALUES(?,?,?,?,?,?,?,?)`)
+        .run(r.id, curso, String(r.email), tel, email_ok, wa_ok, erro || null, agora());
+      enviados++;
+    }
+    _ndOk(res, { confirmar, curso, limite, candidatos: rows.length, enviados, enviados_com_whatsapp: comWa, smtp_configurado: !!dom, previa: previa.slice(0, 50) });
+  } catch (e) { _ndErr(res, e); }
+});
 // admin: criar/matricular aluno (e conceder acesso opcional)
 app.post('/academy/matricular', (req: any, res: any) => {
   try {
