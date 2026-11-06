@@ -1,0 +1,512 @@
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Mapa de la Palabra</title>
+<style>
+/* Layout: página de vendas escura (tema warm brown + dourado, CTA amarelo) — herói, mockup fichas, dor, produto, passos, usos, 5 bônus, plano único, garantia, para-ti, FAQ. Design single-dark committed. */
+:root{
+  --bg:#1b130c; --bg2:#120c07; --card:#241a11; --card2:#2c2016; --line:#3a2c1d;
+  --tx:#f5ede1; --mut:#bdae99; --mut2:#8c7e6a;
+  --gold:#e7b949; --gold-2:#f0cd7a; --gold-soft:rgba(231,185,73,.13);
+  --cta:#ffc400; --cta-tx:#241a04;
+  --green:#5ec97c; --green-soft:rgba(94,201,124,.14); --green-ln:rgba(94,201,124,.4);
+  color-scheme:dark;
+}
+@import url('https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,600;0,700;0,800;0,900;1,800&family=Inter:wght@400;500;600;700&family=Poppins:wght@700;800;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:"Inter",system-ui,sans-serif;-webkit-font-smoothing:antialiased;line-height:1.62;font-size:16px;font-variant-numeric:tabular-nums}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+h1,h2,h3,.disp{font-family:"Archivo",system-ui,sans-serif;letter-spacing:-.02em;text-wrap:balance}
+
+section{padding-block:38px}
+.sec-2{background:var(--bg2)}
+.kic{font-family:"Poppins",system-ui,sans-serif;font-size:12.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);text-align:center}
+.h2{font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:33px;text-align:center;margin-top:9px;line-height:1.1;letter-spacing:-.02em}
+.h2 .g{color:var(--gold)}
+.sublead{text-align:center;color:var(--mut);font-size:16.5px;margin:12px auto 0;max-width:52ch}
+
+.cta{display:inline-flex;align-items:center;justify-content:center;gap:9px;background:var(--cta);color:var(--cta-tx);font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:15.5px;text-decoration:none;padding:16px 26px;border-radius:12px;box-shadow:0 10px 30px rgba(246,196,15,.22);transition:transform .1s,box-shadow .1s;text-align:center;letter-spacing:.01em}
+.cta:hover{transform:translateY(-1px);box-shadow:0 14px 34px rgba(246,196,15,.3)}
+.cta:focus-visible{outline:3px solid var(--gold-2);outline-offset:3px}
+.cta.full{display:flex;width:100%}
+.hero .cta{font-size:19px;padding:21px 42px;border-radius:14px;box-shadow:0 14px 38px rgba(255,196,0,.3)}
+@media(max-width:480px){.hero .cta{font-size:17px;padding:18px 26px;width:100%}}
+.hero-sub{font-size:14px;color:var(--mut);margin-top:2px}
+.hero-sub b{color:#fff}
+
+/* HERO */
+.hero{position:relative;text-align:center;padding-block:34px 36px;background:
+   radial-gradient(120% 80% at 50% 0%, #3a2713 0%, transparent 60%),
+   linear-gradient(180deg,#241710 0%,var(--bg) 100%)}
+.hero .wrap{display:flex;flex-direction:column;align-items:center;gap:15px;position:relative;z-index:1}
+.brand{font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);display:inline-flex;align-items:center;gap:8px}
+.hero-pill{display:inline-flex;align-items:center;gap:9px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:11px 22px;font-size:14px;font-weight:700;color:var(--gold)}
+.brand-big{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:58px;line-height:1;letter-spacing:-.02em;color:#fff;display:inline-flex;align-items:center;gap:16px;margin-top:2px}
+.brand-big sup{font-size:.4em;font-weight:800;vertical-align:super;margin-left:2px}
+.brand-sub{font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:27px;letter-spacing:.01em;text-transform:uppercase;color:var(--gold);margin-top:4px}
+@media(max-width:480px){.brand-big{font-size:40px;gap:11px}.brand-sub{font-size:19px}}
+.hero h1{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:46px;line-height:1.04;letter-spacing:-.02em;color:#fff}
+@media(max-width:480px){.hero h1{font-size:37px}}
+.hero h1 .g{color:var(--gold)}
+.hero .lead{font-size:16.5px;color:#e4d7c6;max-width:46ch}
+.hero .lead b{color:#fff}
+.hbul{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.hbul span{font-size:13.5px;font-weight:600;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:999px;padding:7px 14px;color:#e4d7c6}
+.reassure{font-size:12px;color:var(--mut)}
+
+/* MOCKUP fichas */
+.mock{margin:20px auto 0;max-width:440px;background:linear-gradient(180deg,#2a1d12,#1d140c);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 26px 60px rgba(0,0,0,.5)}
+.mock-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.ficha{background:#f7f1e6;border-radius:8px;padding:9px;aspect-ratio:3/4;display:flex;flex-direction:column;gap:5px;box-shadow:0 4px 10px rgba(0,0,0,.25)}
+.ficha .cap{height:30%;border-radius:5px;background:linear-gradient(135deg,#e7cf94,#b98a43)}
+.ficha .nm{font-family:"Archivo";font-weight:800;font-size:9px;color:#7a1f10;line-height:1}
+.ficha .ln{height:3px;border-radius:2px;background:#ddd0b8}
+.ficha .ln.s{width:70%}
+.mock-cap{text-align:center;font-size:11.5px;color:var(--mut);margin-top:12px}
+.hero-img{width:min(460px,100%);height:auto;border-radius:16px;box-shadow:0 26px 60px rgba(0,0,0,.55);margin-top:20px}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:4px}
+@media(max-width:620px){.stats-grid{grid-template-columns:1fr 1fr}}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px 10px;text-align:center}
+.stat .n{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:48px;color:#fff;line-height:1}
+@media(max-width:620px){.stat .n{font-size:42px}}
+.stat .l{font-family:"Poppins",system-ui,sans-serif;font-size:13px;font-weight:800;letter-spacing:.03em;text-transform:uppercase;color:var(--gold);margin-top:6px}
+
+/* testimonials */
+.tr{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:20px}
+@media(max-width:620px){.tr{grid-template-columns:1fr}}
+.tcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px 16px;display:flex;flex-direction:column;gap:8px}
+.tcard .stars{color:var(--gold);font-size:13px;letter-spacing:2px}
+.tcard .txt{font-size:15px;color:var(--tx)}
+.tcard .who{display:flex;align-items:center;gap:11px;font-size:13px;color:var(--mut2);font-weight:700}
+.tcard .who b{display:block;color:var(--tx);font-weight:700;font-size:14px}
+.tcard .who span{display:block;font-weight:500;color:var(--mut2)}
+.tcard .avatar{width:46px;height:46px;border-radius:999px;object-fit:cover;flex:none;border:2px solid var(--line)}
+.tcard .avatar-ini{width:46px;height:46px;border-radius:999px;background:var(--gold-soft);color:var(--gold);display:flex;align-items:center;justify-content:center;font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:18px;flex:none;border:2px solid var(--line)}
+
+/* dor */
+.dor-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;max-width:580px;margin:18px auto 0;text-align:center}
+.dor-card p{font-size:16.5px;color:var(--mut);margin-top:10px}
+.dor-card p.strong{color:#fff;font-weight:600}
+.dor-list{max-width:760px;margin:26px auto 0;display:flex;flex-direction:column;gap:14px}
+.dor-item{display:flex;align-items:flex-start;gap:16px;background:var(--card);border:1px solid var(--line);border-left:3px solid #e05a4e;border-radius:12px;padding:18px 22px}
+.dor-item .x{width:30px;height:30px;border-radius:999px;background:rgba(224,90,78,.16);color:#f07a6e;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;flex:none;margin-top:1px}
+.dor-item p{font-size:16.5px;line-height:1.55;color:var(--mut)}
+.dor-close{max-width:760px;margin:22px auto 0;text-align:center;font-size:17px;line-height:1.5;color:#fff;font-weight:600}
+
+/* producto */
+.test{display:flex;gap:12px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+.test .t{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 20px;text-align:center}
+.test .t .n{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:28px;color:var(--gold)}
+.test .t .l{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--mut2)}
+.tags{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+.tags span{font-size:14px;font-weight:600;color:var(--gold-2);background:var(--gold-soft);border:1px solid var(--line);border-radius:999px;padding:8px 15px}
+.imagine{text-align:center;font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:23px;color:var(--gold);max-width:40ch;margin:20px auto 0;line-height:1.28}
+
+/* pasos */
+.pasos{display:grid;grid-template-columns:repeat(4,1fr);gap:11px;margin-top:22px}
+@media(max-width:620px){.pasos{grid-template-columns:1fr 1fr}}
+.paso{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:15px 14px;text-align:center}
+.paso .num{font-family:"Archivo";font-weight:900;font-size:16px;color:var(--cta-tx);background:var(--gold);width:34px;height:34px;border-radius:999px;display:flex;align-items:center;justify-content:center;margin:0 auto 9px}
+.paso .t{font-weight:700;font-size:15.5px;color:#fff}
+.paso .d{font-size:13.5px;color:var(--mut);margin-top:4px}
+/* qué trae la guía */
+.guia-box{max-width:820px;margin:26px auto 0;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:30px 26px}
+@media(max-width:480px){.guia-box{padding:22px 16px}}
+.guia-hd{display:flex;align-items:center;gap:16px;font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:15px;letter-spacing:.08em;text-transform:uppercase;color:var(--gold);margin-bottom:8px;white-space:nowrap}
+.guia-hd::before,.guia-hd::after{content:"";height:1px;flex:1;background:linear-gradient(90deg,transparent,var(--line),transparent)}
+.guia-row{display:flex;align-items:flex-start;gap:16px;background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--gold);border-radius:13px;padding:18px 20px;margin-top:13px}
+.guia-row.first{border-left-color:var(--green)}
+.guia-row .n{width:32px;height:32px;border-radius:9px;background:var(--gold-soft);color:var(--gold);font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:15px;display:flex;align-items:center;justify-content:center;flex:none;margin-top:2px}
+.guia-row.first .n{background:var(--green-soft);color:var(--green)}
+.guia-row .tt{font-weight:700;font-size:17.5px;color:#fff}
+.guia-row .dd{font-size:15.5px;line-height:1.55;color:var(--mut);margin-top:5px}
+
+/* usos */
+.usos{display:grid;grid-template-columns:repeat(3,1fr);gap:11px;margin-top:22px}
+@media(max-width:620px){.usos{grid-template-columns:1fr}}
+.uso{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 15px}
+.uso .em{font-size:20px}
+.uso .t{font-weight:700;font-size:16px;margin-top:6px;color:#fff}
+.uso .d{font-size:14px;color:var(--mut);margin-top:3px}
+
+/* bonos */
+.bonos{display:flex;flex-direction:column;gap:16px;margin:24px auto 0;max-width:880px}
+.bono{display:flex;gap:20px;align-items:center;text-align:left;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--bc);border-radius:16px;padding:20px;box-shadow:0 0 36px -16px var(--bc)}
+@media(max-width:560px){.bono{flex-direction:column;align-items:stretch;text-align:center}}
+.bono.b-green{--bc:#5ec97c}
+.bono.b-blue{--bc:#4ea3f0}
+.bono.b-purple{--bc:#a98bf0}
+.bono.b-gold{--bc:#e7b949}
+.bono.b-rose{--bc:#f07a8e}
+.bono .cover{width:154px;flex:none;aspect-ratio:1/1.1;border-radius:12px;overflow:hidden;display:flex;align-items:center;justify-content:center;background:linear-gradient(155deg,#2b1e12,#130c06);border:1px solid var(--line)}
+.bono .cover img{width:100%;height:100%;object-fit:cover}
+.bono .cover .ph{font-family:"Archivo";font-weight:800;font-size:13px;color:var(--gold-2);text-align:center;padding:12px;line-height:1.3}
+@media(max-width:560px){.bono .cover{width:100%;aspect-ratio:16/8}}
+.bono .body{flex:1;min-width:0}
+.bono .pill{display:inline-block;background:var(--bc);color:#0c1510;font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:12.5px;letter-spacing:.03em;padding:5px 15px;border-radius:999px}
+.bono .t{font-family:"Archivo";font-weight:800;font-size:21px;color:#fff;margin-top:11px}
+.bono .tag{display:inline-block;border:1px solid var(--bc);color:var(--bc);font-weight:700;font-size:13px;padding:4px 13px;border-radius:999px;margin-top:9px}
+.bono .d{font-size:15px;line-height:1.55;color:var(--mut);margin-top:11px}
+.bono .price{margin-top:13px;font-size:16.5px}
+.bono .price .old{color:var(--mut2);text-decoration:line-through;margin-right:10px}
+.bono .price .free{color:var(--green);font-family:"Poppins",system-ui,sans-serif;font-weight:800}
+.bono-total{max-width:880px;margin:20px auto 0;display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:10px 14px;background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--gold);border-radius:14px;padding:18px 24px;box-shadow:0 0 40px -16px var(--gold);text-align:center}
+.bono-total .lbl{font-size:16px;color:var(--mut)}
+.bono-total .old{color:var(--mut2);text-decoration:line-through;font-weight:600}
+.bono-total .free{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:21px;color:var(--cta);text-transform:uppercase;letter-spacing:.01em;display:inline-flex;align-items:center;gap:8px}
+.bono-total .note{font-size:14px;color:var(--mut2)}
+/* urgencia */
+.urg{max-width:720px;margin:14px auto 0;text-align:center;background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--cta);border-radius:16px;padding:26px 24px;box-shadow:0 0 44px -18px var(--cta)}
+.urg-top{display:inline-block;font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--cta);background:var(--gold-soft);border:1px solid var(--line);border-radius:999px;padding:6px 16px}
+.urg-main{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:26px;color:#fff;margin-top:14px;line-height:1.15}
+@media(max-width:480px){.urg-main{font-size:22px}}
+.urg-sub{font-size:15.5px;color:var(--mut);margin-top:12px;max-width:46ch;margin-inline:auto}
+.countdown{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:16px}
+.cd-box{background:var(--bg);border:1px solid var(--cta);border-radius:12px;padding:10px 6px;min-width:84px;display:flex;flex-direction:column;align-items:center;box-shadow:0 0 28px -14px var(--cta)}
+.cd-box span{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:40px;line-height:1;color:var(--cta)}
+.cd-box small{font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin-top:6px}
+.cd-sep{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:34px;color:var(--cta)}
+@media(max-width:480px){.cd-box{min-width:72px}.cd-box span{font-size:34px}}
+
+/* plan único */
+.planwrap{max-width:430px;margin:22px auto 0}
+.plan{background:linear-gradient(180deg,#2a1d12,#20160d);border:2px solid var(--gold);border-radius:18px;padding:22px 20px;display:flex;flex-direction:column;gap:12px;position:relative;box-shadow:0 24px 60px rgba(0,0,0,.45)}
+.plan .flag{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--gold);color:var(--cta-tx);font-family:"Archivo";font-weight:800;font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;padding:4px 13px;border-radius:999px;white-space:nowrap}
+.plan .pn{font-family:"Archivo";font-weight:900;font-size:25px;color:#fff;text-align:center}
+.plan .psub{font-size:12.5px;color:var(--mut);text-align:center;margin-top:-6px}
+.plan .pr{display:flex;align-items:baseline;justify-content:center;gap:4px;margin-top:4px}
+.plan .pr .de{font-size:14px;color:var(--mut2);text-decoration:line-through;align-self:center;margin-right:8px}
+.plan .pr .cur{font-family:"Poppins",system-ui,sans-serif;font-weight:800;font-size:20px;color:var(--gold)}
+.plan .pr .big{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:58px;color:var(--gold);line-height:.9}
+.plan .once{font-size:11.5px;color:var(--mut2);font-weight:600;text-align:center}
+.plan ul{list-style:none;display:flex;flex-direction:column;gap:7px}
+.plan li{font-size:14.5px;display:flex;gap:8px;color:var(--tx)}
+.plan li .ck{color:var(--green);font-weight:800;flex:none}
+.paynote{text-align:center;font-size:12px;color:var(--mut2);margin-top:14px}
+
+/* garantia */
+.guar-seal{width:66px;height:66px;border-radius:999px;background:var(--card);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:30px;margin:0 auto;box-shadow:0 0 44px -10px var(--gold)}
+.guar-box{max-width:820px;margin:22px auto 0;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:34px 28px;text-align:center}
+@media(max-width:480px){.guar-box{padding:26px 18px}}
+.guar-box .desc{font-size:16.5px;color:var(--mut);max-width:52ch;margin:0 auto;line-height:1.55}
+.guar-box .big{font-family:"Poppins",system-ui,sans-serif;font-weight:900;font-size:34px;color:var(--cta);margin-top:20px}
+@media(max-width:480px){.guar-box .big{font-size:27px}}
+.guar-pill{display:inline-block;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:12px 24px;font-family:"Archivo";font-weight:800;font-size:16px;color:#fff;margin-top:20px}
+.guar-close{max-width:620px;margin:18px auto 0;text-align:center;font-size:14.5px;color:var(--mut2);line-height:1.5}
+
+/* para ti */
+.forti{list-style:none;display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px;max-width:620px;margin-left:auto;margin-right:auto}
+@media(max-width:560px){.forti{grid-template-columns:1fr}}
+.forti li{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:14px 16px;font-size:15.5px;display:flex;gap:9px;color:var(--tx)}
+.forti li .ck{color:var(--green);font-weight:800;flex:none}
+
+/* faq */
+.faq{max-width:600px;margin:20px auto 0;display:flex;flex-direction:column;gap:9px}
+.faq details{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:0 15px}
+.faq summary{cursor:pointer;list-style:none;padding:16px 0;font-weight:600;font-size:16px;display:flex;justify-content:space-between;gap:12px;align-items:center;color:#fff}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";color:var(--gold);font-weight:800;font-size:19px;flex:none}
+.faq details[open] summary::after{content:"–"}
+.faq .ans{font-size:15px;color:var(--mut);padding:0 0 16px}
+
+/* final + footer */
+.final{background:radial-gradient(120% 90% at 50% 0%, #3a2713 0%, transparent 60%), var(--bg2);text-align:center}
+.final h2{color:#fff;font-size:31px}
+.final h2 .g{color:var(--gold)}
+.final p{font-size:16px;color:#e4d7c6;max-width:46ch;margin:10px auto 16px}
+.final .pricetag{font-family:"Poppins",system-ui,sans-serif;font-size:13px;color:var(--gold);font-weight:700;margin-bottom:16px}
+.foot{background:var(--bg2);border-top:1px solid var(--line);text-align:center;padding-block:24px}
+.foot .fname{font-family:"Archivo";font-weight:800;font-size:17px;color:#fff;margin-bottom:6px}
+.foot p{font-size:12px;color:var(--mut)}
+.foot .verse{font-style:italic;margin-top:10px;font-size:14px;color:var(--gold-2)}
+</style>
+
+<!-- HERO -->
+<header class="hero"><div class="wrap">
+  <span class="hero-pill">✝️ El mapa claro para recorrer toda la Biblia</span>
+  <div class="brand-big">📖 Mapa de la Palabra<sup>™</sup></div>
+  <div class="brand-sub">Guía de estudio de los 66 libros</div>
+  <h1>Entiende los <span class="g">66 libros de la Biblia</span>, un libro a la vez.</h1>
+  <p class="lead">66 fichas ilustradas y listas para imprimir, con el contexto, los personajes y el mensaje de cada libro. <b>Aunque nunca hayas estudiado la Biblia.</b></p>
+  <img class="hero-img" src="hero-mapa.png" alt="Mapa de la Palabra — Guía de los 66 Libros de la Biblia">
+  <div class="hbul"><span>📖 66 libros</span><span>⚡ Acceso inmediato</span><span>🖨️ Imprimible</span><span>🙏 Para todo creyente</span></div>
+  <a class="cta" href="#planes">QUIERO ENTENDER LA BIBLIA →</a>
+  <p class="hero-sub">📖 <b>De Génesis a Apocalipsis</b>, una ficha a la vez</p>
+  <p class="reassure">🛡️ Garantía 30 días · 🔒 Pago seguro · ⚡ Acceso inmediato</p>
+</div></header>
+
+<!-- STATS -->
+<section class="sec-2"><div class="wrap">
+  <div class="stats-grid">
+    <div class="stat"><div class="n">66</div><div class="l">Libros explicados</div></div>
+    <div class="stat"><div class="n">7</div><div class="l">Días de recorrido</div></div>
+    <div class="stat"><div class="n">5</div><div class="l">Bonos incluidos</div></div>
+    <div class="stat"><div class="n">1</div><div class="l">Ficha por libro</div></div>
+  </div>
+</div></section>
+
+<!-- DOR -->
+<section><div class="wrap">
+  <div class="kic">¿Te pasa esto?</div>
+  <h2 class="h2">Si quieres leer la Biblia pero sientes que <span class="g">no la entiendes</span>, seguramente te pasa esto:</h2>
+  <div class="dor-list">
+    <div class="dor-item"><span class="x">✕</span><p>Empiezas a leer con muchas ganas, pero a los pocos capítulos te pierdes y terminas abandonando.</p></div>
+    <div class="dor-item"><span class="x">✕</span><p>Lees un pasaje y no sabes quién lo escribió, a quién iba dirigido ni qué estaba pasando en ese momento.</p></div>
+    <div class="dor-item"><span class="x">✕</span><p>Los comentarios bíblicos son tan largos y técnicos que te abruman más de lo que te ayudan.</p></div>
+    <div class="dor-item"><span class="x">✕</span><p>Entiendes las palabras, pero no sabes cómo llevar lo que lees a tu vida de todos los días.</p></div>
+    <div class="dor-item"><span class="x">✕</span><p>Sientes que deberías conocer mejor la Palabra de Dios, pero nadie te dio un mapa claro para recorrerla.</p></div>
+  </div>
+  <p class="dor-close">El problema no es falta de fe ni de ganas. Faltaba alguien que te mostrara el camino, un libro a la vez.</p>
+</div></section>
+
+<!-- PRODUCTO -->
+<section class="sec-2"><div class="wrap">
+  <div class="kic">La solución</div>
+  <div class="brand-big">📖 Mapa de la Palabra<sup>™</sup></div>
+  <div class="brand-sub">Guía de estudio de los 66 libros</div>
+  <h2 class="h2" style="margin-top:14px">66 fichas ilustradas, <span class="g">una por cada libro</span></h2>
+  <div class="test">
+    <div class="t"><div class="n">39</div><div class="l">del Antiguo Testamento</div></div>
+    <div class="t"><div class="n">27</div><div class="l">del Nuevo Testamento</div></div>
+  </div>
+  <div class="tags">
+    <span>Resúmenes</span><span>Personajes</span><span>Contexto</span><span>Versículos clave</span><span>Preguntas para reflexión</span>
+  </div>
+  <p class="imagine">Lee con contexto. Entiende con claridad. Vive lo que aprendes.</p>
+  <img class="hero-img" src="hero-mapa.png" alt="Mapa de la Palabra — Guía de los 66 Libros de la Biblia">
+</div></section>
+
+<!-- LO QUE RECIBES -->
+<section><div class="wrap">
+  <div class="kic">Así es cada ficha</div>
+  <h2 class="h2">Lo que <span class="g">recibes</span></h2>
+  <div class="guia-box">
+    <div class="guia-hd">📖 Qué trae la guía</div>
+    <div class="guia-row first"><div class="n">1</div><div><div class="tt">De qué trata y en qué contexto nació</div><div class="dd">Un resumen claro de cada libro y el escenario en que se escribió. En el Nuevo Testamento, además, quién lo escribió.</div></div></div>
+    <div class="guia-row"><div class="n">2</div><div><div class="tt">Temas clave</div><div class="dd">Las ideas centrales que sostiene cada libro, para que veas el hilo del mensaje y no te quedes en frases sueltas.</div></div></div>
+    <div class="guia-row"><div class="n">3</div><div><div class="tt">Símbolos principales</div><div class="dd">Las imágenes y señales que usa cada libro y qué representan, para leer con más profundidad sin adivinar.</div></div></div>
+    <div class="guia-row"><div class="n">4</div><div><div class="tt">Aplicación práctica para hoy</div><div class="dd">En cada ficha, una forma concreta de llevar ese libro a tu vida. No consejos vagos: acciones reales que puedes hacer esta semana.</div></div></div>
+    <div class="guia-row"><div class="n">5</div><div><div class="tt">Plan de lectura de 7 días</div><div class="dd">Un recorrido día por día para atravesar los 66 libros en una semana, de la forma más simple posible.</div></div></div>
+  </div>
+</div></section>
+
+<!-- USOS -->
+<section class="sec-2"><div class="wrap">
+  <div class="kic">Para cada momento de tu caminar</div>
+  <h2 class="h2">Úsalas en cualquier momento</h2>
+  <div class="usos">
+    <div class="uso"><div class="em">🙏</div><div class="t">Devocional diario</div><div class="d">Lee con más entendimiento y propósito.</div></div>
+    <div class="uso"><div class="em">📘</div><div class="t">Escuela Dominical</div><div class="d">Apoyo práctico para preparar tus clases.</div></div>
+    <div class="uso"><div class="em">👥</div><div class="t">Células y grupos</div><div class="d">Conduce los encuentros con más seguridad.</div></div>
+    <div class="uso"><div class="em">🌱</div><div class="t">Nuevos creyentes</div><div class="d">Un primer contacto con la Biblia, sin miedo.</div></div>
+    <div class="uso"><div class="em">🏠</div><div class="t">Estudio en familia</div><div class="d">Conversaciones sobre la Palabra en casa.</div></div>
+    <div class="uso"><div class="em">✍️</div><div class="t">Estudio personal</div><div class="d">Organiza tus anotaciones libro por libro.</div></div>
+  </div>
+</div></section>
+
+<!-- PARA TI -->
+<section><div class="wrap">
+  <div class="kic">Es para ti que…</div>
+  <h2 class="h2">¿Para quién es?</h2>
+  <ul class="forti">
+    <li><span class="ck">✓</span>Quieres entender la Biblia sin lenguaje complicado</li>
+    <li><span class="ck">✓</span>Ya empezaste a leer y te perdiste en el camino</li>
+    <li><span class="ck">✓</span>Te convertiste hace poco y quieres empezar bien</li>
+    <li><span class="ck">✓</span>Enseñas en la Escuela Dominical</li>
+    <li><span class="ck">✓</span>Lideras una célula o un grupo de estudio</li>
+    <li><span class="ck">✓</span>Deseas crear constancia en el estudio de la Palabra</li>
+  </ul>
+</div></section>
+
+<!-- BONOS -->
+<section><div class="wrap">
+  <div class="kic">Incluido gratis en tu kit</div>
+  <h2 class="h2"><span class="g">+5 bonos</span> exclusivos para profundizar</h2>
+  <div class="bonos">
+    <div class="bono b-green">
+      <div class="cover"><img src="bono-plan.png" alt="Plan de Lectura de 7 Días"></div>
+      <div class="body">
+        <span class="pill">BONO #1</span>
+        <div class="t">Plan de Lectura de 7 Días</div>
+        <span class="tag">checklist imprimible</span>
+        <div class="d">Una guía sencilla, día por día, para acercarte a la Palabra sin perderte: sabes qué leer cada día y acompañas tu progreso con constancia.</div>
+        <div class="price"><span class="old">$129 MXN</span><span class="free">✓ GRATIS HOY</span></div>
+      </div>
+    </div>
+    <div class="bono b-blue">
+      <div class="cover"><img src="bono-linea.png" alt="Línea de Tiempo Bíblica"></div>
+      <div class="body">
+        <span class="pill">BONO #2</span>
+        <div class="t">Línea de Tiempo Bíblica</div>
+        <span class="tag">cronología</span>
+        <div class="d">Una guía visual de la historia sagrada, para ver la secuencia completa de los acontecimientos y relacionar los libros entre sí de un vistazo.</div>
+        <div class="price"><span class="old">$119 MXN</span><span class="free">✓ GRATIS HOY</span></div>
+      </div>
+    </div>
+    <div class="bono b-purple">
+      <div class="cover"><img src="bono-personajes.png" alt="Personajes Clave de la Biblia"></div>
+      <div class="body">
+        <span class="pill">BONO #3</span>
+        <div class="t">Personajes Clave de la Biblia</div>
+        <span class="tag">tarjetas ilustradas</span>
+        <div class="d">Conoce la historia, el propósito y las lecciones de los principales personajes de la Biblia, para memorizarlos y usarlos en tus estudios.</div>
+        <div class="price"><span class="old">$99 MXN</span><span class="free">✓ GRATIS HOY</span></div>
+      </div>
+    </div>
+    <div class="bono b-gold">
+      <div class="cover"><img src="bono-atlas.png" alt="Atlas Bíblico"></div>
+      <div class="body">
+        <span class="pill">BONO #4</span>
+        <div class="t">Atlas Bíblico</div>
+        <span class="tag">mapas ilustrados</span>
+        <div class="d">Los mapas de los principales lugares y viajes de la Biblia, para ubicar regiones y ciudades y entender mejor dónde ocurrió cada historia.</div>
+        <div class="price"><span class="old">$89 MXN</span><span class="free">✓ GRATIS HOY</span></div>
+      </div>
+    </div>
+    <div class="bono b-rose">
+      <div class="cover"><img src="bono-leia.png" alt="Método L.E.I.A."></div>
+      <div class="body">
+        <span class="pill">BONO #5</span>
+        <div class="t">Método L.E.I.A.</div>
+        <span class="tag">método de estudio</span>
+        <div class="d">Una guía práctica para Leer, Estudiar, Interpretar y Aplicar la Palabra: una secuencia simple para estudiar cualquier pasaje en su contexto.</div>
+        <div class="price"><span class="old">$109 MXN</span><span class="free">✓ GRATIS HOY</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="bono-total">
+    <span class="lbl">Valor total de los bonos: <span class="old">$545 MXN</span></span>
+    <span class="free">🎁 ¡Gratis hoy!</span>
+    <span class="note">· Al llevarte Mapa de la Palabra</span>
+  </div>
+</div></section>
+
+<!-- URGENCIA -->
+<section><div class="wrap">
+  <div class="kic">Oferta de lanzamiento</div>
+  <h2 class="h2">Por <span class="g">tiempo limitado</span></h2>
+  <div class="urg">
+    <span class="urg-top">⏳ Precio promocional</span>
+    <div class="urg-main">Tu oferta con los 5 bonos termina en:</div>
+    <div class="countdown">
+      <div class="cd-box"><span id="cd-m">10</span><small>Minutos</small></div>
+      <div class="cd-sep">:</div>
+      <div class="cd-box"><span id="cd-s">00</span><small>Segundos</small></div>
+    </div>
+    <div class="urg-sub">Cuando el tiempo termine, el precio de lanzamiento con todos los bonos de regalo puede cerrarse.</div>
+  </div>
+</div></section>
+
+<!-- PLAN -->
+<section class="sec-2" id="planes"><div class="wrap">
+  <div class="kic">Un solo pago, todo incluido</div>
+  <h2 class="h2">Llévate el <span class="g">kit completo</span></h2>
+  <div class="planwrap">
+    <div class="plan">
+      <span class="flag">⭐ 66 fichas + 5 bonos</span>
+      <div class="pn">Mapa de la Palabra</div>
+      <div class="psub">Kit completo — 66 fichas + 5 recursos de regalo</div>
+      <div class="pr"><span class="de">$297 MXN</span><span class="cur">$</span><span class="big">147</span></div>
+      <div class="once">Pago único · IVA incluido · acceso de por vida</div>
+      <ul>
+        <li><span class="ck">✓</span>66 fichas bíblicas ilustradas (una por libro)</li>
+        <li><span class="ck">✓</span>39 del Antiguo + 27 del Nuevo Testamento</li>
+        <li><span class="ck">✓</span>Resúmenes, contexto, personajes y versículos clave</li>
+        <li><span class="ck">✓</span>Aplicación práctica y preguntas para reflexión</li>
+        <li><span class="ck">✓</span>🎁 Plan de Lectura de 7 Días</li>
+        <li><span class="ck">✓</span>🎁 Línea de Tiempo Bíblica</li>
+        <li><span class="ck">✓</span>🎁 Personajes Clave de la Biblia</li>
+        <li><span class="ck">✓</span>🎁 Atlas Bíblico</li>
+        <li><span class="ck">✓</span>🎁 Método L.E.I.A.</li>
+      </ul>
+      <a class="cta full" href="#">QUIERO MI KIT COMPLETO →</a>
+    </div>
+  </div>
+  <p class="paynote">Precio final en pesos mexicanos (MXN), IVA incluido • 🔒 Compra segura • ⚡ Acceso inmediato • 🛡️ Garantía de 30 días</p>
+</div></section>
+
+<!-- TESTIMONIOS -->
+<section><div class="wrap">
+  <div class="kic">Testimonios</div>
+  <h2 class="h2">Lo que dicen quienes ya estudian con <span class="g">Mapa de la Palabra</span></h2>
+  <p class="lead" style="margin:4px auto 0">Creyentes que pasaron de leer sin entender a estudiar con claridad.</p>
+  <div class="tr">
+    <div class="tcard"><div class="stars">★★★★★</div><div class="txt">"Por fin entiendo el contexto de lo que leo. Entender los temas de cada libro me cambió la lectura."</div><div class="who"><img class="avatar" src="t-mariana.png" alt="Mariana T."><div><b>Mariana T.</b><span>📍 Lectora diaria</span></div></div></div>
+    <div class="tcard"><div class="stars">★★★★★</div><div class="txt">"La uso para preparar los estudios del grupo. Tengo la ficha de cada libro, clara y ordenada."</div><div class="who"><img class="avatar" src="t-andres.png" alt="Andrés V."><div><b>Andrés V.</b><span>📍 Líder de célula</span></div></div></div>
+    <div class="tcard"><div class="stars">★★★★★</div><div class="txt">"Empecé sin saber nada y ahora leo con orden. La aplicación práctica es lo que más me sirve."</div><div class="who"><img class="avatar" src="t-rosa.png" alt="Rosa M."><div><b>Rosa M.</b><span>📍 Nueva en la fe</span></div></div></div>
+  </div>
+</div></section>
+
+<!-- GARANTIA -->
+<section><div class="wrap">
+  <div class="guar-seal">🛡️</div>
+  <h2 class="h2" style="margin-top:16px">Garantía Mapa de la Palabra™<br><span class="g">100% de devolución en 30 días</span></h2>
+  <div class="guar-box">
+    <p class="desc">Compras la guía, la descargas, recorres las 66 fichas y los 5 bonos. Si sientes que no te ayuda a entender mejor la Biblia:</p>
+    <div class="big">Te devolvemos el 100%.</div>
+    <span class="guar-pill">Sin preguntas. Sin vueltas. Sin riesgo.</span>
+  </div>
+  <p class="guar-close">Queremos que estudies la Palabra con claridad y confianza. Si no te sirve, el riesgo es nuestro.</p>
+</div></section>
+
+<!-- FAQ -->
+<section><div class="wrap">
+  <div class="kic">Dudas resueltas</div>
+  <h2 class="h2">Preguntas frecuentes</h2>
+  <div class="faq">
+    <details open><summary>¿Necesito conocer la Biblia?</summary><div class="ans">No. El material también está indicado para principiantes: cada ficha explica el contexto desde cero.</div></details>
+    <details><summary>¿Es físico o digital?</summary><div class="ans">100% digital. Recibes los archivos para leer en el celular, la tablet o la computadora, o imprimir.</div></details>
+    <details><summary>¿Puedo imprimirlas?</summary><div class="ans">Sí. Están listas para imprimir en casa o en una imprenta, o para usar directamente en PDF.</div></details>
+    <details><summary>¿Incluye los 66 libros?</summary><div class="ans">Sí: 39 del Antiguo Testamento y 27 del Nuevo Testamento, una ficha por cada uno.</div></details>
+    <details><summary>¿Puedo usarlas para preparar clases?</summary><div class="ans">Sí. Son un gran apoyo para Escuela Dominical, células y grupos de estudio.</div></details>
+    <details><summary>¿Qué incluye el kit completo?</summary><div class="ans">Las 66 fichas + 5 bonos: Plan de Lectura de 7 Días, Línea de Tiempo Bíblica, Personajes Clave de la Biblia, Atlas Bíblico y el Método L.E.I.A.</div></details>
+    <details><summary>¿Cómo lo recibo?</summary><div class="ans">Por e-mail, con acceso inmediato apenas se confirma el pago. No hay envío físico.</div></details>
+    <details><summary>¿Puedo usarlas en el celular?</summary><div class="ans">Sí. Funcionan en cualquier dispositivo con lector de PDF.</div></details>
+    <details><summary>¿Las fichas reemplazan la Biblia?</summary><div class="ans">No, la acompañan. Son una guía para entender y aplicar mejor lo que lees en tu propia Biblia.</div></details>
+  </div>
+</div></section>
+
+<!-- FINAL -->
+<section class="final"><div class="wrap">
+  <h2>Tu próxima lectura de la Biblia puede ser <span class="g">diferente</span></h2>
+  <p>Con las fichas correctas, cada libro deja de ser un misterio y empieza a tener sentido.</p>
+  <div class="pricetag">Kit completo — $147 MXN · IVA incluido</div>
+  <a class="cta" href="#planes">QUIERO MIS 66 FICHAS BÍBLICAS →</a>
+</div></section>
+
+<footer class="foot"><div class="wrap">
+  <div class="fname">📖 Mapa de la Palabra</div>
+  <p>66 fichas bíblicas ilustradas • 100% digital e imprimible</p>
+  <div class="verse">"Lámpara es a mis pies tu palabra, y lumbrera a mi camino." — Salmo 119:105</div>
+</div></footer>
+
+<script>
+(function(){
+  var libros=["Génesis","Éxodo","Levítico","Salmos","Isaías","Mateo","Juan","Hechos","Romanos","Gálatas","Hebreos","Apocalipsis"];
+  var g=document.getElementById('mock-grid');
+  if(!g) return;
+  libros.forEach(function(n){
+    var f=document.createElement('div'); f.className='ficha';
+    f.innerHTML='<div class="cap"></div><div class="nm">'+n+'</div><div class="ln"></div><div class="ln s"></div>';
+    g.appendChild(f);
+  });
+})();
+(function(){
+  var mEl=document.getElementById('cd-m'), sEl=document.getElementById('cd-s');
+  if(!mEl||!sEl) return;
+  var DUR=10*60*1000, end;
+  try{
+    var saved=localStorage.getItem('mdlp_cd_end');
+    end=saved?parseInt(saved,10):0;
+    if(!end||isNaN(end)||end-Date.now()>DUR||end<=Date.now()){end=Date.now()+DUR;localStorage.setItem('mdlp_cd_end',String(end));}
+  }catch(e){end=Date.now()+DUR;}
+  function tick(){
+    var left=Math.max(0,end-Date.now());
+    var m=Math.floor(left/60000), s=Math.floor((left%60000)/1000);
+    mEl.textContent=(m<10?'0':'')+m;
+    sEl.textContent=(s<10?'0':'')+s;
+    if(left<=0){clearInterval(t);}
+  }
+  tick(); var t=setInterval(tick,1000);
+})();
+</script>
