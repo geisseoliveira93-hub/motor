@@ -910,20 +910,24 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     // 3) na grade tem a caixa "Pesquise nos seus vídeos": busca o MOLDE pelo título e clica no 1º resultado (robusto; a grade é grande/lazy)
     const termo = (moldeTitulo || '').trim().slice(0, 40);
     if (termo) {
-      try { const b = page.getByPlaceholder(/pesquise|search|esquis/i).first(); if (await b.count()) await b.click({ timeout: 5000 }).catch(() => {}); } catch { /* ok */ }
-      // Polymer do Studio NÃO registra digitação normal: setar value pelo native setter + disparar input/change (truque do procedimento validado)
-      await page.evaluate((t: string) => {
+      // IMPORTANTE: mirar o campo de busca DO MODAL ("Pesquise nos seus vídeos"), NÃO a busca global do Studio (topo).
+      // Setar value pelo native setter + disparar input/change (Polymer não registra digitação normal).
+      const achou = await page.evaluate((t: string) => {
         const doc: any = (globalThis as any).document;
-        const inp: any = Array.from(doc.querySelectorAll('input,textarea')).find((e: any) => /pesquise|search|esquis/i.test(((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || ''))));
+        const ehModal = (e: any) => { const ph = (((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || '')) as string).toLowerCase(); return /nos seus|seus v[íi]deos|your videos|search your videos/.test(ph); };
+        let inp: any = Array.from(doc.querySelectorAll('input,textarea')).find(ehModal);
+        if (!inp) { // fallback: input de busca DENTRO de um diálogo aberto
+          const dlgs = Array.from(doc.querySelectorAll('[role="dialog"], ytcp-dialog, tp-yt-paper-dialog, ytcp-picker-dialog')) as any[];
+          for (const d of dlgs) { const i: any = Array.from(d.querySelectorAll('input,textarea')).find((e: any) => /pesquis|search/i.test((e.placeholder || '') + ' ' + ((e.getAttribute && e.getAttribute('aria-label')) || ''))); if (i) { inp = i; break; } }
+        }
         if (!inp) return false;
+        try { inp.focus(); } catch { /* ok */ }
         try { const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set; set.call(inp, t); } catch { inp.value = t; }
         inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }, termo).catch(() => false);
-      await delayHumano(900, 1400);
-      try { await page.keyboard.press('Enter'); } catch { /* ok */ }
       await delayHumano(3000, 4200); // espera a grade filtrar
-      await snap('tf-03a-busca');
+      await snap('tf-03a-busca-' + (achou ? 'ok' : 'naoachou'));
     }
     // clica no card do MOLDE: 1º tenta pelo moldeId na thumb; senão (após a busca) o 1º card de vídeo da grade. Clique REAL por mouse no título.
     const boxTitulo = await page.evaluate((mid: string) => {
