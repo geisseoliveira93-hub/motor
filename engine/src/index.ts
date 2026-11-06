@@ -14529,10 +14529,10 @@ function _acEnvioWaTexto(nome: string, link: string): string {
 app.get('/academy/envio-acesso/status', (req: any, res: any) => {
   try {
     const curso = String(req.query.curso || '').trim();
-    const elegiveis = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>''`).get(curso, curso) as any;
+    const elegiveis = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%'`).get(curso, curso) as any;
     const enviados = db.prepare(`SELECT COUNT(*) n FROM academy_envio_acesso WHERE (?='' OR curso_id=?)`).get(curso, curso) as any;
     const comWa = db.prepare(`SELECT COUNT(*) n FROM academy_envio_acesso WHERE wa_ok=1 AND (?='' OR curso_id=?)`).get(curso, curso) as any;
-    const faltam = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso)`).get(curso, curso) as any;
+    const faltam = db.prepare(`SELECT COUNT(DISTINCT m.id) n FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso)`).get(curso, curso) as any;
     _ndOk(res, { curso, elegiveis: elegiveis.n, enviados: enviados.n, enviados_com_whatsapp: comWa.n, faltam: faltam.n, senha_padrao: AC_ENVIO_SENHA_PADRAO, instancia: AC_ENVIO_INSTANCIA });
   } catch (e) { _ndErr(res, e); }
 });
@@ -14543,7 +14543,7 @@ app.post('/academy/envio-acesso/rodar', (req: any, res: any) => {
     const curso = String(b.curso || '').trim();
     const limite = Math.max(1, Math.min(500, Number(b.limite) || 30));
     const confirmar = b.confirmar === true;
-    const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, limite) as any[];
+    const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, limite) as any[];
     const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY (padrao=1) DESC, criado_em DESC LIMIT 1`).get(AC_ENVIO_PROJETO) as any);
     const previa: any[] = []; let enviados = 0; let comWa = 0;
     for (const r of rows) {
