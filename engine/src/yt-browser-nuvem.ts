@@ -840,12 +840,13 @@ export async function aplicarCapaViaEdit(opts: { projeto: string; videoId: strin
 // vídeo-MOLDE do próprio canal via "Importar do vídeo" no Studio (navegador invisível, sessão + proxy do canal).
 // O YouTube NÃO tem API de tela final — só dá pelo Studio. Molde por canal (traz "Envio mais recente" + link do combo
 // com a arte, 20s). Instrumentado com snaps em cada passo p/ diagnóstico. NÃO monta na mão (usa o molde).
-export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; moldeTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[]; debug?: any }> {
+export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; moldeTitulo?: string; snaps?: boolean; soSeExiste?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; pulou?: boolean; proxyUsado?: string | null; screenshots?: string[]; debug?: any }> {
   const projeto = String(opts.projeto || '').trim().toLowerCase();
   const videoId = String(opts.videoId || '').trim();
   const moldeId = String(opts.moldeId || '').trim();
   const moldeTitulo = String(opts.moldeTitulo || '').trim();
   const querSnaps = !!opts.snaps;
+  const soSeExiste = !!opts.soSeExiste; // [+tela-final só-corrige 09/11] quando true: só mexe em quem JÁ tem tela final
   const screenshots: string[] = [];
   if (!projeto || !videoId || !moldeId) return { ok: false, erro: 'projeto/videoId/moldeId obrigatórios' };
   if (videoId === moldeId) return { ok: false, erro: 'videoId == moldeId (não aplicar no próprio molde)' };
@@ -913,6 +914,14 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     await snap('tf-02-editor-tela-final');
     if (!abriu) return { ok: false, erro: 'cliquei no card Tela final mas o editor não abriu (sem botão Importar do vídeo)', proxyUsado, screenshots };
 
+    // [+tela-final só-corrige 09/11] Detecta se o vídeo JÁ TEM tela final (algum elemento existente).
+    // Sinal forte: o cabeçalho "Elemento: vídeo/link" só aparece quando há elemento; ou um link já presente.
+    // Com soSeExiste=true (varredura) só mexe em quem já tem — PULA os sem tela final (vídeos antigos "só o
+    // vídeo e acaba" e vídeos de marca) pra não enfiar a telinha no lugar errado.
+    await delayHumano(1200, 1800);
+    const jaTemTelaFinal = await temTexto(/elemento:\s*(v[íi]deo|link|video)|melodiaseriffs|lastlink\.com|combo-200-cifras/);
+    if (soSeExiste && !jaTemTelaFinal) { await snap('tf-02b-sem-tela-final-pula'); return { ok: true, pulou: true, jaTinha: false, detalhe: 'vídeo sem tela final — pulado (só corrige quem já tem)', proxyUsado, screenshots }; }
+
     // 2) clicar "Importar do vídeo" -> abre o modal "Escolha um vídeo específico"
     try { const imp = page.locator(selImportar).first(); await imp.waitFor({ state: 'visible', timeout: 8000 }); await imp.click({ timeout: 8000 }); } catch { /* ok */ }
     await delayHumano(1500, 2500);
@@ -941,6 +950,9 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     try { await cardMolde.scrollIntoViewIfNeeded(); } catch { /* ok */ }
     try { await cardMolde.click({ timeout: 8000 }); } catch { /* ok */ }
     await delayHumano(2000, 3000);
+    // [+tela-final só-corrige 09/11] se o vídeo JÁ tinha tela final, o "Importar do vídeo" pode pedir
+    // confirmação de SUBSTITUIR os elementos atuais — confirma (só clica se o botão existir num diálogo).
+    try { const cf = page.locator('tp-yt-paper-dialog, ytcp-dialog, ytcp-confirmation-dialog').locator('ytcp-button:has-text("Importar"), ytcp-button:has-text("Substituir"), ytcp-button:has-text("Confirmar"), ytcp-button:has-text("Import"), ytcp-button:has-text("Replace")').first(); if (await cf.count()) { await cf.click({ timeout: 4000 }).catch(() => { /* ok */ }); await delayHumano(1200, 2000); } } catch { /* ok */ }
     await snap('tf-04-molde-aplicado');
 
     // 4) Salvar (botão "Salvar" habilitado do editor de tela final)
