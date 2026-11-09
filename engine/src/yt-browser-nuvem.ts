@@ -981,11 +981,14 @@ export async function aplicarVideoRelacionadoViaEdit(opts: { projeto: string; vi
   const projeto = String(opts.projeto || '').trim().toLowerCase();
   const videoId = String(opts.videoId || '').trim();
   const ancoraId = String(opts.ancoraId || '').trim();
-  const ancoraTitulo = String(opts.ancoraTitulo || '').trim();
+  let ancoraTitulo = String(opts.ancoraTitulo || '').trim();
   const querSnaps = !!opts.snaps;
   const screenshots: string[] = [];
   if (!projeto || !videoId || !ancoraId) return { ok: false, erro: 'projeto/videoId/ancoraId obrigatórios' };
   if (videoId === ancoraId) return { ok: false, erro: 'videoId == ancoraId (não aponta pra si mesmo)' };
+  // título do âncora via oEmbed PÚBLICO (confiável, sem token) — a grade do seletor filtra por título,
+  // e a âncora é uma live antiga que NÃO está entre os ~50 recentes; sem o título a busca não acha.
+  if (!ancoraTitulo) { try { const oe: any = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://youtu.be/' + ancoraId)); if (oe && oe.ok) { const oj: any = await oe.json(); ancoraTitulo = String((oj && oj.title) || '').trim(); } } catch { /* segue sem título */ } }
   const sess = lerSessao(projeto);
   if (!sess) return { ok: false, erro: 'sem sessão YT na nuvem para ' + projeto };
   let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
