@@ -1108,3 +1108,112 @@ export async function aplicarVideoRelacionadoViaEdit(opts: { projeto: string; vi
     try { if (browser) await browser.close(); } catch { /* ignore */ }
   }
 }
+
+// [+tela-final-link 09/11 Ezequias] Monta a TELA FINAL direto (SEM molde): elemento "Envio mais recente" (último vídeo
+// do canal, auto-atualiza) + elemento LINK com a URL da página do instrumento. Portado do app do PC (youtube-endscreen.ts,
+// montagem manual), por LOCATORS. Assim o link por instrumento fica em config, sem precisar de molde.
+export async function aplicarTelaFinalLinkViaEdit(opts: { projeto: string; videoId: string; linkUrl: string; linkTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; proxyUsado?: string | null; screenshots?: string[] }> {
+  const projeto = String(opts.projeto || '').trim().toLowerCase();
+  const videoId = String(opts.videoId || '').trim();
+  const linkUrl = String(opts.linkUrl || '').trim();
+  const linkTitulo = String(opts.linkTitulo || '').trim();
+  const querSnaps = !!opts.snaps;
+  const screenshots: string[] = [];
+  if (!projeto || !videoId || !linkUrl) return { ok: false, erro: 'projeto/videoId/linkUrl obrigatórios' };
+  const sess = lerSessao(projeto);
+  if (!sess) return { ok: false, erro: 'sem sessão YT na nuvem para ' + projeto };
+  let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
+  try { if (querSnaps) fs.mkdirSync(SNAP_DIR, { recursive: true }); } catch { /* ok */ }
+  async function snap(etapa: string): Promise<void> {
+    if (!querSnaps || !page) return;
+    try { const p = path.join(SNAP_DIR, projeto + '-tfl-' + Date.now() + '-' + etapa + '.png'); await page.screenshot({ path: p, fullPage: false }); screenshots.push(p); } catch { /* ignore */ }
+  }
+  try {
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) return { ok: false, erro: 'nenhum aparelho de casa (proxy residencial) online', screenshots };
+    const launchOpts: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] };
+    if (escolhido) { launchOpts.proxy = escolhido.playwright; proxyUsado = escolhido.node.nome || escolhido.node.host; }
+    const chromium = await carregarChromium();
+    browser = await chromium.launch(launchOpts);
+    ctx = await browser.newContext({ storageState: sess.storageState, userAgent: sess.userAgent || USER_AGENT_DEFAULT, viewport: { width: 1400, height: 900 }, locale: 'pt-BR' });
+    page = await ctx.newPage();
+    try { await page.addInitScript((ua: string) => { try { const nav = (globalThis as unknown as { navigator: object }).navigator; Object.defineProperty(nav, 'userAgent', { get: () => ua }); } catch { /* ignore */ } }, sess.userAgent || USER_AGENT_DEFAULT); } catch { /* best-effort */ }
+    try { await page.goto('https://www.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 }); await delayHumano(1500, 2500); } catch { /* best-effort */ }
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (login do Google)', proxyUsado, screenshots };
+
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delayHumano(3500, 5000);
+    await snap('tfl-01-edit');
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (redirecionou pro login)', proxyUsado, screenshots };
+    try { await page.waitForLoadState('networkidle', { timeout: 20_000 }); } catch { /* ok */ }
+
+    async function temTexto(re: RegExp): Promise<boolean> {
+      return await page.evaluate((src: string) => { const t = ((globalThis as any).document.body?.innerText || ''); return new RegExp(src, 'i').test(t); }, re.source).catch(() => false);
+    }
+
+    // 1) abre o editor de Tela final (card "Tela final")
+    const selCard = 'ytcp-text-dropdown-trigger:has-text("Tela final"), ytcp-text-dropdown-trigger:has-text("Telas finais"), ytcp-text-dropdown-trigger:has-text("End screen")';
+    let cardLoc: any = null;
+    try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 30_000 }); cardLoc = l; } catch { /* trata abaixo */ }
+    if (!cardLoc) { await snap('tfl-02-sem-card'); return { ok: false, erro: 'não achei o card "Tela final"', proxyUsado, screenshots }; }
+    let abriu = false;
+    for (let i = 0; i < 4 && !abriu; i++) {
+      try { await cardLoc.scrollIntoViewIfNeeded(); } catch { /* ok */ }
+      try { await cardLoc.click({ timeout: 8000 }); } catch { /* ok */ }
+      await delayHumano(1800, 2600);
+      try { abriu = await page.locator('text=/\\+?\\s*elemento\\b|add element|importar do v[íi]deo/i').first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
+      if (!abriu) await snap('tfl-02-tentativa-' + (i + 1));
+    }
+    await snap('tfl-02-editor');
+    if (!abriu) return { ok: false, erro: 'o editor de Tela final não abriu', proxyUsado, screenshots };
+
+    // helper: + Elemento -> opção (Vídeo / Link)
+    async function adicionarElemento(rxTipo: RegExp): Promise<boolean> {
+      try { await page.getByText(/\+?\s*(adicionar\s+)?elemento\b|\+?\s*(add\s+)?element\b/i).first().click({ timeout: 8000 }); } catch { return false; }
+      await delayHumano(1200, 2200);
+      try { await page.getByText(rxTipo).first().click({ timeout: 8000 }); await delayHumano(1500, 2500); return true; } catch { return false; }
+    }
+
+    // 2) elemento VÍDEO -> "Envio mais recente" (aponta sempre pro último vídeo do canal; auto-atualiza)
+    const vOk = await adicionarElemento(/^\s*(v[íi]deo|video)\s*$/i);
+    if (vOk) { try { await page.getByText(/envio\s+mais\s+recente|most\s+recent\s+upload|latest\s+upload/i).first().click({ timeout: 8000 }); await delayHumano(1200, 2000); } catch { /* segue */ } }
+    await snap('tfl-03-video');
+
+    // 3) elemento LINK -> URL (página do instrumento) + título
+    const lOk = await adicionarElemento(/^\s*(link)\s*$/i);
+    if (!lOk) { await snap('tfl-03b-sem-link'); return { ok: false, erro: 'não consegui abrir o elemento de Link (+ Elemento -> Link)', proxyUsado, screenshots }; }
+    let urlOk = false;
+    try {
+      const cand = page.locator('input[type="url"], tp-yt-paper-dialog input[type="text"], ytcp-form-input-container input').first();
+      await cand.waitFor({ state: 'visible', timeout: 8000 });
+      await cand.click({ timeout: 5000 });
+      await cand.fill(linkUrl);
+      urlOk = true;
+      await delayHumano(1200, 2000);
+    } catch { /* trata abaixo */ }
+    if (!urlOk) { await snap('tfl-03c-sem-url'); return { ok: false, erro: 'não achei o campo de URL do link', proxyUsado, screenshots }; }
+    if (linkTitulo) {
+      try { const ct = page.getByLabel(/t[íi]tulo|title|texto|text/i).first(); if (await ct.isVisible({ timeout: 4000 })) { await ct.click(); await ct.fill(linkTitulo); await delayHumano(1000, 1800); } } catch { /* opcional */ }
+    }
+    await snap('tfl-04-link');
+
+    // 4) Salvar
+    let salvou = false;
+    try { const s = page.locator('ytcp-button#save-button:not([disabled]), #save-button:not([disabled]), ytcp-button:not([disabled]):has-text("Salvar"), ytcp-button:not([disabled]):has-text("Save")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => { /* ok */ }); salvou = true; } } catch { /* ok */ }
+    if (!salvou) { try { await page.getByRole('button', { name: /^\s*(salvar|save)\s*$/i }).first().click({ timeout: 8000 }); salvou = true; } catch { /* ok */ } }
+    await delayHumano(2500, 4000);
+    await snap('tfl-05-salvo');
+
+    const ok = await temTexto(/salvo|altera[çc][õo]es\s+salvas|saved|changes\s+saved/i);
+    await snap('tfl-06-fim');
+    if (ok) return { ok: true, detalhe: 'tela final montada (Envio mais recente + link ' + linkUrl + ')', proxyUsado, screenshots };
+    return { ok: true, detalhe: 'cliquei em salvar mas não confirmei o toast (revisar pelos snaps)', proxyUsado, screenshots };
+  } catch (e: any) {
+    try { await snap('tfl-erro'); } catch { /* ok */ }
+    return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado, screenshots };
+  } finally {
+    try { if (ctx) await ctx.close(); } catch { /* ignore */ }
+    try { if (browser) await browser.close(); } catch { /* ignore */ }
+  }
+}
