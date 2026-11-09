@@ -970,3 +970,136 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     try { if (browser) await browser.close(); } catch { /* ignore */ }
   }
 }
+
+// [+video-relacionado 09/11 Ezequias] VÍDEO RELACIONADO (o "botãozinho" no rodapé dos SHORTS, equivalente da tela final).
+// Aponta 1 vídeo-ÂNCORA FIXO por instrumento (ex.: baixo -> "Guia completo Baixo Gospel"). YouTube só aceita vídeo
+// relacionado do PRÓPRIO canal. Portado do app do PC (youtube-video-relacionado.ts), por LOCATORS (patchright na nuvem).
+// Fluxo REAL do Studio: abrir /edit do Short -> card "Vídeo relacionado" (card INTEIRO clicável, sem lápis) abre direto
+// o modal "Escolha um vídeo específico" -> buscar pelo TÍTULO -> clicar o card pelo ID na miniatura (i.ytimg.com/vi/<ID>)
+// -> Salvar. NUNCA clica no "1º card" genérico (apontaria pro vídeo errado em silêncio).
+export async function aplicarVideoRelacionadoViaEdit(opts: { projeto: string; videoId: string; ancoraId: string; ancoraTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[] }> {
+  const projeto = String(opts.projeto || '').trim().toLowerCase();
+  const videoId = String(opts.videoId || '').trim();
+  const ancoraId = String(opts.ancoraId || '').trim();
+  const ancoraTitulo = String(opts.ancoraTitulo || '').trim();
+  const querSnaps = !!opts.snaps;
+  const screenshots: string[] = [];
+  if (!projeto || !videoId || !ancoraId) return { ok: false, erro: 'projeto/videoId/ancoraId obrigatórios' };
+  if (videoId === ancoraId) return { ok: false, erro: 'videoId == ancoraId (não aponta pra si mesmo)' };
+  const sess = lerSessao(projeto);
+  if (!sess) return { ok: false, erro: 'sem sessão YT na nuvem para ' + projeto };
+  let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
+  try { if (querSnaps) fs.mkdirSync(SNAP_DIR, { recursive: true }); } catch { /* ok */ }
+  async function snap(etapa: string): Promise<void> {
+    if (!querSnaps || !page) return;
+    try { const p = path.join(SNAP_DIR, projeto + '-vr-' + Date.now() + '-' + etapa + '.png'); await page.screenshot({ path: p, fullPage: false }); screenshots.push(p); } catch { /* ignore */ }
+  }
+  try {
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) return { ok: false, erro: 'nenhum aparelho de casa (proxy residencial) online', screenshots };
+    const launchOpts: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] };
+    if (escolhido) { launchOpts.proxy = escolhido.playwright; proxyUsado = escolhido.node.nome || escolhido.node.host; }
+    const chromium = await carregarChromium();
+    browser = await chromium.launch(launchOpts);
+    ctx = await browser.newContext({ storageState: sess.storageState, userAgent: sess.userAgent || USER_AGENT_DEFAULT, viewport: { width: 1400, height: 900 }, locale: 'pt-BR' });
+    page = await ctx.newPage();
+    try { await page.addInitScript((ua: string) => { try { const nav = (globalThis as unknown as { navigator: object }).navigator; Object.defineProperty(nav, 'userAgent', { get: () => ua }); } catch { /* ignore */ } }, sess.userAgent || USER_AGENT_DEFAULT); } catch { /* best-effort */ }
+
+    // WARMUP: passa pelo youtube.com p/ o Google re-emitir o token rotativo (evita "sessão expirou" após ~1h parada)
+    try { await page.goto('https://www.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 }); await delayHumano(1500, 2500); } catch { /* best-effort */ }
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (login do Google)', proxyUsado, screenshots };
+
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delayHumano(3500, 5000);
+    await snap('vr-01-edit');
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessão YT expirou (redirecionou pro login do Google)', proxyUsado, screenshots };
+    try { await page.waitForLoadState('networkidle', { timeout: 20_000 }); } catch { /* ok */ }
+
+    async function temTexto(re: RegExp): Promise<boolean> {
+      return await page.evaluate((src: string) => { const t = ((globalThis as any).document.body?.innerText || ''); return new RegExp(src, 'i').test(t); }, re.source).catch(() => false);
+    }
+    const RX_VR = /v[íi]deo relacionado|related video/i;
+    const selModal = '[role="dialog"], tp-yt-paper-dialog, ytcp-dialog';
+
+    // 1) ESPERA o card "Vídeo relacionado" aparecer (só nasce quando o Short fica pronto; se não vier, ainda processando)
+    let cardVR: any = null;
+    for (let i = 0; i < 6 && !cardVR; i++) {
+      const l = page.getByText(RX_VR).first();
+      try { await l.waitFor({ state: 'visible', timeout: 10_000 }); cardVR = l; break; } catch { /* espera + retenta: pode estar processando */ }
+      await delayHumano(3000, 4500);
+    }
+    if (!cardVR) { await snap('vr-02-sem-card'); return { ok: false, erro: 'card "Vídeo relacionado" não apareceu (Short ainda processando ou não é Short?)', proxyUsado, screenshots }; }
+
+    // 2) clica o card INTEIRO (sem lápis) -> abre direto o modal "Escolha um vídeo específico". 3 tentativas.
+    let abriu = false;
+    for (let i = 0; i < 3 && !abriu; i++) {
+      try { await cardVR.scrollIntoViewIfNeeded(); } catch { /* ok */ }
+      try { await cardVR.click({ timeout: 6000 }); } catch {
+        try { await cardVR.locator('xpath=ancestor::*[self::ytcp-form-input-container or self::div][1]').first().click({ timeout: 5000 }); } catch { /* ok */ }
+      }
+      await delayHumano(1800, 2800);
+      try { abriu = await page.locator(selModal + ', ytcp-entity-card[role="option"], input[placeholder*="Pesquise nos seus" i]').first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
+      if (!abriu) await snap('vr-02-tentativa-abrir-' + (i + 1));
+    }
+    await snap('vr-02-modal');
+    if (!abriu) return { ok: false, erro: 'cliquei no card Vídeo relacionado mas o seletor não abriu', proxyUsado, screenshots };
+
+    // escopo = o modal (evita clicar na busca GLOBAL do Studio, que fecharia o modal)
+    const modal = page.locator(selModal).filter({ hasText: /escolha um v[íi]deo|choose a video|selecione um v[íi]deo|select a video/i }).first();
+    const temModal = await modal.isVisible({ timeout: 2000 }).catch(() => false);
+    const escopo = temModal ? modal : page;
+
+    // 3) busca pelo TÍTULO do âncora (clica o campo e digita; o picker filtra por título)
+    if (ancoraTitulo) {
+      try {
+        const campo = escopo.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first();
+        await campo.waitFor({ state: 'visible', timeout: 8000 });
+        await campo.click({ timeout: 5000 }).catch(() => { /* ok */ });
+        await campo.fill(ancoraTitulo.slice(0, 40)).catch(async () => { await page.keyboard.type(ancoraTitulo.slice(0, 40), { delay: 40 }).catch(() => { /* ok */ }); });
+        await delayHumano(600, 1000);
+        await page.keyboard.press('Enter').catch(() => { /* ok */ });
+      } catch { /* ok */ }
+      await delayHumano(3000, 4200);
+      await snap('vr-03-busca');
+    }
+
+    // 4) clica o card do ÂNCORA pelo ID na miniatura (i.ytimg.com/vi/<ID>). SEM fallback genérico (não aponta errado).
+    let escolheu = false;
+    const alvos = [
+      () => escopo.locator('xpath=.//*[contains(@style,"' + ancoraId + '")]/ancestor::ytcp-entity-card[1]').first(),
+      () => escopo.locator('xpath=.//*[contains(@style,"' + ancoraId + '")]/ancestor::*[@role="option"][1]').first(),
+      () => escopo.locator('[href*="' + ancoraId + '"]').first(),
+      () => escopo.locator('[video-id="' + ancoraId + '"]').first()
+    ];
+    for (const criar of alvos) {
+      try { const el = criar(); await el.waitFor({ state: 'visible', timeout: 4000 }); await el.scrollIntoViewIfNeeded().catch(() => { /* ok */ }); await el.click({ timeout: 4000 }); escolheu = true; break; } catch { /* tenta próximo */ }
+    }
+    if (!escolheu) { await snap('vr-04-ancora-nao-achada'); return { ok: false, erro: 'não achei o vídeo-âncora ' + ancoraId + ' no seletor (âncora é de OUTRO canal? busca: "' + ancoraTitulo + '")', proxyUsado, screenshots }; }
+    await delayHumano(1200, 2000);
+    // confirma o seletor se tiver botão (nem sempre tem)
+    try { await escopo.getByRole('button', { name: /^\s*(conclu[íi]do|ok|selecionar|select|done|confirmar|confirm)\s*$/i }).first().click({ timeout: 5000 }); } catch { /* sem botão: a escolha já valeu */ }
+    await delayHumano(1000, 1800);
+    await snap('vr-04-escolhido');
+
+    // 5) Salvar
+    let salvou = false;
+    try { const s = page.locator('ytcp-button#save-button:not([disabled]), #save-button:not([disabled]), ytcp-button:not([disabled]):has-text("Salvar"), ytcp-button:not([disabled]):has-text("Guardar"), ytcp-button:not([disabled]):has-text("Save")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => { /* ok */ }); salvou = true; } } catch { /* ok */ }
+    if (!salvou) { try { await page.getByRole('button', { name: /^\s*(salvar|guardar|save)\s*$/i }).first().click({ timeout: 8000 }); salvou = true; } catch { /* ok */ } }
+    await delayHumano(2500, 4000);
+    await snap('vr-05-salvo');
+
+    // 6) conferir: toast "alterações salvas" OU a linha Vídeo relacionado não mostra mais "Nenhum"
+    let ok = await temTexto(/salvo|guardad|altera[çc][õo]es\s+(salvas|guardadas)|saved|changes\s+saved/i);
+    if (!ok) { await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => { /* ok */ }); await delayHumano(3000, 4500); ok = !(await temTexto(/v[íi]deo relacionado[\s\S]{0,40}\b(nenhum|nada|none)\b/i)); }
+    await snap('vr-06-conferencia');
+    if (ok) return { ok: true, detalhe: 'vídeo relacionado aplicado (âncora ' + ancoraId + ')', proxyUsado, screenshots };
+    return { ok: true, detalhe: 'cliquei em salvar, mas não confirmei (revisar pelos snaps)', proxyUsado, screenshots };
+  } catch (e: any) {
+    try { await snap('vr-erro'); } catch { /* ok */ }
+    return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado, screenshots };
+  } finally {
+    try { if (ctx) await ctx.close(); } catch { /* ignore */ }
+    try { if (browser) await browser.close(); } catch { /* ignore */ }
+  }
+}
