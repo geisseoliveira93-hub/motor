@@ -1183,20 +1183,28 @@ export async function aplicarTelaFinalLinkViaEdit(opts: { projeto: string; video
     // 3) elemento LINK -> URL (página do instrumento) + título
     const lOk = await adicionarElemento(/^\s*(link)\s*$/i);
     if (!lOk) { await snap('tfl-03b-sem-link'); return { ok: false, erro: 'não consegui abrir o elemento de Link (+ Elemento -> Link)', proxyUsado, screenshots }; }
+    // modal "Adicionar um link": campo com placeholder "Cole ou digite um link"
     let urlOk = false;
     try {
-      const cand = page.locator('input[type="url"], tp-yt-paper-dialog input[type="text"], ytcp-form-input-container input').first();
-      await cand.waitFor({ state: 'visible', timeout: 8000 });
-      await cand.click({ timeout: 5000 });
-      await cand.fill(linkUrl);
+      const campo = page.getByPlaceholder(/cole ou digite|paste or type|url|link/i).first();
+      await campo.waitFor({ state: 'visible', timeout: 8000 });
+      await campo.click({ timeout: 5000 });
+      await campo.fill(linkUrl);
+      await delayHumano(1000, 1800);
       urlOk = true;
-      await delayHumano(1200, 2000);
-    } catch { /* trata abaixo */ }
+    } catch { /* fallback abaixo */ }
+    if (!urlOk) { try { const c2 = page.locator('[role="dialog"] input, tp-yt-paper-dialog input, input[type="url"], input[type="text"]').first(); await c2.waitFor({ state: 'visible', timeout: 5000 }); await c2.click({ timeout: 4000 }); await c2.fill(linkUrl); await delayHumano(1000, 1800); urlOk = true; } catch { /* ok */ } }
     if (!urlOk) { await snap('tfl-03c-sem-url'); return { ok: false, erro: 'não achei o campo de URL do link', proxyUsado, screenshots }; }
-    if (linkTitulo) {
-      try { const ct = page.getByLabel(/t[íi]tulo|title|texto|text/i).first(); if (await ct.isVisible({ timeout: 4000 })) { await ct.click(); await ct.fill(linkTitulo); await delayHumano(1000, 1800); } } catch { /* opcional */ }
-    }
+    // confirma o link (botão "Usar"/"Adicionar" habilita depois de digitar a URL); se não achar, Enter
+    let usou = false;
+    try { const bu = page.getByRole('button', { name: /^\s*(usar|use|adicionar|add|conclu[íi]do|done|ok)\s*$/i }).first(); await bu.click({ timeout: 6000 }); usou = true; } catch { /* tenta Enter */ }
+    if (!usou) { try { await page.keyboard.press('Enter'); } catch { /* ok */ } }
+    await delayHumano(1500, 2500);
     await snap('tfl-04-link');
+    // título do link (se o Studio abrir um campo de título depois)
+    if (linkTitulo) {
+      try { const ct = page.getByLabel(/t[íi]tulo|title|texto|text/i).first(); if (await ct.isVisible({ timeout: 3000 })) { await ct.click(); await ct.fill(linkTitulo); await delayHumano(1000, 1800); } } catch { /* opcional */ }
+    }
 
     // 4) Salvar
     let salvou = false;
