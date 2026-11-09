@@ -9036,8 +9036,11 @@ async function _tfEnumerarCanal(projeto: string, maxPaginas = 20): Promise<{ ok:
   let token = ''; try { token = await pbYtToken(projeto); } catch (e: any) { return { ok: false, achados: 0, novos: 0, erro: String(e?.message || e) }; }
   const H = { Authorization: 'Bearer ' + token };
   let uploads = '';
-  try { const r: any = await fetch('https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true', { headers: H }); const j: any = await r.json(); uploads = j?.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || ''; } catch { /* ok */ }
-  if (!uploads) return { ok: false, achados: 0, novos: 0, erro: 'não achei a playlist de uploads do canal' };
+  // [+fix 09/11] deriva a playlist de uploads a partir do vídeo-MOLDE (videos?part=snippet dá o channelId; uploads = "UU"+resto).
+  // Usa o endpoint 'videos' (que o token de upload já acessa) e evita channels?mine=true (que precisa de escopo de leitura).
+  try { const mv: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet&id=' + encodeURIComponent(AC_TF_MOLDE[projeto]), { headers: H }); const mj: any = await mv.json(); const ch = String(mj?.items?.[0]?.snippet?.channelId || ''); if (/^UC/.test(ch)) uploads = 'UU' + ch.slice(2); } catch { /* ok */ }
+  if (!uploads) { try { const r: any = await fetch('https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true', { headers: H }); const j: any = await r.json(); uploads = j?.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || ''; } catch { /* ok */ } }
+  if (!uploads) return { ok: false, achados: 0, novos: 0, erro: 'não achei a playlist de uploads do canal (molde sem channelId?)' };
   let achados = 0; let novos = 0; let pageToken = '';
   for (let pg = 0; pg < maxPaginas; pg++) {
     let ids: string[] = [];
