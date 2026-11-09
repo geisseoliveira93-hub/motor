@@ -9018,6 +9018,66 @@ app.post('/pub/youtube/video-relacionado', (req: any, res: any) => {
 });
 app.get('/pub/youtube/video-relacionado/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _vrRodando, resultado: _vrResultado }));
 
+// [+video-relacionado-varredura 09/11] Aplica o botãozinho nos SHORTS publicados pela NUVEM que ainda não têm.
+// Cobre os DOIS: os NOVOS (o cron pega logo após publicar -> sai "sozinho") e o ATRASO desde o cutover.
+// 1 Short por vez (navegador pesado). NÃO toca no caminho de publicação (zero risco pra postagem).
+try { db.prepare(`CREATE TABLE IF NOT EXISTS vr_log (video_id TEXT PRIMARY KEY, projeto TEXT, ancora TEXT, status TEXT, erro TEXT, tentativas INTEGER DEFAULT 0, quando TEXT)`).run(); } catch { /* ok */ }
+function _vrRegistrar(videoId: string, projeto: string, ancora: string, status: string, erro?: string): void {
+  try {
+    const prev = db.prepare(`SELECT tentativas FROM vr_log WHERE video_id=?`).get(videoId) as any;
+    const tent = (prev ? (Number(prev.tentativas) || 0) : 0) + (status === 'falha' ? 1 : 0);
+    db.prepare(`INSERT INTO vr_log (video_id,projeto,ancora,status,erro,tentativas,quando) VALUES (?,?,?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET projeto=excluded.projeto, ancora=excluded.ancora, status=excluded.status, erro=excluded.erro, tentativas=excluded.tentativas, quando=excluded.quando`)
+      .run(videoId, projeto, ancora, status, (erro || '').slice(0, 200), tent, agora());
+  } catch { /* ok */ }
+}
+function _vrPular(videoId: string): boolean { try { const r = db.prepare(`SELECT status, tentativas FROM vr_log WHERE video_id=?`).get(videoId) as any; if (!r) return false; if (r.status === 'ok' || r.status === 'pulado') return true; return (Number(r.tentativas) || 0) >= 4; } catch { return false; } }
+function _vrInstrumentoDoTitulo(txt: string): string { const t = String(txt || '').toLowerCase(); if (/\bcontrabaix|baixist|\bbaixo\b/.test(t)) return 'baixo'; if (/viol[ãa]o|violonist/.test(t)) return 'violao'; if (/teclad|tecladist|\bpiano\b/.test(t)) return 'teclado'; return ''; }
+function _vrAncoraDe(projeto: string, titulo: string): string { if (projeto === 'comunidade') { return AC_VR_ANCORA_COMUNIDADE[_vrInstrumentoDoTitulo(titulo)] || ''; } return AC_VR_ANCORA[projeto] || ''; }
+// Shorts publicados pela nuvem (vertical/reels), com OK no YouTube, ainda sem o botãozinho
+function _vrPendentes(limite: number): any[] {
+  let rows: any[] = [];
+  try { rows = db.prepare(`SELECT canal_id, projeto, titulo, video_ids_externos_json, resultado_por_plataforma_json FROM fila_publicacao WHERE status IN ('publicado','parcial') AND (formato='vertical' OR formato='reels') ORDER BY atualizado_em DESC LIMIT 500`).all() as any[]; } catch { rows = []; }
+  const out: any[] = [];
+  for (const row of rows) {
+    let vids: any = {}; try { vids = JSON.parse(row.video_ids_externos_json || '{}'); } catch { vids = {}; }
+    const vid = String(vids.youtube || '').trim();
+    if (!vid) continue;
+    let res: any = {}; try { res = JSON.parse(row.resultado_por_plataforma_json || '{}'); } catch { res = {}; }
+    if (!/^OK:/i.test(String(res.youtube || ''))) continue;
+    if (_vrPular(vid)) continue;
+    const projeto = String(row.projeto || row.canal_id || '').trim().toLowerCase();
+    const ancora = _vrAncoraDe(projeto, row.titulo || '');
+    if (!ancora) { _vrRegistrar(vid, projeto, '', 'pulado', 'sem ancora (comunidade: instrumento nao achado no titulo)'); continue; }
+    out.push({ vid, projeto, titulo: row.titulo || '', ancora });
+    if (out.length >= limite) break;
+  }
+  return out;
+}
+let _vrVarrendo = false; let _vrVarreduraStatus: any = null;
+async function _vrRodarVarredura(limite: number): Promise<void> {
+  if (_vrVarrendo) return; _vrVarrendo = true;
+  const pend = _vrPendentes(limite);
+  _vrVarreduraStatus = { inicio: agora(), total: pend.length, feitos: 0, ok: 0, falhas: 0, rodando: true };
+  try {
+    const mod: any = await import('./yt-browser-nuvem');
+    for (const it of pend) {
+      try {
+        const r = await mod.aplicarVideoRelacionadoViaEdit({ projeto: it.projeto, videoId: it.vid, ancoraId: it.ancora, snaps: false });
+        _vrRegistrar(it.vid, it.projeto, it.ancora, r && r.ok ? 'ok' : 'falha', r && r.erro);
+        if (r && r.ok) _vrVarreduraStatus.ok++; else _vrVarreduraStatus.falhas++;
+      } catch (e: any) { _vrRegistrar(it.vid, it.projeto, it.ancora, 'falha', String(e?.message || e)); _vrVarreduraStatus.falhas++; }
+      _vrVarreduraStatus.feitos++;
+    }
+  } catch (e: any) { _vrVarreduraStatus.erro = String(e?.message || e); }
+  finally { _vrVarreduraStatus.rodando = false; _vrVarreduraStatus.fim = agora(); _vrVarrendo = false; }
+}
+// cron ~10min: se ligado (pub_vr_auto, padrão 1), aplica um lote pequeno. Os Shorts novos saem sozinhos; o atraso vai escoando.
+setInterval(() => { try { if (pubFlag('pub_vr_auto', '1') !== '1') return; if (_vrVarrendo || _vrRodando) return; const lote = Number(pubFlag('pub_vr_lote', '3')) || 3; _vrRodarVarredura(lote).catch(() => { /* ok */ }); } catch { /* ok */ } }, 10 * 60 * 1000);
+app.post('/pub/youtube/video-relacionado/varrer', (req: any, res: any) => { const lim = Number((req.body || {}).limite) || 20; if (_vrVarrendo) return res.json({ ok: false, erro: 'varredura ja rodando', status: _vrVarreduraStatus }); _vrRodarVarredura(lim).catch(() => { /* ok */ }); res.json({ ok: true, iniciado: true, limite: lim, pendentes_estimados: _vrPendentes(999).length }); });
+app.get('/pub/youtube/video-relacionado/varrer/status', (_req: any, res: any) => { let feitos = 0; let okc = 0; try { const a = db.prepare(`SELECT status, COUNT(*) c FROM vr_log GROUP BY status`).all() as any[]; for (const x of a) { feitos += Number(x.c) || 0; if (x.status === 'ok') okc = Number(x.c) || 0; } } catch { /* ok */ } res.json({ ok: true, rodando: _vrVarrendo, ultima: _vrVarreduraStatus, pendentes_agora: _vrPendentes(999).length, total_log: feitos, ja_ok: okc }); });
+app.get('/pub/youtube/video-relacionado/config', (_req: any, res: any) => res.json({ ok: true, auto: pubFlag('pub_vr_auto', '1') === '1', lote: Number(pubFlag('pub_vr_lote', '3')) || 3 }));
+app.post('/pub/youtube/video-relacionado/config', (req: any, res: any) => { const b = req.body || {}; if (b.auto != null) setPubFlag('pub_vr_auto', b.auto ? '1' : '0'); if (b.lote != null) setPubFlag('pub_vr_lote', String(Number(b.lote) || 3)); res.json({ ok: true, auto: pubFlag('pub_vr_auto', '1') === '1', lote: Number(pubFlag('pub_vr_lote', '3')) || 3 }); });
+
 // ============================ UPLOADER — INSTAGRAM ============================
 async function pbIgPoll(igToken: string, containerId: string, maxIter = 60): Promise<void> {
   let erros = 0;
