@@ -885,173 +885,80 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
       return await page.evaluate((src: string) => { const t = ((globalThis as any).document.body?.innerText || ''); return new RegExp(src, 'i').test(t); }, re.source).catch(() => false);
     }
 
-    // 1) abrir o editor de TELA FINAL.
-    //    A página de Detalhes demora a renderizar (fica em branco ~5s). O gatilho NÃO é o texto "Tela final"
-    //    e sim o BOTÃO (lápis) do card — então: ESPERAMOS o card carregar e clicamos no lápis por coordenada real.
-    async function acharCardTelaFinal(): Promise<{ bx: number; by: number; via: string } | null> {
-      return await page.evaluate(() => {
-        const all: any[] = [];
-        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
-        walk((globalThis as any).document);
-        const RXsolto = /tela final|telas finais|end screen/i;
-        const ehClicavel = (el: any) => { const t = (el.tagName || '').toLowerCase(); const role = (el.getAttribute && el.getAttribute('role')) || ''; return t === 'button' || t === 'a' || t === 'ytcp-button' || t.indexOf('icon-button') >= 0 || role === 'button' || role === 'link'; };
-        // ESTRATÉGIA 1: elemento CLICÁVEL cujo aria-label/title casa "tela final" (o lápis costuma ter esse rótulo)
-        for (const el of all) {
-          const al = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || '')) || '';
-          if (RXsolto.test(al) && ehClicavel(el)) { const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (r && r.width > 8 && r.height > 8 && r.top > 120) return { bx: r.left + r.width / 2, by: r.top + r.height / 2, via: 'aria' }; }
-        }
-        // ESTRATÉGIA 2: acha o RÓTULO "Tela final" (match solto, em elemento pequeno) e pega o botão à direita na mesma linha
-        let titulo: any = null; let rt: any = null;
-        for (const el of all) {
-          let tx = ''; try { tx = (el.textContent || '').trim(); } catch { tx = ''; }
-          if (!tx || tx.length > 24) continue; // pequeno = só o rótulo, não um container grande
-          if (!RXsolto.test(tx)) continue;
-          const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-          if (r && r.width > 8 && r.height > 6 && r.top > 250) { titulo = el; rt = r; break; }
-        }
-        if (titulo && rt) {
-          const yC = rt.top + rt.height / 2;
-          let melhor: any = null; let melhorX = -1;
-          for (const el of all) {
-            if (!ehClicavel(el)) continue;
-            const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-            if (!r || r.width < 8 || r.height < 8) continue;
-            const yb = r.top + r.height / 2;
-            if (Math.abs(yb - yC) <= 34 && r.left >= rt.left - 10 && r.left > melhorX) { melhorX = r.left; melhor = r; }
-          }
-          if (melhor) return { bx: melhor.left + melhor.width / 2, by: melhor.top + melhor.height / 2, via: 'linha-botao' };
-          return { bx: rt.left + Math.min(rt.width / 2, 60), by: yC, via: 'titulo' };
-        }
-        return null;
-      }).catch(() => null);
-    }
-    // dump de diagnóstico da coluna direita (só usado se a abertura falhar)
-    async function dumpColunaDireita(): Promise<any> {
-      return await page.evaluate(() => {
-        const all: any[] = [];
-        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
-        walk((globalThis as any).document);
-        const out: any[] = [];
-        for (const el of all) {
-          const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-          if (!r || r.left < 900 || r.top < 300 || r.top > 880 || r.width < 20 || r.height < 12) continue;
-          const tag = (el.tagName || '').toLowerCase();
-          const al = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || '')) || '';
-          let tx = ''; try { tx = (el.textContent || '').trim().slice(0, 30); } catch { tx = ''; }
-          if (!tx && !al) continue;
-          out.push({ tag, tx, al: String(al).slice(0, 30), top: Math.round(r.top), x: Math.round(r.left) });
-          if (out.length >= 40) break;
-        }
-        return out;
-      }).catch(() => null);
-    }
+    // ======== FLUXO POR LOCATORS ========
+    // IMPORTANTE: no navegador stealth da nuvem (patchright), page.evaluate com varredura pesada de
+    // shadow DOM falha/estoura em silêncio. Então usamos LOCATORS do Playwright (que funcionam lá,
+    // igual a automação de CAPA). Seletores confirmados ao vivo no Studio (09/11):
+    //   - card "Tela final":   ytcp-text-dropdown-trigger com texto "Tela final" (role=button; a linha toda abre)
+    //   - botão importar:      texto "Importar do vídeo"
+    //   - busca da grade:      input[placeholder="Pesquise nos seus vídeos"]
+    //   - cards da grade:      ytcp-entity-card[role="option"]  (dentro de tp-yt-paper-dialog "Escolha um vídeo específico")
+    //   - salvar do editor:    ytcp-button#save-button / "Salvar" habilitado
+    const selCard = 'ytcp-text-dropdown-trigger:has-text("Tela final"), ytcp-text-dropdown-trigger:has-text("Telas finais"), ytcp-text-dropdown-trigger:has-text("End screen")';
+    const selImportar = 'text=/importar do v[íi]deo|import from video/i';
 
-    let abriu = false; let viaAbriu = '';
-    for (let i = 0; i < 7 && !abriu; i++) {
-      const alvo = await acharCardTelaFinal();
-      if (alvo) {
-        viaAbriu = alvo.via;
-        try { await page.mouse.click(alvo.bx, alvo.by); } catch { /* ok */ }
-        await delayHumano(1800, 2600);
-        abriu = await temTexto(/importar do v[íi]deo|import from video|\+\s*elemento|\+\s*element/);
-      } else {
-        // card ainda não renderizou (página de detalhes lenta): espera mais e tenta de novo
-        await delayHumano(2500, 3500);
-      }
+    // 1) ESPERA o card "Tela final" aparecer (a página de Detalhes demora ~5s) e clica nele
+    let cardLoc: any = null;
+    try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 30_000 }); cardLoc = l; } catch { /* trata abaixo */ }
+    if (!cardLoc) { await snap('tf-02-sem-card'); return { ok: false, erro: 'não achei o card "Tela final" na página de detalhes (UI mudou ou vídeo inexistente)', proxyUsado, screenshots }; }
+    let abriu = false;
+    for (let i = 0; i < 4 && !abriu; i++) {
+      try { await cardLoc.scrollIntoViewIfNeeded(); } catch { /* ok */ }
+      try { await cardLoc.click({ timeout: 8000 }); } catch { /* ok */ }
+      await delayHumano(1800, 2600);
+      // editor abriu = botão "Importar do vídeo" visível (só existe no editor de tela final)
+      try { abriu = await page.locator(selImportar).first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
       if (!abriu) await snap('tf-02-tentativa-abrir-' + (i + 1));
     }
     await snap('tf-02-editor-tela-final');
-    if (!abriu) { const dbgCard = await dumpColunaDireita(); return { ok: false, erro: 'não consegui abrir o editor de Tela final (card não respondeu após esperar a página carregar)', detalhe: 'via=' + (viaAbriu || 'card-nao-apareceu'), debug: dbgCard, proxyUsado, screenshots }; }
+    if (!abriu) return { ok: false, erro: 'cliquei no card Tela final mas o editor não abriu (sem botão Importar do vídeo)', proxyUsado, screenshots };
 
-    // se o vídeo JÁ tem elementos, o "Importar do vídeo" some -> considera que já tinha tela final
-    const temImportar = await temTexto(/importar do v[íi]deo|import from video/);
-    if (!temImportar) { await snap('tf-02b-ja-tinha'); return { ok: true, jaTinha: true, detalhe: 'vídeo já tinha tela final (sem botão Importar)', proxyUsado, screenshots }; }
-
-    // 2) clicar "Importar do vídeo" (precisa de 2 cliques — o 1º é absorvido)
-    await clicarTexto(['Importar do vídeo', 'Import from video']);
-    await delayHumano(900, 1500);
-    await clicarTexto(['Importar do vídeo', 'Import from video']);
-    await delayHumano(2000, 3000);
+    // 2) clicar "Importar do vídeo" -> abre o modal "Escolha um vídeo específico"
+    try { const imp = page.locator(selImportar).first(); await imp.waitFor({ state: 'visible', timeout: 8000 }); await imp.click({ timeout: 8000 }); } catch { /* ok */ }
+    await delayHumano(1500, 2500);
+    try { await page.locator('ytcp-entity-card[role="option"], input[placeholder*="Pesquise nos seus" i]').first().waitFor({ state: 'visible', timeout: 12_000 }); } catch { /* ok */ }
     await snap('tf-03-grade-videos');
 
-    // 3) na grade tem a caixa "Pesquise nos seus vídeos": busca o MOLDE pelo título e clica no 1º resultado (robusto; a grade é grande/lazy)
+    // 3) buscar o MOLDE pelo título no campo do modal (a grade filtra) e clicar no 1º card
     const termo = (moldeTitulo || '').trim().slice(0, 40);
     if (termo) {
-      // 1) clica o campo de busca DO MODAL por COORDENADA (viewport 1400x900: fica ~y=100, abaixo do título) e digita no teclado real
-      try { await page.mouse.click(700, 100); await delayHumano(300, 600); await page.keyboard.type(termo, { delay: 40 }); } catch { /* reforço abaixo */ }
-      // 2) reforço: varre inclusive SHADOW DOM (Studio é Polymer) e seta value pelo native setter no input visível do modal (y 55-240)
-      const achou = await page.evaluate((t: string) => {
-        const inputs: any[] = [];
-        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { const tag = (el.tagName || '').toLowerCase(); if (tag === 'input' || tag === 'textarea') inputs.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
-        walk((globalThis as any).document);
-        const cand = inputs.map((e: any) => { const r = e.getBoundingClientRect ? e.getBoundingClientRect() : { width: 0, height: 0, top: -1 }; return { e, r }; })
-          .filter((o: any) => o.r.width > 150 && o.r.height > 10 && o.r.top > 55 && o.r.top < 240)
-          .sort((a: any, b: any) => a.r.top - b.r.top);
-        const inp: any = cand.length ? cand[0].e : null;
-        if (!inp) return false;
-        try { inp.focus(); } catch { /* ok */ }
-        try { const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set; set.call(inp, t); } catch { inp.value = t; }
-        inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }, termo).catch(() => false);
-      await delayHumano(800, 1200);
-      try { await page.keyboard.press('Enter'); } catch { /* ok */ }
-      await delayHumano(3000, 4200); // espera a grade filtrar
-      await snap('tf-03a-busca-' + (achou ? 'ok' : 'naoachou'));
+      try {
+        const busca = page.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first();
+        await busca.waitFor({ state: 'visible', timeout: 8000 });
+        await busca.click({ timeout: 5000 }).catch(() => { /* ok */ });
+        await busca.fill(termo).catch(async () => { await page.keyboard.type(termo, { delay: 40 }).catch(() => { /* ok */ }); });
+        await delayHumano(600, 1000);
+        await page.keyboard.press('Enter').catch(() => { /* ok */ });
+      } catch { /* ok */ }
+      await delayHumano(3000, 4200);
+      await snap('tf-03a-busca');
     }
-    // clica no card do MOLDE: 1º tenta pelo moldeId na thumb; senão (após a busca) o 1º card de vídeo da grade. Clique REAL por mouse no título.
-    const boxTitulo = await page.evaluate((mid: string) => {
-      // varre inclusive SHADOW DOM (os cards da grade ficam dentro de web components)
-      const all: any[] = [];
-      const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
-      walk((globalThis as any).document);
-      function subirAteCard(el: any) { let card = el; for (let up = 0; up < 7 && card; up++) { const r = card.getBoundingClientRect ? card.getBoundingClientRect() : null; if (r && r.width > 120 && r.height > 80) return card; card = card.parentElement || (card.getRootNode && card.getRootNode().host) || null; } return el; }
-      function boxDoTitulo(card: any) {
-        let titulo: any = null; let maxLen = 0;
-        let desc: any[] = []; try { desc = Array.from(card.querySelectorAll('*')); } catch { desc = []; }
-        for (const c of desc) { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8 && r.top > 120) { maxLen = tx.length; titulo = c; } } }
-        const alvo = titulo || card; const r = alvo.getBoundingClientRect ? alvo.getBoundingClientRect() : null;
-        return (r && r.width > 20 && r.height > 8) ? { x: r.x + Math.min(r.width / 2, 80), y: r.y + r.height / 2, txt: (alvo.innerText || '').slice(0, 60) } : null;
-      }
-      // 1) pelo moldeId na thumbnail/href/bg
-      for (const el of all) {
-        let attr = ''; try { attr = ((el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || el.getAttribute('thumbnail') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || ''); } catch { attr = ''; }
-        if (attr.indexOf(mid) >= 0) { const b = boxDoTitulo(subirAteCard(el)); if (b) return b; }
-      }
-      // 2) fallback: 1º card de vídeo da grade (miniatura i.ytimg.com/vi/), abaixo da busca (top>120) — após o filtro é o molde
-      for (const el of all) {
-        let src = ''; try { src = ((el.getAttribute && (el.getAttribute('src') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || ''); } catch { src = ''; }
-        if (/i\.ytimg\.com\/vi\//.test(src)) { const r0 = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (r0 && r0.top > 120) { const b = boxDoTitulo(subirAteCard(el)); if (b) return b; } }
-      }
-      return null;
-    }, moldeId).catch(() => null);
-    if (!boxTitulo) {
-      const dbg = await page.evaluate(() => {
-        const all: any[] = []; const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
-        walk((globalThis as any).document);
-        const out: any[] = [];
-        for (const el of all) { const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (!r || r.top < 110 || r.top > 480 || r.width < 40 || r.height < 18) continue; const tag = (el.tagName || '').toLowerCase(); const src = (el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || '')) || ''; let bg = ''; try { bg = (el.style && el.style.backgroundImage) || ''; } catch { bg = ''; } const tx = (el.innerText || '').trim().slice(0, 30); if (tag === 'img' || src || bg || tx) out.push({ tag, src: String(src).slice(0, 100), bg: String(bg).slice(0, 80), top: Math.round(r.top), x: Math.round(r.left + r.width / 2), w: Math.round(r.width), tx }); if (out.length >= 20) break; }
-        return out;
-      }).catch(() => []);
-      await snap('tf-03b-molde-nao-achado');
-      return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', debug: dbg, proxyUsado, screenshots };
-    }
-    await page.mouse.click(boxTitulo.x, boxTitulo.y);
+    // card do molde: 1º pelo título; senão o 1º card da grade (após o filtro é o molde)
+    let cardMolde: any = null;
+    if (termo) { try { const c = page.locator('ytcp-entity-card[role="option"]', { hasText: termo.slice(0, 22) }).first(); if (await c.count()) cardMolde = c; } catch { /* ok */ } }
+    if (!cardMolde) { try { const c = page.locator('ytcp-entity-card[role="option"]').first(); if (await c.count()) cardMolde = c; } catch { /* ok */ } }
+    if (!cardMolde) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', proxyUsado, screenshots }; }
+    try { await cardMolde.scrollIntoViewIfNeeded(); } catch { /* ok */ }
+    try { await cardMolde.click({ timeout: 8000 }); } catch { /* ok */ }
     await delayHumano(2000, 3000);
     await snap('tf-04-molde-aplicado');
 
-    // 4) Salvar (topo do modal). tenta botão #save-button / texto "Salvar"
+    // 4) Salvar (botão "Salvar" habilitado do editor de tela final)
     let salvou = false;
-    try { const s = page.locator('#save-button, ytcp-button#save-button, tp-yt-paper-button:has-text("Salvar"), ytcp-button:has-text("Salvar")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => {}); salvou = true; } } catch { /* */ }
+    try { const s = page.locator('ytcp-button#save-button:not([disabled]), #save-button:not([disabled]), ytcp-button:not([disabled]):has-text("Salvar"), ytcp-button:not([disabled]):has-text("Save")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => { /* ok */ }); salvou = true; } } catch { /* ok */ }
     if (!salvou) salvou = await clicarTexto(['Salvar', 'Save']);
     await delayHumano(2500, 4000);
     await snap('tf-05-salvo');
 
-    // 5) conferir: reabrir /edit e checar se a tela final agora tem elementos (Vídeo + Link)
-    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    // 5) conferir: reabrir /edit, abrir o card Tela final e checar os elementos (vídeo + link do combo)
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => { /* ok */ });
     await delayHumano(3000, 4500);
     let conferido = false;
-    for (let i = 0; i < 4 && !conferido; i++) { const a = await acharCardTelaFinal(); if (a) { try { await page.mouse.click(a.bx, a.by); } catch { /* ok */ } } await delayHumano(1600, 2300); conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br/); }
+    for (let i = 0; i < 3 && !conferido; i++) {
+      try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 12_000 }); await l.click({ timeout: 6000 }); } catch { /* ok */ }
+      await delayHumano(1600, 2300);
+      conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br|importar do v[íi]deo/);
+    }
     await snap('tf-06-conferencia');
     if (conferido) return { ok: true, detalhe: 'tela final aplicada e confirmada (molde ' + moldeId + ')', proxyUsado, screenshots };
     return { ok: true, detalhe: 'cliquei em salvar, mas não confirmei os elementos na reabertura (revisar pelos snaps)', proxyUsado, screenshots };
