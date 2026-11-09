@@ -8983,6 +8983,41 @@ app.post('/pub/youtube/tela-final', (req: any, res: any) => {
 });
 app.get('/pub/youtube/tela-final/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _tfRodando, resultado: _tfResultado }));
 
+// [+video-relacionado 09/11 Ezequias] VÍDEO RELACIONADO dos SHORTS (o "botãozinho" no rodapé) via navegador no Studio.
+// Âncora FIXA por instrumento (teclado/baixo/violao). Comunidade intercala instrumentos -> precisa do 'instrumento'
+// no body (os vídeos de lá são reposts, então quem chama sabe qual é) + usa a âncora-cópia que mora no canal da Comunidade.
+const AC_VR_ANCORA: any = { teclado: '4VDpoZENn-c', violao: '4chl_wIGVhk', baixo: 'VS5Nhn7wf5A' };
+const AC_VR_ANCORA_COMUNIDADE: any = { teclado: 'eoIP_RRjxqQ', violao: 'SXNgrvMIcVs', baixo: 'iWyhMSeaGiw' };
+let _vrRodando = false; let _vrResultado: any = null;
+// POST {projeto, videoId|url, instrumento?, ancoraId?, snaps?} — roda em background. Acompanhar em /pub/youtube/video-relacionado/resultado.
+app.post('/pub/youtube/video-relacionado', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || b.canal || '').trim().toLowerCase();
+    const videoId = String(b.videoId || pbYtIdDaUrl(String(b.url || '')) || '').trim();
+    const instrumento = String(b.instrumento || '').trim().toLowerCase();
+    let ancora = String(b.ancoraId || '').trim();
+    if (!ancora) { ancora = projeto === 'comunidade' ? (AC_VR_ANCORA_COMUNIDADE[instrumento] || '') : (AC_VR_ANCORA[projeto] || ''); }
+    if (!projeto || !videoId) return res.json({ ok: false, erro: 'informe projeto e videoId (ou url)' });
+    if (!ancora) return res.json({ ok: false, erro: projeto === 'comunidade' ? 'comunidade precisa de instrumento (teclado/baixo/violao) ou ancoraId' : 'sem âncora p/ o canal ' + projeto });
+    if (_vrRodando) return res.json({ ok: false, erro: 'já tem uma aplicação de vídeo relacionado rodando; aguarde terminar' });
+    _vrRodando = true; _vrResultado = { status: 'rodando', projeto, videoId, ancora, inicio: agora() };
+    (async () => {
+      try {
+        let ancoraTitulo = String(b.ancoraTitulo || '');
+        if (!ancoraTitulo) { try { const tk = await pbYtToken(projeto); const gg: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet&id=' + encodeURIComponent(ancora), { headers: { Authorization: 'Bearer ' + tk } }); const gj: any = await gg.json(); ancoraTitulo = (gj && gj.items && gj.items[0] && gj.items[0].snippet && gj.items[0].snippet.title) || ''; } catch { /* segue sem título */ } }
+        const mod: any = await import('./yt-browser-nuvem');
+        const r = await mod.aplicarVideoRelacionadoViaEdit({ projeto, videoId, ancoraId: ancora, ancoraTitulo, snaps: b.snaps !== false });
+        _vrResultado = { status: 'fim', projeto, videoId, ancora, ancoraTitulo, resultado: r, fim: agora() };
+      }
+      catch (e: any) { _vrResultado = { status: 'erro', projeto, videoId, ancora, erro: String(e?.message || e), fim: agora() }; }
+      finally { _vrRodando = false; }
+    })();
+    res.json({ ok: true, iniciado: true, projeto, videoId, ancora });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/video-relacionado/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _vrRodando, resultado: _vrResultado }));
+
 // ============================ UPLOADER — INSTAGRAM ============================
 async function pbIgPoll(igToken: string, containerId: string, maxIter = 60): Promise<void> {
   let erros = 0;
