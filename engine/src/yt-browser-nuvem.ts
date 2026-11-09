@@ -928,8 +928,12 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     try { await page.locator('ytcp-entity-card[role="option"], input[placeholder*="Pesquise nos seus" i]').first().waitFor({ state: 'visible', timeout: 12_000 }); } catch { /* ok */ }
     await snap('tf-03-grade-videos');
 
-    // 3) buscar o MOLDE pelo título no campo do modal (a grade filtra) e clicar no 1º card
-    const termo = (moldeTitulo || '').trim().slice(0, 40);
+    // 3) buscar o MOLDE pelo título no campo do modal (a grade filtra) e clicar no card certo pelo ID
+    // [+fix 09/11] resolve o título por oEmbed PÚBLICO (sem token) se veio vazio — senão a busca não filtra
+    // e a grade mostra os vídeos recentes (o molde pode nem estar nela).
+    let tituloMolde = (moldeTitulo || '').trim();
+    if (!tituloMolde) { try { const oe: any = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://youtu.be/' + moldeId)); if (oe && oe.ok) { const oj: any = await oe.json(); tituloMolde = String((oj && oj.title) || '').trim(); } } catch { /* segue sem título */ } }
+    const termo = tituloMolde.slice(0, 40);
     if (termo) {
       try {
         const busca = page.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first();
@@ -942,13 +946,19 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
       await delayHumano(3000, 4200);
       await snap('tf-03a-busca');
     }
-    // card do molde: 1º pelo título; senão o 1º card da grade (após o filtro é o molde)
-    let cardMolde: any = null;
-    if (termo) { try { const c = page.locator('ytcp-entity-card[role="option"]', { hasText: termo.slice(0, 22) }).first(); if (await c.count()) cardMolde = c; } catch { /* ok */ } }
-    if (!cardMolde) { try { const c = page.locator('ytcp-entity-card[role="option"]').first(); if (await c.count()) cardMolde = c; } catch { /* ok */ } }
-    if (!cardMolde) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', proxyUsado, screenshots }; }
-    try { await cardMolde.scrollIntoViewIfNeeded(); } catch { /* ok */ }
-    try { await cardMolde.click({ timeout: 8000 }); } catch { /* ok */ }
+    // [+fix 09/11] card do molde: acha pelo ID na miniatura (i.ytimg.com/vi/<ID>) — robusto, NÃO depende do título.
+    // SEM fallback de "1º card" (pegar o card errado = importa tela final VAZIA, que foi o bug do baixo/violão).
+    let escolheuMolde = false;
+    const alvosMolde = [
+      () => page.locator('xpath=.//*[contains(@style,"' + moldeId + '")]/ancestor::ytcp-entity-card[1]').first(),
+      () => page.locator('xpath=.//*[contains(@style,"' + moldeId + '")]/ancestor::*[@role="option"][1]').first(),
+      () => page.locator('[href*="' + moldeId + '"]').first(),
+      () => page.locator('[video-id="' + moldeId + '"]').first()
+    ];
+    for (const criar of alvosMolde) {
+      try { const el = criar(); await el.waitFor({ state: 'visible', timeout: 4000 }); await el.scrollIntoViewIfNeeded().catch(() => { /* ok */ }); await el.click({ timeout: 4000 }); escolheuMolde = true; break; } catch { /* tenta próximo */ }
+    }
+    if (!escolheuMolde) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde ' + moldeId + ' na grade (busca: "' + termo + '")', proxyUsado, screenshots }; }
     await delayHumano(2000, 3000);
     // [+tela-final só-corrige 09/11] se o vídeo JÁ tinha tela final, o "Importar do vídeo" pode pedir
     // confirmação de SUBSTITUIR os elementos atuais — confirma (só clica se o botão existir num diálogo).
@@ -969,7 +979,9 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     for (let i = 0; i < 3 && !conferido; i++) {
       try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 12_000 }); await l.click({ timeout: 6000 }); } catch { /* ok */ }
       await delayHumano(1600, 2300);
-      conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br|importar do v[íi]deo/);
+      // [+fix 09/11] confere ELEMENTO de verdade (o cabeçalho "Elemento: vídeo/link" só existe quando há elemento salvo).
+      // NÃO usar "melodiaseriffs"/"importar do vídeo" — aparecem na descrição/UI mesmo sem tela final (falso positivo).
+      conferido = await temTexto(/elemento:\s*(v[íi]deo|link|video)/i);
     }
     await snap('tf-06-conferencia');
     if (conferido) return { ok: true, detalhe: 'tela final aplicada e confirmada (molde ' + moldeId + ')', proxyUsado, screenshots };
