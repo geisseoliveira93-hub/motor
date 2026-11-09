@@ -893,33 +893,56 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
         const all: any[] = [];
         const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
         walk((globalThis as any).document);
-        const RX = /^(tela final|telas finais|end screen|end screens)$/i;
-        // 1) acha o elemento-TÍTULO "Tela final" (texto exato), na coluna direita (top>300)
+        const RXsolto = /tela final|telas finais|end screen/i;
+        const ehClicavel = (el: any) => { const t = (el.tagName || '').toLowerCase(); const role = (el.getAttribute && el.getAttribute('role')) || ''; return t === 'button' || t === 'a' || t === 'ytcp-button' || t.indexOf('icon-button') >= 0 || role === 'button' || role === 'link'; };
+        // ESTRATÉGIA 1: elemento CLICÁVEL cujo aria-label/title casa "tela final" (o lápis costuma ter esse rótulo)
+        for (const el of all) {
+          const al = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || '')) || '';
+          if (RXsolto.test(al) && ehClicavel(el)) { const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (r && r.width > 8 && r.height > 8 && r.top > 120) return { bx: r.left + r.width / 2, by: r.top + r.height / 2, via: 'aria' }; }
+        }
+        // ESTRATÉGIA 2: acha o RÓTULO "Tela final" (match solto, em elemento pequeno) e pega o botão à direita na mesma linha
         let titulo: any = null; let rt: any = null;
         for (const el of all) {
           let tx = ''; try { tx = (el.textContent || '').trim(); } catch { tx = ''; }
-          if (!RX.test(tx)) continue;
+          if (!tx || tx.length > 24) continue; // pequeno = só o rótulo, não um container grande
+          if (!RXsolto.test(tx)) continue;
           const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-          if (r && r.width > 10 && r.height > 6 && r.top > 300) { titulo = el; rt = r; break; }
+          if (r && r.width > 8 && r.height > 6 && r.top > 250) { titulo = el; rt = r; break; }
         }
-        if (!titulo || !rt) return null;
-        const yC = rt.top + rt.height / 2;
-        // 2) procura o BOTÃO/ícone (lápis) na MESMA linha do título e à direita dele (o gatilho de abrir)
-        let melhor: any = null; let melhorX = -1;
+        if (titulo && rt) {
+          const yC = rt.top + rt.height / 2;
+          let melhor: any = null; let melhorX = -1;
+          for (const el of all) {
+            if (!ehClicavel(el)) continue;
+            const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!r || r.width < 8 || r.height < 8) continue;
+            const yb = r.top + r.height / 2;
+            if (Math.abs(yb - yC) <= 34 && r.left >= rt.left - 10 && r.left > melhorX) { melhorX = r.left; melhor = r; }
+          }
+          if (melhor) return { bx: melhor.left + melhor.width / 2, by: melhor.top + melhor.height / 2, via: 'linha-botao' };
+          return { bx: rt.left + Math.min(rt.width / 2, 60), by: yC, via: 'titulo' };
+        }
+        return null;
+      }).catch(() => null);
+    }
+    // dump de diagnóstico da coluna direita (só usado se a abertura falhar)
+    async function dumpColunaDireita(): Promise<any> {
+      return await page.evaluate(() => {
+        const all: any[] = [];
+        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+        walk((globalThis as any).document);
+        const out: any[] = [];
         for (const el of all) {
-          const tag = (el.tagName || '').toLowerCase();
-          const al = (el.getAttribute && (el.getAttribute('aria-label') || '')) || '';
-          const role = (el.getAttribute && el.getAttribute('role')) || '';
-          const ehBtn = tag === 'button' || tag === 'ytcp-button' || tag.indexOf('icon-button') >= 0 || role === 'button' || /editar|edit|tela final|end screen/i.test(al);
-          if (!ehBtn) continue;
           const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-          if (!r || r.width < 10 || r.height < 10) continue;
-          const yb = r.top + r.height / 2;
-          if (Math.abs(yb - yC) <= 30 && r.left >= rt.left - 8 && r.left > melhorX) { melhorX = r.left; melhor = r; }
+          if (!r || r.left < 900 || r.top < 300 || r.top > 880 || r.width < 20 || r.height < 12) continue;
+          const tag = (el.tagName || '').toLowerCase();
+          const al = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || '')) || '';
+          let tx = ''; try { tx = (el.textContent || '').trim().slice(0, 30); } catch { tx = ''; }
+          if (!tx && !al) continue;
+          out.push({ tag, tx, al: String(al).slice(0, 30), top: Math.round(r.top), x: Math.round(r.left) });
+          if (out.length >= 40) break;
         }
-        if (melhor) return { bx: melhor.left + melhor.width / 2, by: melhor.top + melhor.height / 2, via: 'botao' };
-        // 3) fallback: clica o próprio card/título
-        return { bx: rt.left + Math.min(rt.width / 2, 60), by: yC, via: 'titulo' };
+        return out;
       }).catch(() => null);
     }
 
@@ -938,7 +961,7 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
       if (!abriu) await snap('tf-02-tentativa-abrir-' + (i + 1));
     }
     await snap('tf-02-editor-tela-final');
-    if (!abriu) return { ok: false, erro: 'não consegui abrir o editor de Tela final (card não respondeu após esperar a página carregar)', detalhe: 'via=' + (viaAbriu || 'card-nao-apareceu'), proxyUsado, screenshots };
+    if (!abriu) { const dbgCard = await dumpColunaDireita(); return { ok: false, erro: 'não consegui abrir o editor de Tela final (card não respondeu após esperar a página carregar)', detalhe: 'via=' + (viaAbriu || 'card-nao-apareceu'), debug: dbgCard, proxyUsado, screenshots }; }
 
     // se o vídeo JÁ tem elementos, o "Importar do vídeo" some -> considera que já tinha tela final
     const temImportar = await temTexto(/importar do v[íi]deo|import from video/);
