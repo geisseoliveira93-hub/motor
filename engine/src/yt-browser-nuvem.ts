@@ -840,7 +840,7 @@ export async function aplicarCapaViaEdit(opts: { projeto: string; videoId: strin
 // vídeo-MOLDE do próprio canal via "Importar do vídeo" no Studio (navegador invisível, sessão + proxy do canal).
 // O YouTube NÃO tem API de tela final — só dá pelo Studio. Molde por canal (traz "Envio mais recente" + link do combo
 // com a arte, 20s). Instrumentado com snaps em cada passo p/ diagnóstico. NÃO monta na mão (usa o molde).
-export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; moldeTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[] }> {
+export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: string; moldeId: string; moldeTitulo?: string; snaps?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; jaTinha?: boolean; proxyUsado?: string | null; screenshots?: string[]; debug?: any }> {
   const projeto = String(opts.projeto || '').trim().toLowerCase();
   const videoId = String(opts.videoId || '').trim();
   const moldeId = String(opts.moldeId || '').trim();
@@ -885,16 +885,60 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
       return await page.evaluate((src: string) => { const t = ((globalThis as any).document.body?.innerText || ''); return new RegExp(src, 'i').test(t); }, re.source).catch(() => false);
     }
 
-    // 1) abrir o editor de TELA FINAL (card no painel). 2 tentativas (o 1º clique às vezes só foca).
-    let abriu = false;
-    for (let i = 0; i < 3 && !abriu; i++) {
-      await clicarTexto(['Tela final', 'End screen', 'Telas finais']);
-      await delayHumano(1500, 2500);
-      abriu = await temTexto(/importar do v[íi]deo|import from video|\+\s*elemento|\+\s*element/);
+    // 1) abrir o editor de TELA FINAL.
+    //    A página de Detalhes demora a renderizar (fica em branco ~5s). O gatilho NÃO é o texto "Tela final"
+    //    e sim o BOTÃO (lápis) do card — então: ESPERAMOS o card carregar e clicamos no lápis por coordenada real.
+    async function acharCardTelaFinal(): Promise<{ bx: number; by: number; via: string } | null> {
+      return await page.evaluate(() => {
+        const all: any[] = [];
+        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+        walk((globalThis as any).document);
+        const RX = /^(tela final|telas finais|end screen|end screens)$/i;
+        // 1) acha o elemento-TÍTULO "Tela final" (texto exato), na coluna direita (top>300)
+        let titulo: any = null; let rt: any = null;
+        for (const el of all) {
+          let tx = ''; try { tx = (el.textContent || '').trim(); } catch { tx = ''; }
+          if (!RX.test(tx)) continue;
+          const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (r && r.width > 10 && r.height > 6 && r.top > 300) { titulo = el; rt = r; break; }
+        }
+        if (!titulo || !rt) return null;
+        const yC = rt.top + rt.height / 2;
+        // 2) procura o BOTÃO/ícone (lápis) na MESMA linha do título e à direita dele (o gatilho de abrir)
+        let melhor: any = null; let melhorX = -1;
+        for (const el of all) {
+          const tag = (el.tagName || '').toLowerCase();
+          const al = (el.getAttribute && (el.getAttribute('aria-label') || '')) || '';
+          const role = (el.getAttribute && el.getAttribute('role')) || '';
+          const ehBtn = tag === 'button' || tag === 'ytcp-button' || tag.indexOf('icon-button') >= 0 || role === 'button' || /editar|edit|tela final|end screen/i.test(al);
+          if (!ehBtn) continue;
+          const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          if (!r || r.width < 10 || r.height < 10) continue;
+          const yb = r.top + r.height / 2;
+          if (Math.abs(yb - yC) <= 30 && r.left >= rt.left - 8 && r.left > melhorX) { melhorX = r.left; melhor = r; }
+        }
+        if (melhor) return { bx: melhor.left + melhor.width / 2, by: melhor.top + melhor.height / 2, via: 'botao' };
+        // 3) fallback: clica o próprio card/título
+        return { bx: rt.left + Math.min(rt.width / 2, 60), by: yC, via: 'titulo' };
+      }).catch(() => null);
+    }
+
+    let abriu = false; let viaAbriu = '';
+    for (let i = 0; i < 7 && !abriu; i++) {
+      const alvo = await acharCardTelaFinal();
+      if (alvo) {
+        viaAbriu = alvo.via;
+        try { await page.mouse.click(alvo.bx, alvo.by); } catch { /* ok */ }
+        await delayHumano(1800, 2600);
+        abriu = await temTexto(/importar do v[íi]deo|import from video|\+\s*elemento|\+\s*element/);
+      } else {
+        // card ainda não renderizou (página de detalhes lenta): espera mais e tenta de novo
+        await delayHumano(2500, 3500);
+      }
       if (!abriu) await snap('tf-02-tentativa-abrir-' + (i + 1));
     }
     await snap('tf-02-editor-tela-final');
-    if (!abriu) return { ok: false, erro: 'não consegui abrir o editor de Tela final (UI mudou?)', proxyUsado, screenshots };
+    if (!abriu) return { ok: false, erro: 'não consegui abrir o editor de Tela final (card não respondeu após esperar a página carregar)', detalhe: 'via=' + (viaAbriu || 'card-nao-apareceu'), proxyUsado, screenshots };
 
     // se o vídeo JÁ tem elementos, o "Importar do vídeo" some -> considera que já tinha tela final
     const temImportar = await temTexto(/importar do v[íi]deo|import from video/);
@@ -910,46 +954,65 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     // 3) na grade tem a caixa "Pesquise nos seus vídeos": busca o MOLDE pelo título e clica no 1º resultado (robusto; a grade é grande/lazy)
     const termo = (moldeTitulo || '').trim().slice(0, 40);
     if (termo) {
-      // IMPORTANTE: mirar o campo de busca DO MODAL ("Pesquise nos seus vídeos"), NÃO a busca global do Studio (topo).
-      // Setar value pelo native setter + disparar input/change (Polymer não registra digitação normal).
+      // 1) clica o campo de busca DO MODAL por COORDENADA (viewport 1400x900: fica ~y=100, abaixo do título) e digita no teclado real
+      try { await page.mouse.click(700, 100); await delayHumano(300, 600); await page.keyboard.type(termo, { delay: 40 }); } catch { /* reforço abaixo */ }
+      // 2) reforço: varre inclusive SHADOW DOM (Studio é Polymer) e seta value pelo native setter no input visível do modal (y 55-240)
       const achou = await page.evaluate((t: string) => {
-        const doc: any = (globalThis as any).document;
-        // o input do MODAL fica logo abaixo do título ("Escolha um vídeo específico"), y entre ~60 e ~220; a busca GLOBAL do Studio fica no topo (y<60). Seleciona por POSIÇÃO (o input real não tem placeholder).
-        const cands = (Array.from(doc.querySelectorAll('input[type="text"], input:not([type]), input[type="search"], textarea')) as any[])
-          .map((e: any) => { const r = e.getBoundingClientRect ? e.getBoundingClientRect() : { width: 0, height: 0, top: -1 }; return { e, r }; })
+        const inputs: any[] = [];
+        const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { const tag = (el.tagName || '').toLowerCase(); if (tag === 'input' || tag === 'textarea') inputs.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+        walk((globalThis as any).document);
+        const cand = inputs.map((e: any) => { const r = e.getBoundingClientRect ? e.getBoundingClientRect() : { width: 0, height: 0, top: -1 }; return { e, r }; })
           .filter((o: any) => o.r.width > 150 && o.r.height > 10 && o.r.top > 55 && o.r.top < 240)
           .sort((a: any, b: any) => a.r.top - b.r.top);
-        const inp: any = cands.length ? cands[0].e : null;
+        const inp: any = cand.length ? cand[0].e : null;
         if (!inp) return false;
         try { inp.focus(); } catch { /* ok */ }
         try { const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set; set.call(inp, t); } catch { inp.value = t; }
         inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }, termo).catch(() => false);
+      await delayHumano(800, 1200);
+      try { await page.keyboard.press('Enter'); } catch { /* ok */ }
       await delayHumano(3000, 4200); // espera a grade filtrar
       await snap('tf-03a-busca-' + (achou ? 'ok' : 'naoachou'));
     }
     // clica no card do MOLDE: 1º tenta pelo moldeId na thumb; senão (após a busca) o 1º card de vídeo da grade. Clique REAL por mouse no título.
     const boxTitulo = await page.evaluate((mid: string) => {
-      const doc: any = (globalThis as any).document;
+      // varre inclusive SHADOW DOM (os cards da grade ficam dentro de web components)
+      const all: any[] = [];
+      const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+      walk((globalThis as any).document);
+      function subirAteCard(el: any) { let card = el; for (let up = 0; up < 7 && card; up++) { const r = card.getBoundingClientRect ? card.getBoundingClientRect() : null; if (r && r.width > 120 && r.height > 80) return card; card = card.parentElement || (card.getRootNode && card.getRootNode().host) || null; } return el; }
       function boxDoTitulo(card: any) {
         let titulo: any = null; let maxLen = 0;
-        card.querySelectorAll('*').forEach((c: any) => { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8) { maxLen = tx.length; titulo = c; } } });
+        let desc: any[] = []; try { desc = Array.from(card.querySelectorAll('*')); } catch { desc = []; }
+        for (const c of desc) { const tx = (c.innerText || '').trim(); if (tx.length > maxLen && tx.length < 120 && c.getBoundingClientRect) { const r = c.getBoundingClientRect(); if (r.width > 30 && r.height > 8 && r.top > 120) { maxLen = tx.length; titulo = c; } } }
         const alvo = titulo || card; const r = alvo.getBoundingClientRect ? alvo.getBoundingClientRect() : null;
         return (r && r.width > 20 && r.height > 8) ? { x: r.x + Math.min(r.width / 2, 80), y: r.y + r.height / 2, txt: (alvo.innerText || '').slice(0, 60) } : null;
       }
-      // 1) pelo moldeId (thumb/href/bg)
-      const els = Array.from(doc.querySelectorAll('*')) as any[];
-      for (const el of els) {
-        const attr = ((el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || '') + ' ' + (() => { try { return getComputedStyle(el).backgroundImage || ''; } catch { return ''; } })();
-        if (attr.indexOf(mid) >= 0) { const card = (el.closest && (el.closest('[role="option"], ytcp-ve, ytcp-video-row, #video-card, ytcp-card, tr, li') || el.parentElement)) || el; const b = boxDoTitulo(card); if (b) return b; }
+      // 1) pelo moldeId na thumbnail/href/bg
+      for (const el of all) {
+        let attr = ''; try { attr = ((el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || el.getAttribute('thumbnail') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || ''); } catch { attr = ''; }
+        if (attr.indexOf(mid) >= 0) { const b = boxDoTitulo(subirAteCard(el)); if (b) return b; }
       }
-      // 2) fallback: 1º card de vídeo visível da grade (y>80 p/ pular a busca/cabeçalho)
-      const cards = Array.from(doc.querySelectorAll('[role="option"], ytcp-ve, #video-card, ytcp-card')) as any[];
-      for (const card of cards) { const r = card.getBoundingClientRect ? card.getBoundingClientRect() : null; if (r && r.width > 60 && r.height > 60 && r.y > 80) { const b = boxDoTitulo(card); if (b) return b; } }
+      // 2) fallback: 1º card de vídeo da grade (miniatura i.ytimg.com/vi/), abaixo da busca (top>120) — após o filtro é o molde
+      for (const el of all) {
+        let src = ''; try { src = ((el.getAttribute && (el.getAttribute('src') || '')) || '') + ' ' + ((el.style && el.style.backgroundImage) || ''); } catch { src = ''; }
+        if (/i\.ytimg\.com\/vi\//.test(src)) { const r0 = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (r0 && r0.top > 120) { const b = boxDoTitulo(subirAteCard(el)); if (b) return b; } }
+      }
       return null;
     }, moldeId).catch(() => null);
-    if (!boxTitulo) { await snap('tf-03b-molde-nao-achado'); return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', proxyUsado, screenshots }; }
+    if (!boxTitulo) {
+      const dbg = await page.evaluate(() => {
+        const all: any[] = []; const walk = (root: any) => { if (!root) return; let els: any[] = []; try { els = Array.from(root.querySelectorAll('*')); } catch { return; } for (const el of els) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
+        walk((globalThis as any).document);
+        const out: any[] = [];
+        for (const el of all) { const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null; if (!r || r.top < 110 || r.top > 480 || r.width < 40 || r.height < 18) continue; const tag = (el.tagName || '').toLowerCase(); const src = (el.getAttribute && (el.getAttribute('src') || el.getAttribute('href') || '')) || ''; let bg = ''; try { bg = (el.style && el.style.backgroundImage) || ''; } catch { bg = ''; } const tx = (el.innerText || '').trim().slice(0, 30); if (tag === 'img' || src || bg || tx) out.push({ tag, src: String(src).slice(0, 100), bg: String(bg).slice(0, 80), top: Math.round(r.top), x: Math.round(r.left + r.width / 2), w: Math.round(r.width), tx }); if (out.length >= 20) break; }
+        return out;
+      }).catch(() => []);
+      await snap('tf-03b-molde-nao-achado');
+      return { ok: false, erro: 'não achei o vídeo-molde na grade (busca: "' + termo + '")', debug: dbg, proxyUsado, screenshots };
+    }
     await page.mouse.click(boxTitulo.x, boxTitulo.y);
     await delayHumano(2000, 3000);
     await snap('tf-04-molde-aplicado');
@@ -965,7 +1028,7 @@ export async function aplicarTelaFinalViaEdit(opts: { projeto: string; videoId: 
     await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
     await delayHumano(3000, 4500);
     let conferido = false;
-    for (let i = 0; i < 3 && !conferido; i++) { await clicarTexto(['Tela final', 'End screen']); await delayHumano(1500, 2200); conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br/); }
+    for (let i = 0; i < 4 && !conferido; i++) { const a = await acharCardTelaFinal(); if (a) { try { await page.mouse.click(a.bx, a.by); } catch { /* ok */ } } await delayHumano(1600, 2300); conferido = await temTexto(/envio mais recente|v[íi]deo mais recente|most recent upload|teclado\.melodiaseriffs|melodiaseriffs\.com\.br/); }
     await snap('tf-06-conferencia');
     if (conferido) return { ok: true, detalhe: 'tela final aplicada e confirmada (molde ' + moldeId + ')', proxyUsado, screenshots };
     return { ok: true, detalhe: 'cliquei em salvar, mas não confirmei os elementos na reabertura (revisar pelos snaps)', proxyUsado, screenshots };
