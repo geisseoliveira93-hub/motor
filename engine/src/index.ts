@@ -8953,8 +8953,8 @@ app.post('/pub/youtube/publicar-rascunho', async (req: any, res: any) => {
 
 // [+tela-final 07/11 Ezequias] TELA FINAL (end screen) via navegador no Studio (YouTube não tem API disso).
 // Copia de um vídeo-MOLDE do próprio canal ("Importar do vídeo"): traz "Envio mais recente" + link do combo + arte.
-// Molde por canal (só teclado tem por enquanto; os outros precisam de 1 vídeo-molde com a tela final pronta).
-const AC_TF_MOLDE: any = { teclado: 'g8w2d3702Ws' };
+// Molde por canal (1 vídeo-molde por instrumento com a tela final pronta: Envio mais recente + link novo + capinha).
+const AC_TF_MOLDE: any = { teclado: 'AIOiL1BYQUo', violao: 'BsUOAahk_mk', baixo: '0d2s_qaivWw' }; // [moldes 09/11 Ezequias]
 let _tfRodando = false; let _tfResultado: any = null;
 // POST {projeto, videoId|url, moldeId?, snaps?} — roda em background (demora ~1-3min). Acompanhar em /pub/youtube/tela-final/resultado.
 app.post('/pub/youtube/tela-final', (req: any, res: any) => {
@@ -8972,7 +8972,7 @@ app.post('/pub/youtube/tela-final', (req: any, res: any) => {
         let moldeTitulo = String(b.moldeTitulo || '');
         if (!moldeTitulo) { try { const tk = await pbYtToken(projeto); const gg: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet&id=' + encodeURIComponent(molde), { headers: { Authorization: 'Bearer ' + tk } }); const gj: any = await gg.json(); moldeTitulo = (gj && gj.items && gj.items[0] && gj.items[0].snippet && gj.items[0].snippet.title) || ''; } catch { /* segue sem título */ } }
         const mod: any = await import('./yt-browser-nuvem');
-        const r = await mod.aplicarTelaFinalViaEdit({ projeto, videoId, moldeId: molde, moldeTitulo, snaps: b.snaps !== false });
+        const r = await mod.aplicarTelaFinalViaEdit({ projeto, videoId, moldeId: molde, moldeTitulo, snaps: b.snaps !== false, soSeExiste: b.soSeExiste === true });
         _tfResultado = { status: 'fim', projeto, videoId, molde, moldeTitulo, resultado: r, fim: agora() };
       }
       catch (e: any) { _tfResultado = { status: 'erro', projeto, videoId, molde, erro: String(e?.message || e), fim: agora() }; }
@@ -9012,6 +9012,93 @@ app.post('/pub/youtube/tela-final-link', (req: any, res: any) => {
   } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
 });
 app.get('/pub/youtube/tela-final-link/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _tflRodando, resultado: _tflResultado }));
+
+// [+tela-final-varredura 09/11 Ezequias] CORRIGE o link (pack do instrumento) nos HORIZONTAIS que JÁ TÊM tela final.
+// REGRA (decidida 09/11): só MEXE em quem já tem a "telinha amarela" (tela final com elementos). NÃO adiciona em quem
+// não tem (vídeos antigos "só o vídeo e acaba", vídeos de marca -> pulados sozinhos). Importa o vídeo-MOLDE do canal
+// (AC_TF_MOLDE) -> substitui a tela final inteira pela certa (Envio mais recente + link novo + capinha).
+// Enumera uploads do canal pela API (1 unidade/página, barato) -> tf_log; o cron processa 1 por vez (navegador pesado).
+// NÃO toca no caminho de publicação (zero risco pra postagem). Começa DESLIGADO (pub_tf_auto padrão 0) até validar.
+try { db.prepare(`CREATE TABLE IF NOT EXISTS tf_log (video_id TEXT PRIMARY KEY, projeto TEXT, status TEXT, motivo TEXT, dur INTEGER, tentativas INTEGER DEFAULT 0, quando TEXT)`).run(); } catch { /* ok */ }
+function _tfRegistrar(videoId: string, projeto: string, status: string, motivo?: string, dur?: number | null): void {
+  try {
+    const prev = db.prepare(`SELECT tentativas FROM tf_log WHERE video_id=?`).get(videoId) as any;
+    const tent = (prev ? (Number(prev.tentativas) || 0) : 0) + (status === 'falha' ? 1 : 0);
+    db.prepare(`INSERT INTO tf_log (video_id,projeto,status,motivo,dur,tentativas,quando) VALUES (?,?,?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET projeto=excluded.projeto, status=excluded.status, motivo=excluded.motivo, dur=COALESCE(excluded.dur, tf_log.dur), tentativas=excluded.tentativas, quando=excluded.quando`)
+      .run(videoId, projeto, status, (motivo || '').slice(0, 200), (dur == null ? null : Number(dur) || 0), tent, agora());
+  } catch { /* ok */ }
+}
+function _tfISO8601segundos(d: string): number { try { const m = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/i.exec(String(d || '')); if (!m) return 0; return (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0); } catch { return 0; } }
+// enumera os uploads do canal (API barata) e marca pendentes no tf_log; Shorts curtos (<=75s) já saem como 'pulado'
+async function _tfEnumerarCanal(projeto: string, maxPaginas = 20): Promise<{ ok: boolean; achados: number; novos: number; erro?: string }> {
+  projeto = String(projeto || '').trim().toLowerCase();
+  if (!AC_TF_MOLDE[projeto]) return { ok: false, achados: 0, novos: 0, erro: 'sem molde p/ ' + projeto };
+  let token = ''; try { token = await pbYtToken(projeto); } catch (e: any) { return { ok: false, achados: 0, novos: 0, erro: String(e?.message || e) }; }
+  const H = { Authorization: 'Bearer ' + token };
+  let uploads = '';
+  try { const r: any = await fetch('https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true', { headers: H }); const j: any = await r.json(); uploads = j?.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || ''; } catch { /* ok */ }
+  if (!uploads) return { ok: false, achados: 0, novos: 0, erro: 'não achei a playlist de uploads do canal' };
+  let achados = 0; let novos = 0; let pageToken = '';
+  for (let pg = 0; pg < maxPaginas; pg++) {
+    let ids: string[] = [];
+    try {
+      const u = 'https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=50&playlistId=' + encodeURIComponent(uploads) + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : '');
+      const r: any = await fetch(u, { headers: H }); const j: any = await r.json();
+      ids = (j?.items || []).map((it: any) => it?.contentDetails?.videoId).filter(Boolean);
+      pageToken = j?.nextPageToken || '';
+    } catch { break; }
+    if (!ids.length) break;
+    const durs: any = {};
+    try { const r: any = await fetch('https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=' + ids.join(','), { headers: H }); const j: any = await r.json(); for (const it of (j?.items || [])) { durs[it.id] = _tfISO8601segundos(it?.contentDetails?.duration || ''); } } catch { /* ok */ }
+    for (const vid of ids) {
+      achados++;
+      const ex = db.prepare(`SELECT status FROM tf_log WHERE video_id=?`).get(vid) as any;
+      if (ex && (ex.status === 'ok' || ex.status === 'pulado')) continue; // já resolvido, não reprocessa
+      const dur = Number(durs[vid] || 0);
+      if (dur > 0 && dur <= 75) { _tfRegistrar(vid, projeto, 'pulado', 'curto (provável Short)', dur); continue; }
+      if (!ex) { _tfRegistrar(vid, projeto, 'pendente', '', dur); novos++; }
+      else { try { db.prepare(`UPDATE tf_log SET dur=COALESCE(?, dur) WHERE video_id=?`).run(dur || null, vid); } catch { /* ok */ } }
+    }
+    if (!pageToken) break;
+  }
+  return { ok: true, achados, novos };
+}
+function _tfPendentes(limite: number): any[] {
+  let rows: any[] = [];
+  try { rows = db.prepare(`SELECT video_id, projeto FROM tf_log WHERE status='pendente' AND tentativas < 4 ORDER BY quando ASC LIMIT ?`).all(Math.max(1, limite)) as any[]; } catch { rows = []; }
+  const out: any[] = [];
+  for (const r of rows) { const projeto = String(r.projeto || '').trim().toLowerCase(); const molde = AC_TF_MOLDE[projeto]; if (!molde) continue; out.push({ vid: r.video_id, projeto, molde }); if (out.length >= limite) break; }
+  return out;
+}
+let _tfVarrendo = false; let _tfVarreduraStatus: any = null;
+async function _tfRodarVarredura(limite: number): Promise<void> {
+  if (_tfVarrendo) return; _tfVarrendo = true;
+  const pend = _tfPendentes(limite);
+  _tfVarreduraStatus = { inicio: agora(), total: pend.length, feitos: 0, ok: 0, pulados: 0, falhas: 0, rodando: true };
+  try {
+    const mod: any = await import('./yt-browser-nuvem');
+    for (const it of pend) {
+      try {
+        const r = await mod.aplicarTelaFinalViaEdit({ projeto: it.projeto, videoId: it.vid, moldeId: it.molde, soSeExiste: true, snaps: false });
+        if (r && r.ok && r.pulou) { _tfRegistrar(it.vid, it.projeto, 'pulado', r.detalhe || 'sem tela final'); _tfVarreduraStatus.pulados++; }
+        else if (r && r.ok) { _tfRegistrar(it.vid, it.projeto, 'ok', 'link corrigido'); _tfVarreduraStatus.ok++; }
+        else { _tfRegistrar(it.vid, it.projeto, 'falha', r && r.erro); _tfVarreduraStatus.falhas++; }
+      } catch (e: any) { _tfRegistrar(it.vid, it.projeto, 'falha', String(e?.message || e)); _tfVarreduraStatus.falhas++; }
+      _tfVarreduraStatus.feitos++;
+    }
+  } catch (e: any) { _tfVarreduraStatus.erro = String(e?.message || e); }
+  finally { _tfVarreduraStatus.rodando = false; _tfVarreduraStatus.fim = agora(); _tfVarrendo = false; }
+}
+// cron ~12min: se LIGADO (pub_tf_auto, padrão 0 = desligado até validar), corrige um lote pequeno. 1 por vez (navegador pesado).
+// Não roda junto com as outras automações de navegador (tela-final/link/video-relacionado) pra não disputar o proxy.
+setInterval(() => { try { if (pubFlag('pub_tf_auto', '0') !== '1') return; if (_tfVarrendo || _tfRodando || _tflRodando || _vrVarrendo || _vrRodando) return; const lote = Number(pubFlag('pub_tf_lote', '2')) || 2; _tfRodarVarredura(lote).catch(() => { /* ok */ }); } catch { /* ok */ } }, 12 * 60 * 1000);
+// enumeração automática 1x/dia (barata, só API) pra pegar uploads novos; só quando auto ligado
+setInterval(() => { try { if (pubFlag('pub_tf_auto', '0') !== '1') return; for (const p of Object.keys(AC_TF_MOLDE)) { _tfEnumerarCanal(p).catch(() => { /* ok */ }); } } catch { /* ok */ } }, 24 * 60 * 60 * 1000);
+app.post('/pub/youtube/tela-final/enumerar', async (req: any, res: any) => { try { const b = req.body || {}; const alvos = b.projeto ? [String(b.projeto).toLowerCase()] : Object.keys(AC_TF_MOLDE); const out: any = {}; for (const p of alvos) { out[p] = await _tfEnumerarCanal(p, Number(b.maxPaginas) || 20); } res.json({ ok: true, enumerado: out, pendentes: _tfPendentes(999999).length }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
+app.post('/pub/youtube/tela-final/varrer', (req: any, res: any) => { const lim = Number((req.body || {}).limite) || 10; if (_tfVarrendo) return res.json({ ok: false, erro: 'varredura ja rodando', status: _tfVarreduraStatus }); _tfRodarVarredura(lim).catch(() => { /* ok */ }); res.json({ ok: true, iniciado: true, limite: lim, pendentes_estimados: _tfPendentes(999999).length }); });
+app.get('/pub/youtube/tela-final/varrer/status', (_req: any, res: any) => { const porStatus: any = {}; try { const a = db.prepare(`SELECT status, COUNT(*) c FROM tf_log GROUP BY status`).all() as any[]; for (const x of a) porStatus[x.status] = Number(x.c) || 0; } catch { /* ok */ } res.json({ ok: true, rodando: _tfVarrendo, ultima: _tfVarreduraStatus, pendentes_agora: _tfPendentes(999999).length, por_status: porStatus }); });
+app.get('/pub/youtube/tela-final/config', (_req: any, res: any) => res.json({ ok: true, auto: pubFlag('pub_tf_auto', '0') === '1', lote: Number(pubFlag('pub_tf_lote', '2')) || 2, moldes: AC_TF_MOLDE }));
+app.post('/pub/youtube/tela-final/config', (req: any, res: any) => { const b = req.body || {}; if (b.auto != null) setPubFlag('pub_tf_auto', b.auto ? '1' : '0'); if (b.lote != null) setPubFlag('pub_tf_lote', String(Number(b.lote) || 2)); res.json({ ok: true, auto: pubFlag('pub_tf_auto', '0') === '1', lote: Number(pubFlag('pub_tf_lote', '2')) || 2 }); });
 
 // [+video-relacionado 09/11 Ezequias] VÍDEO RELACIONADO dos SHORTS (o "botãozinho" no rodapé) via navegador no Studio.
 // Âncora FIXA por instrumento (teclado/baixo/violao). Comunidade intercala instrumentos -> precisa do 'instrumento'
