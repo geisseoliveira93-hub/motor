@@ -9082,7 +9082,7 @@ async function _tfRodarVarredura(limite: number): Promise<void> {
     const mod: any = await import('./yt-browser-nuvem');
     for (const it of pend) {
       try {
-        const r = await mod.aplicarTelaFinalViaEdit({ projeto: it.projeto, videoId: it.vid, moldeId: it.molde, soSeExiste: true, snaps: false });
+        const r = await mod.aplicarTelaFinalViaEdit({ projeto: it.projeto, videoId: it.vid, moldeId: it.molde, soSeExiste: false, snaps: false });
         if (r && r.ok && r.pulou) { _tfRegistrar(it.vid, it.projeto, 'pulado', r.detalhe || 'sem tela final'); _tfVarreduraStatus.pulados++; }
         else if (r && r.ok) { _tfRegistrar(it.vid, it.projeto, 'ok', 'link corrigido'); _tfVarreduraStatus.ok++; }
         else { _tfRegistrar(it.vid, it.projeto, 'falha', r && r.erro); _tfVarreduraStatus.falhas++; }
