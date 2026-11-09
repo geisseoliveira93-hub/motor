@@ -1039,7 +1039,9 @@ export async function aplicarVideoRelacionadoViaEdit(opts: { projeto: string; vi
         try { await cardVR.locator('xpath=ancestor::*[self::ytcp-form-input-container or self::div][1]').first().click({ timeout: 5000 }); } catch { /* ok */ }
       }
       await delayHumano(1800, 2800);
-      try { abriu = await page.locator(selModal + ', ytcp-entity-card[role="option"], input[placeholder*="Pesquise nos seus" i]').first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
+      // detecta o modal pelo TÍTULO/busca (NÃO .first() amplo — há diálogos OCULTOS do Studio que davam falso-negativo)
+      try { abriu = await page.locator(selModal).filter({ hasText: /escolha um v[íi]deo|choose a video|selecione um v[íi]deo|select a video/i }).first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
+      if (!abriu) { try { abriu = await page.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first().isVisible({ timeout: 1500 }); } catch { abriu = false; } }
       if (!abriu) await snap('vr-02-tentativa-abrir-' + (i + 1));
     }
     await snap('vr-02-modal');
