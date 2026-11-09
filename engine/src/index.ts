@@ -9102,6 +9102,27 @@ app.post('/pub/youtube/tela-final/varrer', (req: any, res: any) => { const lim =
 app.get('/pub/youtube/tela-final/varrer/status', (_req: any, res: any) => { const porStatus: any = {}; try { const a = db.prepare(`SELECT status, COUNT(*) c FROM tf_log GROUP BY status`).all() as any[]; for (const x of a) porStatus[x.status] = Number(x.c) || 0; } catch { /* ok */ } res.json({ ok: true, rodando: _tfVarrendo, ultima: _tfVarreduraStatus, pendentes_agora: _tfPendentes(999999).length, por_status: porStatus }); });
 app.get('/pub/youtube/tela-final/config', (_req: any, res: any) => res.json({ ok: true, auto: pubFlag('pub_tf_auto', '0') === '1', lote: Number(pubFlag('pub_tf_lote', '2')) || 2, moldes: AC_TF_MOLDE }));
 app.post('/pub/youtube/tela-final/config', (req: any, res: any) => { const b = req.body || {}; if (b.auto != null) setPubFlag('pub_tf_auto', b.auto ? '1' : '0'); if (b.lote != null) setPubFlag('pub_tf_lote', String(Number(b.lote) || 2)); res.json({ ok: true, auto: pubFlag('pub_tf_auto', '0') === '1', lote: Number(pubFlag('pub_tf_lote', '2')) || 2 }); });
+// [+fila 09/11] recebe uma LISTA de video IDs (coletada por fora, do navegador) e enfileira no tf_log como 'pendente'.
+// Usado porque a API de LEITURA do YouTube não funciona da nuvem (token só de upload). A ordem recebida é respeitada
+// (coletar do mais recente pro mais antigo -> os recentes, que têm tela final, são corrigidos primeiro).
+app.post('/pub/youtube/tela-final/fila', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || '').trim().toLowerCase();
+    if (!projeto || !AC_TF_MOLDE[projeto]) return res.json({ ok: false, erro: 'projeto sem molde: ' + projeto });
+    const ids: string[] = Array.isArray(b.ids) ? b.ids.map((x: any) => String(x || '').trim()).filter(Boolean) : [];
+    if (!ids.length) return res.json({ ok: false, erro: 'passe ids: [ ... ]' });
+    let novos = 0; let jaResolvidos = 0; let jaNaFila = 0;
+    for (const vid of ids) {
+      if (vid === AC_TF_MOLDE[projeto]) continue; // nunca processa o próprio molde
+      const ex = db.prepare(`SELECT status FROM tf_log WHERE video_id=?`).get(vid) as any;
+      if (ex && (ex.status === 'ok' || ex.status === 'pulado')) { jaResolvidos++; continue; }
+      if (ex && ex.status === 'pendente') { jaNaFila++; continue; }
+      _tfRegistrar(vid, projeto, 'pendente', 'fila (navegador)', null); novos++;
+    }
+    res.json({ ok: true, projeto, recebidos: ids.length, novos, ja_resolvidos: jaResolvidos, ja_na_fila: jaNaFila, pendentes_agora: _tfPendentes(999999).length });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
 
 // [+video-relacionado 09/11 Ezequias] VÍDEO RELACIONADO dos SHORTS (o "botãozinho" no rodapé) via navegador no Studio.
 // Âncora FIXA por instrumento (teclado/baixo/violao). Comunidade intercala instrumentos -> precisa do 'instrumento'
