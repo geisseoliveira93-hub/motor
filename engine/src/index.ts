@@ -8983,6 +8983,36 @@ app.post('/pub/youtube/tela-final', (req: any, res: any) => {
 });
 app.get('/pub/youtube/tela-final/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _tfRodando, resultado: _tfResultado }));
 
+// [+tela-final-link 09/11 Ezequias] TELA FINAL montada DIRETO (Envio mais recente + LINK da página do instrumento),
+// sem molde. Links novos por instrumento (páginas que o Ezequias criou em 09/11).
+const AC_TF_LINK: any = { teclado: 'https://teclado.melodiaseriffs.com.br/p/pack-do-tecladista-iniciante', violao: 'https://violao.melodiaseriffs.com.br/p/pack-do-violonista-iniciante', baixo: 'https://baixo.melodiaseriffs.com.br/p/pack-do-baixista-iniciante' };
+const AC_TF_LINK_TITULO: any = { teclado: 'Pack do Tecladista Iniciante', violao: 'Pack do Violonista Iniciante', baixo: 'Pack do Baixista Iniciante' };
+let _tflRodando = false; let _tflResultado: any = null;
+app.post('/pub/youtube/tela-final-link', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const projeto = String(b.projeto || b.canal || '').trim().toLowerCase();
+    const videoId = String(b.videoId || pbYtIdDaUrl(String(b.url || '')) || '').trim();
+    const linkUrl = String(b.linkUrl || AC_TF_LINK[projeto] || '').trim();
+    const linkTitulo = String(b.linkTitulo || AC_TF_LINK_TITULO[projeto] || '').trim();
+    if (!projeto || !videoId) return res.json({ ok: false, erro: 'informe projeto e videoId (ou url)' });
+    if (!linkUrl) return res.json({ ok: false, erro: 'sem link p/ o canal ' + projeto + ' — passe linkUrl' });
+    if (_tflRodando) return res.json({ ok: false, erro: 'já tem uma montagem de tela final rodando; aguarde' });
+    _tflRodando = true; _tflResultado = { status: 'rodando', projeto, videoId, linkUrl, inicio: agora() };
+    (async () => {
+      try {
+        const mod: any = await import('./yt-browser-nuvem');
+        const r = await mod.aplicarTelaFinalLinkViaEdit({ projeto, videoId, linkUrl, linkTitulo, snaps: b.snaps !== false });
+        _tflResultado = { status: 'fim', projeto, videoId, linkUrl, linkTitulo, resultado: r, fim: agora() };
+      }
+      catch (e: any) { _tflResultado = { status: 'erro', projeto, videoId, linkUrl, erro: String(e?.message || e), fim: agora() }; }
+      finally { _tflRodando = false; }
+    })();
+    res.json({ ok: true, iniciado: true, projeto, videoId, linkUrl });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/youtube/tela-final-link/resultado', (_req: any, res: any) => res.json({ ok: true, rodando: _tflRodando, resultado: _tflResultado }));
+
 // [+video-relacionado 09/11 Ezequias] VÍDEO RELACIONADO dos SHORTS (o "botãozinho" no rodapé) via navegador no Studio.
 // Âncora FIXA por instrumento (teclado/baixo/violao). Comunidade intercala instrumentos -> precisa do 'instrumento'
 // no body (os vídeos de lá são reposts, então quem chama sabe qual é) + usa a âncora-cópia que mora no canal da Comunidade.
