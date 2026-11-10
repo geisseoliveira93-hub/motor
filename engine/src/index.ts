@@ -18236,3 +18236,30 @@ console.log('[teclado-nuvem] bloco carregado; ativo=', tnAtivo(), 'ig=', TN_IG_I
   });
   console.log('[+yt-log-falhas] bloco carregado: /pub/youtube/vr-log|tf-log/falhas (GET) + reset-falhas (POST)');
 })();
+
+// [+troca-link-no-lugar 2026-11-10] ADITIVO (fim do arquivo). Troca o LINK da tela final dos videos que JA TEM.
+(() => {
+  let _trlRes: any = { rodando: false };
+  app.post('/pub/youtube/tela-final/trocar-link', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const projeto = String(b.projeto || '').trim().toLowerCase();
+      const videoId = String(b.videoId || b.url || '').trim().replace(/^.*[\/=]/, '');
+      const linkUrl = String(b.linkUrl || '').trim();
+      const debug = !!b.debug;
+      if (!projeto || !videoId || !linkUrl) return _ndErr(res, 'projeto/videoId/linkUrl obrigatorios');
+      if (_trlRes.rodando) return _ndErr(res, 'ja ha uma troca em andamento');
+      _trlRes = { rodando: true, inicio: new Date().toISOString(), projeto, videoId, debug };
+      res.json({ ok: true, iniciado: true, obs: 'confira em /pub/youtube/tela-final/trocar-link/resultado' });
+      (async () => {
+        try {
+          const mod: any = await import('./yt-browser-nuvem');
+          const r = await mod.aplicarTrocaLinkViaEdit({ projeto, videoId, linkUrl, linkTitulo: b.linkTitulo, snaps: !!b.snaps, debug });
+          _trlRes = { rodando: false, fim: new Date().toISOString(), projeto, videoId, resultado: r };
+        } catch (e: any) { _trlRes = { rodando: false, erro: String(e?.message || e).slice(0, 200), projeto, videoId }; }
+      })();
+    } catch (e) { try { _ndErr(res, e); } catch { /* ok */ } }
+  });
+  app.get('/pub/youtube/tela-final/trocar-link/resultado', (_req: any, res: any) => { _ndOk(res, _trlRes); });
+  console.log('[+troca-link-no-lugar] /pub/youtube/tela-final/trocar-link (POST) + /resultado (GET)');
+})();
