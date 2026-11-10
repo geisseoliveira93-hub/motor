@@ -4230,6 +4230,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
+    if (categoria === 'aprovado') { try { _acAcessoNaVenda(p, b, provider); } catch { /* acesso-academy best-effort: nunca quebra a entrega */ } }
     // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
     if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
     if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
@@ -9632,6 +9633,41 @@ async function tickPublicador() {
 }
 setInterval(() => { tickPublicador().catch(() => { }); }, 30000);
 
+// [+destravar-presos-publicador 10/11] ADD-ONLY. Destrava posts ORFAOS presos em 'publicando'
+// (sobram de um restart/deploy no meio da postagem). Criterio por TEMPO: so mexe em quem esta
+// 'publicando' ha mais de 20 min (muito alem do timeout de 12 min do worker), entao NUNCA pega um
+// que esta postando de verdade. Se existir outro item do mesmo canal+onedrive_ref publicado/agendado/
+// publicando -> cancela como duplicado; senao -> reagenda pra daqui 5 min.
+function pbDestravarPresos(dry?: boolean): any {
+  const limite = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  const presos = db.prepare(`SELECT * FROM fila_publicacao WHERE status='publicando' AND COALESCE(atualizado_em,'') < ? ORDER BY atualizado_em ASC LIMIT 200`).all(limite) as any[];
+  const acoes: any[] = [];
+  for (const it of presos) {
+    const outro = db.prepare(`SELECT id,status FROM fila_publicacao WHERE id<>? AND canal_id=? AND onedrive_ref=? AND status IN ('agendado','publicando','publicado') LIMIT 1`).get(it.id, it.canal_id, it.onedrive_ref) as any;
+    if (outro) {
+      if (!dry) db.prepare(`UPDATE fila_publicacao SET status='cancelado', erro=?, atualizado_em=? WHERE id=?`).run('duplicado de ' + outro.id + ', destravado', agora(), it.id);
+      acoes.push({ id: it.id, canal_id: it.canal_id, acao: 'cancelado_duplicado', de: outro.id });
+    } else {
+      const quando = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      if (!dry) db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(quando, 'destravado: estava preso em publicando', agora(), it.id);
+      acoes.push({ id: it.id, canal_id: it.canal_id, acao: 'reagendado', quando });
+    }
+  }
+  return { presos: presos.length, acoes, dry: !!dry };
+}
+app.get('/pub/publicador/presos', (_req: any, res: any) => {
+  try {
+    const limite = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+    const presos = db.prepare(`SELECT id,canal_id,titulo,onedrive_ref,atualizado_em FROM fila_publicacao WHERE status='publicando' AND COALESCE(atualizado_em,'') < ? ORDER BY atualizado_em ASC LIMIT 200`).all(limite);
+    res.json({ ok: true, total: (presos as any[]).length, presos });
+  } catch (e) { res.status(500).json({ ok: false, erro: String((e as any)?.message || e) }); }
+});
+app.post('/pub/publicador/destravar', (req: any, res: any) => {
+  try { res.json({ ok: true, ...pbDestravarPresos(!!(req.body || {}).dry) }); } catch (e) { res.status(500).json({ ok: false, erro: String((e as any)?.message || e) }); }
+});
+setTimeout(() => { try { pbDestravarPresos(false); } catch { /* */ } }, 60000);
+setInterval(() => { try { pbDestravarPresos(false); } catch { /* */ } }, 10 * 60 * 1000);
+
 // ============================ ENDPOINTS DE CONTROLE / CALENDÁRIO ============================
 // configura client_id/secret de uma plataforma (cifrado)
 app.post('/pub/pub-cred', (req, res) => {
@@ -14264,7 +14300,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
       const meusV = doV.filter((c) => meus.has(c.id));
       if (!_adm && !meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela (admin vê todas)
       if (!doV.length) continue;
-      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(doV.map(cardHtml).join(''))}</div>`; // mostra TODOS (cadeado faz o resto)
+      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(_acCardsVitrine(v, doV, cardHtml, meus))}</div>`; // mostra TODOS (cadeado faz o resto); modo_modulos=1 + 1 curso => cards de módulos
     }
     const semVit = cursos.filter((c) => !c.vitrine_id && (_adm || meus.has(c.id)));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
@@ -14628,6 +14664,8 @@ app.post('/academy/vitrine', (req: any, res: any) => {
   try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_vitrines SET nome=?, ordem=?, listada=?, cor=?, categoria=? WHERE id=?`).run(b.nome, b.ordem || 0, b.listada ? 1 : 0, b.cor || '', b.categoria || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_vitrines (id,nome,ordem,listada,cor,criado_em,categoria) VALUES (?,?,?,?,?,?,?)`).run(id, b.nome, b.ordem || 0, b.listada ? 1 : 1, b.cor || '', agora(), b.categoria || ''); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
 });
 app.post('/academy/vitrine/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_vitrines WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+// [+modulos-como-cursos 10/11] liga/desliga o modo "módulos como cursos" de uma vitrine (1 curso => mostra os módulos).
+app.post('/academy/vitrine/modo', (req: any, res: any) => { try { const b = req.body || {}; if (!b.id) return _ndErr(res, 'id obrigatorio'); db.prepare(`UPDATE academy_vitrines SET modo_modulos=? WHERE id=?`).run(b.modo_modulos ? 1 : 0, b.id); _ndOk(res, { id: b.id, modo_modulos: b.modo_modulos ? 1 : 0 }); } catch (e) { _ndErr(res, e); } });
 // Módulos
 app.post('/academy/modulo', (req: any, res: any) => {
   try { const b = req.body || {}; if (b.id) { db.prepare(`UPDATE academy_modulos SET nome=?, ordem=?, capa=? WHERE id=?`).run(b.nome, b.ordem || 0, b.capa || '', b.id); return _ndOk(res, { id: b.id }); } const id = randomUUID(); db.prepare(`INSERT INTO academy_modulos (id,curso_id,nome,ordem,capa) VALUES (?,?,?,?,?)`).run(id, b.curso_id, b.nome, b.ordem || 0, b.capa || ''); _acRecount(b.curso_id); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); }
@@ -14821,6 +14859,21 @@ app.get('/academy/magiclinks', (req: any, res: any) => {
   } catch (e) { _ndErr(res, e); }
 });
 // admin: gerar/retornar magic link do aluno
+// [+endpoint-email-aluno 10/11] ADMIN: troca o e-mail de um aluno (valida nao-vazio + formato + unico).
+app.post('/academy/aluno/email', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    if (!id || !email) return _ndErr(res, 'id e email obrigatorios');
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return _ndErr(res, 'email invalido');
+    const outro = db.prepare(`SELECT id FROM academy_matriculas WHERE lower(email)=? AND id<>?`).get(email, id) as any;
+    if (outro) return _ndErr(res, 'email_em_uso');
+    db.prepare(`UPDATE academy_matriculas SET email=? WHERE id=?`).run(email, id);
+    _acLog(id, 'email_alterado', email);
+    _ndOk(res, { ok: true, email });
+  } catch (e) { _ndErr(res, e); }
+});
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: _AREA_URL + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
 });
@@ -15795,6 +15848,7 @@ app.post('/area/api/prova', (req: any, res: any) => {
 
 // ---------- [B.9] Layout inteligente: categorias + pop-up na tela + clareza tem/não-tem + metrônomo ----------
 _acAlter(`ALTER TABLE academy_vitrines ADD COLUMN categoria TEXT`);
+_acAlter(`ALTER TABLE academy_vitrines ADD COLUMN modo_modulos INTEGER DEFAULT 0`); // [+modulos-como-cursos 10/11] vitrine de 1 curso mostra os MÓDULOS como cards
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN tipo TEXT`);       // hero | popup
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN tamanho TEXT`);    // p | m | g | full
 _acAlter(`ALTER TABLE academy_banners ADD COLUMN freq TEXT`);       // once | day | always
@@ -15813,6 +15867,30 @@ const _acCardCurso = (c: any, meus: Set<string>, pmap: any, ehAdmin?: boolean): 
   const href = abre ? ('/area/curso/' + c.id) : (c.checkout_url ? esc(c.checkout_url) : '#');
   const tgt = abre ? '' : ' target="_blank"';
   return `<a class="card${abre ? '' : ' locked'}" href="${href}"${tgt}>${inner}</a>`;
+};
+// [+modulos-como-cursos 10/11] card de MÓDULO (mesmo visual do _acCardCurso: .card/.pz/.nm/.lock).
+// Link abre o curso no modulo (#mod-<id>). Cadeado/grayscale se o aluno nao tem o curso.
+const _acCardModulo = (md: any, cursoId: string, temAcesso: boolean): string => {
+  const capa = md.capa || '';
+  const img = capa ? `<img src="${esc(capa)}" alt="" loading="lazy" decoding="async">` : `<div style="display:grid;place-items:center;height:100%;color:#55555f;padding:10px;text-align:center;font-size:12px">${esc(md.nome || '')}</div>`;
+  const inner = `<div class="pz"${temAcesso ? '' : ' style="filter:grayscale(.6) brightness(.5)"'}>${img}`
+    + (temAcesso ? '' : `<div class="lock">🔒<span class="unlock">Desbloquear</span></div>`)
+    + `</div><div class="nm">${esc(md.nome || '')}</div>`;
+  const href = temAcesso ? ('/area/curso/' + cursoId + '#mod-' + md.id) : '#';
+  return `<a class="card${temAcesso ? '' : ' locked'}" href="${href}">${inner}</a>`;
+};
+// Decide os cards de uma vitrine: se ela esta em modo_modulos=1 E tem exatamente 1 curso, mostra os
+// MÓDULOS desse curso como cards (igual Cademi). Senao, cai no render normal de cursos (identico ao antigo).
+const _acCardsVitrine = (v: any, doV: any[], cardHtml: (c: any) => string, meus: Set<string>): string => {
+  try {
+    if (v && Number(v.modo_modulos) === 1 && doV.length === 1) {
+      const curso = doV[0];
+      const tem = meus.has(curso.id);
+      const mods = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(curso.id) as any[];
+      if (mods.length) return mods.map((md) => _acCardModulo(md, curso.id, tem)).join('');
+    }
+  } catch { /* qualquer problema: cai no render normal */ }
+  return doV.map(cardHtml).join('');
 };
 // pop-up/banner na tela (X pra fechar; tamanhos p/m/g/full; frequência once/day/always)
 const _acPopupHtml = (al?: any): string => {
@@ -15857,7 +15935,7 @@ app.get('/area/categoria/:cat', (req: any, res: any) => {
     const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
     const _admC = _acEhAdmin(req); // [07/11 Ezequias] admin abre qualquer curso aqui também
     let shelves = '';
-    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${doV.map((c) => _acCardCurso(c, meus, pmap, _admC)).join('')}</div></div>`; }
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${_acCardsVitrine(v, doV, (c: any) => _acCardCurso(c, meus, pmap, _admC), meus)}</div></div>`; }
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
     const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
     res.type('html').send(_acPage(al, cat, corpo));
@@ -15949,6 +16027,61 @@ const _acMatricularPorVenda = (v: any): void => {
 app.get('/academy/mapa', (_req: any, res: any) => { try { const mapa = db.prepare(`SELECT mc.*, c.nome curso_nome FROM academy_produto_curso mc LEFT JOIN academy_cursos c ON c.id=mc.curso_id ORDER BY mc.criado_em DESC`).all(); _ndOk(res, { mapa }); } catch (e) { _ndErr(res, e); } });
 app.post('/academy/mapa', (req: any, res: any) => { try { const b = req.body || {}; const id = b.id || randomUUID(); db.prepare(`INSERT OR REPLACE INTO academy_produto_curso (id,match,curso_id,validade,criado_em) VALUES (?,?,?,?,?)`).run(id, String(b.match || '').trim(), b.curso_id, b.validade || 'vitalicio', agora()); _ndOk(res, { id }); } catch (e) { _ndErr(res, e); } });
 app.post('/academy/mapa/remover', (req: any, res: any) => { try { db.prepare(`DELETE FROM academy_produto_curso WHERE id=?`).run((req.body || {}).id); _ndOk(res, { removido: true }); } catch (e) { _ndErr(res, e); } });
+
+// [+acesso-academy-na-compra 10/11] Mensagem de ACESSO (link magico + video + email) quando entra compra
+// aprovada de produto com curso na Academia. _acMatricularPorVenda (acima) ja cria o aluno e concede o
+// curso; ESTE bloco so manda a mensagem de acesso. INERTE ate pub_kv 'acesso_academy_msg_ativo'='1'.
+// Dedup por (email,curso) em academy_envio_acesso: nunca remanda em recompra.
+try { db.exec(`CREATE TABLE IF NOT EXISTS academy_envio_acesso ( id TEXT PRIMARY KEY, email TEXT, curso_id TEXT, canal TEXT, criado_em TEXT )`); } catch { /* existe */ }
+const _ACESSO_ACADEMY_MSG: any[] = [
+  { match: /baixista\s*pr/i, curso: '42825fe8-0b6a-464a-b7c7-1b98048571ff', produto_nome: 'Método Baixista Pró',
+    projeto: 'baixo', instancia: 'Baixo', emoji: '🎸',
+    video: 'https://motor.melodiaseriffs.com.br/media/academy/tutorial-baixista-pro.mp4' },
+  // extensivel: 1 linha por produto low-ticket que tenha curso na Academia + mensagem/video prontos.
+];
+const _acAcessoMsgTexto = (m: any, nome: string, email: string, link: string): string =>
+  `${m.emoji} Parabéns pela sua compra${nome ? ', ' + nome : ''}! Seu acesso ao *${m.produto_nome}* já está liberado 🙌\n\n`
+  + `Sua *Área do Aluno* já está pronta. É só tocar no link abaixo pra entrar direto, sem precisar digitar senha 👇🏼\n${link}\n\n`
+  + `📲 *Tutorial em vídeo:* dá o play que eu te mostro o passo a passo de onde clicar — fica bem fácil 😊\n\n`
+  + `Se preferir entrar pelo site:\n🌐 Site: areadoaluno.melodiaseriffs.com.br\n📧 E-mail: ${email}\n🔑 Senha: melodias123\n\n`
+  + `Também mandei esses dados no seu e-mail. Qualquer dúvida é só me chamar aqui! 🙏${m.emoji}`;
+const _acAcessoMsgEmailHtml = (m: any, nome: string, email: string, link: string): string =>
+  `<div style="font:16px/1.6 system-ui,Arial,sans-serif;color:#1a1a1a;max-width:560px;margin:0 auto">`
+  + `<h2 style="color:#111">Seu acesso ao ${m.produto_nome} 🎉</h2>`
+  + `<p>Olá${nome ? ' ' + nome : ''}, sua compra foi aprovada e seu acesso já está liberado!</p>`
+  + `<p style="text-align:center;margin:28px 0"><a href="${link}" style="background:#e7c86a;color:#1a1a1a;font-weight:700;text-decoration:none;padding:14px 28px;border-radius:10px;display:inline-block">Acessar minha área</a></p>`
+  + `<p>Se preferir entrar pelo site:<br>🌐 <b>Site:</b> areadoaluno.melodiaseriffs.com.br<br>📧 <b>E-mail:</b> ${email}<br>🔑 <b>Senha:</b> melodias123</p>`
+  + `<p>📲 <b>Tutorial:</b> <a href="${link}">clique aqui e acesse sua área</a> — lá dentro é só seguir o passo a passo.</p>`
+  + `<p style="color:#777;font-size:13px">Qualquer dúvida, é só responder este e-mail. 🙏</p></div>`;
+const _acAcessoNaVenda = (p: any, b: any, provider: string): void => {
+  try {
+    if (pubFlag('acesso_academy_msg_ativo', '0') !== '1') return;   // INERTE ate ligar o flag
+    const email = String((p && p.email) || '').trim().toLowerCase(); if (!email) return;
+    let itens: any[] = []; try { itens = _itensPagamento(provider, b); } catch { /* */ }
+    const nomes = [String((p && p.produtoNome) || '')].concat(itens.map((it: any) => String((it && it.produtoNome) || '')));
+    const feitos = new Set<string>();
+    for (const m of _ACESSO_ACADEMY_MSG) {
+      if (feitos.has(m.curso)) continue;
+      if (!nomes.some((n) => m.match.test(n))) continue;
+      feitos.add(m.curso);
+      const ja = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, m.curso);
+      if (ja) continue;   // ja mandou acesso desse curso pra esse email (recompra): nao remanda
+      const al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+      if (!al) continue;  // _acMatricularPorVenda deveria ter criado; se nao casou o mapa, sai
+      if (!al.senha_hash) { try { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash('melodias123'), 'melodias123', al.id); } catch { /* */ } }
+      let tok = al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, al.id); }
+      const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
+      const nome = _primeiroNomeBonito(String((p && p.nome) || al.nome || ''));
+      if (p && p.telefone) {
+        try { enviarTexto(m.projeto as any, String(p.telefone), _acAcessoMsgTexto(m, nome, email, link), m.instancia).catch(() => {}); } catch { /* */ }
+        if (m.video) { try { enviarMidia(m.projeto as any, String(p.telefone), 'video', m.video, 'Tutorial de acesso', m.instancia).catch(() => {}); } catch { /* */ } }
+      }
+      try { _emailFilaEnfileirar(m.projeto, email, 'Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs', _acAcessoMsgEmailHtml(m, nome, email, link)); } catch { /* */ }
+      try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), email, m.curso, ((p && p.telefone) ? 'wa+email' : 'email'), agora()); } catch { /* */ }
+      try { _acLog(al.id, 'acesso_enviado_venda', m.curso); } catch { /* */ }
+    }
+  } catch { /* best-effort: nunca quebra a entrega */ }
+};
 
 // ===================== FIM DO LOTE B =====================
 
