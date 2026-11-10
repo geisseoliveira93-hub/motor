@@ -18191,3 +18191,48 @@ console.log('[teclado-nuvem] bloco carregado; ativo=', tnAtivo(), 'ig=', TN_IG_I
 
   console.log('[+cifras-violao +de-ouvido] bloco carregado: /academy/cifras-violao/sync|status, /academy/aula/anexo-lote, /academy/de-ouvido/reconciliar');
 })();
+
+// ============================================================================
+// [+yt-log-falhas] (2026-11-10) ADITIVO — apendado no FIM. Ver/resetar falhas das
+// varreduras do YouTube: vr_log (botaozinho dos Shorts) e tf_log (tela final).
+// Reaproveita globais: app, db, _ndOk, _ndErr.
+// ============================================================================
+(() => {
+  app.get('/pub/youtube/vr-log/falhas', (req: any, res: any) => {
+    try {
+      const lim = Math.min(Number((req.query || {}).limite) || 50, 500);
+      const por_motivo = db.prepare(`SELECT COALESCE(erro,'(sem)') motivo, projeto, COUNT(*) c FROM vr_log WHERE status='falha' GROUP BY erro, projeto ORDER BY c DESC`).all();
+      const total = (db.prepare(`SELECT COUNT(*) c FROM vr_log WHERE status='falha'`).get() as any).c;
+      const amostra = db.prepare(`SELECT video_id, projeto, erro, tentativas, quando FROM vr_log WHERE status='falha' ORDER BY quando DESC LIMIT ?`).all(lim);
+      _ndOk(res, { total, por_motivo, amostra });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.get('/pub/youtube/tf-log/falhas', (req: any, res: any) => {
+    try {
+      const lim = Math.min(Number((req.query || {}).limite) || 50, 500);
+      const por_motivo = db.prepare(`SELECT COALESCE(motivo,'(sem)') motivo, projeto, COUNT(*) c FROM tf_log WHERE status='falha' GROUP BY motivo, projeto ORDER BY c DESC`).all();
+      const total = (db.prepare(`SELECT COUNT(*) c FROM tf_log WHERE status='falha'`).get() as any).c;
+      const amostra = db.prepare(`SELECT video_id, projeto, motivo, tentativas, quando FROM tf_log WHERE status='falha' ORDER BY quando DESC LIMIT ?`).all(lim);
+      _ndOk(res, { total, por_motivo, amostra });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/pub/youtube/vr-log/reset-falhas', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const proj = String(b.projeto || '');
+      const r = proj
+        ? db.prepare(`UPDATE vr_log SET status='pendente', tentativas=0, erro=NULL WHERE status='falha' AND projeto=?`).run(proj)
+        : db.prepare(`UPDATE vr_log SET status='pendente', tentativas=0, erro=NULL WHERE status='falha'`).run();
+      _ndOk(res, { resetados: (r as any).changes });
+    } catch (e) { _ndErr(res, e); }
+  });
+  app.post('/pub/youtube/tf-log/reset-falhas', (req: any, res: any) => {
+    try {
+      const b = req.body || {}; const proj = String(b.projeto || '');
+      const r = proj
+        ? db.prepare(`UPDATE tf_log SET status='pendente', tentativas=0, motivo=NULL WHERE status='falha' AND projeto=?`).run(proj)
+        : db.prepare(`UPDATE tf_log SET status='pendente', tentativas=0, motivo=NULL WHERE status='falha'`).run();
+      _ndOk(res, { resetados: (r as any).changes });
+    } catch (e) { _ndErr(res, e); }
+  });
+  console.log('[+yt-log-falhas] bloco carregado: /pub/youtube/vr-log|tf-log/falhas (GET) + reset-falhas (POST)');
+})();
