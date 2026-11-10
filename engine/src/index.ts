@@ -16525,6 +16525,39 @@ app.post('/obs/rota/remover', (req, res) => { try { const id = String((req.body 
 app.post('/obs/sinal/regenerar', (req, res) => { try { const sinal = String((req.body || {}).sinal || ''); if (sinal !== 'h' && sinal !== 'v') return res.json({ ok: false, erro: 'sinal_invalido' }); const nk = _obsChaveNova(sinal); db.prepare(`UPDATE obs_sinal SET stream_key=?,atualizado_em=? WHERE id=?`).run(nk, agora(), sinal); res.json({ ok: true, streamKey: nk }); } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); } });
 app.get('/obs/status', (_req, res) => { const out: any = { ok: true, sinais: {} }; for (const s of _obsSinais()) { const arr = _obsRelays.get(s.id) || []; out.sinais[s.id] = { publicando: !!_obsPublicando[s.id], desde: _obsPublicando[s.id]?.desde || null, relays: arr.map((r: any) => ({ id: r.id, vivo: r.vivo, tentativas: r.tentativas })) }; } res.json(out); });
 app.post('/obs/parar', (req, res) => { const sinal = String((req.body || {}).sinal || ''); if (sinal) { _obsPararRelay(sinal); } else { _obsPararRelay('h'); _obsPararRelay('v'); } res.json({ ok: true }); });
+// [+obs-diag 10/11] DIAGNÓSTICO: mostra o ERRO real do ffmpeg (stderr) de cada relay + destino.
+// vivo:true só diz que o processo ffmpeg está rodando; este endpoint mostra o que o YouTube respondeu.
+app.get('/obs/diag', (_req, res) => {
+  try {
+    const out: any = {};
+    for (const s of _obsSinais()) {
+      const arr = _obsRelays.get(s.id) || [];
+      out[s.id] = { publicando: !!_obsPublicando[s.id], desde: _obsPublicando[s.id]?.desde || null, relays: arr.map((r: any) => ({ id: r.id, dest: r.dest, vivo: r.vivo, tentativas: r.tentativas, erro: (r.child && r.child._tail) ? String(r.child._tail() || '') : '' })) };
+    }
+    res.json({ ok: true, sinais: out });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
+// [+obs-play 10/11] ATIVA várias rotas DE UMA VEZ e sobe os relays numa tacada só (sem o churn de ativar
+// uma a uma com o OBS no ar, que mata+reinicia TODOS os relays a cada clique). body: {ids:[...]} ou {sinal}.
+app.post('/obs/play', (req, res) => {
+  try {
+    const b = req.body || {};
+    const sinaisAfetados = new Set<string>();
+    const tx = db.transaction(() => {
+      if (Array.isArray(b.ids) && b.ids.length) {
+        for (const id of b.ids.map((x: any) => String(x))) {
+          const r = db.prepare(`SELECT sinal FROM obs_rota WHERE id=?`).get(id) as any;
+          if (r) { db.prepare(`UPDATE obs_rota SET ativo=1, atualizado_em=? WHERE id=?`).run(agora(), id); sinaisAfetados.add(r.sinal); }
+        }
+      } else if (b.sinal) {
+        db.prepare(`UPDATE obs_rota SET ativo=1, atualizado_em=? WHERE sinal=?`).run(agora(), String(b.sinal)); sinaisAfetados.add(String(b.sinal));
+      }
+    });
+    tx();
+    for (const s of sinaisAfetados) { if (_obsPublicando[s]) _obsIniciarRelay(s); }  // UMA vez por sinal (start limpo)
+    res.json({ ok: true, sinais: [...sinaisAfetados], obs: 'relays iniciados numa tacada só' });
+  } catch (e: any) { res.json({ ok: false, erro: String(e?.message || e) }); }
+});
 // webhooks do nginx-rtmp (sem x-api-key; valida token na query). nginx manda 'name'=chave no corpo (form).
 app.post('/obs/on_publish', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (!sinal) return res.status(404).send('chave desconhecida'); _obsIniciarRelay(sinal); console.log('[obs] on_publish sinal', sinal); return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
 app.post('/obs/on_publish_done', (req, res) => { try { if (String(req.query.token || '') !== OBS_HOOK_TOKEN) return res.status(403).send('no'); const key = String((req.body && req.body.name) || req.query.name || ''); const sinal = _obsSinalPorKey(key); if (sinal) { _obsPararRelay(sinal); console.log('[obs] on_publish_done sinal', sinal); } return res.status(200).send('ok'); } catch { return res.status(200).send('ok'); } });
