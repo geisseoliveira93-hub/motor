@@ -1249,3 +1249,87 @@ export async function aplicarTelaFinalLinkViaEdit(opts: { projeto: string; video
     try { if (browser) await browser.close(); } catch { /* ignore */ }
   }
 }
+
+// [+troca-link-no-lugar 2026-11-10] ADITIVO. Troca a URL do LINK da tela final dos videos que JA TEM
+// tela final (onde "Importar do video" nao aparece). Com debug=true devolve um RETRATO do editor (DOM)
+// pra mapear os seletores antes de implementar a edicao de verdade. Por LOCATORS (patchright na nuvem).
+export async function aplicarTrocaLinkViaEdit(opts: { projeto: string; videoId: string; linkUrl: string; linkTitulo?: string; snaps?: boolean; debug?: boolean }): Promise<{ ok: boolean; erro?: string; detalhe?: string; proxyUsado?: string | null; screenshots?: string[]; debug?: any }> {
+  const projeto = String(opts.projeto || '').trim().toLowerCase();
+  const videoId = String(opts.videoId || '').trim();
+  const linkUrl = String(opts.linkUrl || '').trim();
+  const querDebug = !!opts.debug;
+  const querSnaps = !!opts.snaps;
+  const screenshots: string[] = [];
+  if (!projeto || !videoId || !linkUrl) return { ok: false, erro: 'projeto/videoId/linkUrl obrigatorios' };
+  const sess = lerSessao(projeto);
+  if (!sess) return { ok: false, erro: 'sem sessao YT na nuvem para ' + projeto };
+  let browser: any = null; let ctx: any = null; let page: any = null; let proxyUsado: string | null = null;
+  try { if (querSnaps) fs.mkdirSync(SNAP_DIR, { recursive: true }); } catch { /* ok */ }
+  async function snap(etapa: string): Promise<void> {
+    if (!querSnaps || !page) return;
+    try { const p = path.join(SNAP_DIR, projeto + '-trl-' + Date.now() + '-' + etapa + '.png'); await page.screenshot({ path: p, fullPage: false }); screenshots.push(p); } catch { /* ignore */ }
+  }
+  try {
+    const temLista = lerProxies().length > 0;
+    const escolhido = await escolherProxy();
+    if (temLista && !escolhido) return { ok: false, erro: 'nenhum aparelho de casa (proxy residencial) online', screenshots };
+    const launchOpts: any = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] };
+    if (escolhido) { launchOpts.proxy = escolhido.playwright; proxyUsado = escolhido.node.nome || escolhido.node.host; }
+    const chromium = await carregarChromium();
+    browser = await chromium.launch(launchOpts);
+    ctx = await browser.newContext({ storageState: sess.storageState, userAgent: sess.userAgent || USER_AGENT_DEFAULT, viewport: { width: 1400, height: 900 }, locale: 'pt-BR' });
+    page = await ctx.newPage();
+    try { await page.goto('https://www.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 60_000 }); await delayHumano(1500, 2500); } catch { /* ok */ }
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessao YT expirou (login do Google)', proxyUsado, screenshots };
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await delayHumano(3500, 5000);
+    if (/accounts\.google\.com/.test(page.url())) return { ok: false, erro: 'sessao YT expirou (redirecionou pro login)', proxyUsado, screenshots };
+    try { await page.waitForLoadState('networkidle', { timeout: 20_000 }); } catch { /* ok */ }
+    const selCard = 'ytcp-text-dropdown-trigger:has-text("Tela final"), ytcp-text-dropdown-trigger:has-text("Telas finais"), ytcp-text-dropdown-trigger:has-text("End screen")';
+    let cardLoc: any = null;
+    try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 30_000 }); cardLoc = l; } catch { /* trata abaixo */ }
+    if (!cardLoc) { await snap('trl-02-sem-card'); return { ok: false, erro: 'nao achei o card "Tela final"', proxyUsado, screenshots }; }
+    let abriu = false;
+    for (let i = 0; i < 4 && !abriu; i++) {
+      try { await cardLoc.scrollIntoViewIfNeeded(); } catch { /* ok */ }
+      try { await cardLoc.click({ timeout: 8000 }); } catch { /* ok */ }
+      await delayHumano(1800, 2600);
+      try { abriu = await page.locator('text=/\\+?\\s*elemento\\b|add element|importar do v[íi]deo/i').first().isVisible({ timeout: 2500 }); } catch { abriu = false; }
+    }
+    await snap('trl-02-editor');
+    if (!abriu) return { ok: false, erro: 'o editor de Tela final nao abriu', proxyUsado, screenshots };
+    await delayHumano(1200, 1800);
+    // RETRATO do editor (pra mapear seletores): inputs visiveis + nodes que parecem elemento + textos com link
+    let dump: any = null;
+    try {
+      dump = await page.evaluate(() => {
+        const d: any = (globalThis as any).document;
+        const out: any = { inputs: [], candidatos: [], linksNaPagina: [] };
+        for (const inp of Array.from(d.querySelectorAll('input, textarea')) as any[]) {
+          const r = inp.getBoundingClientRect(); if (r.width < 2 || r.height < 2) continue;
+          out.inputs.push({ tag: inp.tagName, type: inp.type || '', ph: inp.placeholder || '', aria: inp.getAttribute('aria-label') || '', val: String(inp.value || '').slice(0, 90) });
+        }
+        const sel = '[class*="endscreen" i],[class*="end-screen" i],[class*="element" i],ytve-element,ytve-editor,ytcp-ve,[id*="element" i]';
+        for (const el of Array.from(d.querySelectorAll(sel)) as any[]) {
+          const r = el.getBoundingClientRect(); if (r.width < 2 || r.height < 2) continue;
+          const t = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 70);
+          out.candidatos.push({ tag: el.tagName, id: el.id || '', cls: String(el.className || '').slice(0, 90), txt: t });
+          if (out.candidatos.length > 40) break;
+        }
+        for (const a of Array.from(d.querySelectorAll('a[href]')) as any[]) {
+          const h = a.getAttribute('href') || ''; if (/melodiaseriffs|lastlink|combo|pack-do/i.test(h)) out.linksNaPagina.push(h.slice(0, 120));
+        }
+        return out;
+      });
+    } catch (e: any) { dump = { erroDump: String(e?.message || e).slice(0, 150) }; }
+    await snap('trl-03-dump');
+    if (querDebug) return { ok: true, detalhe: 'retrato do editor (debug)', debug: dump, proxyUsado, screenshots };
+    return { ok: false, erro: 'edicao-no-lugar ainda nao implementada; rode com debug:true pra mapear', debug: dump, proxyUsado, screenshots };
+  } catch (e: any) {
+    try { await snap('trl-erro'); } catch { /* ok */ }
+    return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado, screenshots };
+  } finally {
+    try { if (ctx) await ctx.close(); } catch { /* ignore */ }
+    try { if (browser) await browser.close(); } catch { /* ignore */ }
+  }
+}
