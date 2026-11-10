@@ -14952,6 +14952,83 @@ setInterval(() => {
     console.log('[envio-acesso] lote diário disparado', diaBRT, JSON.stringify({ enviados: r.enviados, wa: r.enviados_com_whatsapp, candidatos: r.candidatos }));
   } catch (e: any) { console.log('[envio-acesso] erro no lote diário:', String(e?.message || e)); }
 }, 10 * 60000);
+// ============================================================================
+// [+envio-acesso-v2 10/11] (add-only) -- 2 blocos/dia (manha/tarde) x multi-numero.
+//  Teclado: 60 via Teclado-suporte(1030) + 60 via Teclado-mr3-novo(8151) por bloco.
+//  Violao:  60 via Violao(8144) por bloco, PULANDO quem tem o Curso de Teclado Gospel.
+//  Texto novo (login automatico + email + senha). Mesma lista de controle (nunca 2x).
+//  O relogio antigo so roda se envio_v2_ativo!=1 (desligo o antigo por config pos-deploy).
+// ============================================================================
+function _acEnvioIcone(instrumento: string): string { return (instrumento === 'violao' || instrumento === 'baixo') ? '🎸' : '🎹'; }
+function _acEnvioAssunto2(instrumento: string): string { return 'Sua nova área de aluno da Melodias e Riffs chegou! ' + _acEnvioIcone(instrumento); }
+function _acEnvioWaTexto2(nome: string, link: string, email: string, instrumento: string): string {
+  const ic = _acEnvioIcone(instrumento); const pn = _acEnvioPrimeiroNome(nome); const ola = pn ? ('Olá, ' + pn + '!') : 'Olá!';
+  return `${ic} *Melodias e Riffs — Sua nova área de aluno chegou!*\n\n${ola} Sua área de aluno agora está no nosso novo sistema — todos os seus cursos em um só lugar, mais rápida e organizada.\n\n👉 Acesse direto por aqui (login automático):\n${link}\n\nOu entre pela área do aluno (areadoaluno.melodiaseriffs.com.br) com:\n📧 E-mail: ${email}\n🔑 Senha: ${AC_ENVIO_SENHA_PADRAO}\n\nÉ só entrar e continuar seus estudos. Qualquer dúvida, fala com a gente por aqui. Deus abençoe! 🙏`;
+}
+function _acEnvioEmailHtml2(nome: string, link: string, email: string, instrumento: string): string {
+  const ic = _acEnvioIcone(instrumento); const pn = _acEnvioPrimeiroNome(nome); const ola = pn ? ('Olá, ' + esc(pn) + '!') : 'Olá!';
+  return `<div style="font:16px/1.6 system-ui,Arial,sans-serif;color:#1a1a1a;max-width:560px;margin:auto"><p style="font-size:18px"><b>${ic} Melodias e Riffs — Sua nova área de aluno chegou!</b></p><p>${ola} Sua área de aluno agora está no nosso novo sistema — todos os seus cursos em um só lugar, mais rápida e organizada.</p><p>Acesse direto por aqui (login automático):</p><p style="text-align:center;margin:24px 0"><a href="${esc(link)}" style="background:#e7c86a;color:#1a1a1a;font-weight:700;text-decoration:none;padding:14px 28px;border-radius:10px;display:inline-block">ENTRAR NA MINHA ÁREA</a></p><p>Ou entre pela área do aluno (<a href="https://areadoaluno.melodiaseriffs.com.br">areadoaluno.melodiaseriffs.com.br</a>) com:<br>📧 <b>E-mail:</b> ${esc(email)}<br>🔑 <b>Senha:</b> ${AC_ENVIO_SENHA_PADRAO}</p><p>É só entrar e continuar seus estudos. Qualquer dúvida, fala com a gente por aqui. Deus abençoe! 🙏</p></div>`;
+}
+function _acEnvioRodarBloco(curso: string, limite: number, instancia: string, projeto: string, instrumento: string, excluirCurso: string, confirmar: boolean): any {
+  curso = String(curso || '').trim(); limite = Math.max(1, Math.min(500, Number(limite) || 60));
+  instancia = String(instancia || AC_ENVIO_INSTANCIA); projeto = String(projeto || AC_ENVIO_PROJETO); excluirCurso = String(excluirCurso || '').trim();
+  const rows = db.prepare(`SELECT DISTINCT m.id, m.nome, m.email, m.telefone, m.token_login FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuário teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%usuario teste%' AND lower(IFNULL(m.nome,'')) NOT LIKE '%aluno teste%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) AND (?='' OR m.id NOT IN (SELECT aluno_id FROM academy_acesso WHERE alvo_id=?)) ORDER BY m.criado_em LIMIT ?`).all(curso, curso, excluirCurso, excluirCurso, limite) as any[];
+  const dom = (db.prepare(`SELECT id FROM email_dominios WHERE projeto=? AND smtp_host<>'' AND smtp_senha IS NOT NULL AND smtp_senha<>'' ORDER BY (padrao=1) DESC, criado_em DESC LIMIT 1`).get(projeto) as any);
+  let enviados = 0, comWa = 0;
+  for (const r of rows) {
+    let tok = r.token_login;
+    if (!tok && confirmar) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, r.id); }
+    const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + (tok || '<token>');
+    const tel = String(r.telefone || '').replace(/\D/g, '');
+    if (!confirmar) continue;
+    let email_ok = 0, wa_ok = 0, erro = '';
+    try { db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projeto, String(r.email), _acEnvioAssunto2(instrumento), _acEnvioEmailHtml2(r.nome || '', link, String(r.email), instrumento), 'pendente', agora(), (dom && dom.id) || null, null); email_ok = 1; } catch (e: any) { erro += 'email:' + String(e?.message || e) + '; '; }
+    if (tel) { try { enfileirarFluxo(projeto as Projeto, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto2(r.nome || '', link, String(r.email), instrumento), delaySegundos: 0 } as any], r.nome || '', undefined, instancia, 'envio-acesso'); wa_ok = 1; comWa++; } catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; } }
+    db.prepare(`INSERT OR REPLACE INTO academy_envio_acesso(aluno_id,curso_id,email,telefone,email_ok,wa_ok,erro,enviado_em) VALUES(?,?,?,?,?,?,?,?)`).run(r.id, curso, String(r.email), tel, email_ok, wa_ok, erro || null, agora());
+    enviados++;
+  }
+  return { curso, instancia, projeto, instrumento, candidatos: rows.length, enviados, enviados_com_whatsapp: comWa, smtp_configurado: !!dom };
+}
+const AC_V2_JOBS_PADRAO: any[] = [
+  { curso: '5ea854ac-2870-4e01-a1b6-b7eb9f2bbd86', instancia: 'Teclado-suporte', projeto: 'teclado', instrumento: 'teclado', limite: 60, excluirCurso: '' },
+  { curso: '5ea854ac-2870-4e01-a1b6-b7eb9f2bbd86', instancia: 'Teclado-mr3-novo', projeto: 'teclado', instrumento: 'teclado', limite: 60, excluirCurso: '' },
+  { curso: '2355f72d-9c41-4237-96c2-d11dc045be0f', instancia: 'Violao', projeto: 'violao', instrumento: 'violao', limite: 60, excluirCurso: '5ea854ac-2870-4e01-a1b6-b7eb9f2bbd86' }
+];
+if (pubFlag('envio_v2_ativo', '') === '') setPubFlag('envio_v2_ativo', '1');
+if (pubFlag('envio_v2_hora_manha', '') === '') setPubFlag('envio_v2_hora_manha', '9');
+if (pubFlag('envio_v2_hora_tarde', '') === '') setPubFlag('envio_v2_hora_tarde', '14');
+if (pubFlag('envio_v2_jobs', '') === '') setPubFlag('envio_v2_jobs', JSON.stringify(AC_V2_JOBS_PADRAO));
+function _acEnvioV2Jobs(): any[] { try { const j = JSON.parse(pubFlag('envio_v2_jobs', JSON.stringify(AC_V2_JOBS_PADRAO))); return Array.isArray(j) && j.length ? j : AC_V2_JOBS_PADRAO; } catch { return AC_V2_JOBS_PADRAO; } }
+function _acEnvioV2Bloco(tag: string, confirmar: boolean): any[] {
+  const jobs = _acEnvioV2Jobs(); const out: any[] = [];
+  for (const j of jobs) { try { out.push(_acEnvioRodarBloco(j.curso, Number(j.limite) || 60, j.instancia, j.projeto, j.instrumento, j.excluirCurso || '', confirmar)); } catch (e: any) { out.push({ erro: String(e?.message || e), job: j }); } }
+  console.log('[envio-v2] bloco', tag, 'confirmar=', confirmar, JSON.stringify(out));
+  return out;
+}
+setInterval(() => {
+  try {
+    if (pubFlag('envio_v2_ativo', '1') !== '1') return;
+    const nowBRT = new Date(Date.now() - 3 * 3600 * 1000); const diaBRT = nowBRT.toISOString().slice(0, 10); const horaBRT = nowBRT.getUTCHours();
+    const hm = Number(pubFlag('envio_v2_hora_manha', '9')), ht = Number(pubFlag('envio_v2_hora_tarde', '14'));
+    let bloco = ''; if (horaBRT === hm) bloco = 'manha'; else if (horaBRT === ht) bloco = 'tarde'; else return;
+    const chave = diaBRT + '-' + bloco;
+    if (pubFlag('envio_v2_ultimo_bloco', '') === chave) return;
+    setPubFlag('envio_v2_ultimo_bloco', chave);
+    _acEnvioV2Bloco(chave, true);
+  } catch (e: any) { console.error('[envio-v2] erro relogio', String(e?.message || e)); }
+}, 10 * 60000);
+app.get('/academy/envio-v2/config', (_req: any, res: any) => { _ndOk(res, { ativo: pubFlag('envio_v2_ativo', '1') === '1', hora_manha: Number(pubFlag('envio_v2_hora_manha', '9')), hora_tarde: Number(pubFlag('envio_v2_hora_tarde', '14')), ultimo_bloco: pubFlag('envio_v2_ultimo_bloco', ''), jobs: _acEnvioV2Jobs() }); });
+app.post('/academy/envio-v2/config', (req: any, res: any) => { try { const b = req.body || {}; if (b.ativo !== undefined) setPubFlag('envio_v2_ativo', (b.ativo === true || b.ativo === '1' || b.ativo === 1) ? '1' : '0'); if (b.hora_manha !== undefined) setPubFlag('envio_v2_hora_manha', String(Math.max(0, Math.min(23, Number(b.hora_manha) || 9)))); if (b.hora_tarde !== undefined) setPubFlag('envio_v2_hora_tarde', String(Math.max(0, Math.min(23, Number(b.hora_tarde) || 14)))); if (b.jobs !== undefined && Array.isArray(b.jobs)) setPubFlag('envio_v2_jobs', JSON.stringify(b.jobs)); _ndOk(res, { ativo: pubFlag('envio_v2_ativo', '1') === '1', hora_manha: Number(pubFlag('envio_v2_hora_manha', '9')), hora_tarde: Number(pubFlag('envio_v2_hora_tarde', '14')), jobs: _acEnvioV2Jobs() }); } catch (e) { _ndErr(res, e); } });
+app.post('/academy/envio-v2/rodar', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.confirmar === true) { _ndOk(res, { blocos: _acEnvioV2Bloco('manual', true) }); return; }
+    const jobs = _acEnvioV2Jobs();
+    const previa = jobs.map((j: any) => { const c = db.prepare(`SELECT COUNT(*) n FROM (SELECT DISTINCT m.id FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) AND (?='' OR m.id NOT IN (SELECT aluno_id FROM academy_acesso WHERE alvo_id=?)))`).get(j.curso, j.curso, j.excluirCurso || '', j.excluirCurso || '') as any; return { instrumento: j.instrumento, instancia: j.instancia, curso: j.curso, limite: j.limite, elegiveis_agora: c.n }; });
+    _ndOk(res, { previa });
+  } catch (e) { _ndErr(res, e); }
+});
+
 // admin: criar/matricular aluno (e conceder acesso opcional)
 app.post('/academy/matricular', (req: any, res: any) => {
   try {
