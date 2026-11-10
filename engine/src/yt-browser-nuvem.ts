@@ -1324,7 +1324,62 @@ export async function aplicarTrocaLinkViaEdit(opts: { projeto: string; videoId: 
     } catch (e: any) { dump = { erroDump: String(e?.message || e).slice(0, 150) }; }
     await snap('trl-03-dump');
     if (querDebug) return { ok: true, detalhe: 'retrato do editor (debug)', debug: dump, proxyUsado, screenshots };
-    return { ok: false, erro: 'edicao-no-lugar ainda nao implementada; rode com debug:true pra mapear', debug: dump, proxyUsado, screenshots };
+    const temTextoLocal = async (re: RegExp): Promise<boolean> => { try { return await page.evaluate((s: string) => new RegExp(s, 'i').test(((globalThis as any).document.body?.innerText) || ''), re.source); } catch { return false; } };
+    // APAGAR todos os elementos atuais (botao #delete do painel de opcoes)
+    const panelSel = 'ytve-endscreen-editor-options-panel';
+    let deletados = 0;
+    for (let i = 0; i < 6; i++) {
+      let del: any = null;
+      try { const d = page.locator(panelSel + ' ytcp-icon-button#delete, ' + panelSel + ' #delete').first(); if (await d.isVisible({ timeout: 2500 })) del = d; } catch { del = null; }
+      if (!del) {
+        try { const canv = page.locator('ytve-endscreen-editor-preview-overlay [tabindex="0"], ytve-endscreen-editor-preview-overlay div[role="button"]').first(); if (await canv.isVisible({ timeout: 2000 })) { await canv.click({ timeout: 4000 }); await delayHumano(800, 1400); const d2 = page.locator(panelSel + ' #delete').first(); if (await d2.isVisible({ timeout: 2000 })) del = d2; } } catch { del = null; }
+      }
+      if (!del) break;
+      try { await del.click({ timeout: 5000 }); } catch { break; }
+      await delayHumano(900, 1500);
+      try { const cf = page.locator('ytcp-confirmation-dialog, tp-yt-paper-dialog, ytcp-dialog').locator('ytcp-button:has-text("Excluir"), ytcp-button:has-text("Remover"), ytcp-button:has-text("Apagar"), ytcp-button:has-text("Delete"), ytcp-button:has-text("Remove")').first(); if (await cf.isVisible({ timeout: 1500 })) { await cf.click({ timeout: 4000 }).catch(() => { /* ok */ }); await delayHumano(800, 1400); } } catch { /* ok */ }
+      deletados++;
+    }
+    await snap('trl-04-apagados');
+    let temImport = false;
+    try { temImport = await page.locator('text=/importar do v[íi]deo|import from video/i').first().isVisible({ timeout: 4000 }); } catch { temImport = false; }
+    if (!temImport) return { ok: false, erro: 'apaguei ' + deletados + ' elemento(s) mas nao apareceu "Importar do video"', debug: { deletados, dump }, proxyUsado, screenshots };
+    const MOLDES: any = { teclado: 'AIOiL1BYQUo', violao: 'BsUOAahk_mk', baixo: '0d2s_qaivWw' };
+    const moldeId = MOLDES[projeto];
+    if (!moldeId) return { ok: false, erro: 'sem molde definido para ' + projeto, debug: { deletados }, proxyUsado, screenshots };
+    try { await page.locator('text=/importar do v[íi]deo|import from video/i').first().click({ timeout: 8000 }); } catch { /* ok */ }
+    await delayHumano(1500, 2500);
+    try { await page.locator('ytcp-entity-card[role="option"], input[placeholder*="Pesquise nos seus" i]').first().waitFor({ state: 'visible', timeout: 12_000 }); } catch { /* ok */ }
+    let titulo = '';
+    try { const oe: any = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://youtu.be/' + moldeId)); if (oe && oe.ok) { const oj: any = await oe.json(); titulo = String((oj && oj.title) || '').trim(); } } catch { /* ok */ }
+    const termo = titulo.slice(0, 40);
+    if (termo) {
+      try { const busca = page.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first(); await busca.waitFor({ state: 'visible', timeout: 8000 }); await busca.click({ timeout: 5000 }).catch(() => { /* ok */ }); await busca.fill(termo).catch(() => { /* ok */ }); await delayHumano(600, 1000); await page.keyboard.press('Enter').catch(() => { /* ok */ }); } catch { /* ok */ }
+      await delayHumano(3000, 4200);
+    }
+    let escolheu = false;
+    const alvos = [
+      () => page.locator('xpath=.//*[contains(@style,"' + moldeId + '")]/ancestor::ytcp-entity-card[1]').first(),
+      () => page.locator('xpath=.//*[contains(@style,"' + moldeId + '")]/ancestor::*[@role="option"][1]').first(),
+      () => page.locator('[href*="' + moldeId + '"]').first(),
+      () => page.locator('[video-id="' + moldeId + '"]').first()
+    ];
+    for (const criar of alvos) { try { const el = criar(); await el.waitFor({ state: 'visible', timeout: 4000 }); await el.scrollIntoViewIfNeeded().catch(() => { /* ok */ }); await el.click({ timeout: 4000 }); escolheu = true; break; } catch { /* proximo */ } }
+    if (!escolheu) { await snap('trl-05-molde-nao-achado'); return { ok: false, erro: 'nao achei o molde ' + moldeId + ' na grade (busca "' + termo + '")', debug: { deletados }, proxyUsado, screenshots }; }
+    await delayHumano(2000, 3000);
+    try { const cf = page.locator('tp-yt-paper-dialog, ytcp-dialog, ytcp-confirmation-dialog').locator('ytcp-button:has-text("Importar"), ytcp-button:has-text("Substituir"), ytcp-button:has-text("Confirmar"), ytcp-button:has-text("Import"), ytcp-button:has-text("Replace")').first(); if (await cf.count()) { await cf.click({ timeout: 4000 }).catch(() => { /* ok */ }); await delayHumano(1200, 2000); } } catch { /* ok */ }
+    await snap('trl-06-importado');
+    let salvou = false;
+    try { const s = page.locator('ytcp-button#save-button:not([disabled]), #save-button:not([disabled]), ytcp-button:not([disabled]):has-text("Salvar"), ytcp-button:not([disabled]):has-text("Save")').first(); if (await s.count()) { await s.click({ timeout: 8000 }).catch(() => { /* ok */ }); salvou = true; } } catch { /* ok */ }
+    await delayHumano(2500, 4000);
+    await snap('trl-07-salvo');
+    await page.goto('https://studio.youtube.com/video/' + videoId + '/edit', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => { /* ok */ });
+    await delayHumano(3000, 4500);
+    let conf = false;
+    for (let i = 0; i < 3 && !conf; i++) { try { const l = page.locator(selCard).first(); await l.waitFor({ state: 'visible', timeout: 12_000 }); await l.click({ timeout: 6000 }); } catch { /* ok */ } await delayHumano(1600, 2300); conf = await temTextoLocal(/elemento:\s*(v[íi]deo|link|video)/i); }
+    await snap('trl-08-conf');
+    if (conf) return { ok: true, detalhe: 'apaguei ' + deletados + ' elemento(s) e reimportei o molde ' + moldeId + ' (link novo) [salvou=' + salvou + ']', proxyUsado, screenshots };
+    return { ok: true, detalhe: 'salvei mas nao confirmei na reabertura (revisar snaps) [deletados=' + deletados + ']', proxyUsado, screenshots };
   } catch (e: any) {
     try { await snap('trl-erro'); } catch { /* ok */ }
     return { ok: false, erro: String(e?.message || e).slice(0, 200), proxyUsado, screenshots };
