@@ -18077,3 +18077,117 @@ app.post('/webhook/ig-teclado', (req: any, res: any) => {
   try { void tnProcessar(req.body || {}); } catch {}
 });
 console.log('[teclado-nuvem] bloco carregado; ativo=', tnAtivo(), 'ig=', TN_IG_ID ? 'ok' : 'FALTA-ENV');
+
+// ============================================================================
+// [+cifras-violao +de-ouvido] (2026-11-10) ADITIVO — apendado no FIM do arquivo
+// (depois do app.listen, igual ao bloco teclado-nuvem). So ACRESCENTA.
+// Reaproveita globais ja definidos: app, db, _rclone, RCLONE_REMOTE, MEDIA_DIR,
+// PUBLIC_BASE_URL, _ndOk, _ndErr, fs, spawn.
+// ============================================================================
+(() => {
+  const CV_DIR = MEDIA_DIR + '/academy/cifras-violao';
+  try { fs.mkdirSync(CV_DIR, { recursive: true }); } catch { /* ok */ }
+  const CV_SRC = `${RCLONE_REMOTE}:_PARA_PC1/PDFS CURSO DE VIOLAO`;
+
+  function cvWalk(dir: string): string[] {
+    const out: string[] = [];
+    let ents: string[] = [];
+    try { ents = fs.readdirSync(dir); } catch { return out; }
+    for (const e of ents) {
+      const p = dir + '/' + e;
+      let st: any; try { st = fs.statSync(p); } catch { continue; }
+      if (st.isDirectory()) out.push(...cvWalk(p));
+      else if (/\.pdf$/i.test(e)) out.push(p);
+    }
+    return out;
+  }
+
+  // Sincroniza os PDFs do OneDrive (_PARA_PC1/PDFS CURSO DE VIOLAO) -> /data/media/academy/cifras-violao.
+  // confirmar:true => copia em BACKGROUND (rclone) e volta na hora; confira em /status.
+  app.post('/academy/cifras-violao/sync', (req: any, res: any) => {
+    try {
+      const confirmar = !!(req.body || {}).confirmar;
+      if (!confirmar) {
+        return _ndOk(res, { previa: true, origem: CV_SRC, destino: CV_DIR, ja_no_disco: cvWalk(CV_DIR).length, obs: 'rode com confirmar:true pra copiar' });
+      }
+      const child = spawn('rclone', ['copy', CV_SRC, CV_DIR, '--transfers', '8', '--checkers', '16'], { detached: true, stdio: 'ignore' });
+      child.unref();
+      _ndOk(res, { iniciado: true, origem: CV_SRC, destino: CV_DIR, obs: 'copiando em background; confira /academy/cifras-violao/status' });
+    } catch (e) { _ndErr(res, e); }
+  });
+
+  app.get('/academy/cifras-violao/status', (_req: any, res: any) => {
+    try {
+      const arqs = cvWalk(CV_DIR).map((p) => p.replace(CV_DIR + '/', ''));
+      _ndOk(res, { total: arqs.length, amostra: arqs.slice(0, 6) });
+    } catch (e) { _ndErr(res, e); }
+  });
+
+  // Anexa PDFs em lote nas aulas. body { items:[{aula_id,nome,url,tamanho?}], confirmar }.
+  // Dedup por url (igual /academy/aula/anexo). confirmar:false => so conta (previa).
+  app.post('/academy/aula/anexo-lote', (req: any, res: any) => {
+    try {
+      const b = req.body || {};
+      const items: any[] = Array.isArray(b.items) ? b.items : [];
+      const confirmar = !!b.confirmar;
+      let novos = 0, repetidos = 0, sem_aula = 0, aplicados = 0;
+      const exemplos: any[] = [];
+      const sel = db.prepare(`SELECT id, anexos FROM academy_aulas WHERE id=?`);
+      const upd = db.prepare(`UPDATE academy_aulas SET anexos=? WHERE id=?`);
+      const run = db.transaction(() => {
+        for (const it of items) {
+          const aulaId = String(it.aula_id || ''); const url = String(it.url || '');
+          const nome = String(it.nome || 'Baixar cifra');
+          if (!aulaId || !url) { sem_aula++; continue; }
+          const a = sel.get(aulaId) as any;
+          if (!a) { sem_aula++; continue; }
+          let an: any[] = []; try { an = JSON.parse(a.anexos || '[]'); } catch { an = []; }
+          if (an.some((x: any) => x && x.url === url)) { repetidos++; continue; }
+          novos++;
+          if (exemplos.length < 5) exemplos.push({ aula_id: aulaId, nome });
+          if (confirmar) { an.push({ nome, url, tamanho: String(it.tamanho || '') }); upd.run(JSON.stringify(an), aulaId); aplicados++; }
+        }
+      });
+      run();
+      _ndOk(res, { confirmar, total_itens: items.length, novos, repetidos, sem_aula, aplicados, exemplos });
+    } catch (e) { _ndErr(res, e); }
+  });
+
+  // Corrige "Como tocar de ouvido" dos alunos de TECLADO: 3f47ba52 (violao) -> cab69a22 (teclado).
+  // Preserva validade. Idempotente. Pula quem NAO e aluno de teclado. confirmar:false => so conta.
+  const DEOUVIDO_VIOLAO = '3f47ba52-2825-4c91-b7ce-c571e1f12191';
+  const DEOUVIDO_TECLADO = 'cab69a22-d1bd-4875-a27a-0e8b2749a54b';
+  const VITRINE_TECLADO = '88cefcb0-526b-4ffb-a993-5b269ffe1332';
+  app.post('/academy/de-ouvido/reconciliar', (req: any, res: any) => {
+    try {
+      const confirmar = !!(req.body || {}).confirmar;
+      const cursosTeclado = (db.prepare(`SELECT id FROM academy_cursos WHERE vitrine_id=?`).all(VITRINE_TECLADO) as any[]).map((r) => r.id);
+      const setTeclado = new Set(cursosTeclado);
+      const ehAlunoTeclado = (aluno_id: string): boolean => {
+        const accs = db.prepare(`SELECT alvo_tipo, alvo_id FROM academy_acesso WHERE aluno_id=?`).all(aluno_id) as any[];
+        for (const a of accs) {
+          if (a.alvo_tipo === 'vitrine' && a.alvo_id === VITRINE_TECLADO) return true;
+          if (a.alvo_tipo !== 'vitrine' && setTeclado.has(a.alvo_id)) return true;
+        }
+        return false;
+      };
+      const linhas = db.prepare(`SELECT id, aluno_id, validade FROM academy_acesso WHERE alvo_id=?`).all(DEOUVIDO_VIOLAO) as any[];
+      const temTeclado = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_id=? LIMIT 1`);
+      const upd = db.prepare(`UPDATE academy_acesso SET alvo_id=? WHERE id=?`);
+      const del = db.prepare(`DELETE FROM academy_acesso WHERE id=?`);
+      let corrigidos = 0, duplicados_removidos = 0, pulados_violao = 0;
+      const exemplos: any = { corrigir: [], dup: [], pular: [] };
+      const run = db.transaction(() => {
+        for (const l of linhas) {
+          if (!ehAlunoTeclado(l.aluno_id)) { pulados_violao++; if (exemplos.pular.length < 3) exemplos.pular.push(l.aluno_id); continue; }
+          if (temTeclado.get(l.aluno_id, DEOUVIDO_TECLADO)) { duplicados_removidos++; if (exemplos.dup.length < 3) exemplos.dup.push(l.aluno_id); if (confirmar) del.run(l.id); }
+          else { corrigidos++; if (exemplos.corrigir.length < 3) exemplos.corrigir.push(l.aluno_id); if (confirmar) upd.run(DEOUVIDO_TECLADO, l.id); }
+        }
+      });
+      run();
+      _ndOk(res, { confirmar, cursos_vitrine_teclado: cursosTeclado.length, total_acessos_deouvido_violao: linhas.length, corrigidos_violao_para_teclado: corrigidos, duplicados_removidos, pulados_sao_alunos_de_violao: pulados_violao, exemplos });
+    } catch (e) { _ndErr(res, e); }
+  });
+
+  console.log('[+cifras-violao +de-ouvido] bloco carregado: /academy/cifras-violao/sync|status, /academy/aula/anexo-lote, /academy/de-ouvido/reconciliar');
+})();
