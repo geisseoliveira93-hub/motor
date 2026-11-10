@@ -4301,6 +4301,23 @@ app.post('/webhook/payment/:provider', async (req, res) => {
           } catch { /* [motor2] best-effort: nunca quebra a entrega padrão */ }
         }
         await rodarAutomacoes(projeto, 'pagamento_aprovado', { contatoId: cid, telefone: p.telefone, nome: p.nome }).catch(() => {});
+      // [+desafio-saia-tonicas 10/11] (add-only) -- entradas automaticas no funil wbr "saia-das-tonicas-baixo"
+      //  (1) comprou o DESAFIO (LastLink CB94811D8 = "Desafio Guia do Zero de Baixo") -> entra DIRETO:
+      //      insere resposta no formulario de inscricao (formId que o funil ja le no tick => wLerFormulario => wInscrever).
+      //      dia1 = dia da compra; recebe a apostila (m01) + as 3 aulas automaticamente.
+      //  (2) comprou o METODO BAIXISTA PRO -> ganha a aula de bonus e recebe convite p/ se inscrever na pagina.
+      try {
+        const _pnST = String(p.produtoNome || '').toLowerCase();
+        if (/guia do zero de baixo/.test(_pnST)) {
+          db.prepare(`INSERT INTO formulario_respostas(id,formulario_id,projeto,contato_id,dados,criado_em) VALUES(?,?,?,?,?,?)`)
+            .run(randomUUID(), 'de6e32e2-72cd-4dd4-9a45-963d67b40113', projeto, cid,
+              JSON.stringify({ nome: p.nome || '', whatsapp: p.telefone || '', email: p.email || '', origem: 'compra-desafio' }), agora());
+        } else if (/baixista pr/.test(_pnST)) {
+          const _nmST = String(p.nome || '').trim().split(' ')[0];
+          const _txtST = (_nmST ? _nmST + ', p' : 'P') + 'arabéns pela compra do *Método Baixista Pró*! 🎸\n\nE eu tenho um presente a mais pra você: você acaba de *ganhar uma vaga* no *Desafio Baixo na Igreja — Saia das Tônicas em 3 dias* — 3 aulas ao vivo comigo (Melodias, Ritmos e Grooves e Frases), pra você sair das tônicas e tocar os louvores com firmeza.\n\nÉ um bônus gratuito, mas as vagas são limitadas. Pra garantir a sua, é só se inscrever aqui 👇\nhttps://baixo.melodiaseriffs.com.br/p/desafio-saia-das-tonicas\n\nTe espero no desafio! 🙌\nProfessor Ezequias';
+          await enviarTexto(projeto, p.telefone, _txtST, 'Baixo').catch(() => {});
+        }
+      } catch (e) { /* desafio-saia-tonicas best-effort: nunca quebra a entrega */ }
       } else if (categoria === 'perdido') {
         aplicarTag(projeto, cid, 'recuperacao');
         await dispararRecuperacao(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
