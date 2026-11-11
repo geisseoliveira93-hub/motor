@@ -1371,6 +1371,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/e-api/')) return next();  // [evento] API publica do evento (inscricao)
   if (req.path.startsWith('/c/')) return next();      // [#13 convite] pagina publica do convite (o aluno ve e agenda)
   if (req.path.startsWith('/c-api/')) return next();  // [#13 convite] API publica do convite (agendamento, sem x-api-key)
+  if (req.path.startsWith('/pay/')) return next();      // [+checkout-proprio 11/11] pagina/cobranca publica do checkout proprio
   if (req.path === '/mcp' || req.path.startsWith('/mcp/')) return next(); // [MCP] endpoint remoto: auth propria (MCP_API_KEY)
   if (req.path.startsWith('/.well-known/oauth')) return next(); // [MCP OAuth] metadata de descoberta
   if (req.path.startsWith('/oauth/')) return next(); // [MCP OAuth] authorize/token/register (gate pela MCP_API_KEY)
@@ -4233,6 +4234,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
     if (categoria === 'aprovado') { try { _acAcessoNaVenda(p, b, provider); } catch { /* acesso-academy best-effort: nunca quebra a entrega */ } }
+    if (categoria === 'aprovado') { try { _ckWebhookPaid(p); } catch { /* checkout-proprio best-effort: nunca quebra a entrega */ } }
     // [email-entrega] e-mail automatico na compra (POR PRODUTO). INERTE ate pub_kv 'email_entrega_ativo'='1' e so com template casado.
     if (categoria === 'aprovado' && pubFlag('email_entrega_ativo','0')==='1') { try { await _emailEntregaCompra(projeto, p.email, p.nome, p.produtoId, p.produtoNome); } catch { /* email-entrega best-effort: nunca quebra a entrega */ } }
     if (categoria === 'aprovado') { try { await _emailFluxoDisparar('pos_compra', projeto, p.email, p.nome, p.produtoId, p.produtoNome, p.telefone); } catch { /* email-fluxos best-effort */ } }
@@ -18383,6 +18385,369 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
 
   console.log('[wbr] régua de webinário genérica carregada; funis=', (db.prepare(`SELECT COUNT(*) n FROM wbr_funis`).get() as any).n);
 }
+
+
+
+// ===================== [+checkout-proprio 11/11] CHECKOUT PRÓPRIO (Pagar.me) =====================
+// ADD-ONLY. Checkout transparente próprio pra QUALQUER produto (cursos principais, Black Friday).
+// Reaproveita: cifra/decifra (chave secreta), pubFlag/setPubFlag, academy_matriculas/academy_acesso,
+// _acToken/_acHash, _AREA_URL, enviarTexto/enviarMidia, _emailFilaEnfileirar, _acAcessoMsgTexto/Email.
+// Público em /pay/* (liberado no middleware); admin em /checkout/* (exige x-api-key).
+// INERTE até pub_kv 'checkout_ativo'='1' (a cobrança só roda com a chave Pagar.me configurada + flag ligado).
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS ck_produtos (
+    id TEXT PRIMARY KEY, slug TEXT UNIQUE, nome TEXT, descricao TEXT, imagem TEXT,
+    preco_centavos INTEGER DEFAULT 0, de_centavos INTEGER DEFAULT 0,
+    academy_curso_id TEXT, validade TEXT DEFAULT 'vitalicio',
+    metodos TEXT DEFAULT '["card","pix","boleto"]', max_parcelas INTEGER DEFAULT 12, juros_am REAL DEFAULT 0,
+    projeto TEXT DEFAULT 'teclado', instancia TEXT, instrumento TEXT, emoji TEXT DEFAULT '🎵',
+    itens_json TEXT, ativo INTEGER DEFAULT 1, criado_em TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ck_pedidos (
+    id TEXT PRIMARY KEY, produto_id TEXT, slug TEXT, nome TEXT, email TEXT, telefone TEXT, cpf TEXT,
+    metodo TEXT, parcelas INTEGER DEFAULT 1, valor_centavos INTEGER DEFAULT 0, status TEXT DEFAULT 'pending',
+    pagarme_order_id TEXT, pagarme_charge_id TEXT,
+    pix_qr TEXT, pix_copia TEXT, pix_expira TEXT, boleto_url TEXT, boleto_linha TEXT,
+    erro TEXT, criado_em TEXT, pago_em TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ix_ckped_ord ON ck_pedidos(pagarme_order_id)`);
+} catch (e) { console.error('[checkout] schema erro (ignorado):', e); }
+
+// --- chamada à API da Pagar.me (core v5) com a chave secreta (decifrada na hora) ---
+async function _ckPagarme(caminho: string, metodo: string, corpo: any): Promise<any> {
+  const sk = decifra(pubFlag('pagarme_sk_enc', ''));
+  if (!sk) { const e: any = new Error('chave_pagarme_ausente'); throw e; }
+  const auth = 'Basic ' + Buffer.from(sk + ':').toString('base64');
+  const r = await fetch('https://api.pagar.me/core/v5' + caminho, {
+    method: metodo, headers: { Authorization: auth, 'Content-Type': 'application/json' },
+    body: corpo ? JSON.stringify(corpo) : undefined,
+  });
+  const txt = await r.text(); let j: any = null; try { j = JSON.parse(txt); } catch { j = { raw: txt }; }
+  if (!r.ok) { const e: any = new Error('pagarme_' + r.status); e.detalhe = j; throw e; }
+  return j;
+}
+
+// --- libera o acesso na Academia + manda link mágico (WhatsApp + e-mail). Idempotente. ---
+function _ckConceder(pedidoId: string): void {
+  try {
+    const pd = db.prepare(`SELECT * FROM ck_pedidos WHERE id=?`).get(pedidoId) as any;
+    if (!pd) return;
+    const prod = db.prepare(`SELECT * FROM ck_produtos WHERE id=?`).get(pd.produto_id) as any;
+    if (!prod) return;
+    const email = String(pd.email || '').trim().toLowerCase(); if (!email) return;
+    const curso = String(prod.academy_curso_id || '').trim();
+    let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+    let id = al && al.id;
+    if (!al) {
+      id = randomUUID(); const tok = _acToken();
+      db.prepare(`INSERT INTO academy_matriculas (id,nome,email,telefone,cpf,token_login,senha_hash,senha_plana,ativo,criado_em) VALUES (?,?,?,?,?,?,?,?,1,?)`)
+        .run(id, pd.nome || '', email, pd.telefone || '', pd.cpf || '', tok, _acHash('melodias123'), 'melodias123', agora());
+      al = db.prepare(`SELECT * FROM academy_matriculas WHERE id=?`).get(id) as any;
+    }
+    if (al && !al.senha_hash) { try { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash('melodias123'), 'melodias123', id); } catch { /* */ } }
+    let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, id); }
+    if (curso) {
+      const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, curso);
+      if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', curso, String(prod.validade || 'vitalicio'), agora());
+    }
+    const dedupKey = curso || ('ck:' + prod.id);
+    const jaEnv = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, dedupKey);
+    if (jaEnv) return; // já mandou acesso desse produto pra esse e-mail (recompra): não remanda
+    const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
+    const nome = _primeiroNomeBonito(String(pd.nome || (al && al.nome) || ''));
+    const m: any = { emoji: String(prod.emoji || '🎵'), produto_nome: String(prod.nome || 'seu curso'), projeto: String(prod.projeto || 'teclado'), instancia: String(prod.instancia || '') };
+    if (pd.telefone) { try { enviarTexto(m.projeto as any, String(pd.telefone), _acAcessoMsgTexto(m, nome, email, link), m.instancia || undefined).catch(() => {}); } catch { /* */ } }
+    try { _emailFilaEnfileirar(m.projeto, email, 'Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs', _acAcessoMsgEmailHtml(m, nome, email, link)); } catch { /* */ }
+    try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), email, dedupKey, (pd.telefone ? 'wa+email' : 'email'), agora()); } catch { /* */ }
+    try { _acLog(id, 'acesso_checkout', dedupKey); } catch { /* */ }
+  } catch { /* best-effort: nunca quebra */ }
+}
+
+// --- gancho chamado pelo webhook de pagamento quando um pedido Pagar.me é PAGO (declaração: hoisted) ---
+function _ckWebhookPaid(p: any): void {
+  try {
+    const ordId = String((p && p.pedido) || ''); if (!ordId) return;
+    const pd = db.prepare(`SELECT * FROM ck_pedidos WHERE pagarme_order_id=?`).get(ordId) as any;
+    if (!pd) return; // não é um pedido do nosso checkout
+    if (pd.status !== 'paid') db.prepare(`UPDATE ck_pedidos SET status='paid', pago_em=? WHERE id=?`).run(agora(), pd.id);
+    _ckConceder(pd.id);
+  } catch { /* best-effort */ }
+}
+
+// --- parse telefone BR -> {area_code, number} ---
+function _ckPhone(telDig: string): any {
+  try { let t = String(telDig || '').replace(/\D/g, ''); if (t.length > 11 && t.startsWith('55')) t = t.slice(2); if (t.length < 10) return null; return { mobile_phone: { country_code: '55', area_code: t.slice(0, 2), number: t.slice(2) } }; } catch { return null; }
+}
+
+// ============================= ADMIN (x-api-key) =============================
+app.get('/checkout/config', (_req: any, res: any) => {
+  try {
+    res.json({ ok: true, tem_sk: !!decifra(pubFlag('pagarme_sk_enc', '')), pk: pubFlag('pagarme_pk', ''), ativo: pubFlag('checkout_ativo', '0') === '1', tem_logo: !!pubFlag('checkout_logo', '') });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/checkout/config', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (typeof b.sk === 'string' && b.sk.trim()) setPubFlag('pagarme_sk_enc', cifra(b.sk.trim())); // guarda CIFRADA
+    if (typeof b.pk === 'string') setPubFlag('pagarme_pk', b.pk.trim());
+    if (typeof b.logo === 'string' && b.logo.trim()) setPubFlag('checkout_logo', b.logo.trim());
+    if (b.ativo !== undefined) setPubFlag('checkout_ativo', b.ativo ? '1' : '0');
+    res.json({ ok: true, tem_sk: !!decifra(pubFlag('pagarme_sk_enc', '')), pk: pubFlag('pagarme_pk', ''), ativo: pubFlag('checkout_ativo', '0') === '1' });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/checkout/produtos', (_req: any, res: any) => {
+  try { res.json({ ok: true, produtos: db.prepare(`SELECT * FROM ck_produtos ORDER BY criado_em DESC`).all() }); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/checkout/produto', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || randomUUID());
+    const slug = String(b.slug || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!slug) return res.status(400).json({ ok: false, erro: 'slug_obrigatorio' });
+    if (!b.nome || !Number(b.preco_centavos)) return res.status(400).json({ ok: false, erro: 'nome_e_preco_obrigatorios' });
+    const metodos = Array.isArray(b.metodos) ? JSON.stringify(b.metodos) : String(b.metodos || '["card","pix","boleto"]');
+    const itens = Array.isArray(b.itens) ? JSON.stringify(b.itens) : String(b.itens_json || b.itens || '[]');
+    const ex = db.prepare(`SELECT id FROM ck_produtos WHERE id=?`).get(id);
+    if (ex) {
+      db.prepare(`UPDATE ck_produtos SET slug=?, nome=?, descricao=?, imagem=?, preco_centavos=?, de_centavos=?, academy_curso_id=?, validade=?, metodos=?, max_parcelas=?, juros_am=?, projeto=?, instancia=?, instrumento=?, emoji=?, itens_json=?, ativo=? WHERE id=?`)
+        .run(slug, String(b.nome), String(b.descricao || ''), String(b.imagem || ''), Number(b.preco_centavos || 0), Number(b.de_centavos || 0), String(b.academy_curso_id || ''), String(b.validade || 'vitalicio'), metodos, Number(b.max_parcelas || 12), Number(b.juros_am || 0), String(b.projeto || 'teclado'), String(b.instancia || ''), String(b.instrumento || ''), String(b.emoji || '🎵'), itens, (b.ativo === 0 || b.ativo === false) ? 0 : 1, id);
+    } else {
+      db.prepare(`INSERT INTO ck_produtos (id,slug,nome,descricao,imagem,preco_centavos,de_centavos,academy_curso_id,validade,metodos,max_parcelas,juros_am,projeto,instancia,instrumento,emoji,itens_json,ativo,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, slug, String(b.nome), String(b.descricao || ''), String(b.imagem || ''), Number(b.preco_centavos || 0), Number(b.de_centavos || 0), String(b.academy_curso_id || ''), String(b.validade || 'vitalicio'), metodos, Number(b.max_parcelas || 12), Number(b.juros_am || 0), String(b.projeto || 'teclado'), String(b.instancia || ''), String(b.instrumento || ''), String(b.emoji || '🎵'), itens, 1, agora());
+    }
+    res.json({ ok: true, id, slug, url: '/pay/' + slug });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/checkout/produto/remover', (req: any, res: any) => {
+  try { db.prepare(`UPDATE ck_produtos SET ativo=0 WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true, inativado: true }); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/checkout/pedidos', (req: any, res: any) => {
+  try {
+    const st = String(req.query.status || '').trim();
+    const lim = Math.min(500, Number(req.query.limite || 100));
+    const rows = st
+      ? db.prepare(`SELECT id,produto_id,slug,nome,email,telefone,metodo,parcelas,valor_centavos,status,criado_em,pago_em FROM ck_pedidos WHERE status=? ORDER BY criado_em DESC LIMIT ?`).all(st, lim)
+      : db.prepare(`SELECT id,produto_id,slug,nome,email,telefone,metodo,parcelas,valor_centavos,status,criado_em,pago_em FROM ck_pedidos ORDER BY criado_em DESC LIMIT ?`).all(lim);
+    res.json({ ok: true, pedidos: rows });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/checkout/resumo', (_req: any, res: any) => {
+  try {
+    const pagos = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(valor_centavos),0) soma FROM ck_pedidos WHERE status='paid'`).get() as any;
+    const pend = (db.prepare(`SELECT COUNT(*) n FROM ck_pedidos WHERE status='pending'`).get() as any).n;
+    const porProd = db.prepare(`SELECT p.nome, COUNT(*) n, COALESCE(SUM(k.valor_centavos),0) soma FROM ck_pedidos k LEFT JOIN ck_produtos p ON p.id=k.produto_id WHERE k.status='paid' GROUP BY k.produto_id ORDER BY soma DESC`).all();
+    res.json({ ok: true, vendas: pagos.n, faturamento_centavos: pagos.soma, pendentes: pend, por_produto: porProd });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+
+// ============================= PÚBLICO (/pay/*) =============================
+// cobrança: cria a order na Pagar.me (cartão tokenizado no navegador, ou pix/boleto)
+app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
+  try {
+    if (pubFlag('checkout_ativo', '0') !== '1') return res.status(503).json({ ok: false, erro: 'checkout_inativo' });
+    const prod = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(req.params.slug || '')) as any;
+    if (!prod) return res.status(404).json({ ok: false, erro: 'produto_nao_encontrado' });
+    const b = req.body || {};
+    const metodo = String(b.metodo || 'card').toLowerCase();
+    let metodosOk: string[] = []; try { metodosOk = JSON.parse(prod.metodos || '["card","pix","boleto"]'); } catch { metodosOk = ['card', 'pix', 'boleto']; }
+    if (!metodosOk.includes(metodo)) return res.status(400).json({ ok: false, erro: 'metodo_nao_disponivel' });
+    const nome = String(b.nome || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    const telDig = String(b.telefone || '').replace(/\D/g, '');
+    const cpf = String(b.cpf || '').replace(/\D/g, '');
+    if (!nome || !email || email.indexOf('@') < 0) return res.status(400).json({ ok: false, erro: 'dados_incompletos' });
+    if ((metodo === 'boleto' || metodo === 'card') && cpf.length < 11) return res.status(400).json({ ok: false, erro: 'cpf_obrigatorio' });
+    const parcelas = Math.max(1, Math.min(Number(prod.max_parcelas || 12), Number(b.parcelas || 1)));
+    const valor = Number(prod.preco_centavos || 0);
+    const customer: any = { name: nome, email, type: 'individual' };
+    if (cpf) customer.document = cpf;
+    const ph = _ckPhone(telDig); if (ph) customer.phones = ph;
+    let pagamento: any;
+    if (metodo === 'card') {
+      const token = String(b.card_token || '');
+      if (!token) return res.status(400).json({ ok: false, erro: 'cartao_sem_token' });
+      pagamento = { payment_method: 'credit_card', credit_card: { installments: parcelas, statement_descriptor: 'MELODIASRIF', card_token: token } };
+    } else if (metodo === 'pix') {
+      pagamento = { payment_method: 'pix', pix: { expires_in: 3600 } };
+    } else {
+      const due = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+      pagamento = { payment_method: 'boleto', boleto: { due_at: due + 'T23:59:59Z', instructions: 'Pague até o vencimento' } };
+    }
+    const pedidoId = randomUUID();
+    const payload: any = { code: pedidoId, items: [{ amount: valor, description: String(prod.nome || 'Produto'), quantity: 1, code: String(prod.id) }], customer, payments: [pagamento] };
+    db.prepare(`INSERT INTO ck_pedidos (id,produto_id,slug,nome,email,telefone,cpf,metodo,parcelas,valor_centavos,status,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, valor, 'pending', agora());
+    let j: any;
+    try { j = await _ckPagarme('/orders', 'POST', payload); }
+    catch (e: any) {
+      db.prepare(`UPDATE ck_pedidos SET status='erro', erro=? WHERE id=?`).run(String((e && e.message) || 'erro').slice(0, 300), pedidoId);
+      return res.status(400).json({ ok: false, erro: 'falha_cobranca', detalhe: (e && e.detalhe) || null });
+    }
+    const ordId = String(j.id || '');
+    const ch = (j.charges && j.charges[0]) || {};
+    const lt = ch.last_transaction || {};
+    const stRaw = String(j.status || ch.status || 'pending').toLowerCase();
+    const statusNorm = stRaw === 'paid' ? 'paid' : (/(failed|refused|not_authorized|canceled)/.test(stRaw) ? 'refused' : 'pending');
+    const pixCopia = String(lt.qr_code || '');
+    const pixUrl = String(lt.qr_code_url || '');
+    const pixExp = String(lt.expires_at || '');
+    const boletoUrl = String(lt.url || lt.pdf || '');
+    const boletoLinha = String(lt.line || lt.barcode || '');
+    db.prepare(`UPDATE ck_pedidos SET pagarme_order_id=?, pagarme_charge_id=?, status=?, pix_qr=?, pix_copia=?, pix_expira=?, boleto_url=?, boleto_linha=? WHERE id=?`)
+      .run(ordId, String(ch.id || ''), statusNorm, pixUrl, pixCopia, pixExp, boletoUrl, boletoLinha, pedidoId);
+    if (statusNorm === 'paid') { try { _ckConceder(pedidoId); } catch { /* */ } }
+    return res.json({ ok: true, pedido: pedidoId, status: statusNorm, metodo, pix: { copia: pixCopia, qr_url: pixUrl, expira: pixExp }, boleto: { url: boletoUrl, linha: boletoLinha } });
+  } catch (e: any) { return res.status(500).json({ ok: false, erro: String((e && e.message) || e).slice(0, 200) }); }
+});
+// status do pedido (polling do PIX/boleto)
+app.get('/pay/status/:id', (req: any, res: any) => {
+  try { const pd = db.prepare(`SELECT status, metodo FROM ck_pedidos WHERE id=?`).get(String(req.params.id || '')) as any; if (!pd) return res.status(404).json({ ok: false }); res.json({ ok: true, status: pd.status, metodo: pd.metodo }); } catch (e: any) { res.status(500).json({ ok: false }); }
+});
+// página pública do checkout
+app.get('/pay/:slug', (req: any, res: any) => {
+  try {
+    const prod = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(req.params.slug || '')) as any;
+    if (!prod) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1 style="font-family:sans-serif">Produto não encontrado</h1>');
+    res.type('html').send(_ckPaginaHtml(prod));
+  } catch (e: any) { res.status(500).type('html').send('erro'); }
+});
+
+// --- HTML da página de checkout (design aprovado: roxo + dourado + logo) ---
+function _ckPaginaHtml(prod: any): string {
+  const pk = pubFlag('pagarme_pk', '');
+  const logo = pubFlag('checkout_logo', '');
+  let itens: string[] = []; try { itens = JSON.parse(prod.itens_json || '[]'); } catch { itens = []; }
+  let metodos: string[] = []; try { metodos = JSON.parse(prod.metodos || '["card","pix","boleto"]'); } catch { metodos = ['card', 'pix', 'boleto']; }
+  const cfg = {
+    slug: String(prod.slug), pk, preco: Number(prod.preco_centavos || 0), maxp: Number(prod.max_parcelas || 12),
+    juros: Number(prod.juros_am || 0), metodos,
+  };
+  const precoBR = (c: number) => 'R$ ' + (c / 100).toFixed(2).replace('.', ',');
+  const logoHtml = logo
+    ? '<img src="' + esc(logo) + '" alt="Melodias e Riffs" style="width:44px;height:44px;border-radius:11px;display:block;box-shadow:0 6px 16px rgba(75,46,131,.3)">'
+    : '<span style="width:40px;height:40px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#4b2e83,#6d4bb8);color:#fff;font-size:18px">' + esc(String(prod.emoji || '🎵')) + '</span>';
+  const incHtml = itens.map((t) => '<li><i><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg></i>' + esc(String(t)) + '</li>').join('');
+  const tabCard = metodos.indexOf('card') >= 0 ? '<div class="pay active" data-p="card"><span class="ic">💳</span>Cartão</div>' : '';
+  const tabPix = metodos.indexOf('pix') >= 0 ? '<div class="pay" data-p="pix"><span class="ic">⚡</span>PIX</div>' : '';
+  const tabBol = metodos.indexOf('boleto') >= 0 ? '<div class="pay" data-p="bol"><span class="ic">📄</span>Boleto</div>' : '';
+  const deHtml = Number(prod.de_centavos || 0) > Number(prod.preco_centavos || 0)
+    ? '<div class="l"><span>De</span><s>' + precoBR(Number(prod.de_centavos)) + '</s></div><div class="l"><span>Promoção à vista</span><span class="save">− ' + precoBR(Number(prod.de_centavos) - Number(prod.preco_centavos)) + '</span></div>'
+    : '';
+
+  // CSS (roxo + dourado, versão aprovada)
+  const css = `
+  :root{--brand:#4b2e83;--brand-2:#6d4bb8;--gold:#e8a62c;--gold-d:#c6861a;--ink:#1d1a26;--muted:#6a6577;--line:#e7e3ef;--bg:#f4f1f9;--card:#fff;--ok:#1f9d57;--field:#faf9fd;--shadow:0 10px 30px rgba(43,24,78,.08);--radius:16px}
+  *{box-sizing:border-box}html,body{margin:0}
+  body{font-family:"Poppins",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:radial-gradient(1200px 500px at 80% -10%,rgba(109,75,184,.14),transparent 60%),var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+  .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;max-width:1060px;margin:0 auto;padding:16px 20px}
+  .logo{display:flex;align-items:center;gap:11px;font-weight:800;color:var(--brand);font-size:16px}
+  .logo small{display:block;font-weight:600;font-size:10.5px;color:var(--muted);margin-top:1px}
+  .secure{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12.5px;font-weight:600}.secure svg{width:15px;height:15px}
+  .wrap{max-width:1060px;margin:0 auto;padding:8px 20px 48px}
+  .grid{display:grid;grid-template-columns:1.25fr .9fr;gap:22px;align-items:start}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}.summary{order:-1}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}.pad{padding:20px}
+  .sec-h{display:flex;align-items:center;gap:10px;margin:0 0 14px}.sec-h .n{width:24px;height:24px;border-radius:999px;background:var(--brand);color:#fff;font-size:13px;font-weight:700;display:grid;place-items:center}.sec-h h2{font-size:15.5px;margin:0}
+  label.f{display:block;margin:0 0 12px}label.f span{display:block;font-size:12.5px;font-weight:600;color:#43404d;margin-bottom:6px}
+  .in{width:100%;border:1.5px solid var(--line);background:var(--field);border-radius:11px;padding:12px 13px;font-size:14.5px;font-family:inherit;color:var(--ink);outline:none;transition:.15s}
+  .in:focus{border-color:var(--brand-2);background:#fff;box-shadow:0 0 0 4px rgba(109,75,184,.12)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:420px){.row2{grid-template-columns:1fr}}
+  .pays{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+  .pay{border:1.5px solid var(--line);border-radius:12px;padding:12px 8px;text-align:center;cursor:pointer;background:var(--field);transition:.15s;font-weight:600;font-size:13px;color:#43404d;user-select:none}
+  .pay .ic{font-size:19px;display:block;margin-bottom:5px}.pay.active{border-color:var(--brand);background:#fff;color:var(--brand);box-shadow:0 0 0 3px rgba(75,46,131,.1)}
+  .panel{display:none}.panel.show{display:block}
+  .flags{display:flex;gap:5px;margin-top:4px}.flag{height:20px;padding:0 6px;border-radius:4px;border:1px solid var(--line);display:grid;place-items:center;font-size:9px;font-weight:700;color:#555;background:#fff}
+  .pill{display:inline-flex;align-items:center;gap:6px;background:#eefaf1;color:var(--ok);font-weight:700;font-size:12px;padding:5px 10px;border-radius:999px}
+  .cta{width:100%;margin-top:6px;border:0;border-radius:13px;cursor:pointer;background:linear-gradient(180deg,#2bb56a,var(--ok));color:#fff;font-weight:800;font-size:16.5px;padding:16px;box-shadow:0 10px 22px rgba(31,157,87,.33);display:flex;align-items:center;justify-content:center;gap:9px}
+  .cta:disabled{opacity:.6;cursor:default}.cta small{font-weight:600;opacity:.9;font-size:12px}
+  .undercta{display:flex;align-items:center;justify-content:center;gap:7px;color:var(--muted);font-size:12px;margin-top:11px}
+  .summary .prod{display:flex;gap:13px;align-items:center}.thumb{width:62px;height:62px;border-radius:13px;flex:0 0 auto;display:grid;place-items:center;font-size:30px;background:linear-gradient(135deg,#efe7ff,#fbeecb);border:1px solid var(--line);overflow:hidden}.thumb img{width:100%;height:100%;object-fit:cover}
+  .prod h3{margin:0 0 3px;font-size:15px}.prod p{margin:0;color:var(--muted);font-size:12.5px}
+  .inc{list-style:none;margin:16px 0 0;padding:16px 0 0;border-top:1px dashed var(--line);display:grid;gap:9px}
+  .inc li{display:flex;gap:9px;font-size:13px;color:#3c3947;align-items:center}.inc li i{width:20px;height:20px;border-radius:999px;flex:0 0 auto;display:grid;place-items:center;background:var(--gold)}.inc li i svg{width:12px;height:12px;color:#fff}
+  .totals{margin-top:16px;padding-top:14px;border-top:1px solid var(--line);display:grid;gap:7px;font-size:13.5px;color:var(--muted)}
+  .totals .l{display:flex;justify-content:space-between}.totals .l s{color:#b7b2c4}.save{color:var(--gold-d);font-weight:700}
+  .totals .big{display:flex;justify-content:space-between;align-items:baseline;color:var(--ink);font-weight:800;font-size:15px;margin-top:4px}.totals .big b{font-size:26px;color:var(--brand)}.totals .big b small{font-size:13px;color:var(--muted);font-weight:600}
+  .guar{margin-top:14px;display:flex;gap:11px;align-items:center;background:var(--field);border:1px solid var(--line);border-radius:12px;padding:12px}.guar .seal{width:40px;height:40px;border-radius:999px;flex:0 0 auto;display:grid;place-items:center;background:#fff6e6;color:var(--gold-d);font-size:20px;border:1px solid #f1e2c0}.guar b{font-size:13px}.guar p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}
+  .trust{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:18px;color:var(--muted);font-size:11.5px}.trust b{color:#4b2e83}
+  .foot{max-width:1060px;margin:0 auto;padding:4px 20px 30px;color:#9a95a8;font-size:11px;text-align:center;line-height:1.6}
+  .qr{width:132px;height:132px;border-radius:12px;border:1px solid var(--line);margin-bottom:8px}
+  .copia{display:flex;margin-top:8px;border:1.5px dashed var(--line);border-radius:10px;overflow:hidden}.copia input{flex:1;border:0;background:var(--field);padding:10px;font-size:12px;color:var(--muted);min-width:0}.copia button{border:0;background:var(--brand);color:#fff;font-weight:700;padding:0 14px;cursor:pointer}
+  .msg{padding:12px 14px;border-radius:11px;font-size:13px;margin-top:10px;display:none}.msg.err{display:block;background:#fdeaea;color:#b03232}.msg.ok{display:block;background:#eefaf1;color:#1f7a44}
+  `;
+
+  const CFGJSON = JSON.stringify(cfg);
+  // Client JS — sem template literals (evita colisão com ${}). PK vai no appId da tokenização.
+  const js = [
+    'var CFG=', CFGJSON, ';',
+    'var $=function(s,r){return (r||document).querySelector(s)};',
+    'function brl(c){return "R$ "+(c/100).toFixed(2).replace(".",",")}',
+    'function soDig(s){return String(s||"").replace(/\\D/g,"")}',
+    'function parcelasOpts(){var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=CFG.preco/n}else{var j=CFG.juros;var coef=(j*Math.pow(1+j,n))/(Math.pow(1+j,n)-1);v=CFG.preco*coef}out.push({n:n,v:Math.round(v)})}return out}',
+    'function montaParcelas(){var sel=$("#parcelas");if(!sel)return;var o=parcelasOpts();sel.innerHTML=o.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
+    'var metodoAtual="",parcelasAtual=1;',
+    'document.querySelectorAll(".pay").forEach(function(b){b.addEventListener("click",function(){document.querySelectorAll(".pay").forEach(function(x){x.classList.remove("active")});b.classList.add("active");var p=b.getAttribute("data-p");metodoAtual=p==="bol"?"boleto":p;document.querySelectorAll(".panel").forEach(function(pn){pn.classList.toggle("show",pn.getAttribute("data-panel")===p)})})});',
+    'var pa=document.querySelector(".pay.active");metodoAtual=pa?(pa.getAttribute("data-p")==="bol"?"boleto":pa.getAttribute("data-p")):(CFG.metodos[0]==="card"?"card":CFG.metodos[0]);',
+    'function showMsg(t,ok){var m=$("#msg");m.className="msg "+(ok?"ok":"err");m.textContent=t}',
+    'async function tokenizaCartao(){var card={number:soDig($("#c_num").value),holder_name:$("#c_nome").value.trim(),exp_month:soDig($("#c_val").value).slice(0,2),exp_year:soDig($("#c_val").value).slice(2),cvv:soDig($("#c_cvv").value)};var r=await fetch("https://api.pagar.me/core/v5/tokens?appId="+encodeURIComponent(CFG.pk),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({type:"card",card:card})});var j=await r.json();if(!r.ok||!j.id){throw new Error((j&&(j.message||(j.errors&&JSON.stringify(j.errors))))||"Cartão inválido")}return j.id}',
+    'async function pagar(){var btn=$("#btn");btn.disabled=true;var old=btn.innerHTML;btn.innerHTML="Processando...";try{',
+    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual};',
+    'if(metodoAtual==="card"){body.cpf=$("#c_cpf")?$("#c_cpf").value:body.cpf;body.parcelas=Number($("#parcelas").value||1);body.card_token=await tokenizaCartao()}',
+    'if(metodoAtual==="boleto"){body.cpf=$("#b_cpf")?$("#b_cpf").value:body.cpf}',
+    'var r=await fetch("/pay/"+CFG.slug+"/cobrar",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});var j=await r.json();',
+    'if(!j.ok){showMsg(j.erro==="cpf_obrigatorio"?"Informe o CPF.":j.erro==="dados_incompletos"?"Preencha nome e e-mail.":"Não foi possível concluir. Confira os dados e tente de novo.",false);btn.disabled=false;btn.innerHTML=old;return}',
+    'if(metodoAtual==="pix"){mostraPix(j);btn.innerHTML=old}',
+    'else if(metodoAtual==="boleto"){mostraBoleto(j);btn.innerHTML=old}',
+    'else{if(j.status==="paid"){sucesso()}else{showMsg("Pagamento recebido, aguardando confirmação.",true);poll(j.pedido);btn.disabled=false;btn.innerHTML=old}}',
+    '}catch(e){showMsg(String(e&&e.message||e),false);btn.disabled=false;btn.innerHTML=old}}',
+    'function sucesso(){$("#area").innerHTML="<div class=\\"card pad\\" style=\\"text-align:center\\"><div style=\\"font-size:44px\\">✅</div><h2 style=\\"color:#1f9d57;margin:8px 0\\">Pagamento aprovado!</h2><p>Seu acesso foi liberado. Enviamos o link de acesso no seu WhatsApp e e-mail.</p></div>"}',
+    'function mostraPix(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><span class=\\"pill\\">⚡ Aprovação na hora</span><h2 style=\\"margin:12px 0 4px\\">Escaneie o PIX pra pagar</h2>";if(j.pix&&j.pix.qr_url)html+="<img class=\\"qr\\" src=\\""+j.pix.qr_url+"\\" alt=\\"QR PIX\\">";html+="<div class=\\"copia\\"><input id=\\"pxc\\" value=\\""+(j.pix&&j.pix.copia||"")+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText($(\'#pxc\').value)\\">Copiar</button></div><p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">Assim que o pagamento cair, seu acesso é liberado automaticamente.</p></div>";$("#area").innerHTML=html;poll(j.pedido)}',
+    'function mostraBoleto(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><h2 style=\\"margin:0 0 8px\\">Boleto gerado</h2>";if(j.boleto&&j.boleto.url)html+="<p><a class=\\"cta\\" style=\\"text-decoration:none\\" href=\\""+j.boleto.url+"\\" target=\\"_blank\\">Abrir boleto</a></p>";if(j.boleto&&j.boleto.linha)html+="<div class=\\"copia\\"><input value=\\""+j.boleto.linha+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText(this.previousSibling.value)\\">Copiar</button></div>";html+="<p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">O acesso é liberado quando o pagamento for compensado.</p></div>";$("#area").innerHTML=html}',
+    'function poll(id){var n=0;var t=setInterval(function(){n++;fetch("/pay/status/"+id).then(function(r){return r.json()}).then(function(s){if(s&&s.status==="paid"){clearInterval(t);sucesso()}});if(n>120)clearInterval(t)},5000)}',
+    'montaParcelas();var bt=$("#btn");if(bt)bt.addEventListener("click",pagar);',
+  ].join('');
+
+  const thumb = prod.imagem ? '<div class="thumb"><img src="' + esc(String(prod.imagem)) + '" alt=""></div>' : '<div class="thumb">' + esc(String(prod.emoji || '🎵')) + '</div>';
+
+  return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+    + '<title>' + esc(String(prod.nome || 'Checkout')) + ' — Melodias e Riffs</title>'
+    + '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    + '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap">'
+    + '<style>' + css + '</style></head><body>'
+    + '<div class="topbar"><div class="logo">' + logoHtml + '<span>Melodias e Riffs<small>A Escola do Músico Cristão</small></span></div>'
+    + '<div class="secure"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Ambiente 100% seguro</div></div>'
+    + '<div class="wrap" id="area"><div class="grid">'
+    + '<div style="display:grid;gap:18px">'
+    + '<div class="card pad"><div class="sec-h"><span class="n">1</span><h2>Seus dados</h2></div>'
+    + '<label class="f"><span>Nome completo</span><input id="nome" class="in" placeholder="Como está no seu documento"></label>'
+    + '<div class="row2"><label class="f"><span>E-mail</span><input id="email" type="email" class="in" placeholder="voce@email.com"></label>'
+    + '<label class="f"><span>WhatsApp</span><input id="tel" class="in" placeholder="(16) 90000-0000"></label></div>'
+    + '<label class="f" style="margin-bottom:0"><span>CPF</span><input id="cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label></div>'
+    + '<div class="card pad"><div class="sec-h"><span class="n">2</span><h2>Forma de pagamento</h2></div>'
+    + '<div class="pays">' + tabCard + tabPix + tabBol + '</div>'
+    + (metodos.indexOf('card') >= 0 ? ('<div class="panel show" data-panel="card">'
+      + '<label class="f"><span>Número do cartão</span><input id="c_num" class="in" inputmode="numeric" placeholder="0000 0000 0000 0000"></label>'
+      + '<label class="f"><span>Nome impresso no cartão</span><input id="c_nome" class="in" placeholder="NOME SOBRENOME"></label>'
+      + '<div class="row2"><label class="f"><span>Validade</span><input id="c_val" class="in" placeholder="MM/AA"></label><label class="f"><span>CVV</span><input id="c_cvv" class="in" inputmode="numeric" placeholder="000"></label></div>'
+      + '<label class="f" style="margin-bottom:6px"><span>Parcelas</span><select id="parcelas" class="in"></select></label>'
+      + '<div class="flags"><div class="flag">VISA</div><div class="flag">MASTER</div><div class="flag">ELO</div><div class="flag">AMEX</div><div class="flag">HIPER</div></div></div>') : '')
+    + (metodos.indexOf('pix') >= 0 ? ('<div class="panel' + (metodos.indexOf('card') < 0 ? ' show' : '') + '" data-panel="pix"><span class="pill">⚡ Aprovação na hora</span><p style="font-size:13px;color:#3c3947;margin:10px 0 0">Ao clicar em pagar, geramos o QR Code do PIX. O acesso é liberado automaticamente assim que o pagamento cair.</p></div>') : '')
+    + (metodos.indexOf('boleto') >= 0 ? ('<div class="panel" data-panel="bol"><p style="font-size:13px;color:#3c3947;margin:4px 0 12px">O boleto é gerado após confirmar e pode levar até 1 dia útil pra compensar.</p><label class="f" style="margin-bottom:0"><span>CPF do pagador</span><input id="b_cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label></div>') : '')
+    + '<button class="cta" id="btn" type="button">Pagar agora<small>· ' + precoBR(Number(prod.preco_centavos || 0)) + '</small></button>'
+    + '<div id="msg" class="msg"></div>'
+    + '<div class="undercta"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Pagamento processado pela Pagar.me · dados criptografados</div></div></div>'
+    + '<div class="summary"><div class="card pad"><div class="prod">' + thumb
+    + '<div><h3>' + esc(String(prod.nome || '')) + '</h3><p>' + esc(String(prod.descricao || 'Acesso imediato')) + '</p></div></div>'
+    + (incHtml ? ('<ul class="inc">' + incHtml + '</ul>') : '')
+    + '<div class="totals">' + deHtml + '<div class="big"><span>Total</span><b>' + precoBR(Number(prod.preco_centavos || 0)) + '<small> à vista</small></b></div></div>'
+    + '<div class="guar"><div class="seal">🛡️</div><div><b>7 dias de garantia</b><p>Não curtiu? Devolvemos 100% do valor.</p></div></div></div>'
+    + '<div class="trust"><span>🔒 Compra segura</span>·<span>Processado por <b>Pagar.me</b></span>·<span>SSL</span></div></div>'
+    + '</div></div>'
+    + '<div class="foot">Melodias e Riffs — A Escola do Músico Cristão</div>'
+    + '<script>' + js + '</script></body></html>';
+}
+// ===================== FIM [+checkout-proprio 11/11] =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
