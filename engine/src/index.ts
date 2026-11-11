@@ -14874,6 +14874,18 @@ app.post('/academy/aluno/email', (req: any, res: any) => {
     _ndOk(res, { ok: true, email });
   } catch (e) { _ndErr(res, e); }
 });
+// [+endpoint-telefone-aluno 11/11 Ezequias] ADD-ONLY. Igual ao /academy/aluno/email: troca o telefone de um aluno ja criado (reutilizavel). So adiciona.
+app.post('/academy/aluno/telefone', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || '').trim();
+    const telefone = String(b.telefone || '').replace(/\D/g, '');
+    if (!id || !telefone) return _ndErr(res, 'id e telefone obrigatorios');
+    db.prepare(`UPDATE academy_matriculas SET telefone=? WHERE id=?`).run(telefone, id);
+    _acLog(id, 'telefone_alterado', telefone);
+    _ndOk(res, { ok: true, telefone });
+  } catch (e) { _ndErr(res, e); }
+});
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: _AREA_URL + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
 });
