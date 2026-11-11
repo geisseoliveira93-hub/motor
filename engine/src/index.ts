@@ -4036,6 +4036,8 @@ app.post('/webhook/evolution', (req, res) => {
             else if (_comboBxPendentes(telefone) > 0) { _comboBxCancelarPendentes(telefone); _handoffComboBaixo(projeto, cid, telefone, texto, String(ev.instance || '')); } // RESPONDEU -> cancela restante + passa pro agente
           } catch { /* best-effort: nunca quebra o webhook */ }
         }
+        // [+agencia-prospeccao 11/11] número da fila de prospecção respondeu -> marca respondido/opt_out + abre atendimento na Central (para de disparar; a conversa já cai na Central). So adiciona.
+        if (!ehGrupo) { try { _agProspReplyHook(telefone, cid, texto); } catch { /* best-effort: nunca quebra o webhook */ } }
       }
     }
     if (ev?.event === 'connection.update' && data?.state) {
@@ -15095,6 +15097,142 @@ app.post('/academy/envio-v2/rodar', (req: any, res: any) => {
     const previa = jobs.map((j: any) => { const c = db.prepare(`SELECT COUNT(*) n FROM (SELECT DISTINCT m.id FROM academy_matriculas m JOIN academy_acesso a ON a.aluno_id=m.id WHERE (?='' OR a.alvo_id=?) AND (a.validade IS NULL OR a.validade='' OR a.validade='vitalicio' OR a.validade >= date('now')) AND m.email IS NOT NULL AND m.email<>'' AND lower(IFNULL(m.email,'')) NOT LIKE '%@teste%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@test.%' AND lower(IFNULL(m.email,'')) NOT LIKE '%@example%' AND m.id NOT IN (SELECT aluno_id FROM academy_envio_acesso) AND (?='' OR m.id NOT IN (SELECT aluno_id FROM academy_acesso WHERE alvo_id=?)))`).get(j.curso, j.curso, j.excluirCurso || '', j.excluirCurso || '') as any; return { instrumento: j.instrumento, instancia: j.instancia, curso: j.curso, limite: j.limite, elegiveis_agora: c.n }; });
     _ndOk(res, { previa });
   } catch (e) { _ndErr(res, e); }
+});
+
+// ============================================================================
+// [+agencia-prospeccao 11/11 Ezequias] DISPARADOR AUTOMÁTICO de prospecção da Agência MR.
+// O motor envia sozinho a partir de uma fila, 2x/dia (manhã+tarde, fuso SP), rodízio de 5
+// mensagens com {empresa}, intervalo ~20s com jitter, teto diário e por-bloco CONFIGURÁVEIS,
+// trava anti-ban (PARA + alerta em sinal de bloqueio/desconexão), e NUNCA re-manda pra quem
+// respondeu/descadastrou. O Claude só ALIMENTA a fila (POST /prospeccao/adicionar).
+// Nasce com envio LIGADO mas a fila VAZIA = nada dispara até ter contato. ADD-ONLY, INERTE.
+// ============================================================================
+db.prepare(`CREATE TABLE IF NOT EXISTS agencia_prospeccao (
+  id TEXT PRIMARY KEY, empresa TEXT, telefone TEXT UNIQUE, nicho TEXT, cidade TEXT,
+  status TEXT DEFAULT 'pendente', variacao_usada INTEGER, enviado_em TEXT, erro TEXT, criado_em TEXT
+)`);
+const AG_PROSP_INSTANCIA = 'EquipeMelodiasERiffs-Suporte2TECLADO'; // número da agência (final 2123953)
+const AG_PROSP_PROJETO: any = 'teclado'; // conta dona dessa instância
+const AG_PROSP_MSGS: string[] = [
+  'Oii, tudo bem? 😊 Aqui é o Ezequias, da Agência MR — somos uma agência de marketing e automações aqui da região. Posso te fazer uma pergunta rápida sobre a {empresa}? A gente ajuda negócios a venderem mais e a organizar o atendimento e a divulgação, cada um do jeito que precisa. Faz sentido a gente conversar rapidinho pra eu entender como poderia ajudar? 🙌',
+  'Olá! 😊 Ezequias aqui, da Agência MR, uma agência de marketing e automações. Ajudo negócios da região a crescer — mais clientes, mais vendas e menos trabalho manual no dia a dia. Queria entender rapidinho como está a {empresa} hoje pra te mostrar o que daria pra fazer. Posso te explicar em 1 minutinho? 🙌',
+  'Oi, tudo bem? 😊 Aqui é o Ezequias, da Agência MR (marketing e automações). A gente cuida da parte de atrair cliente, vender e automatizar o atendimento dos negócios da região — sob medida pra cada um. Posso te fazer umas perguntas rápidas sobre a {empresa} pra ver como poderíamos ajudar? 🙌',
+  'Oii! 😊 Ezequias, da Agência MR — agência de marketing e automações. A gente ajuda negócios como a {empresa} a aparecer mais, vender mais e economizar tempo com automação. Faz sentido trocarmos uma ideia rapidinho pra eu entender o seu momento e te mostrar o que dá pra fazer? 🙌',
+  'Olá, tudo bem? 😊 Aqui é o Ezequias, da Agência MR, agência de marketing e automações da região. Antes de te falar qualquer coisa, queria entender como está a {empresa} hoje — o que já funciona e o que te incomoda. A partir daí te mostro, sem compromisso, como poderíamos ajudar. Podemos conversar? 🙌'
+];
+// defaults (pub_kv; sobrevivem a deploy): envio LIGADO, teto 60/dia, 30/bloco, blocos 9h e 15h BRT.
+if (pubFlag('prosp_ativo', '') === '') setPubFlag('prosp_ativo', '1');
+if (pubFlag('prosp_teto_dia', '') === '') setPubFlag('prosp_teto_dia', '60');
+if (pubFlag('prosp_por_bloco', '') === '') setPubFlag('prosp_por_bloco', '30');
+if (pubFlag('prosp_hora_manha', '') === '') setPubFlag('prosp_hora_manha', '9');
+if (pubFlag('prosp_hora_tarde', '') === '') setPubFlag('prosp_hora_tarde', '15');
+function _agProspNorm(tel: string): string { let t = String(tel || '').replace(/\D/g, ''); if (t && !t.startsWith('55') && t.length <= 11) t = '55' + t; return t; }
+function _agProspDiaBRT(): string { return new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); }
+function _agProspEnviadosHoje(): number { try { const r = db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='enviado' AND substr(IFNULL(enviado_em,''),1,10)=?`).get(_agProspDiaBRT()) as any; return r ? r.n : 0; } catch { return 0; } }
+function _agProspAlerta(msg: string): void { try { setPubFlag('prosp_ultimo_alerta', _agProspDiaBRT() + ' ' + msg); } catch { /* */ } console.error('[prosp][ALERTA]', msg); }
+// gancho do webhook: contato da fila respondeu -> marca respondido/opt_out e abre atendimento na Central. Hoisted (function), chamável do webhook acima.
+function _agProspReplyHook(telefone: string, cid?: string, texto?: string): void {
+  try {
+    const t = _agProspNorm(telefone); if (!t || t.length < 8) return;
+    const fim = t.slice(-10);
+    const row = db.prepare(`SELECT id,status FROM agencia_prospeccao WHERE replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + fim) as any;
+    if (!row || row.status === 'opt_out') return;
+    const low = String(texto || '').toLowerCase();
+    const optout = /(^|\s)(parar|sair|pare|remover|cancelar|descadastr|n[ãa]o quero|sem interesse)(\s|$|[.,!])/.test(low);
+    db.prepare(`UPDATE agencia_prospeccao SET status=? WHERE id=?`).run(optout ? 'opt_out' : 'respondido', row.id);
+    if (cid) { try { setAtendimentoCA(cid, { status: 'fila', instancia: AG_PROSP_INSTANCIA }); } catch { /* central best-effort */ } }
+  } catch { /* best-effort: nunca quebra o webhook */ }
+}
+// envia 1 bloco (até N pendentes), respeitando o teto do dia. Assíncrono: ~20s (15-25s jitter) entre mensagens. PARA + alerta em sinal de ban.
+async function _agProspBloco(tag: string, confirmar: boolean): Promise<any> {
+  const teto = Number(pubFlag('prosp_teto_dia', '60')) || 60;
+  const porBloco = Number(pubFlag('prosp_por_bloco', '30')) || 30;
+  const jaHoje = _agProspEnviadosHoje();
+  const alvo = Math.min(porBloco, Math.max(0, teto - jaHoje));
+  const pend = (db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='pendente'`).get() as any).n;
+  if (!confirmar) return { previa: true, tag, pendentes: pend, enviados_hoje: jaHoje, teto, por_bloco: porBloco, enviaria_agora: Math.min(alvo, pend) };
+  if (alvo <= 0) { console.log('[prosp] bloco', tag, 'teto atingido', jaHoje, '/', teto); return { tag, enviados: 0, motivo: 'teto_atingido', enviados_hoje: jaHoje, teto }; }
+  const lista = db.prepare(`SELECT * FROM agencia_prospeccao WHERE status='pendente' ORDER BY criado_em ASC LIMIT ?`).all(alvo) as any[];
+  let enviados = 0, erros = 0; let pararBan = false;
+  for (let i = 0; i < lista.length; i++) {
+    const c = lista[i];
+    const vi = (Number(pubFlag('prosp_rodizio', '0')) || 0) % AG_PROSP_MSGS.length;
+    setPubFlag('prosp_rodizio', String((vi + 1) % AG_PROSP_MSGS.length));
+    const msg = AG_PROSP_MSGS[vi].replace(/\{empresa\}/g, (String(c.empresa || '').trim() || 'seu negócio'));
+    try {
+      await enviarTexto(AG_PROSP_PROJETO, _agProspNorm(c.telefone), msg, AG_PROSP_INSTANCIA);
+      db.prepare(`UPDATE agencia_prospeccao SET status='enviado', variacao_usada=?, enviado_em=?, erro=NULL WHERE id=?`).run(vi + 1, agora(), c.id);
+      enviados++;
+    } catch (e: any) {
+      const em = String(e?.message || e);
+      db.prepare(`UPDATE agencia_prospeccao SET erro=? WHERE id=?`).run(em.slice(0, 300), c.id);
+      erros++;
+      if (/not.?connected|desconect|close|logged.?out|forbidden|blocked|\bban\b|429|rate.?limit/i.test(em)) { pararBan = true; break; }
+    }
+    if (i < lista.length - 1 && !pararBan) await new Promise(r => setTimeout(r, 15000 + Math.floor(Math.random() * 10000)));
+  }
+  if (pararBan) { try { setPubFlag('prosp_ativo', '0'); } catch { /* */ } _agProspAlerta(`Prospecção Agência MR PAUSADA automaticamente: WhatsApp deu sinal de bloqueio/desconexão após ${enviados} envios no bloco ${tag}. Reative com POST /prospeccao/config {ativo:true} quando o número normalizar.`); }
+  console.log('[prosp] bloco', tag, 'enviados', enviados, 'erros', erros, 'parou_ban', pararBan);
+  return { tag, enviados, erros, parou_ban: pararBan, enviados_hoje: _agProspEnviadosHoje(), teto };
+}
+// RELÓGIO: 2 blocos/dia nos horários configurados (BRT), 1x cada (trava por dia-bloco).
+setInterval(() => {
+  try {
+    if (pubFlag('prosp_ativo', '1') !== '1') return;
+    const nowBRT = new Date(Date.now() - 3 * 3600 * 1000); const diaBRT = nowBRT.toISOString().slice(0, 10); const horaBRT = nowBRT.getUTCHours();
+    const hm = Number(pubFlag('prosp_hora_manha', '9')), ht = Number(pubFlag('prosp_hora_tarde', '15'));
+    let bloco = ''; if (horaBRT === hm) bloco = 'manha'; else if (horaBRT === ht) bloco = 'tarde'; else return;
+    const chave = diaBRT + '-' + bloco;
+    if (pubFlag('prosp_ultimo_bloco', '') === chave) return;
+    setPubFlag('prosp_ultimo_bloco', chave);
+    _agProspBloco(chave, true).catch((e: any) => console.error('[prosp] erro bloco', String(e?.message || e)));
+  } catch (e: any) { console.error('[prosp] erro relogio', String(e?.message || e)); }
+}, 10 * 60000);
+// POST /prospeccao/adicionar {contatos:[{empresa,telefone,nicho,cidade}]} -> dedup por telefone, insere pendentes. (É isto que o Claude chama pra alimentar a fila.)
+app.post('/prospeccao/adicionar', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const arr = Array.isArray(b.contatos) ? b.contatos : (Array.isArray(b) ? b : []);
+    if (!arr.length) return _ndErr(res, 'contatos vazio (mande {contatos:[{empresa,telefone,nicho,cidade}]})');
+    let add = 0, dup = 0, inval = 0;
+    const ins = db.prepare(`INSERT OR IGNORE INTO agencia_prospeccao(id,empresa,telefone,nicho,cidade,status,criado_em) VALUES(?,?,?,?,?,'pendente',?)`);
+    const tx = db.transaction((rows: any[]) => {
+      for (const c of rows) {
+        const tel = _agProspNorm(c.telefone || c.tel || '');
+        if (!tel || tel.length < 12) { inval++; continue; }
+        const r = ins.run(randomUUID(), String(c.empresa || '').trim(), tel, String(c.nicho || '').trim(), String(c.cidade || '').trim(), agora());
+        if (r.changes > 0) add++; else dup++;
+      }
+    });
+    tx(arr);
+    _ndOk(res, { adicionados: add, duplicados: dup, invalidos: inval, total_pendentes: (db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='pendente'`).get() as any).n });
+  } catch (e) { _ndErr(res, e); }
+});
+// GET /prospeccao/status -> contagens + config + último alerta
+app.get('/prospeccao/status', (_req: any, res: any) => {
+  try {
+    const por: any = {}; for (const r of db.prepare(`SELECT status, COUNT(*) n FROM agencia_prospeccao GROUP BY status`).all() as any[]) por[r.status] = r.n;
+    _ndOk(res, { ativo: pubFlag('prosp_ativo', '1') === '1', teto_dia: Number(pubFlag('prosp_teto_dia', '60')), por_bloco: Number(pubFlag('prosp_por_bloco', '30')), hora_manha: Number(pubFlag('prosp_hora_manha', '9')), hora_tarde: Number(pubFlag('prosp_hora_tarde', '15')), instancia: AG_PROSP_INSTANCIA, enviados_hoje: _agProspEnviadosHoje(), ultimo_bloco: pubFlag('prosp_ultimo_bloco', ''), ultimo_alerta: pubFlag('prosp_ultimo_alerta', ''), por_status: por });
+  } catch (e) { _ndErr(res, e); }
+});
+app.get('/prospeccao/config', (_req: any, res: any) => _ndOk(res, { ativo: pubFlag('prosp_ativo', '1') === '1', teto_dia: Number(pubFlag('prosp_teto_dia', '60')), por_bloco: Number(pubFlag('prosp_por_bloco', '30')), hora_manha: Number(pubFlag('prosp_hora_manha', '9')), hora_tarde: Number(pubFlag('prosp_hora_tarde', '15')), instancia: AG_PROSP_INSTANCIA }));
+app.post('/prospeccao/config', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.ativo !== undefined) setPubFlag('prosp_ativo', (b.ativo === true || b.ativo === '1' || b.ativo === 1) ? '1' : '0');
+    if (b.teto_dia !== undefined) setPubFlag('prosp_teto_dia', String(Math.max(0, Math.min(500, Number(b.teto_dia) || 60))));
+    if (b.por_bloco !== undefined) setPubFlag('prosp_por_bloco', String(Math.max(0, Math.min(200, Number(b.por_bloco) || 30))));
+    if (b.hora_manha !== undefined) setPubFlag('prosp_hora_manha', String(Math.max(0, Math.min(23, Number(b.hora_manha) || 9))));
+    if (b.hora_tarde !== undefined) setPubFlag('prosp_hora_tarde', String(Math.max(0, Math.min(23, Number(b.hora_tarde) || 15))));
+    _ndOk(res, { ativo: pubFlag('prosp_ativo', '1') === '1', teto_dia: Number(pubFlag('prosp_teto_dia', '60')), por_bloco: Number(pubFlag('prosp_por_bloco', '30')), hora_manha: Number(pubFlag('prosp_hora_manha', '9')), hora_tarde: Number(pubFlag('prosp_hora_tarde', '15')) });
+  } catch (e) { _ndErr(res, e); }
+});
+// POST /prospeccao/rodar {confirmar:true} -> DISPARAR AGORA um bloco (sem confirmar = prévia). Respeita o teto do dia.
+app.post('/prospeccao/rodar', (req: any, res: any) => {
+  try { const b = req.body || {}; _agProspBloco(b.confirmar === true ? 'manual' : 'previa', b.confirmar === true).then((r: any) => _ndOk(res, r)).catch((e: any) => _ndErr(res, e)); } catch (e) { _ndErr(res, e); }
+});
+// GET /prospeccao/lista?status= -> ver a fila
+app.get('/prospeccao/lista', (req: any, res: any) => {
+  try { const st = String((req.query || {}).status || ''); const rows = st ? db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao WHERE status=? ORDER BY criado_em DESC LIMIT 500`).all(st) : db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao ORDER BY criado_em DESC LIMIT 500`).all(); _ndOk(res, { total: rows.length, rows }); } catch (e) { _ndErr(res, e); }
 });
 
 // admin: criar/matricular aluno (e conceder acesso opcional)
