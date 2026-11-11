@@ -18426,6 +18426,10 @@ try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN utm_campaign TEXT`); } catch {
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN cupom TEXT`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN desconto_centavos INTEGER DEFAULT 0`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bump_slug TEXT`); } catch { /* já existe */ }
+// [+ck-extras2] controle de exibição do cupom + múltiplos order bumps
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN mostrar_cupom TEXT DEFAULT ''`); } catch { /* já existe */ } // ''=automático(se tiver cupom), '1'=sempre, '0'=nunca
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bumps_json TEXT`); } catch { /* já existe */ } // lista [{slug,titulo}] — vários order bumps
+try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bumps_json TEXT`); } catch { /* já existe */ }
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ck_cupons (
     id TEXT PRIMARY KEY, codigo TEXT UNIQUE, tipo TEXT DEFAULT 'percent', valor INTEGER DEFAULT 0,
@@ -18530,14 +18534,16 @@ function _ckPagoExtras(pedidoId: string): void {
     if (!pd) return;
     // (a) cupom: conta 1 uso quando o pedido virou pago
     if (pd.cupom) { try { db.prepare(`UPDATE ck_cupons SET usos=usos+1 WHERE upper(codigo)=? AND NOT EXISTS (SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?)`).run(String(pd.cupom).toUpperCase(), String(pd.email || '').toLowerCase(), 'ckcupom:' + pedidoId); } catch { /* */ } try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), String(pd.email || '').toLowerCase(), 'ckcupom:' + pedidoId, 'cupom', agora()); } catch { /* */ } }
-    // (b) order bump: libera o curso do produto-bump pro mesmo aluno/e-mail
-    if (pd.bump_slug) {
-      const bp = db.prepare(`SELECT * FROM ck_produtos WHERE slug=?`).get(String(pd.bump_slug)) as any;
+    // (b) order bumps: libera o curso de CADA produto-bump comprado pro mesmo aluno/e-mail
+    let _bslugs: string[] = []; try { _bslugs = JSON.parse(pd.bumps_json || '[]'); } catch { _bslugs = []; }
+    if (!_bslugs.length && pd.bump_slug) _bslugs = [String(pd.bump_slug)];
+    if (_bslugs.length) {
       const email = String(pd.email || '').trim().toLowerCase();
-      const curso = bp && String(bp.academy_curso_id || '').trim();
-      if (bp && email && curso) {
-        let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
-        if (al) {
+      let al = email ? (db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any) : null;
+      for (const slug of _bslugs) {
+        const bp = db.prepare(`SELECT * FROM ck_produtos WHERE slug=?`).get(String(slug)) as any;
+        const curso = bp && String(bp.academy_curso_id || '').trim();
+        if (bp && al && curso) {
           const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(al.id, curso);
           if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'curso', curso, String(bp.validade || 'vitalicio'), agora());
           try { _acLog(al.id, 'acesso_bump', curso); } catch { /* */ }
@@ -18635,9 +18641,15 @@ app.post('/checkout/produto/extras', (req: any, res: any) => {
     const b = req.body || {};
     const id = String(b.id || '');
     if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
-    db.prepare(`UPDATE ck_produtos SET bump_slug=?, bump_titulo=?, pixel_id=?, utm_source=?, utm_medium=?, utm_campaign=? WHERE id=?`)
-      .run(String(b.bump_slug || ''), String(b.bump_titulo || ''), String(b.pixel_id || ''), String(b.utm_source || ''), String(b.utm_medium || ''), String(b.utm_campaign || ''), id);
-    res.json({ ok: true, id });
+    // [+ck-extras2] lista de bumps (vários). Aceita b.bumps=[{slug,titulo}]; mantém bump_slug/bump_titulo = 1º (compat).
+    let bumps: any[] = [];
+    if (Array.isArray(b.bumps)) bumps = b.bumps.map((x: any) => ({ slug: String((x && x.slug) || x || '').trim(), titulo: String((x && x.titulo) || '').trim() })).filter((x: any) => x.slug);
+    else if (b.bump_slug) bumps = [{ slug: String(b.bump_slug), titulo: String(b.bump_titulo || '') }];
+    const primeiro = bumps[0] || { slug: '', titulo: '' };
+    const mostrarCupom = (b.mostrar_cupom === '1' || b.mostrar_cupom === '0') ? String(b.mostrar_cupom) : '';
+    db.prepare(`UPDATE ck_produtos SET bump_slug=?, bump_titulo=?, bumps_json=?, mostrar_cupom=?, pixel_id=?, utm_source=?, utm_medium=?, utm_campaign=? WHERE id=?`)
+      .run(String(primeiro.slug || ''), String(primeiro.titulo || ''), JSON.stringify(bumps), mostrarCupom, String(b.pixel_id || ''), String(b.utm_source || ''), String(b.utm_medium || ''), String(b.utm_campaign || ''), id);
+    res.json({ ok: true, id, bumps: bumps.length });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
@@ -18664,10 +18676,18 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     let _descont = 0, _cupomCod = '';
     try { const rc = _ckAplicarCupom(prod, String(b.cupom || '')); if (rc) { _descont = Number(rc.desconto || 0); _cupomCod = String(rc.codigo || ''); } } catch { /* */ }
     if (_descont < 0) _descont = 0; if (_descont > _preco - 100) _descont = Math.max(0, _preco - 100);
-    let _bumpProd: any = null;
-    try { if ((b.bump === true || b.bump === '1' || b.bump === 1) && prod.bump_slug) { _bumpProd = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(prod.bump_slug)) as any; } } catch { /* */ }
+    // [+ck-extras2] order bumps (vários): só entram os slugs que o cliente marcou (body.bumps). Compat: body.bump=true marca todos.
+    let _bumpsCfg: any[] = []; try { _bumpsCfg = JSON.parse(prod.bumps_json || '[]'); } catch { _bumpsCfg = []; }
+    if (!_bumpsCfg.length && prod.bump_slug) _bumpsCfg = [{ slug: String(prod.bump_slug) }];
+    const _sel: string[] = Array.isArray(b.bumps) ? b.bumps.map((s: any) => String(s)) : ((b.bump === true || b.bump === '1' || b.bump === 1) ? _bumpsCfg.map((x: any) => String(x.slug)) : []);
+    const _bumpProds: any[] = [];
+    for (const bc of _bumpsCfg) {
+      if (_sel.indexOf(String(bc.slug)) < 0) continue;
+      try { const bp = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(bc.slug)) as any; if (bp && !_bumpProds.find((x) => x.id === bp.id)) _bumpProds.push(bp); } catch { /* */ }
+    }
     const _itensPay: any[] = [{ amount: Math.max(100, _preco - _descont), description: String(prod.nome || 'Produto'), quantity: 1, code: String(prod.id) }];
-    if (_bumpProd) _itensPay.push({ amount: Number(_bumpProd.preco_centavos || 0), description: String(_bumpProd.nome || 'Bônus'), quantity: 1, code: String(_bumpProd.id) });
+    for (const bp of _bumpProds) _itensPay.push({ amount: Number(bp.preco_centavos || 0), description: String(bp.nome || 'Bônus'), quantity: 1, code: String(bp.id) });
+    const _bumpSlugsPagos = _bumpProds.map((x) => String(x.slug));
     const valor = _itensPay.reduce((s, i) => s + Number(i.amount || 0), 0);
     const customer: any = { name: nome, email, type: 'individual' };
     if (cpf) customer.document = cpf;
@@ -18688,7 +18708,7 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     db.prepare(`INSERT INTO ck_pedidos (id,produto_id,slug,nome,email,telefone,cpf,metodo,parcelas,valor_centavos,status,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, valor, 'pending', agora());
     // [+ck-extras] registra cupom/desconto/bump usados nesse pedido (pra concessão e relatório)
-    try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=? WHERE id=?`).run(_cupomCod, _descont, (_bumpProd ? String(_bumpProd.slug) : ''), pedidoId); } catch { /* */ }
+    try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=?, bumps_json=? WHERE id=?`).run(_cupomCod, _descont, (_bumpSlugsPagos[0] || ''), JSON.stringify(_bumpSlugsPagos), pedidoId); } catch { /* */ }
     let j: any;
     try { j = await _ckPagarme('/orders', 'POST', payload); }
     catch (e: any) {
@@ -18741,13 +18761,16 @@ function _ckPaginaHtml(prod: any): string {
   const logo = pubFlag('checkout_logo', '');
   let itens: string[] = []; try { itens = JSON.parse(prod.itens_json || '[]'); } catch { itens = []; }
   let metodos: string[] = []; try { metodos = JSON.parse(prod.metodos || '["card","pix","boleto"]'); } catch { metodos = ['card', 'pix', 'boleto']; }
-  // [+ck-extras] order bump (produto-bônus) + pixel do produto
-  let bumpP: any = null; try { if (prod.bump_slug) bumpP = db.prepare(`SELECT slug,nome,descricao,preco_centavos,de_centavos,emoji FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(prod.bump_slug)) as any; } catch { bumpP = null; }
+  // [+ck-extras2] order bumps (vários) + pixel do produto
+  let _bcfg: any[] = []; try { _bcfg = JSON.parse(prod.bumps_json || '[]'); } catch { _bcfg = []; }
+  if (!_bcfg.length && prod.bump_slug) _bcfg = [{ slug: String(prod.bump_slug), titulo: String(prod.bump_titulo || '') }];
+  const bumpsP: any[] = [];
+  for (const bc of _bcfg) { try { const bp = db.prepare(`SELECT slug,nome,descricao,preco_centavos,de_centavos,emoji FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(bc.slug)) as any; if (bp && !bumpsP.find((x) => x.slug === bp.slug)) bumpsP.push({ ...bp, _titulo: String((bc && bc.titulo) || '') }); } catch { /* */ } }
   const pixelId = String(prod.pixel_id || '').trim();
   const cfg = {
     slug: String(prod.slug), pk, preco: Number(prod.preco_centavos || 0), maxp: Number(prod.max_parcelas || 12),
     juros: Number(prod.juros_am || 0), metodos,
-    temBump: !!bumpP, bumpPreco: bumpP ? Number(bumpP.preco_centavos || 0) : 0,
+    bumps: bumpsP.map((bp: any) => ({ slug: String(bp.slug), preco: Number(bp.preco_centavos || 0) })),
   };
   const precoBR = (c: number) => 'R$ ' + (c / 100).toFixed(2).replace('.', ',');
   const logoHtml = logo
@@ -18823,7 +18846,7 @@ function _ckPaginaHtml(prod: any): string {
     'function showMsg(t,ok){var m=$("#msg");m.className="msg "+(ok?"ok":"err");m.textContent=t}',
     'async function tokenizaCartao(){var card={number:soDig($("#c_num").value),holder_name:$("#c_nome").value.trim(),exp_month:soDig($("#c_val").value).slice(0,2),exp_year:soDig($("#c_val").value).slice(2),cvv:soDig($("#c_cvv").value)};var r=await fetch("https://api.pagar.me/core/v5/tokens?appId="+encodeURIComponent(CFG.pk),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({type:"card",card:card})});var j=await r.json();if(!r.ok||!j.id){throw new Error((j&&(j.message||(j.errors&&JSON.stringify(j.errors))))||"Cartão inválido")}return j.id}',
     'async function pagar(){var btn=$("#btn");btn.disabled=true;var old=btn.innerHTML;btn.innerHTML="Processando...";try{',
-    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual,cupom:(window.MR_CUPOM||""),bump:!!(document.getElementById("bumpck")&&document.getElementById("bumpck").checked)};',
+    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual,cupom:(window.MR_CUPOM||""),bumps:(function(){var a=[];document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)a.push(c.getAttribute("data-slug"))});return a})()};',
     'if(metodoAtual==="card"){body.cpf=$("#c_cpf")?$("#c_cpf").value:body.cpf;body.parcelas=Number($("#parcelas").value||1);body.card_token=await tokenizaCartao()}',
     'if(metodoAtual==="boleto"){body.cpf=$("#b_cpf")?$("#b_cpf").value:body.cpf}',
     'var r=await fetch("/pay/"+CFG.slug+"/cobrar",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});var j=await r.json();',
@@ -18840,18 +18863,20 @@ function _ckPaginaHtml(prod: any): string {
     // [+ck-extras] cupom + order bump: recalcula total e parcelas
     'window.MR_CUPOM="";window.MR_DESC=0;',
     'function montaParcelasBase(val){var sel=$("#parcelas");if(!sel)return;var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=val/n}else{var j=CFG.juros;var coef=(j*Math.pow(1+j,n))/(Math.pow(1+j,n)-1);v=val*coef}out.push({n:n,v:Math.round(v)})}sel.innerHTML=out.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
-    'function recalcTotal(){var base=CFG.preco;var dc=(window.MR_DESC||0);var bp=(CFG.temBump&&document.getElementById("bumpck")&&document.getElementById("bumpck").checked)?CFG.bumpPreco:0;var tot=Math.max(100,base-dc)+bp;var el=$("#totbig");if(el)el.innerHTML=brl(tot)+"<small> à vista</small>";montaParcelasBase(tot)}',
-    'var _bk=document.getElementById("bumpck");if(_bk)_bk.addEventListener("change",recalcTotal);',
+    'function recalcTotal(){var base=CFG.preco;var dc=(window.MR_DESC||0);var bp=0;document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)bp+=Number(c.getAttribute("data-preco")||0)});var tot=Math.max(100,base-dc)+bp;var el=$("#totbig");if(el)el.innerHTML=brl(tot)+"<small> à vista</small>";montaParcelasBase(tot)}',
+    'document.querySelectorAll(".bumpck").forEach(function(c){c.addEventListener("change",recalcTotal)});',
     'async function aplicarCupom(){var i=document.getElementById("cupom_in");if(!i)return;var cod=i.value.trim();var fb=document.getElementById("cupom_fb");if(!cod){window.MR_CUPOM="";window.MR_DESC=0;if(fb)fb.textContent="";recalcTotal();return}try{var r=await fetch("/pay/"+CFG.slug+"/cupom",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cupom:cod})});var j=await r.json();if(j&&j.valido){window.MR_CUPOM=j.codigo;window.MR_DESC=j.desconto_centavos||0;if(fb){fb.textContent="✔ Cupom aplicado: −"+brl(j.desconto_centavos||0);fb.style.color="#1f9d57"}}else{window.MR_CUPOM="";window.MR_DESC=0;if(fb){fb.textContent="Cupom inválido ou expirado.";fb.style.color="#b03232"}}recalcTotal()}catch(e){}}',
     'var _cb=document.getElementById("cupom_btn");if(_cb)_cb.addEventListener("click",aplicarCupom);',
     'try{if(window.fbq)fbq("track","InitiateCheckout")}catch(e){}',
   ].join('');
 
   const thumb = prod.imagem ? '<div class="thumb"><img src="' + esc(String(prod.imagem)) + '" alt=""></div>' : '<div class="thumb">' + esc(String(prod.emoji || '🎵')) + '</div>';
-  // [+ck-extras] caixa de order bump (só aparece se o produto tiver um bump configurado) + campo de cupom
-  const bumpHtml = bumpP ? ('<label class="bump"><input type="checkbox" id="bumpck"><span class="bk-box"><b>' + esc(String(prod.bump_titulo || ('Adicionar: ' + bumpP.nome))) + '</b><em>' + esc(String(bumpP.descricao || '')) + '</em><u>+ ' + precoBR(Number(bumpP.preco_centavos || 0)) + (Number(bumpP.de_centavos || 0) > Number(bumpP.preco_centavos || 0) ? (' <s>' + precoBR(Number(bumpP.de_centavos)) + '</s>') : '') + '</u></span></label>') : '';
+  // [+ck-extras2] uma caixa por order bump (vários) + campo de cupom com controle de exibição
+  const bumpHtml = bumpsP.map((bp: any) => '<label class="bump"><input type="checkbox" class="bumpck" data-slug="' + esc(String(bp.slug)) + '" data-preco="' + Number(bp.preco_centavos || 0) + '"><span class="bk-box"><b>' + esc(String(bp._titulo || ('Adicionar: ' + bp.nome))) + '</b><em>' + esc(String(bp.descricao || '')) + '</em><u>+ ' + precoBR(Number(bp.preco_centavos || 0)) + (Number(bp.de_centavos || 0) > Number(bp.preco_centavos || 0) ? (' <s>' + precoBR(Number(bp.de_centavos)) + '</s>') : '') + '</u></span></label>').join('');
+  const _mc = String(prod.mostrar_cupom || '');
   let _temCupom = false; try { _temCupom = !!db.prepare(`SELECT 1 FROM ck_cupons WHERE ativo=1 AND (produto_slug='' OR produto_slug=?) LIMIT 1`).get(String(prod.slug)); } catch { _temCupom = false; }
-  const cupomHtml = _temCupom ? '<div class="cupom"><input id="cupom_in" class="in" placeholder="Cupom de desconto"><button type="button" id="cupom_btn" class="cupbtn">Aplicar</button></div><div id="cupom_fb" class="cupfb"></div>' : '';
+  const _mostraCupom = _mc === '1' ? true : (_mc === '0' ? false : _temCupom); // '1'=sempre, '0'=nunca, ''=auto(se tiver cupom)
+  const cupomHtml = _mostraCupom ? '<div class="cupom"><input id="cupom_in" class="in" placeholder="Cupom de desconto"><button type="button" id="cupom_btn" class="cupbtn">Aplicar</button></div><div id="cupom_fb" class="cupfb"></div>' : '';
   // [+ck-extras] pixel do produto (Meta) no <head>, se configurado
   const pixelHead = pixelId ? ('<script>!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version="2.0";n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,"script","https://connect.facebook.net/en_US/fbevents.js");fbq("init","' + esc(pixelId) + '");fbq("track","PageView");</script>') : '';
 
