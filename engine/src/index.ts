@@ -1366,6 +1366,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/j/')) return next();      // [jornada 27/10] links pessoais do webinário (sala/oferta/vídeo), validados pelo token
   if (req.path.startsWith('/r/')) return next();      // [wbr 29/10] links pessoais da régua de webinário genérica (/r/:funil/:aula|oferta/:token), validados pelo token
   if (req.path.startsWith('/go/')) return next();      // [+lives-ig-link 11/11] link da live redirecionavel (publico)
+  if (req.path.startsWith('/yt/')) return next();      // [+yt-link 11/11] link fixo de divulgacao do YouTube (publico)
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   if (req.path.startsWith('/w-media/')) return next(); // [+webinario-storage] serve o vídeo próprio do webinário (OneDrive) pro player, sem x-api-key
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
@@ -18414,6 +18415,25 @@ try {
   db.exec(`CREATE INDEX IF NOT EXISTS ix_ckped_ord ON ck_pedidos(pagarme_order_id)`);
 } catch (e) { console.error('[checkout] schema erro (ignorado):', e); }
 
+// [+ck-extras] colunas novas (add-only, ignoram se já existem) + tabela de cupons.
+// Tudo INERTE por padrão: sem cupom cadastrado e sem bump_slug, o checkout roda idêntico.
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bump_slug TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bump_titulo TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN pixel_id TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN utm_source TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN utm_medium TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN utm_campaign TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN cupom TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN desconto_centavos INTEGER DEFAULT 0`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bump_slug TEXT`); } catch { /* já existe */ }
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS ck_cupons (
+    id TEXT PRIMARY KEY, codigo TEXT UNIQUE, tipo TEXT DEFAULT 'percent', valor INTEGER DEFAULT 0,
+    produto_slug TEXT DEFAULT '', validade TEXT DEFAULT '', max_usos INTEGER DEFAULT 0, usos INTEGER DEFAULT 0,
+    ativo INTEGER DEFAULT 1, criado_em TEXT
+  )`);
+} catch (e) { console.error('[checkout] ck_cupons erro (ignorado):', e); }
+
 // --- chamada à API da Pagar.me (core v5) com a chave secreta (decifrada na hora) ---
 async function _ckPagarme(caminho: string, metodo: string, corpo: any): Promise<any> {
   const sk = decifra(pubFlag('pagarme_sk_enc', ''));
@@ -18472,12 +18492,59 @@ function _ckWebhookPaid(p: any): void {
     if (!pd) return; // não é um pedido do nosso checkout
     if (pd.status !== 'paid') db.prepare(`UPDATE ck_pedidos SET status='paid', pago_em=? WHERE id=?`).run(agora(), pd.id);
     _ckConceder(pd.id);
+    try { _ckPagoExtras(pd.id); } catch { /* */ }
   } catch { /* best-effort */ }
 }
 
 // --- parse telefone BR -> {area_code, number} ---
 function _ckPhone(telDig: string): any {
   try { let t = String(telDig || '').replace(/\D/g, ''); if (t.length > 11 && t.startsWith('55')) t = t.slice(2); if (t.length < 10) return null; return { mobile_phone: { country_code: '55', area_code: t.slice(0, 2), number: t.slice(2) } }; } catch { return null; }
+}
+
+// [+ck-extras] valida um cupom pra um produto e calcula o desconto em centavos. Retorna null se inválido.
+function _ckAplicarCupom(prod: any, codigo: string): any {
+  try {
+    const cod = String(codigo || '').trim().toUpperCase();
+    if (!cod) return null;
+    const c = db.prepare(`SELECT * FROM ck_cupons WHERE upper(codigo)=? AND ativo=1`).get(cod) as any;
+    if (!c) return null;
+    // escopo: cupom global (produto_slug vazio) ou específico do produto
+    if (c.produto_slug && String(c.produto_slug) !== String(prod.slug)) return null;
+    // validade (YYYY-MM-DD) e limite de usos
+    if (c.validade && String(c.validade).length >= 10) { try { if (new Date(String(c.validade) + 'T23:59:59') < new Date()) return null; } catch { /* */ } }
+    if (Number(c.max_usos || 0) > 0 && Number(c.usos || 0) >= Number(c.max_usos || 0)) return null;
+    const preco = Number(prod.preco_centavos || 0);
+    let desc = 0;
+    if (String(c.tipo) === 'fixo') desc = Number(c.valor || 0);
+    else desc = Math.round(preco * (Number(c.valor || 0) / 100)); // percent
+    if (desc < 0) desc = 0;
+    if (desc > preco - 100) desc = Math.max(0, preco - 100); // nunca zera (mín. R$1 pra Pagar.me aceitar)
+    return { codigo: cod, desconto: desc, tipo: String(c.tipo), valor: Number(c.valor || 0) };
+  } catch { return null; }
+}
+
+// [+ck-extras] pós-pagamento: libera o acesso do order bump (se houve) e marca 1 uso no cupom. Idempotente-ish.
+function _ckPagoExtras(pedidoId: string): void {
+  try {
+    const pd = db.prepare(`SELECT * FROM ck_pedidos WHERE id=?`).get(pedidoId) as any;
+    if (!pd) return;
+    // (a) cupom: conta 1 uso quando o pedido virou pago
+    if (pd.cupom) { try { db.prepare(`UPDATE ck_cupons SET usos=usos+1 WHERE upper(codigo)=? AND NOT EXISTS (SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?)`).run(String(pd.cupom).toUpperCase(), String(pd.email || '').toLowerCase(), 'ckcupom:' + pedidoId); } catch { /* */ } try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), String(pd.email || '').toLowerCase(), 'ckcupom:' + pedidoId, 'cupom', agora()); } catch { /* */ } }
+    // (b) order bump: libera o curso do produto-bump pro mesmo aluno/e-mail
+    if (pd.bump_slug) {
+      const bp = db.prepare(`SELECT * FROM ck_produtos WHERE slug=?`).get(String(pd.bump_slug)) as any;
+      const email = String(pd.email || '').trim().toLowerCase();
+      const curso = bp && String(bp.academy_curso_id || '').trim();
+      if (bp && email && curso) {
+        let al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
+        if (al) {
+          const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(al.id, curso);
+          if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'curso', curso, String(bp.validade || 'vitalicio'), agora());
+          try { _acLog(al.id, 'acesso_bump', curso); } catch { /* */ }
+        }
+      }
+    }
+  } catch { /* best-effort */ }
 }
 
 // ============================= ADMIN (x-api-key) =============================
@@ -18541,6 +18608,39 @@ app.get('/checkout/resumo', (_req: any, res: any) => {
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 
+// [+ck-extras] CUPONS (admin) --------------------------------------------------
+app.get('/checkout/cupons', (_req: any, res: any) => {
+  try { res.json({ ok: true, cupons: db.prepare(`SELECT * FROM ck_cupons ORDER BY criado_em DESC`).all() }); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/checkout/cupom', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || randomUUID());
+    const codigo = String(b.codigo || '').trim().toUpperCase().replace(/\s+/g, '');
+    if (!codigo) return res.status(400).json({ ok: false, erro: 'codigo_obrigatorio' });
+    const tipo = (String(b.tipo || 'percent') === 'fixo') ? 'fixo' : 'percent';
+    const valor = Math.max(0, Number(b.valor || 0)); // percent: 0-100 ; fixo: centavos
+    const ex = db.prepare(`SELECT id FROM ck_cupons WHERE id=?`).get(id);
+    if (ex) db.prepare(`UPDATE ck_cupons SET codigo=?, tipo=?, valor=?, produto_slug=?, validade=?, max_usos=?, ativo=? WHERE id=?`).run(codigo, tipo, valor, String(b.produto_slug || ''), String(b.validade || ''), Number(b.max_usos || 0), (b.ativo === 0 || b.ativo === false) ? 0 : 1, id);
+    else db.prepare(`INSERT INTO ck_cupons (id,codigo,tipo,valor,produto_slug,validade,max_usos,usos,ativo,criado_em) VALUES (?,?,?,?,?,?,?,0,1,?)`).run(id, codigo, tipo, valor, String(b.produto_slug || ''), String(b.validade || ''), Number(b.max_usos || 0), agora());
+    res.json({ ok: true, id, codigo });
+  } catch (e: any) { const m = String(e && e.message || e); res.status(500).json({ ok: false, erro: /UNIQUE/.test(m) ? 'codigo_duplicado' : m }); }
+});
+app.post('/checkout/cupom/remover', (req: any, res: any) => {
+  try { db.prepare(`DELETE FROM ck_cupons WHERE id=?`).run(String((req.body || {}).id || '')); res.json({ ok: true, removido: true }); } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+// [+ck-extras] salvar EXTRAS do produto (order bump + pixel + UTM) sem mexer no /checkout/produto já existente
+app.post('/checkout/produto/extras', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || '');
+    if (!id) return res.status(400).json({ ok: false, erro: 'id_obrigatorio' });
+    db.prepare(`UPDATE ck_produtos SET bump_slug=?, bump_titulo=?, pixel_id=?, utm_source=?, utm_medium=?, utm_campaign=? WHERE id=?`)
+      .run(String(b.bump_slug || ''), String(b.bump_titulo || ''), String(b.pixel_id || ''), String(b.utm_source || ''), String(b.utm_medium || ''), String(b.utm_campaign || ''), id);
+    res.json({ ok: true, id });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+
 // ============================= PÚBLICO (/pay/*) =============================
 // cobrança: cria a order na Pagar.me (cartão tokenizado no navegador, ou pix/boleto)
 app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
@@ -18559,7 +18659,16 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     if (!nome || !email || email.indexOf('@') < 0) return res.status(400).json({ ok: false, erro: 'dados_incompletos' });
     if ((metodo === 'boleto' || metodo === 'card') && cpf.length < 11) return res.status(400).json({ ok: false, erro: 'cpf_obrigatorio' });
     const parcelas = Math.max(1, Math.min(Number(prod.max_parcelas || 12), Number(b.parcelas || 1)));
-    const valor = Number(prod.preco_centavos || 0);
+    // [+ck-extras] preço base + cupom + order bump (sem cupom e sem bump: idêntico ao anterior)
+    const _preco = Number(prod.preco_centavos || 0);
+    let _descont = 0, _cupomCod = '';
+    try { const rc = _ckAplicarCupom(prod, String(b.cupom || '')); if (rc) { _descont = Number(rc.desconto || 0); _cupomCod = String(rc.codigo || ''); } } catch { /* */ }
+    if (_descont < 0) _descont = 0; if (_descont > _preco - 100) _descont = Math.max(0, _preco - 100);
+    let _bumpProd: any = null;
+    try { if ((b.bump === true || b.bump === '1' || b.bump === 1) && prod.bump_slug) { _bumpProd = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(prod.bump_slug)) as any; } } catch { /* */ }
+    const _itensPay: any[] = [{ amount: Math.max(100, _preco - _descont), description: String(prod.nome || 'Produto'), quantity: 1, code: String(prod.id) }];
+    if (_bumpProd) _itensPay.push({ amount: Number(_bumpProd.preco_centavos || 0), description: String(_bumpProd.nome || 'Bônus'), quantity: 1, code: String(_bumpProd.id) });
+    const valor = _itensPay.reduce((s, i) => s + Number(i.amount || 0), 0);
     const customer: any = { name: nome, email, type: 'individual' };
     if (cpf) customer.document = cpf;
     const ph = _ckPhone(telDig); if (ph) customer.phones = ph;
@@ -18575,9 +18684,11 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
       pagamento = { payment_method: 'boleto', boleto: { due_at: due + 'T23:59:59Z', instructions: 'Pague até o vencimento' } };
     }
     const pedidoId = randomUUID();
-    const payload: any = { code: pedidoId, items: [{ amount: valor, description: String(prod.nome || 'Produto'), quantity: 1, code: String(prod.id) }], customer, payments: [pagamento] };
+    const payload: any = { code: pedidoId, items: _itensPay, customer, payments: [pagamento] };
     db.prepare(`INSERT INTO ck_pedidos (id,produto_id,slug,nome,email,telefone,cpf,metodo,parcelas,valor_centavos,status,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, valor, 'pending', agora());
+    // [+ck-extras] registra cupom/desconto/bump usados nesse pedido (pra concessão e relatório)
+    try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=? WHERE id=?`).run(_cupomCod, _descont, (_bumpProd ? String(_bumpProd.slug) : ''), pedidoId); } catch { /* */ }
     let j: any;
     try { j = await _ckPagarme('/orders', 'POST', payload); }
     catch (e: any) {
@@ -18596,13 +18707,24 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     const boletoLinha = String(lt.line || lt.barcode || '');
     db.prepare(`UPDATE ck_pedidos SET pagarme_order_id=?, pagarme_charge_id=?, status=?, pix_qr=?, pix_copia=?, pix_expira=?, boleto_url=?, boleto_linha=? WHERE id=?`)
       .run(ordId, String(ch.id || ''), statusNorm, pixUrl, pixCopia, pixExp, boletoUrl, boletoLinha, pedidoId);
-    if (statusNorm === 'paid') { try { _ckConceder(pedidoId); } catch { /* */ } }
+    if (statusNorm === 'paid') { try { _ckConceder(pedidoId); } catch { /* */ } try { _ckPagoExtras(pedidoId); } catch { /* */ } }
     return res.json({ ok: true, pedido: pedidoId, status: statusNorm, metodo, pix: { copia: pixCopia, qr_url: pixUrl, expira: pixExp }, boleto: { url: boletoUrl, linha: boletoLinha } });
   } catch (e: any) { return res.status(500).json({ ok: false, erro: String((e && e.message) || e).slice(0, 200) }); }
 });
 // status do pedido (polling do PIX/boleto)
 app.get('/pay/status/:id', (req: any, res: any) => {
   try { const pd = db.prepare(`SELECT status, metodo FROM ck_pedidos WHERE id=?`).get(String(req.params.id || '')) as any; if (!pd) return res.status(404).json({ ok: false }); res.json({ ok: true, status: pd.status, metodo: pd.metodo }); } catch (e: any) { res.status(500).json({ ok: false }); }
+});
+// [+ck-extras] prévia do cupom (não cobra nada): valida e devolve o desconto/preço final
+app.post('/pay/:slug/cupom', (req: any, res: any) => {
+  try {
+    const prod = db.prepare(`SELECT * FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(req.params.slug || '')) as any;
+    if (!prod) return res.status(404).json({ ok: false, erro: 'produto_nao_encontrado' });
+    const rc = _ckAplicarCupom(prod, String((req.body || {}).cupom || ''));
+    if (!rc) return res.json({ ok: false, valido: false, erro: 'cupom_invalido' });
+    const preco = Number(prod.preco_centavos || 0);
+    res.json({ ok: true, valido: true, codigo: rc.codigo, desconto_centavos: rc.desconto, preco_final_centavos: Math.max(100, preco - rc.desconto) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
 // página pública do checkout
 app.get('/pay/:slug', (req: any, res: any) => {
@@ -18619,9 +18741,13 @@ function _ckPaginaHtml(prod: any): string {
   const logo = pubFlag('checkout_logo', '');
   let itens: string[] = []; try { itens = JSON.parse(prod.itens_json || '[]'); } catch { itens = []; }
   let metodos: string[] = []; try { metodos = JSON.parse(prod.metodos || '["card","pix","boleto"]'); } catch { metodos = ['card', 'pix', 'boleto']; }
+  // [+ck-extras] order bump (produto-bônus) + pixel do produto
+  let bumpP: any = null; try { if (prod.bump_slug) bumpP = db.prepare(`SELECT slug,nome,descricao,preco_centavos,de_centavos,emoji FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(prod.bump_slug)) as any; } catch { bumpP = null; }
+  const pixelId = String(prod.pixel_id || '').trim();
   const cfg = {
     slug: String(prod.slug), pk, preco: Number(prod.preco_centavos || 0), maxp: Number(prod.max_parcelas || 12),
     juros: Number(prod.juros_am || 0), metodos,
+    temBump: !!bumpP, bumpPreco: bumpP ? Number(bumpP.preco_centavos || 0) : 0,
   };
   const precoBR = (c: number) => 'R$ ' + (c / 100).toFixed(2).replace('.', ',');
   const logoHtml = logo
@@ -18675,6 +18801,11 @@ function _ckPaginaHtml(prod: any): string {
   .qr{width:132px;height:132px;border-radius:12px;border:1px solid var(--line);margin-bottom:8px}
   .copia{display:flex;margin-top:8px;border:1.5px dashed var(--line);border-radius:10px;overflow:hidden}.copia input{flex:1;border:0;background:var(--field);padding:10px;font-size:12px;color:var(--muted);min-width:0}.copia button{border:0;background:var(--brand);color:#fff;font-weight:700;padding:0 14px;cursor:pointer}
   .msg{padding:12px 14px;border-radius:11px;font-size:13px;margin-top:10px;display:none}.msg.err{display:block;background:#fdeaea;color:#b03232}.msg.ok{display:block;background:#eefaf1;color:#1f7a44}
+  .bump{display:flex;gap:11px;align-items:flex-start;margin-top:16px;padding:13px;border:1.5px dashed var(--gold-d);border-radius:12px;background:#fffaf0;cursor:pointer}
+  .bump input{margin-top:3px;width:18px;height:18px;accent-color:var(--gold-d);flex:0 0 auto}
+  .bk-box{display:block}.bk-box b{display:block;font-size:13px;color:#7a5410}.bk-box em{display:block;font-style:normal;color:#8a7a52;font-size:11.5px;margin:2px 0 4px}.bk-box u{text-decoration:none;font-weight:800;color:var(--gold-d);font-size:13.5px}.bk-box u s{color:#bbb;font-weight:600;margin-left:5px;font-size:12px}
+  .cupom{display:flex;gap:7px;margin-top:14px}.cupom .in{flex:1}.cupbtn{border:0;border-radius:11px;background:var(--brand);color:#fff;font-weight:700;padding:0 15px;cursor:pointer;font-size:13px;font-family:inherit}
+  .cupfb{font-size:11.5px;margin-top:6px;min-height:14px}
   `;
 
   const CFGJSON = JSON.stringify(cfg);
@@ -18692,7 +18823,7 @@ function _ckPaginaHtml(prod: any): string {
     'function showMsg(t,ok){var m=$("#msg");m.className="msg "+(ok?"ok":"err");m.textContent=t}',
     'async function tokenizaCartao(){var card={number:soDig($("#c_num").value),holder_name:$("#c_nome").value.trim(),exp_month:soDig($("#c_val").value).slice(0,2),exp_year:soDig($("#c_val").value).slice(2),cvv:soDig($("#c_cvv").value)};var r=await fetch("https://api.pagar.me/core/v5/tokens?appId="+encodeURIComponent(CFG.pk),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({type:"card",card:card})});var j=await r.json();if(!r.ok||!j.id){throw new Error((j&&(j.message||(j.errors&&JSON.stringify(j.errors))))||"Cartão inválido")}return j.id}',
     'async function pagar(){var btn=$("#btn");btn.disabled=true;var old=btn.innerHTML;btn.innerHTML="Processando...";try{',
-    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual};',
+    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual,cupom:(window.MR_CUPOM||""),bump:!!(document.getElementById("bumpck")&&document.getElementById("bumpck").checked)};',
     'if(metodoAtual==="card"){body.cpf=$("#c_cpf")?$("#c_cpf").value:body.cpf;body.parcelas=Number($("#parcelas").value||1);body.card_token=await tokenizaCartao()}',
     'if(metodoAtual==="boleto"){body.cpf=$("#b_cpf")?$("#b_cpf").value:body.cpf}',
     'var r=await fetch("/pay/"+CFG.slug+"/cobrar",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});var j=await r.json();',
@@ -18701,21 +18832,35 @@ function _ckPaginaHtml(prod: any): string {
     'else if(metodoAtual==="boleto"){mostraBoleto(j);btn.innerHTML=old}',
     'else{if(j.status==="paid"){sucesso()}else{showMsg("Pagamento recebido, aguardando confirmação.",true);poll(j.pedido);btn.disabled=false;btn.innerHTML=old}}',
     '}catch(e){showMsg(String(e&&e.message||e),false);btn.disabled=false;btn.innerHTML=old}}',
-    'function sucesso(){$("#area").innerHTML="<div class=\\"card pad\\" style=\\"text-align:center\\"><div style=\\"font-size:44px\\">✅</div><h2 style=\\"color:#1f9d57;margin:8px 0\\">Pagamento aprovado!</h2><p>Seu acesso foi liberado. Enviamos o link de acesso no seu WhatsApp e e-mail.</p></div>"}',
+    'function sucesso(){try{if(window.fbq)fbq("track","Purchase",{value:(CFG.preco/100),currency:"BRL"})}catch(e){}$("#area").innerHTML="<div class=\\"card pad\\" style=\\"text-align:center\\"><div style=\\"font-size:44px\\">✅</div><h2 style=\\"color:#1f9d57;margin:8px 0\\">Pagamento aprovado!</h2><p>Seu acesso foi liberado. Enviamos o link de acesso no seu WhatsApp e e-mail.</p></div>"}',
     'function mostraPix(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><span class=\\"pill\\">⚡ Aprovação na hora</span><h2 style=\\"margin:12px 0 4px\\">Escaneie o PIX pra pagar</h2>";if(j.pix&&j.pix.qr_url)html+="<img class=\\"qr\\" src=\\""+j.pix.qr_url+"\\" alt=\\"QR PIX\\">";html+="<div class=\\"copia\\"><input id=\\"pxc\\" value=\\""+(j.pix&&j.pix.copia||"")+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText($(\'#pxc\').value)\\">Copiar</button></div><p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">Assim que o pagamento cair, seu acesso é liberado automaticamente.</p></div>";$("#area").innerHTML=html;poll(j.pedido)}',
     'function mostraBoleto(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><h2 style=\\"margin:0 0 8px\\">Boleto gerado</h2>";if(j.boleto&&j.boleto.url)html+="<p><a class=\\"cta\\" style=\\"text-decoration:none\\" href=\\""+j.boleto.url+"\\" target=\\"_blank\\">Abrir boleto</a></p>";if(j.boleto&&j.boleto.linha)html+="<div class=\\"copia\\"><input value=\\""+j.boleto.linha+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText(this.previousSibling.value)\\">Copiar</button></div>";html+="<p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">O acesso é liberado quando o pagamento for compensado.</p></div>";$("#area").innerHTML=html}',
     'function poll(id){var n=0;var t=setInterval(function(){n++;fetch("/pay/status/"+id).then(function(r){return r.json()}).then(function(s){if(s&&s.status==="paid"){clearInterval(t);sucesso()}});if(n>120)clearInterval(t)},5000)}',
     'montaParcelas();var bt=$("#btn");if(bt)bt.addEventListener("click",pagar);',
+    // [+ck-extras] cupom + order bump: recalcula total e parcelas
+    'window.MR_CUPOM="";window.MR_DESC=0;',
+    'function montaParcelasBase(val){var sel=$("#parcelas");if(!sel)return;var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=val/n}else{var j=CFG.juros;var coef=(j*Math.pow(1+j,n))/(Math.pow(1+j,n)-1);v=val*coef}out.push({n:n,v:Math.round(v)})}sel.innerHTML=out.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
+    'function recalcTotal(){var base=CFG.preco;var dc=(window.MR_DESC||0);var bp=(CFG.temBump&&document.getElementById("bumpck")&&document.getElementById("bumpck").checked)?CFG.bumpPreco:0;var tot=Math.max(100,base-dc)+bp;var el=$("#totbig");if(el)el.innerHTML=brl(tot)+"<small> à vista</small>";montaParcelasBase(tot)}',
+    'var _bk=document.getElementById("bumpck");if(_bk)_bk.addEventListener("change",recalcTotal);',
+    'async function aplicarCupom(){var i=document.getElementById("cupom_in");if(!i)return;var cod=i.value.trim();var fb=document.getElementById("cupom_fb");if(!cod){window.MR_CUPOM="";window.MR_DESC=0;if(fb)fb.textContent="";recalcTotal();return}try{var r=await fetch("/pay/"+CFG.slug+"/cupom",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cupom:cod})});var j=await r.json();if(j&&j.valido){window.MR_CUPOM=j.codigo;window.MR_DESC=j.desconto_centavos||0;if(fb){fb.textContent="✔ Cupom aplicado: −"+brl(j.desconto_centavos||0);fb.style.color="#1f9d57"}}else{window.MR_CUPOM="";window.MR_DESC=0;if(fb){fb.textContent="Cupom inválido ou expirado.";fb.style.color="#b03232"}}recalcTotal()}catch(e){}}',
+    'var _cb=document.getElementById("cupom_btn");if(_cb)_cb.addEventListener("click",aplicarCupom);',
+    'try{if(window.fbq)fbq("track","InitiateCheckout")}catch(e){}',
   ].join('');
 
   const thumb = prod.imagem ? '<div class="thumb"><img src="' + esc(String(prod.imagem)) + '" alt=""></div>' : '<div class="thumb">' + esc(String(prod.emoji || '🎵')) + '</div>';
+  // [+ck-extras] caixa de order bump (só aparece se o produto tiver um bump configurado) + campo de cupom
+  const bumpHtml = bumpP ? ('<label class="bump"><input type="checkbox" id="bumpck"><span class="bk-box"><b>' + esc(String(prod.bump_titulo || ('Adicionar: ' + bumpP.nome))) + '</b><em>' + esc(String(bumpP.descricao || '')) + '</em><u>+ ' + precoBR(Number(bumpP.preco_centavos || 0)) + (Number(bumpP.de_centavos || 0) > Number(bumpP.preco_centavos || 0) ? (' <s>' + precoBR(Number(bumpP.de_centavos)) + '</s>') : '') + '</u></span></label>') : '';
+  let _temCupom = false; try { _temCupom = !!db.prepare(`SELECT 1 FROM ck_cupons WHERE ativo=1 AND (produto_slug='' OR produto_slug=?) LIMIT 1`).get(String(prod.slug)); } catch { _temCupom = false; }
+  const cupomHtml = _temCupom ? '<div class="cupom"><input id="cupom_in" class="in" placeholder="Cupom de desconto"><button type="button" id="cupom_btn" class="cupbtn">Aplicar</button></div><div id="cupom_fb" class="cupfb"></div>' : '';
+  // [+ck-extras] pixel do produto (Meta) no <head>, se configurado
+  const pixelHead = pixelId ? ('<script>!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version="2.0";n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,"script","https://connect.facebook.net/en_US/fbevents.js");fbq("init","' + esc(pixelId) + '");fbq("track","PageView");</script>') : '';
 
   return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
     + '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
     + '<title>' + esc(String(prod.nome || 'Checkout')) + ' — Melodias e Riffs</title>'
     + '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
     + '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap">'
-    + '<style>' + css + '</style></head><body>'
+    + '<style>' + css + '</style>' + pixelHead + '</head><body>'
     + '<div class="topbar"><div class="logo">' + logoHtml + '<span>Melodias e Riffs<small>A Escola do Músico Cristão</small></span></div>'
     + '<div class="secure"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Ambiente 100% seguro</div></div>'
     + '<div class="wrap" id="area"><div class="grid">'
@@ -18741,7 +18886,9 @@ function _ckPaginaHtml(prod: any): string {
     + '<div class="summary"><div class="card pad"><div class="prod">' + thumb
     + '<div><h3>' + esc(String(prod.nome || '')) + '</h3><p>' + esc(String(prod.descricao || 'Acesso imediato')) + '</p></div></div>'
     + (incHtml ? ('<ul class="inc">' + incHtml + '</ul>') : '')
-    + '<div class="totals">' + deHtml + '<div class="big"><span>Total</span><b>' + precoBR(Number(prod.preco_centavos || 0)) + '<small> à vista</small></b></div></div>'
+    + bumpHtml
+    + '<div class="totals">' + deHtml + '<div class="big"><span>Total</span><b id="totbig">' + precoBR(Number(prod.preco_centavos || 0)) + '<small> à vista</small></b></div></div>'
+    + cupomHtml
     + '<div class="guar"><div class="seal">🛡️</div><div><b>7 dias de garantia</b><p>Não curtiu? Devolvemos 100% do valor.</p></div></div></div>'
     + '<div class="trust"><span>🔒 Compra segura</span>·<span>Processado por <b>Pagar.me</b></span>·<span>SSL</span></div></div>'
     + '</div></div>'
@@ -18814,6 +18961,37 @@ app.get('/go/:slug', (req: any, res: any) => {
   } catch { res.status(404).send('404'); }
 });
 // ===================== FIM [+lives-ig-link 11/11] =====================
+
+
+// ===================== [+yt-link 11/11] YouTube: link fixo de divulgação por canal =====================
+// ADD-ONLY. Mesmo padrão do /go/ do Instagram, só que pros canais do YouTube: um link fixo por canal
+// (/yt/<canal>) que você põe uma vez na descrição/fixado e troca o destino (pub_kv ytlink:<canal>) quando quiser.
+const _YT_CANAIS = ['violao', 'teclado', 'baixo', 'comunidade'];
+const _ytNorm = (s: string): string => String(s || '').toLowerCase().replace('yt-', '').replace('live-', '').trim();
+app.get('/lives/yt-links', (_req: any, res: any) => {
+  try {
+    const out = _YT_CANAIS.map((c) => ({ canal: c, slug: 'yt-' + c, url: _LLBASE + '/yt/' + c, destino: pubFlag('ytlink:' + c, '') }));
+    res.json({ ok: true, links: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/lives/yt-link', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const c = _ytNorm(b.canal || b.slug);
+    if (_YT_CANAIS.indexOf(c) < 0) return res.status(400).json({ ok: false, erro: 'canal_invalido' });
+    setPubFlag('ytlink:' + c, String(b.destino || '').trim());
+    res.json({ ok: true, canal: c, destino: pubFlag('ytlink:' + c, '') });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.get('/yt/:slug', (req: any, res: any) => {
+  try {
+    const c = _ytNorm(req.params.slug);
+    const destino = pubFlag('ytlink:' + c, '');
+    if (destino && /^https?:\/\//i.test(destino)) return res.redirect(302, destino);
+    res.status(200).type('html').send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><div style="font-family:system-ui,sans-serif;max-width:420px;margin:60px auto;text-align:center;color:#333"><h2>Melodias e Riffs</h2><p>O link ainda não foi definido. Volte em instantes. \u{1F64F}</p></div>');
+  } catch { res.status(404).send('404'); }
+});
+// ===================== FIM [+yt-link 11/11] =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
