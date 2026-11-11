@@ -15107,7 +15107,7 @@ app.post('/academy/envio-v2/rodar', (req: any, res: any) => {
 // respondeu/descadastrou. O Claude só ALIMENTA a fila (POST /prospeccao/adicionar).
 // Nasce com envio LIGADO mas a fila VAZIA = nada dispara até ter contato. ADD-ONLY, INERTE.
 // ============================================================================
-db.prepare(`CREATE TABLE IF NOT EXISTS agencia_prospeccao (
+db.exec(`CREATE TABLE IF NOT EXISTS agencia_prospeccao (
   id TEXT PRIMARY KEY, empresa TEXT, telefone TEXT UNIQUE, nicho TEXT, cidade TEXT,
   status TEXT DEFAULT 'pendente', variacao_usada INTEGER, enviado_em TEXT, erro TEXT, criado_em TEXT
 )`);
