@@ -1365,6 +1365,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/w/')) return next();      // [webinario] sala pública do webinário (espectadores)
   if (req.path.startsWith('/j/')) return next();      // [jornada 27/10] links pessoais do webinário (sala/oferta/vídeo), validados pelo token
   if (req.path.startsWith('/r/')) return next();      // [wbr 29/10] links pessoais da régua de webinário genérica (/r/:funil/:aula|oferta/:token), validados pelo token
+  if (req.path.startsWith('/go/')) return next();      // [+lives-ig-link 11/11] link da live redirecionavel (publico)
   if (req.path.startsWith('/w-api/')) return next();  // [webinario] APIs públicas da sala (chat/contador/vendas)
   if (req.path.startsWith('/w-media/')) return next(); // [+webinario-storage] serve o vídeo próprio do webinário (OneDrive) pro player, sem x-api-key
   if (req.path.startsWith('/e/')) return next();      // [evento] pagina publica do evento multi-aula
@@ -18748,6 +18749,71 @@ function _ckPaginaHtml(prod: any): string {
     + '<script>' + js + '</script></body></html>';
 }
 // ===================== FIM [+checkout-proprio 11/11] =====================
+
+
+
+// ===================== [+lives-ig-link 11/11] Instagram: chave fixa por instrumento + link da live redirecionável =====================
+// ADD-ONLY. NÃO toca na execução da live (livExecutar). (1) guarda a chave RTMP fixa do IG por instrumento
+// (reusa lives_rtmp_destinos, +coluna instrumento, id estável igfixo-<inst>); (2) link redirecionável /go/:slug
+// por instrumento (destino em pub_kv golink:<inst>, editável em tempo real pelo app).
+try { db.exec(`ALTER TABLE lives_rtmp_destinos ADD COLUMN instrumento TEXT`); } catch { /* coluna existe */ }
+const _LLBASE = (PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br').replace(/\/+$/, '');
+const _LIVE_INSTRUMENTOS = ['violao', 'teclado', 'baixo', 'comunidade'];
+const _llNorm = (s: string): string => String(s || '').toLowerCase().replace('live-', '').trim();
+
+// (1) IG fixo por instrumento
+app.get('/lives/ig-fixo', (_req: any, res: any) => {
+  try {
+    const out = _LIVE_INSTRUMENTOS.map((inst) => {
+      const r = db.prepare(`SELECT rtmp_base, atualizado_em, (stream_key IS NOT NULL AND stream_key<>'') tem_chave FROM lives_rtmp_destinos WHERE id=?`).get('igfixo-' + inst) as any;
+      return { instrumento: inst, rtmp_base: (r && r.rtmp_base) || 'rtmps://live-upload.instagram.com:443/rtmp/', tem_chave: !!(r && r.tem_chave), atualizado_em: (r && r.atualizado_em) || null };
+    });
+    res.json({ ok: true, destinos: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/lives/ig-fixo', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const inst = _llNorm(b.instrumento);
+    if (_LIVE_INSTRUMENTOS.indexOf(inst) < 0) return res.status(400).json({ ok: false, erro: 'instrumento_invalido' });
+    const id = 'igfixo-' + inst;
+    const rtmpBase = (String(b.rtmp_base || '').trim() || 'rtmps://live-upload.instagram.com:443/rtmp/');
+    const nome = 'Instagram - ' + inst.charAt(0).toUpperCase() + inst.slice(1);
+    const ex = db.prepare(`SELECT stream_key FROM lives_rtmp_destinos WHERE id=?`).get(id) as any;
+    // só troca a chave se veio uma nova (não apaga a existente com vazio)
+    const novaChave = (typeof b.stream_key === 'string' && b.stream_key.trim()) ? b.stream_key.trim() : (ex ? ex.stream_key : '');
+    if (ex) db.prepare(`UPDATE lives_rtmp_destinos SET plataforma='instagram', nome=?, rtmp_base=?, stream_key=?, instrumento=?, ativo=1, atualizado_em=? WHERE id=?`).run(nome, rtmpBase, novaChave, inst, agora(), id);
+    else db.prepare(`INSERT INTO lives_rtmp_destinos(id,plataforma,nome,rtmp_base,stream_key,page_url,ativo,instrumento,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,1,?,?,?)`).run(id, 'instagram', nome, rtmpBase, novaChave, '', inst, agora(), agora());
+    res.json({ ok: true, id, instrumento: inst, tem_chave: !!novaChave });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+
+// (2) Link da live redirecionável
+app.get('/lives/links', (_req: any, res: any) => {
+  try {
+    const out = _LIVE_INSTRUMENTOS.map((inst) => ({ instrumento: inst, slug: 'live-' + inst, url: _LLBASE + '/go/live-' + inst, destino: pubFlag('golink:' + inst, '') }));
+    res.json({ ok: true, links: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+app.post('/lives/link', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const inst = _llNorm(b.slug || b.instrumento);
+    if (_LIVE_INSTRUMENTOS.indexOf(inst) < 0) return res.status(400).json({ ok: false, erro: 'instrumento_invalido' });
+    setPubFlag('golink:' + inst, String(b.destino || '').trim());
+    res.json({ ok: true, instrumento: inst, destino: pubFlag('golink:' + inst, '') });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+});
+// público: redireciona pro destino ATUAL (trocável em tempo real)
+app.get('/go/:slug', (req: any, res: any) => {
+  try {
+    const inst = _llNorm(req.params.slug);
+    const destino = pubFlag('golink:' + inst, '');
+    if (destino && /^https?:\/\//i.test(destino)) return res.redirect(302, destino);
+    res.status(200).type('html').send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><div style="font-family:system-ui,sans-serif;max-width:420px;margin:60px auto;text-align:center;color:#333"><h2>Melodias e Riffs</h2><p>O link da live ainda não foi definido. Volte em instantes. \u{1F64F}</p></div>');
+  } catch { res.status(404).send('404'); }
+});
+// ===================== FIM [+lives-ig-link 11/11] =====================
 
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
