@@ -15235,6 +15235,53 @@ app.get('/prospeccao/lista', (req: any, res: any) => {
   try { const st = String((req.query || {}).status || ''); const rows = st ? db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao WHERE status=? ORDER BY criado_em DESC LIMIT 500`).all(st) : db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao ORDER BY criado_em DESC LIMIT 500`).all(); _ndOk(res, { total: rows.length, rows }); } catch (e) { _ndErr(res, e); }
 });
 
+// ============================================================================
+// [+baixista-pro-convite 11/11 Ezequias] ADD-ONLY. Convida os compradores ANTIGOS do Método Baixista Pró
+// pro Desafio (Evento 1 saia-das-tonicas-baixo) — os que compraram ANTES do gancho do webhook existir.
+// Dedup por telefone, pula quem já está no funil e quem já foi convidado (tabela de controle). Envia paced
+// pela fila (instância Baixo). Mesmo texto aprovado do gancho. Nasce inerte (só envia com confirmar:true).
+// ============================================================================
+db.exec(`CREATE TABLE IF NOT EXISTS bx_convite_enviado (telefone TEXT PRIMARY KEY, nome TEXT, enviado_em TEXT)`);
+function _bxConviteTxt(nome: string): string {
+  return (nome ? nome + ', p' : 'P') + 'arabéns pela compra do *Método Baixista Pró*! 🎸\n\nE eu tenho um presente a mais pra você: você acaba de *ganhar uma vaga* no *Desafio Baixo na Igreja — Saia das Tônicas em 3 dias* — 3 aulas ao vivo comigo (Melodias, Ritmos e Grooves e Frases), pra você sair das tônicas e tocar os louvores com firmeza.\n\nÉ um bônus gratuito, mas as vagas são limitadas. Pra garantir a sua, é só se inscrever aqui 👇\nhttps://baixo.melodiaseriffs.com.br/p/desafio-saia-das-tonicas\n\nTe espero no desafio! 🙌\nProfessor Ezequias';
+}
+function _bxCompradores(): any[] {
+  const rows = db.prepare(`SELECT c.nome nome, c.telefone telefone, t.criado_em FROM transacoes t JOIN contatos c ON c.id=t.contato_id WHERE t.projeto='baixo' AND lower(IFNULL(t.produto,'')) LIKE '%baixista pr%' AND (lower(IFNULL(t.status,'')) IN ('liquidada','pago','aprovado','approved','paid') OR lower(IFNULL(t.status,'')) LIKE '%provad%') AND IFNULL(c.telefone,'') <> '' ORDER BY t.criado_em ASC`).all() as any[];
+  const vistos: any = {}; const out: any[] = [];
+  for (const r of rows) { const d = String(r.telefone || '').replace(/\D/g, ''); const k = d.slice(-10); if (!k || k.length < 8) continue; if (vistos[k]) continue; vistos[k] = 1; out.push({ nome: r.nome || '', telefone: d, k }); }
+  return out;
+}
+function _bxJaNoFunil(k: string): boolean { try { return !!db.prepare(`SELECT 1 FROM wbr_inscritos WHERE funil='saia-das-tonicas-baixo' AND status<>'cancelado' AND replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + k); } catch { return false; } }
+function _bxJaConvidado(k: string): boolean { try { return !!db.prepare(`SELECT 1 FROM bx_convite_enviado WHERE replace(replace(replace(telefone,'+',''),' ',''),'-','') LIKE ? LIMIT 1`).get('%' + k); } catch { return false; } }
+function _bxElegiveis(): any[] { return _bxCompradores().filter((r: any) => !_bxJaNoFunil(r.k) && !_bxJaConvidado(r.k)); }
+app.get('/baixista-pro/convidar', (_req: any, res: any) => {
+  try {
+    const comp = _bxCompradores();
+    const eleg = comp.filter((r: any) => !_bxJaNoFunil(r.k) && !_bxJaConvidado(r.k));
+    const jaFunil = comp.filter((r: any) => _bxJaNoFunil(r.k)).length;
+    const jaConv = comp.filter((r: any) => !_bxJaNoFunil(r.k) && _bxJaConvidado(r.k)).length;
+    _ndOk(res, { compradores_unicos: comp.length, ja_no_funil: jaFunil, ja_convidados: jaConv, elegiveis: eleg.length, amostra: eleg.slice(0, 10).map((r: any) => ({ nome: r.nome, telefone: r.telefone })) });
+  } catch (e) { _ndErr(res, e); }
+});
+app.post('/baixista-pro/convidar', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const eleg = _bxElegiveis();
+    if (b.confirmar !== true) { _ndOk(res, { previa: true, elegiveis: eleg.length, amostra: eleg.slice(0, 10).map((r: any) => ({ nome: r.nome, telefone: r.telefone })) }); return; }
+    const limite = Number(b.limite) > 0 ? Number(b.limite) : eleg.length;
+    const lista = eleg.slice(0, limite);
+    let enviados = 0, erros = 0;
+    for (const r of lista) {
+      try {
+        enfileirarFluxo('baixo' as any, r.telefone, [{ tipo: 'texto', texto: _bxConviteTxt(r.nome || ''), delaySegundos: 0 } as any], r.nome || '', undefined, 'Baixo', 'baixista-pro-convite');
+        db.prepare(`INSERT OR IGNORE INTO bx_convite_enviado(telefone,nome,enviado_em) VALUES(?,?,?)`).run(r.telefone, r.nome || '', agora());
+        enviados++;
+      } catch (e) { erros++; }
+    }
+    _ndOk(res, { enviados, erros, restantes: _bxElegiveis().length });
+  } catch (e) { _ndErr(res, e); }
+});
+
 // admin: criar/matricular aluno (e conceder acesso opcional)
 app.post('/academy/matricular', (req: any, res: any) => {
   try {
