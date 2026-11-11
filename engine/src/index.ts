@@ -15036,7 +15036,10 @@ function _acEnvioRodarBloco(curso: string, limite: number, instancia: string, pr
     if (!confirmar) continue;
     let email_ok = 0, wa_ok = 0, erro = '';
     try { db.prepare(`INSERT INTO email_fila(id,projeto,para,assunto,html,status,criado_em,dominio_id,anexos) VALUES(?,?,?,?,?,?,?,?,?)`).run(randomUUID(), projeto, String(r.email), _acEnvioAssunto2(instrumento), _acEnvioEmailHtml2(r.nome || '', link, String(r.email), instrumento), 'pendente', agora(), (dom && dom.id) || null, null); email_ok = 1; } catch (e: any) { erro += 'email:' + String(e?.message || e) + '; '; }
-    if (tel) { try { enfileirarFluxo(projeto as Projeto, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto2(r.nome || '', link, String(r.email), instrumento), delaySegundos: 0 } as any], r.nome || '', undefined, instancia, 'envio-acesso'); wa_ok = 1; comWa++; } catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; } }
+    // [+dedup-telefone 11/11] NAO manda o WhatsApp de acesso 2x pro MESMO numero (contas duplicadas na base): se ja mandou (wa_ok=1) pra esse telefone, pula so o WhatsApp — o e-mail ainda vai. Match pelos ultimos 10 digitos (cobre 55/DDD).
+    let _jaWaTel = false; try { const _d10 = tel.slice(-10); if (tel && _d10.length >= 8) _jaWaTel = !!db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE wa_ok=1 AND telefone IS NOT NULL AND telefone<>'' AND telefone LIKE ? LIMIT 1`).get('%' + _d10); } catch { /* best-effort: nunca quebra o envio */ }
+    if (tel && _jaWaTel) { erro += 'wa:pulado_telefone_duplicado; '; }
+    else if (tel) { try { enfileirarFluxo(projeto as Projeto, tel, [{ tipo: 'texto', texto: _acEnvioWaTexto2(r.nome || '', link, String(r.email), instrumento), delaySegundos: 0 } as any], r.nome || '', undefined, instancia, 'envio-acesso'); wa_ok = 1; comWa++; } catch (e: any) { erro += 'wa:' + String(e?.message || e) + '; '; } }
     db.prepare(`INSERT OR REPLACE INTO academy_envio_acesso(aluno_id,curso_id,email,telefone,email_ok,wa_ok,erro,enviado_em) VALUES(?,?,?,?,?,?,?,?)`).run(r.id, curso, String(r.email), tel, email_ok, wa_ok, erro || null, agora());
     enviados++;
   }
