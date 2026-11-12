@@ -10797,6 +10797,8 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
       // [lives-fonte-grande] local-se-pronto > direto do OneDrive > espera download (sem limite de 3min)
       const fr = await livResolverInput(String(live.fonte_tipo), String(live.fonte_ref || ''));
       input = fr.input; inputPre = fr.preInput || [];
+      // [+live-loop 12/11 Ezequias] em_loop=1: repete o video do inicio sem parar (ffmpeg -stream_loop -1). So age quando em_loop ligado; nada muda pro resto.
+      if (live && live.em_loop) { inputPre = ['-stream_loop', '-1', ...inputPre]; }
       if (!input) throw new Error('fonte do vídeo vazia');
       livLog('fonte da live', liveId, 'modo=' + fr.modo);
     } catch (e: any) {
