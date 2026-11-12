@@ -7745,7 +7745,7 @@ function _odRcloneBaixar(rel: string): { file: string; url: string; nome: string
   const ext = (nome.includes('.') ? nome.split('.').pop() : '') || '';
   const safe = createHash('sha1').update(remote).digest('hex').slice(0, 16) + (ext ? '.' + ext.toLowerCase() : '');
   const dest = MEDIA_DIR + '/' + safe;
-  if (!fs.existsSync(dest)) _rclone(['copyto', remote, dest], { timeoutMs: 180000 });
+  if (!fs.existsSync(dest)) { try { _odBaixarGrande(rel).catch(() => {}); } catch (e) { /* [+media-async 12/11] nunca trava o event loop */ } }
   return { file: dest, url: `${MEDIA_INTERNAL_BASE}/media/${safe}`, nome };
 }
 
