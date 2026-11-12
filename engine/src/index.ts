@@ -11348,6 +11348,30 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
   });
 
+  // [+ck-extras2/fix-rota] registra ANTES de /lives/:id senão o :id captura estas e devolve nao_encontrada.
+  // Mesmos handlers dos blocos [+lives-ig-link]/[+yt-link] no fim do arquivo (lá viram duplicatas inofensivas — Express usa a 1ª).
+  app.get('/lives/ig-fixo', (_req: any, res: any) => {
+    try {
+      const out = _LIVE_INSTRUMENTOS.map((inst) => {
+        const r = db.prepare(`SELECT rtmp_base, atualizado_em, (stream_key IS NOT NULL AND stream_key<>'') tem_chave FROM lives_rtmp_destinos WHERE id=?`).get('igfixo-' + inst) as any;
+        return { instrumento: inst, rtmp_base: (r && r.rtmp_base) || 'rtmps://live-upload.instagram.com:443/rtmp/', tem_chave: !!(r && r.tem_chave), atualizado_em: (r && r.atualizado_em) || null };
+      });
+      res.json({ ok: true, destinos: out });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+  });
+  app.get('/lives/links', (_req: any, res: any) => {
+    try {
+      const out = _LIVE_INSTRUMENTOS.map((inst) => ({ instrumento: inst, slug: 'live-' + inst, url: _LLBASE + '/go/live-' + inst, destino: pubFlag('golink:' + inst, '') }));
+      res.json({ ok: true, links: out });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+  });
+  app.get('/lives/yt-links', (_req: any, res: any) => {
+    try {
+      const out = _YT_CANAIS.map((c) => ({ canal: c, slug: 'yt-' + c, url: _LLBASE + '/yt/' + c, destino: pubFlag('ytlink:' + c, '') }));
+      res.json({ ok: true, links: out });
+    } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
+  });
+
   // detalhe de UMA transmissão (por último: rota com :id não pode capturar /lives/_status e /lives/destinos)
   app.get('/lives/:id', (req: any, res: any) => {
     const row = db.prepare(`SELECT * FROM fila_lives WHERE id=?`).get(String(req.params.id)) as any;
