@@ -6510,6 +6510,55 @@ app.get('/pub/tiktok/testar-navegador/resultado', (_req, res) => {
   res.json({ ok: true, resultado: _ttUltimoTeste });
 });
 
+// ===================== [+ig-live-nuvem 12/11 Ezequias] Instagram LIVE via navegador na nuvem (sai pelo IP de casa) =====================
+// Cofre de sessao por conta (igual ao TikTok) + controle do navegador que da o "Transmitir ao vivo" e segura a live.
+const IG_SESS_DIR_EP = '/data/ig-sessions';
+try { fs.mkdirSync(IG_SESS_DIR_EP, { recursive: true }); } catch { /* ok */ }
+app.post('/pub/instagram/sessao-nuvem', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const conta = String(b.conta || b.projeto || '').trim().toLowerCase();
+    if (!conta) return res.status(400).json({ ok: false, erro: 'conta_obrigatoria' });
+    const storageState = b.storageState;
+    if (!storageState || typeof storageState !== 'object') return res.status(400).json({ ok: false, erro: 'storageState_obrigatorio' });
+    fs.writeFileSync(IG_SESS_DIR_EP + '/' + conta + '.json', JSON.stringify({ conta, userAgent: b.userAgent || null, storageState, salvoEm: agora() }));
+    res.json({ ok: true, conta, cookies: Array.isArray(storageState.cookies) ? storageState.cookies.length : 0 });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/instagram/sessao-nuvem', (_req: any, res: any) => {
+  try {
+    const out: any = {};
+    for (const p of ['teclado', 'baixo', 'violao', 'comunidade']) {
+      try { const d = JSON.parse(fs.readFileSync(IG_SESS_DIR_EP + '/' + p + '.json', 'utf8')); out[p] = { temSessao: true, salvoEm: d.salvoEm || null, cookies: Array.isArray(d.storageState?.cookies) ? d.storageState.cookies.length : 0 }; }
+      catch { out[p] = { temSessao: false }; }
+    }
+    res.json({ ok: true, ativo: pubFlag('ig_live_nuvem_ativo', '0') === '1', sessoes: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/pub/instagram/live-nuvem/iniciar', async (req: any, res: any) => {
+  try {
+    const conta = String((req.body || {}).conta || '').trim().toLowerCase();
+    const titulo = String((req.body || {}).titulo || 'Ao vivo');
+    if (!conta) return res.status(400).json({ ok: false, erro: 'conta_obrigatoria' });
+    const m: any = await import('./ig-live-nuvem');
+    res.json(await m.iniciarLiveIgNuvem({ conta, titulo }));
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.post('/pub/instagram/live-nuvem/parar', async (req: any, res: any) => {
+  try {
+    const conta = String((req.body || {}).conta || '').trim().toLowerCase();
+    if (!conta) return res.status(400).json({ ok: false, erro: 'conta_obrigatoria' });
+    const m: any = await import('./ig-live-nuvem');
+    res.json(await m.pararLiveIgNuvem(conta));
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+app.get('/pub/instagram/live-nuvem/status', async (_req: any, res: any) => {
+  try { const m: any = await import('./ig-live-nuvem'); res.json({ ok: true, ativo: pubFlag('ig_live_nuvem_ativo', '0') === '1', lives: m.listarLivesIgNuvem() }); }
+  catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
+});
+// ===================== FIM [+ig-live-nuvem] =====================
+
+
 // ======================= ENDPOINTS: CONEXÕES (saúde das redes) =======================
 app.get('/pub/conexoes', (_req, res) => {
   try {
@@ -10680,12 +10729,13 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
 
   // [multistream-rtmp] push pro Facebook/Instagram/TikTok (RTMPS). Essas redes são mais exigentes com
   // keyframe/GOP que o YouTube, então aqui RE-CODIFICA com GOP de ~2s (-g 60) em vez de copiar — garante aceite.
-  function ffmpegPushRtmp(input: string, rtmpFull: string, preInput: string[] = []): any {
+  function ffmpegPushRtmp(input: string, rtmpFull: string, preInput: string[] = [], preCodec: string[] = []): any {
     const args = [
       '-hide_banner', '-loglevel', 'warning',
       '-re',
       ...preInput,
       '-i', input,
+      ...preCodec,
       '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
       '-b:v', '4000k', '-maxrate', '4000k', '-bufsize', '8000k',
       '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
@@ -10746,14 +10796,14 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
   // [lives-religar] empurra o ffmpeg com RECONEXAO AUTOMATICA: se a conexao cair com erro ANTES
   // do fim do video, religa sozinho (seek pro ponto onde parou) na MESMA chave/broadcast, ate N vezes.
   // So marca 'erro' de verdade se estourar as tentativas; se o video ja tinha chegado ao fim, marca 'encerrado'.
-  function livPushResiliente(o: { liveId: string; canalId: string; rec: any; input: string; rtmpFull: string; preInput: string[]; isRtmp: boolean; durRef: { seg: number }; inicioMs: number; broadcastId?: string; platNome?: string }): any {
+  function livPushResiliente(o: { liveId: string; canalId: string; rec: any; input: string; rtmpFull: string; preInput: string[]; isRtmp: boolean; durRef: { seg: number }; inicioMs: number; broadcastId?: string; platNome?: string; preCodec?: string[] }): any {
     const MAXREL = 10;        // maximo de religamentos por destino na mesma live
     const DELAYMS = 4000;     // espera antes de religar (dentro da janela de tolerancia do YouTube)
     const MARGEMFIM = 20;     // se faltam <=20s pro fim do video, considera que ja terminou (nao religa)
     const fmt = (sg: number): string => { sg = Math.max(0, Math.floor(sg)); const m = Math.floor(sg / 60); const ss = sg % 60; return m + 'm' + (ss < 10 ? '0' : '') + ss + 's'; };
     function subir(seekS: number): any {
       const pre2 = seekS > 2 ? ['-ss', String(Math.floor(seekS)), ...o.preInput] : o.preInput;
-      const child = o.isRtmp ? ffmpegPushRtmp(o.input, o.rtmpFull, pre2) : ffmpegPush(o.input, o.rtmpFull, pre2);
+      const child = o.isRtmp ? ffmpegPushRtmp(o.input, o.rtmpFull, pre2, o.preCodec || []) : ffmpegPush(o.input, o.rtmpFull, pre2);
       o.rec.child = child;
       child.on('exit', (code: number) => {
         const ok = code === 0;
@@ -10877,7 +10927,15 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         livLog('empurrando ffmpeg RTMP', liveId, dd.plataforma, rid);
         const platNome = dd.plataforma === 'instagram' ? 'Instagram' : dd.plataforma === 'tiktok' ? 'TikTok' : dd.plataforma === 'facebook' ? 'Facebook' : String(dd.plataforma || 'destino');
         // [lives-religar] push com reconexao automatica
-        livPushResiliente({ liveId, canalId: key, rec, input, rtmpFull: full, preInput: inputPre, isRtmp: true, durRef: livDurRef, inicioMs: livInicioMs, broadcastId: '', platNome: platNome + (dd.nome ? ' (' + String(dd.nome).slice(0, 40) + ')' : '') });
+        // [+ig-live-nuvem] Instagram: manda o video no formato VERTICAL (fundo borrado + video horizontal centralizado)
+        const _ehIg = String(dd.plataforma || '') === 'instagram';
+        const _igPreCodec = _ehIg ? ['-filter_complex', '[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:4[bgb];[fg]scale=1080:-2:force_original_aspect_ratio=decrease[fgs];[bgb][fgs]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vout]', '-map', '[vout]', '-map', '0:a?'] : [];
+        livPushResiliente({ liveId, canalId: key, rec, input, rtmpFull: full, preInput: inputPre, isRtmp: true, durRef: livDurRef, inicioMs: livInicioMs, broadcastId: '', platNome: platNome + (dd.nome ? ' (' + String(dd.nome).slice(0, 40) + ')' : ''), preCodec: _igPreCodec });
+        // [+ig-live-nuvem] se ligado (ig_live_nuvem_ativo=1), abre o navegador invisivel na nuvem e da o "Transmitir ao vivo" (depois do ffmpeg conectar na chave)
+        if (_ehIg && pubFlag('ig_live_nuvem_ativo', '0') === '1') {
+          const _contaIg = String(dd.instrumento || rid.replace(/^igfixo-/, '')).toLowerCase();
+          setTimeout(() => { import('./ig-live-nuvem').then((m: any) => m.iniciarLiveIgNuvem({ conta: _contaIg, titulo: live.titulo || 'Ao vivo' })).then((r: any) => livLog('ig-live-nuvem', liveId, _contaIg, JSON.stringify(r))).catch((e: any) => livLog('ig-live-nuvem erro', liveId, _contaIg, String(e && e.message || e))); }, 9000);
+        }
       } catch (e: any) {
         livSetDestino(liveId, key, { plataforma: String(d.plataforma || 'facebook'), status: 'erro', erro: String(e?.message || e).slice(0, 400) });
         livLog('falha destino RTMP', liveId, rid, String(e?.message || e));
@@ -11263,6 +11321,11 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
         for (const d of arr) { if (d.broadcast_id && d.canal_id) { ytLiveTransicao(String(d.canal_id), String(d.broadcast_id), 'complete').catch(() => { /* */ }); } }
       } catch { /* */ }
       livesRun.delete(id);
+      // [+ig-live-nuvem] se a live tinha destino Instagram, fecha o navegador da nuvem que segurava a live
+      try {
+        const _ds = JSON.parse(row.destinos_json || '[]');
+        for (const _d of _ds) { if (String(_d.plataforma || '') === 'instagram') { const _c = String(_d.instrumento || String(_d.rtmp_id || _d.canal_id || '').replace(/^rtmp:/, '').replace(/^igfixo-/, '')).toLowerCase(); import('./ig-live-nuvem').then((m: any) => m.pararLiveIgNuvem(_c)).catch(() => { /* */ }); } }
+      } catch { /* */ }
       db.prepare(`UPDATE fila_lives SET status='cancelado', atualizado_em=? WHERE id=?`).run(agora(), id);
       res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
