@@ -14024,7 +14024,7 @@ a{color:inherit;text-decoration:none}
 .card{flex:0 0 210px;width:210px}
 .card .pz{position:relative;width:210px;height:373px;border-radius:14px;overflow:hidden;background:#17171f;border:1px solid #23232c;transition:transform .2s cubic-bezier(.2,.7,.3,1),filter .2s,box-shadow .2s,outline-color .2s;outline:2px solid transparent;outline-offset:2px}
 .card{cursor:pointer}.card:hover .pz{transform:translateY(-4px) scale(1.045);filter:brightness(1.12);box-shadow:0 16px 30px -12px #000c;outline-color:#e7c86a}.cattile{transition:transform .2s,border-color .2s}.cattile:hover{transform:translateY(-3px)}
-.card .pz img{width:100%;height:100%;object-fit:contain;display:block}
+.card .pz img{width:100%;height:100%;object-fit:cover;display:block}
 /* [layout-home 31/10] HOME em TELA CHEIA + cards MAIORES (so a home; outras telas seguem 1180px). ADITIVO. */
 .wrap.home{max-width:none;padding-left:clamp(16px,3vw,48px);padding-right:clamp(16px,3vw,48px)}
 .wrap.home .shelf h2{font-size:17px;color:#e9e9f2;font-weight:700}
