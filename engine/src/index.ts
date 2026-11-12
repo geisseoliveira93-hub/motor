@@ -13976,6 +13976,8 @@ const _acCursosDoAluno = (alunoId: string): Set<string> => {
 const _AC_IA_APP = 'https://melodias-riffs-app.pages.dev';
 const _acIaUrl = (al: any, pagina = 'inicio.html'): string =>
   _AC_IA_APP + '/' + pagina + '?email=' + encodeURIComponent(String(al && al.email || '')) + '&cuser_fname=' + encodeURIComponent(String(al && al.nome || '').trim().split(' ')[0] || '');
+// [+admin-ia 12/11] admin (cookie mr_adm) ve as 3 IAs liberadas: usa o email de dono nas URLs da IA. Aluno normal segue o gate.
+const _acIaAl = (req: any, al: any): any => (al && _acEhAdmin(req)) ? Object.assign({}, al, { email: 'geisseoliveira.93@gmail.com' }) : al;
 // [+IA-aula-ctx 03/11] instrumento do curso (pelo nome/descrição) + instrumentos cuja IA de CHAT já está pronta + URL da IA de chat já com o contexto da aula. SÓ ADICIONA — não mexe no _acIaUrl acima.
 const _acCursoInst = (curso: any): string => {
   const s = (String(curso && curso.nome || '') + ' ' + String(curso && curso.descricao || '')).toLowerCase();
@@ -14480,7 +14482,7 @@ app.get('/area/ia', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   try { _acLog(al.id, 'abriu_ia', ''); } catch {}
-  const url = _acIaUrl(al, 'escolher-instrumento.html');
+  const url = _acIaUrl(_acIaAl(req, al), 'escolher-instrumento.html');
   const corpo = `<div style="display:flex;flex-direction:column;height:calc(100vh - 58px)">
     <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:#0c0c10;border-bottom:1px solid #1c1c24">
       <b style="color:#e7c86a">🎹 IA Melodias e Riffs</b>
@@ -14577,7 +14579,7 @@ app.get('/area/aula/:id', (req: any, res: any) => {
       const _inst = _AC_IA_PRONTOS.has(_iaInst) ? _iaInst : 'teclado';
       const _modAtual = (mods.find((m: any) => aulas.some((a: any) => a.modulo_id === m.id && a.id === aula.id)) || {}) as any;
       const _ctxAula = (_modAtual && _modAtual.nome ? String(_modAtual.nome) + ' › ' : '') + String(aula.nome || '');
-      const _iaSrc = _acIaUrlAula(al, _inst, _ctxAula);
+      const _iaSrc = _acIaUrlAula(_acIaAl(req, al), _inst, _ctxAula);
       const _instLabel = _inst === 'teclado' ? 'Teclado' : (_inst === 'violao' ? 'Violão' : 'Baixo');
       const _iaEmoji = _inst === 'teclado' ? '🎹' : '🎸';
       fab = `<button class="fab" onclick="document.getElementById('iadrawer').classList.add('open');document.getElementById('iashade').classList.add('open')">💬 Dúvida nesta aula?</button>`;
