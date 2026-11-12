@@ -14019,12 +14019,12 @@ a{color:inherit;text-decoration:none}
 .hero p{color:#d7d7df;max-width:48ch}
 .shelf{margin:26px 0}
 .shelf h2{font-size:15px;color:#bdbdc8;font-weight:600;margin:0 0 12px}
-.rail{display:flex;gap:16px;overflow-x:auto;overflow-y:hidden;padding:14px 16px 10px;scrollbar-width:none;-ms-overflow-style:none}
+.rail{display:flex;gap:16px;overflow-x:auto;overflow-y:hidden;padding:24px 16px 18px;scrollbar-width:none;-ms-overflow-style:none}
 .rail::-webkit-scrollbar{display:none;height:0}
 .card{flex:0 0 210px;width:210px}
 .card .pz{position:relative;width:210px;height:373px;border-radius:14px;overflow:hidden;background:#17171f;border:1px solid #23232c;transition:transform .2s cubic-bezier(.2,.7,.3,1),filter .2s,box-shadow .2s,outline-color .2s;outline:2px solid transparent;outline-offset:2px}
 .card{cursor:pointer}.card:hover .pz{transform:translateY(-4px) scale(1.045);filter:brightness(1.12);box-shadow:0 16px 30px -12px #000c;outline-color:#e7c86a}.cattile{transition:transform .2s,border-color .2s}.cattile:hover{transform:translateY(-3px)}
-.card .pz img{width:100%;height:100%;object-fit:cover;display:block}
+.card .pz img{width:100%;height:100%;object-fit:contain;display:block}
 /* [layout-home 31/10] HOME em TELA CHEIA + cards MAIORES (so a home; outras telas seguem 1180px). ADITIVO. */
 .wrap.home{max-width:none;padding-left:clamp(16px,3vw,48px);padding-right:clamp(16px,3vw,48px)}
 .wrap.home .shelf h2{font-size:17px;color:#e9e9f2;font-weight:700}
@@ -14480,11 +14480,11 @@ app.get('/area/ia', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
   try { _acLog(al.id, 'abriu_ia', ''); } catch {}
-  const url = _acIaUrl(al, 'inicio.html');
+  const url = _acIaUrl(al, 'escolher-instrumento.html');
   const corpo = `<div style="display:flex;flex-direction:column;height:calc(100vh - 58px)">
     <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;background:#0c0c10;border-bottom:1px solid #1c1c24">
       <b style="color:#e7c86a">🎹 IA Melodias e Riffs</b>
-      <span style="color:#8a8a96;font-size:13px">seu tutor de teclado gospel — tire dúvidas, envie foto da cifra e estude com a IA</span>
+      <span style="color:#8a8a96;font-size:13px">escolha o instrumento e converse com a IA — teclado, violão ou baixo</span>
       <a class="btn btn-ghost" style="margin-left:auto;padding:7px 14px" href="${url}" target="_blank">Abrir em nova aba ↗</a>
     </div>
     <iframe src="${url}" style="flex:1;width:100%;border:0;background:#0a0a0c" allow="microphone; clipboard-write; autoplay" title="IA Melodias e Riffs"></iframe>
