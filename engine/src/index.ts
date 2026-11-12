@@ -13985,7 +13985,7 @@ const _acCursoInst = (curso: any): string => {
   return '';
 };
 // instrumentos cuja IA de CONVERSA já existe (hoje só teclado = app.html; adicionar 'violao'/'baixo' quando o chat deles for ao ar)
-const _AC_IA_PRONTOS = new Set<string>(['teclado']);
+const _AC_IA_PRONTOS = new Set<string>(['teclado', 'violao', 'baixo']);  // [+violao-baixo IA de aula]
 const _acIaUrlAula = (al: any, inst: string, aulaCtx: string): string => {
   let u = _acIaUrl(al, 'app.html'); // hoje a IA de chat é a de teclado (app.html)
   if (inst) u += '&inst=' + encodeURIComponent(inst);
@@ -14154,7 +14154,7 @@ const _acTop = (al: any, aba = ''): string => {
 };
 const _acPage = (al: any, titulo: string, corpo: string, aba = '', extraHead = ''): string =>
   '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-  + '<title>' + esc(titulo) + ' — Melodias e Riffs</title><link rel="manifest" href="/area/manifest.webmanifest"><meta name="theme-color" content="#0a0a0c"><style>' + _acCSS + '</style>' + extraHead + '<script>function acBig(){try{var h=document.documentElement;h.classList.toggle("ac-big");localStorage.setItem("ac_big",h.classList.contains("ac-big")?"1":"0");}catch(e){}}try{if(localStorage.getItem("ac_big")==="1")document.documentElement.classList.add("ac-big");}catch(e){}if("serviceWorker" in navigator){navigator.serviceWorker.register("/area/sw.js").catch(function(){});}function _acSomOn(){try{return localStorage.getItem("ac_som")!=="0";}catch(e){return true;}}window.acSom=function(){try{var off=localStorage.getItem("ac_som")==="0";localStorage.setItem("ac_som",off?"1":"0");var b=document.getElementById("acspk");if(b)b.textContent=off?"\u{1F50A}":"\u{1F507}";}catch(e){}};document.addEventListener("DOMContentLoaded",function(){try{var b=document.getElementById("acspk");if(b)b.textContent=_acSomOn()?"\u{1F50A}":"\u{1F507}";}catch(e){}});(function(){var AC=null;function mk(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(AC&&AC.state==="suspended")AC.resume();}document.addEventListener("pointerdown",mk);var L=0;document.addEventListener("mouseover",function(e){var c=e.target&&e.target.closest&&e.target.closest(".card,.cattile,.mcard");if(!c||!AC||!_acSomOn())return;var n=Date.now();if(n-L<90)return;L=n;try{var t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();o.type="sine";o.frequency.setValueAtTime(820,t);o.frequency.exponentialRampToValueAtTime(1240,t+.05);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.03,t+.012);g.gain.exponentialRampToValueAtTime(.0001,t+.12);o.connect(g).connect(AC.destination);o.start(t);o.stop(t+.13);}catch(e){}},true);})();</script></head><body>'
+  + '<title>' + esc(titulo) + ' — Melodias e Riffs</title><link rel="manifest" href="/area/manifest.webmanifest"><link rel="apple-touch-icon" href="/area/apple-touch-icon.png"><link rel="icon" type="image/png" href="/area/icon-192.png"><meta name="theme-color" content="#0a0a0c"><style>' + _acCSS + '</style>' + extraHead + '<script>function acBig(){try{var h=document.documentElement;h.classList.toggle("ac-big");localStorage.setItem("ac_big",h.classList.contains("ac-big")?"1":"0");}catch(e){}}try{if(localStorage.getItem("ac_big")==="1")document.documentElement.classList.add("ac-big");}catch(e){}if("serviceWorker" in navigator){navigator.serviceWorker.register("/area/sw.js").catch(function(){});}function _acSomOn(){try{return localStorage.getItem("ac_som")!=="0";}catch(e){return true;}}window.acSom=function(){try{var off=localStorage.getItem("ac_som")==="0";localStorage.setItem("ac_som",off?"1":"0");var b=document.getElementById("acspk");if(b)b.textContent=off?"\u{1F50A}":"\u{1F507}";}catch(e){}};document.addEventListener("DOMContentLoaded",function(){try{var b=document.getElementById("acspk");if(b)b.textContent=_acSomOn()?"\u{1F50A}":"\u{1F507}";}catch(e){}});(function(){var AC=null;function mk(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}if(AC&&AC.state==="suspended")AC.resume();}document.addEventListener("pointerdown",mk);var L=0;document.addEventListener("mouseover",function(e){var c=e.target&&e.target.closest&&e.target.closest(".card,.cattile,.mcard");if(!c||!AC||!_acSomOn())return;var n=Date.now();if(n-L<90)return;L=n;try{var t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();o.type="sine";o.frequency.setValueAtTime(820,t);o.frequency.exponentialRampToValueAtTime(1240,t+.05);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.03,t+.012);g.gain.exponentialRampToValueAtTime(.0001,t+.12);o.connect(g).connect(AC.destination);o.start(t);o.stop(t+.13);}catch(e){}},true);})();</script></head><body>'
   + _acTop(al, aba) + corpo + '</body></html>';
 
 // ---------- [B.3] Login / magic link / logout ----------
@@ -15742,10 +15742,33 @@ app.get('/academy/dashboard', (_req: any, res: any) => {
 // PWA: manifest + service worker da área do aluno (instalar como app no celular)
 app.get('/area/manifest.webmanifest', (_req: any, res: any) => {
   res.type('application/manifest+json').send(JSON.stringify({
-    name: 'Melodias e Riffs', short_name: 'M|R', start_url: '/area', scope: '/area',
-    display: 'standalone', background_color: '#0a0a0c', theme_color: '#0a0a0c',
-    icons: [{ src: (PUBLIC_BASE_URL || '') + '/area/icon.png', sizes: '512x512', type: 'image/png' }],
+    name: pubFlag('pwa_name', 'Melodias e Riffs'), short_name: pubFlag('pwa_short', 'M|R'), start_url: '/area', scope: '/area',
+    display: 'standalone', background_color: '#0a0a0c', theme_color: pubFlag('pwa_theme', '#0a0a0c'),
+    icons: [{ src: (PUBLIC_BASE_URL || '') + '/area/icon.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }, { src: (PUBLIC_BASE_URL || '') + '/area/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' }],
   }));
+});
+// [PWA icon/nome configuravel] rotas de icone + config (ADD-ONLY). Icone e nome vem do pub_kv, trocaveis sem redeploy.
+app.get('/area/icon.png', (_req: any, res: any) => {
+  try { const b64 = pubFlag('pwa_icon_512', ''); if (!b64) return res.status(404).end(); res.type('image/png').set('Cache-Control', 'public, max-age=3600').send(Buffer.from(b64, 'base64')); } catch (e) { res.status(500).end(); }
+});
+app.get('/area/icon-192.png', (_req: any, res: any) => {
+  try { const b64 = pubFlag('pwa_icon_192', '') || pubFlag('pwa_icon_512', ''); if (!b64) return res.status(404).end(); res.type('image/png').set('Cache-Control', 'public, max-age=3600').send(Buffer.from(b64, 'base64')); } catch (e) { res.status(500).end(); }
+});
+app.get('/area/apple-touch-icon.png', (_req: any, res: any) => {
+  try { const b64 = pubFlag('pwa_icon_180', '') || pubFlag('pwa_icon_512', ''); if (!b64) return res.status(404).end(); res.type('image/png').set('Cache-Control', 'public, max-age=3600').send(Buffer.from(b64, 'base64')); } catch (e) { res.status(500).end(); }
+});
+// troca nome/atalho/tema/icone do app PWA pra TODO MUNDO (admin x-api-key), sem redeploy
+app.post('/academy/pwa-config', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (typeof b.name === 'string' && b.name.trim()) setPubFlag('pwa_name', b.name.trim());
+    if (typeof b.short === 'string' && b.short.trim()) setPubFlag('pwa_short', b.short.trim());
+    if (typeof b.theme === 'string' && b.theme.trim()) setPubFlag('pwa_theme', b.theme.trim());
+    if (typeof b.icon512 === 'string' && b.icon512.length > 100) setPubFlag('pwa_icon_512', b.icon512);
+    if (typeof b.icon192 === 'string' && b.icon192.length > 100) setPubFlag('pwa_icon_192', b.icon192);
+    if (typeof b.icon180 === 'string' && b.icon180.length > 100) setPubFlag('pwa_icon_180', b.icon180);
+    _ndOk(res, { nome: pubFlag('pwa_name', 'Melodias e Riffs'), short: pubFlag('pwa_short', 'M|R'), tem_icone: !!pubFlag('pwa_icon_512', '') });
+  } catch (e) { _ndErr(res, e); }
 });
 app.get('/area/sw.js', (_req: any, res: any) => {
   res.type('application/javascript').send("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',function(){});");
