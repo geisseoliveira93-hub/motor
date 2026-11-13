@@ -14347,6 +14347,25 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 /* [layout-home 31/10] setas SEMPRE visiveis em tela menor / toque (sem hover). ADITIVO. */
 @media(hover:none),(max-width:980px){.railwrap .arw{opacity:.92}}
 .ic.acspk{background:none;font-size:16px}
+/* [+banner-fit 13/11] banner do curso: imagem INTEIRA (sem corte) + fundo da propria imagem desfocado (Proposta B) */
+.coverhero .bgd,.coverhero .bgm{background-size:0 0;filter:none}
+.coverhero .bgd::before,.coverhero .bgm::before{content:'';position:absolute;inset:0;background-image:inherit;background-position:center;background-repeat:no-repeat;background-size:cover;filter:blur(26px) brightness(.42);transform:scale(1.12)}
+.coverhero .bgd::after,.coverhero .bgm::after{content:'';position:absolute;inset:0;background-image:inherit;background-position:center;background-repeat:no-repeat;background-size:contain;filter:brightness(.82)}
+.coverhero .in h1,.coverhero .in .meta{text-shadow:0 2px 10px rgba(0,0,0,.85)}
+/* [+lupa-curso 13/11] busca de aulas dentro do curso */
+.acbusca{display:flex;align-items:center;gap:10px;background:#0e0e12;border:1px solid #26262f;border-radius:999px;padding:11px 16px;margin:4px 0 14px}
+.acbusca svg{flex:none}
+.acbusca input{flex:1;background:transparent;border:0;outline:0;color:#e9e9ef;font-size:15px}
+.acbusca input::-webkit-search-cancel-button{display:none}
+.acbusca button{flex:none;background:#20202a;border:0;color:#cfcfd8;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:12px}
+.acbcount{color:#9a9aa6;font-size:12.5px;margin:0 2px 8px}
+.acbmod{color:#e7c86a;font-weight:700;font-size:13px;letter-spacing:.3px;margin:12px 2px 4px}
+.acbaula{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;border:1px solid transparent;text-decoration:none;color:#e9e9ef}
+.acbaula:hover{background:#1b1b22;border-color:#2a2a34}
+.acbaula .acbplay{color:#6a6a76;font-size:12px;flex:none}
+.acbaula .acbt{flex:1;min-width:0;font-size:14.5px}
+.acbres mark{background:#4a3b12;color:#ffe9a8;border-radius:3px;padding:0 2px}
+.acbempty{color:#9a9aa6;padding:16px;text-align:center}
 `;
 const _acTop = (al: any, aba = ''): string => {
   const ini = esc(String(al && al.nome || 'A').trim().charAt(0).toUpperCase() || 'A');
@@ -14668,16 +14687,18 @@ app.get('/area/curso/:id', (req: any, res: any) => {
     const _chd = esc(curso.capa_hero || curso.capa || '');
     const _chm = esc(curso.capa_hero_mobile || curso.capa_hero || curso.capa || '');
     const _admCurso = _acEhAdmin(req) ? _acAdminBannerCtrl('curso', curso.id) : '';
+    const _acbJson = JSON.stringify(aulas.map((a:any)=>({t:String(a.nome||''),m:String((mods.find((mm:any)=>mm.id===a.modulo_id)||{}).nome||''),u:'/area/aula/'+a.id}))).replace(/</g,'\\u003c'); // [+lupa-curso 13/11]
     const corpo = `<div class="wrap cheio">
       <div class="coverhero"><div class="bgd" style="background-image:url('${_chd}')"></div><div class="bgm" style="background-image:url('${_chm}')"></div>${_admCurso}
         <div class="in"><div class="meta">${mods.length} módulos · ${nAulas} aulas · ${nFeitas}/${nAulas} concluídas${_acTempoCursoHtml(al.id, curso.id)}</div>
         <h1>${esc(curso.nome || '')}</h1>
         ${alvoBtn ? `<a class="btn btn-l" href="/area/aula/${alvoBtn.id}">${btnLabel}</a>` : ''}</div></div>
+      <div class="acbusca"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#9a9aa6" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg><input id="acbq" type="search" placeholder="Buscar aula, tema ou nº do hino…" autocomplete="off" oninput="acBuscar()"><button id="acbx" type="button" onclick="acBuscaLimpar()" hidden aria-label="limpar">✕</button></div><div id="acbres" hidden></div><div id="acbnormal">
       ${nAulas > 0 && nFeitas >= nAulas ? `<div class="card2" style="border:1px solid #e7c86a;margin-bottom:14px;display:flex;align-items:center;gap:12px"><span style="font-size:24px">\u{1F3C6}</span><div style="flex:1">Você concluiu este curso!</div><a class="btn btn-g" href="/area/certificado/${curso.id}">Ver certificado</a></div>` : ''}
       <h2 style="font-size:15px;color:#bdbdc8">Módulos</h2>${modRail}
-      ${(function(){try{var pv=db.prepare(`SELECT * FROM academy_provas WHERE curso_id=? ORDER BY criado_em`).all(curso.id);if(!pv.length)return '';return '<h2 style="font-size:15px;color:#bdbdc8;margin-top:18px">Provas</h2>'+pv.map(function(p){return `<a class="card2" style="display:flex;align-items:center;gap:10px;margin:8px 0" href="/area/prova/${p.id}">📝 <b>${esc(p.titulo||'Prova')}</b><span style="margin-left:auto;color:#8a8a96;font-size:12px">nota mín ${p.nota_minima}%</span></a>`;}).join('');}catch(e){return '';}})()}
+      ${(function(){try{var pv=db.prepare(`SELECT * FROM academy_provas WHERE curso_id=? ORDER BY criado_em`).all(curso.id);if(!pv.length)return '';return '<h2 style="font-size:15px;color:#bdbdc8;margin-top:18px">Provas</h2>'+pv.map(function(p){return `<a class="card2" style="display:flex;align-items:center;gap:10px;margin:8px 0" href="/area/prova/${p.id}">📝 <b>${esc(p.titulo||'Prova')}</b><span style="margin-left:auto;color:#8a8a96;font-size:12px">nota mín ${p.nota_minima}%</span></a>`;}).join('');}catch(e){return '';}})()}</div>
       </div>
-      <script>document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});</script>`;
+      <script>var _ACBIDX=${_acbJson};function _acbEsc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}function _acbHl(s,t){s=String(s);if(!t)return _acbEsc(s);var i=s.toLowerCase().indexOf(t);if(i<0)return _acbEsc(s);return _acbEsc(s.slice(0,i))+'<mark>'+_acbEsc(s.slice(i,i+t.length))+'</mark>'+_acbEsc(s.slice(i+t.length));}function acBuscar(){var q=document.getElementById('acbq'),res=document.getElementById('acbres'),norm=document.getElementById('acbnormal'),x=document.getElementById('acbx');var t=(q.value||'').trim().toLowerCase();if(x)x.hidden=!t;if(!t){res.hidden=true;norm.hidden=false;res.innerHTML='';return;}var f=_ACBIDX.filter(function(a){return (a.t+' '+a.m).toLowerCase().indexOf(t)>=0;});norm.hidden=true;res.hidden=false;if(!f.length){res.innerHTML='<div class="acbempty">Nenhuma aula encontrada</div>';return;}var h='<div class="acbcount">'+f.length+' aula'+(f.length===1?'':'s')+' encontrada'+(f.length===1?'':'s')+'</div>',lm='';f.forEach(function(a){if(a.m!==lm){h+='<div class="acbmod">'+_acbEsc(a.m)+'</div>';lm=a.m;}h+='<a class="acbaula" href="'+a.u+'"><span class="acbplay">▶</span><span class="acbt">'+_acbHl(a.t,t)+'</span></a>';});res.innerHTML=h;}function acBuscaLimpar(){var q=document.getElementById('acbq');q.value='';acBuscar();q.focus();}document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});</script>`;
     _acLog(al.id, 'abriu_curso', curso.id);
     res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo + (_acEhAdmin(req) ? _AC_ADM_JS : '')));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
