@@ -6023,6 +6023,57 @@ console.log('[wa-mcp] /wa/mcp/numeros|conversas|mensagens|enviar|enviar-arquivo|
 
 // ticker próprio do disparo (1s; respeita o agendado_para → intervalo/agenda; NÃO toca no tickFila)
 let _campEnviando = false;
+// [+anti-reenvio 13/11] BARREIRA: um GRUPO nunca recebe 2x a MESMA mensagem (a nao ser com permitir_repetir=1).
+// NASCE INERTE (pub_kv anti_reenvio_ativo='0'); liga com POST /disparo/anti-reenvio {ativo:true}. So toca GRUPO (@g.us); em erro NUNCA bloqueia envio legitimo.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS grupo_envio_log (id TEXT PRIMARY KEY, jid TEXT, hash TEXT, criado_em TEXT)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ix_grupo_envio_log ON grupo_envio_log(jid,hash)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS grupo_envio_bloqueado (id TEXT PRIMARY KEY, jid TEXT, hash TEXT, texto TEXT, bloqueado_em TEXT)`);
+} catch (e) { console.log('[anti-reenvio] schema erro:', String(e)); }
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN permitir_repetir INTEGER DEFAULT 0`); } catch { /* ja existe */ }
+function _arHash(item: any): string {
+  const base = String(item.tipo || 'texto') + '|' + String(item.texto || item.legenda || '').trim().toLowerCase().replace(/\s+/g, ' ') + '|' + String(item.url || '').trim();
+  return createHash('sha1').update(base).digest('hex');
+}
+function _arEhGrupo(para: any): boolean { return /@g\.us$/.test(String(para || '')); }
+function _arDevePular(item: any): boolean {
+  try {
+    if (pubFlag('anti_reenvio_ativo', '0') !== '1') return false;
+    if (Number(item.permitir_repetir || 0) === 1) return false;
+    if (!_arEhGrupo(item.para)) return false;
+    const jid = String(item.para || ''); const h = _arHash(item);
+    const ja = db.prepare(`SELECT 1 FROM grupo_envio_log WHERE jid=? AND hash=? LIMIT 1`).get(jid, h);
+    if (!ja) return false;
+    try { db.prepare(`INSERT OR IGNORE INTO grupo_envio_bloqueado(id,jid,hash,texto,bloqueado_em) VALUES(?,?,?,?,?)`).run(randomUUID(), jid, h, String(item.texto || item.legenda || item.url || '').slice(0, 200), agora()); } catch { /* */ }
+    return true;
+  } catch { return false; }
+}
+function _arRegistrar(item: any): void {
+  try { if (!_arEhGrupo(item.para)) return; db.prepare(`INSERT OR IGNORE INTO grupo_envio_log(id,jid,hash,criado_em) VALUES(?,?,?,?)`).run(randomUUID(), String(item.para || ''), _arHash(item), agora()); } catch { /* */ }
+}
+try {
+  if (pubFlag('anti_reenvio_seeded', '0') !== '1') {
+    const _seed = db.prepare(`SELECT para, tipo, texto, legenda, url FROM fila_envio WHERE status='enviado' AND para LIKE '%@g.us'`).all() as any[];
+    const _insSeed = db.prepare(`INSERT OR IGNORE INTO grupo_envio_log(id,jid,hash,criado_em) VALUES(?,?,?,?)`);
+    for (const r of _seed) { try { _insSeed.run(randomUUID(), String(r.para), _arHash(r), agora()); } catch { /* */ } }
+    setPubFlag('anti_reenvio_seeded', '1');
+    console.log('[anti-reenvio] seed:', _seed.length, 'envios de grupo carregados no historico');
+  }
+} catch (e) { console.log('[anti-reenvio] seed erro:', String(e)); }
+app.get('/disparo/bloqueios', (_req: any, res: any) => {
+  try { const rows = db.prepare(`SELECT * FROM grupo_envio_bloqueado ORDER BY bloqueado_em DESC LIMIT 200`).all(); res.json({ ok: true, ativo: pubFlag('anti_reenvio_ativo', '0') === '1', bloqueios: rows }); } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/disparo/bloqueio/liberar', (req: any, res: any) => {
+  try {
+    const b = req.body || {}; const jid = String(b.jid || ''); if (!jid) return res.json({ ok: false, erro: 'jid_obrigatorio' });
+    if (b.hash) { db.prepare(`DELETE FROM grupo_envio_log WHERE jid=? AND hash=?`).run(jid, String(b.hash)); db.prepare(`DELETE FROM grupo_envio_bloqueado WHERE jid=? AND hash=?`).run(jid, String(b.hash)); }
+    else { db.prepare(`DELETE FROM grupo_envio_log WHERE jid=?`).run(jid); db.prepare(`DELETE FROM grupo_envio_bloqueado WHERE jid=?`).run(jid); }
+    res.json({ ok: true });
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/disparo/anti-reenvio', (req: any, res: any) => {
+  try { const on = !!(req.body || {}).ativo; setPubFlag('anti_reenvio_ativo', on ? '1' : '0'); res.json({ ok: true, ativo: on }); } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 async function tickCampanha() {
   if (_campEnviando) return; _campEnviando = true;
   try {
@@ -6030,9 +6081,13 @@ async function tickCampanha() {
     const item = db.prepare(`SELECT * FROM fila_envio WHERE status='camp_pend' AND (pausado IS NULL OR pausado=0) AND (agendado_para IS NULL OR agendado_para <= ?) AND (agendado_para IS NULL OR agendado_para >= ?) ORDER BY agendado_para, criado_em LIMIT 1`).get(agora(), LIM) as any;
     if (item) {
       try {
+        if (_arDevePular(item)) { db.prepare(`UPDATE fila_envio SET status='bloqueado_dup' WHERE id=?`).run(item.id); }
+        else {
         if ((item.tipo || 'texto') === 'texto') await enviarTexto(item.projeto, item.para, item.texto || '');
         else await enviarMidia(item.projeto, item.para, item.tipo, item.url || '', item.legenda || '');
+        _arRegistrar(item);
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+        }
       } catch {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'camp_pend' END WHERE id=?`).run(item.id);
       }
@@ -8243,9 +8298,13 @@ async function tickCampanhaMulti() {
     const lote = Object.values(porInst) as any[];
     await Promise.all(lote.map(async (item: any) => {
       try {
+        if (_arDevePular(item)) { db.prepare(`UPDATE fila_envio SET status='bloqueado_dup' WHERE id=?`).run(item.id); }
+        else {
         if ((item.tipo || 'texto') === 'texto') await enviarTextoVia(item.instancia, item.para, item.texto || '');
         else await enviarMidiaVia(item.instancia, item.para, item.tipo, item.url || '', item.legenda || '');
+        _arRegistrar(item);
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+        }
       } catch {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_multi' END WHERE id=?`).run(item.id);
       }
@@ -8465,9 +8524,13 @@ async function tickCampanhaMultiMk() {
     const lote = Object.values(porInst) as any[];
     await Promise.all(lote.map(async (item: any) => {
       try {
+        if (_arDevePular(item)) { db.prepare(`UPDATE fila_envio SET status='bloqueado_dup' WHERE id=?`).run(item.id); }
+        else {
         if ((item.tipo || 'texto') === 'texto') await enviarTextoViaMk(item.instancia, item.para, item.texto || '');
         else await enviarMidiaViaMk(item.instancia, item.para, item.tipo, item.url || '', item.legenda || '');
+        _arRegistrar(item);
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
+        }
       } catch {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_mmk' END WHERE id=?`).run(item.id);
       }
@@ -15124,6 +15187,53 @@ app.post('/academy/aluno/telefone', (req: any, res: any) => {
     _acLog(id, 'telefone_alterado', telefone);
     _ndOk(res, { ok: true, telefone });
   } catch (e) { _ndErr(res, e); }
+});
+// [+endpoint-nome-aluno 13/11 Ezequias] ADD-ONLY. Igual ao /email e /telefone: troca o NOME de um aluno ja criado (reutilizavel).
+app.post('/academy/aluno/nome', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || '').trim();
+    const nome = String(b.nome || '').trim();
+    if (!id || !nome) return _ndErr(res, 'id e nome obrigatorios');
+    db.prepare(`UPDATE academy_matriculas SET nome=? WHERE id=?`).run(nome, id);
+    _acLog(id, 'nome_alterado', nome);
+    _ndOk(res, { ok: true, nome });
+  } catch (e) { _ndErr(res, e); }
+});
+// [+webhook-hotmart 13/11] ADD-ONLY. Checkout da Hotmart (produto espanhol "Metodo Bajista Pro", MX) -> libera acesso na Academia + mensagem de acesso EM ESPANHOL (WhatsApp Baixo + e-mail). A entrega e so pela nossa plataforma; Hotmart e so o checkout. Sempre responde 200. Dedup por transacao (hotmart_entregue). NAO toca a entrega BR.
+try { db.exec(`CREATE TABLE IF NOT EXISTS hotmart_entregue (pedido TEXT PRIMARY KEY, email TEXT, criado_em TEXT)`); } catch { /* existe */ }
+app.post('/webhook/hotmart', async (req: any, res: any) => {
+  try {
+    const b: any = req.body || {};
+    const d: any = b.data || b;
+    try { db.prepare(`INSERT OR REPLACE INTO webhook_pagamento_log(id,provider,pedido,raw_json,criado_em) VALUES(?,?,?,?,?)`).run('hotmart:' + String((d.purchase && d.purchase.transaction) || b.id || randomUUID()), 'hotmart', String((d.purchase && d.purchase.transaction) || ''), JSON.stringify(b).slice(0, 20000), agora()); } catch { /* log best-effort */ }
+    const statusRaw = String((d.purchase && d.purchase.status) || b.status || '').toUpperCase();
+    const aprovado = statusRaw === 'APPROVED' || statusRaw === 'COMPLETE' || statusRaw === 'APPROVED_PAYMENT';
+    if (!aprovado) return res.json({ ok: true, ignorado: true, status: statusRaw });
+    const buyer: any = d.buyer || d.contact || {};
+    const prod: any = d.product || {};
+    const email = String(buyer.email || '').trim().toLowerCase();
+    const nome = String(buyer.name || buyer.nome || '').trim();
+    const telefone = String((buyer.phone && (buyer.phone.number || buyer.phone)) || buyer.checkout_phone || buyer.phone_number || '').replace(/\D/g, '');
+    const produtoNome = String(prod.name || prod.nome || 'Metodo Bajista Pro').trim();
+    const pedido = String((d.purchase && d.purchase.transaction) || b.id || ('hotmart-' + Date.now()));
+    if (!email) return res.json({ ok: true, ignorado: true, motivo: 'sem_email' });
+    const dd: any = db.prepare(`INSERT OR IGNORE INTO hotmart_entregue(pedido,email,criado_em) VALUES(?,?,?)`).run(pedido, email, agora());
+    if (!dd.changes) return res.json({ ok: true, duplicado: true });
+    try { _acMatricularPorVenda({ produtoNome, email, nome }); } catch { /* best-effort */ }
+    let tok = '';
+    try { const al: any = db.prepare(`SELECT token_login FROM academy_matriculas WHERE lower(email)=?`).get(email); tok = (al && al.token_login) || ''; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE lower(email)=?`).run(tok, email); } } catch { /* */ }
+    const link = _AREA_URL + '/area/entrar/' + tok;
+    const primeiro = (nome.split(' ')[0] || '').trim();
+    const ola = primeiro ? ('Hola ' + primeiro + '!') : 'Hola!';
+    const msgWa = ola + ' Bienvenido al Metodo Bajista Pro! Ya tienes acceso. Entra con este enlace (un clic, sin contrasena):\n' + link + '\n\nCualquier duda, escribeme por aqui. A tocar!';
+    if (telefone) { try { await enviarTexto('baixo' as any, telefone, msgWa, 'Baixo'); } catch { /* best-effort */ } }
+    try {
+      const html = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.6"><p>' + ola + '</p><p>Bienvenido al <b>Metodo Bajista Pro</b>! Ya tienes acceso a la plataforma.</p><p><a href="' + link + '" style="display:inline-block;background:#1f8a52;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">Acceder a mis clases</a></p><p>O copia este enlace: ' + link + '</p><p>Cualquier duda, responde a este correo. A tocar!</p></div>';
+      _emailFilaEnfileirar('baixo', email, 'Tu acceso al Metodo Bajista Pro', html);
+    } catch { /* email best-effort */ }
+    return res.json({ ok: true, entregue: true, email });
+  } catch (e: any) { try { return res.json({ ok: true, erro: String((e && e.message) || e) }); } catch { return; } }
 });
 app.post('/academy/aluno/magiclink', (req: any, res: any) => {
   try { const b = req.body || {}; let al = db.prepare(`SELECT token_login FROM academy_matriculas WHERE id=?`).get(b.id) as any; let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, b.id); } _ndOk(res, { link: _AREA_URL + '/area/entrar/' + tok }); } catch (e) { _ndErr(res, e); }
