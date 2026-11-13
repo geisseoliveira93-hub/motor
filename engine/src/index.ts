@@ -18833,6 +18833,20 @@ async function _ckPagarme(caminho: string, metodo: string, corpo: any): Promise<
 }
 
 // --- libera o acesso na Academia + manda link mágico (WhatsApp + e-mail). Idempotente. ---
+// [+validade-relativa 13/11] converte validade relativa (1mes/3meses/6meses/1ano/2anos/3anos ou "<n>d|meses|anos") em data YYYY-MM-DD a partir de HOJE; 'vitalicio'/''/data YYYY-MM-DD passam direto. ADD-ONLY, não remove nada.
+function _ckValidade(v: any): string {
+  try {
+    const s = String(v == null ? '' : v).trim().toLowerCase();
+    if (!s || s === 'vitalicio' || s === 'vitalício') return 'vitalicio';
+    const mapa: any = { '1mes': 30, '1mês': 30, '2meses': 60, '3meses': 90, '6meses': 180, '1ano': 365, '2anos': 730, '3anos': 1095 };
+    let dias = 0;
+    if (mapa[s] != null) dias = mapa[s];
+    else { const m = s.match(/^(\d+)\s*(d|dias?|m|mes(?:es)?|a|anos?)$/); if (m) { const n = parseInt(m[1], 10); const u = m[2]; dias = u.charAt(0) === 'a' ? n * 365 : (u.charAt(0) === 'd' ? n : n * 30); } }
+    if (dias > 0) return new Date(Date.now() + dias * 86400000).toISOString().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return String(v).trim();
+    return 'vitalicio';
+  } catch { return 'vitalicio'; }
+}
 function _ckConceder(pedidoId: string): void {
   try {
     const pd = db.prepare(`SELECT * FROM ck_pedidos WHERE id=?`).get(pedidoId) as any;
@@ -18853,7 +18867,7 @@ function _ckConceder(pedidoId: string): void {
     let tok = al && al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, id); }
     if (curso) {
       const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, curso);
-      if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', curso, String(prod.validade || 'vitalicio'), agora());
+      if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', curso, _ckValidade(prod.validade), agora()); // [+validade-relativa 13/11]
     }
     const dedupKey = curso || ('ck:' + prod.id);
     const jaEnv = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, dedupKey);
@@ -18925,7 +18939,7 @@ function _ckPagoExtras(pedidoId: string): void {
         const curso = bp && String(bp.academy_curso_id || '').trim();
         if (bp && al && curso) {
           const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(al.id, curso);
-          if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'curso', curso, String(bp.validade || 'vitalicio'), agora());
+          if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), al.id, 'curso', curso, _ckValidade(bp.validade), agora()); // [+validade-relativa 13/11]
           try { _acLog(al.id, 'acesso_bump', curso); } catch { /* */ }
         }
       }
@@ -19069,6 +19083,18 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     for (const bp of _bumpProds) _itensPay.push({ amount: Number(bp.preco_centavos || 0), description: String(bp.nome || 'Bônus'), quantity: 1, code: String(bp.id) });
     const _bumpSlugsPagos = _bumpProds.map((x) => String(x.slug));
     const valor = _itensPay.reduce((s, i) => s + Number(i.amount || 0), 0);
+    // [+juros-parcelado 13/11] cartão parcelado: embute os juros no valor cobrado (vêm pra nós) usando a MESMA fórmula da página (juros_am do produto). PIX/boleto e à vista não têm juros. IMPORTANTE: Pagar.me deve estar em parcelado SEM juros (lojista), senão dobra. ADD-ONLY.
+    let _valorFinal = valor;
+    try {
+      const _jam = Number(prod.juros_am || 0);
+      if (metodo === 'card' && parcelas > 1 && _jam > 0 && valor > 0) {
+        const _coef = (_jam * Math.pow(1 + _jam, parcelas)) / (Math.pow(1 + _jam, parcelas) - 1);
+        const _parcCent = Math.round(valor * _coef);
+        const _totalJuros = _parcCent * parcelas;
+        const _jurosCent = _totalJuros - valor;
+        if (_jurosCent > 0) { _itensPay.push({ amount: _jurosCent, description: 'Juros do parcelamento (' + parcelas + 'x)', quantity: 1, code: 'juros' }); _valorFinal = _totalJuros; }
+      }
+    } catch { /* */ }
     const customer: any = { name: nome, email, type: 'individual' };
     if (cpf) customer.document = cpf;
     const ph = _ckPhone(telDig); if (ph) customer.phones = ph;
@@ -19086,7 +19112,7 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     const pedidoId = randomUUID();
     const payload: any = { code: pedidoId, items: _itensPay, customer, payments: [pagamento] };
     db.prepare(`INSERT INTO ck_pedidos (id,produto_id,slug,nome,email,telefone,cpf,metodo,parcelas,valor_centavos,status,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, valor, 'pending', agora());
+      .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, _valorFinal, 'pending', agora()); // [+juros-parcelado 13/11] valor cobrado (com juros se cartão parcelado)
     // [+ck-extras] registra cupom/desconto/bump usados nesse pedido (pra concessão e relatório)
     try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=?, bumps_json=? WHERE id=?`).run(_cupomCod, _descont, (_bumpSlugsPagos[0] || ''), JSON.stringify(_bumpSlugsPagos), pedidoId); } catch { /* */ }
     let j: any;
