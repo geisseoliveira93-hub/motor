@@ -5407,6 +5407,41 @@ app.get('/atendimento/numeros', (_req, res) => {
   res.json({ ok: true, numeros: db.prepare(`SELECT id, projeto, telefone, instancia, tipo, status FROM numeros ORDER BY projeto, telefone`).all() });
 });
 
+// ============================================================================
+// [+atendimento-responder 13/11] ENVIAR resposta na Central de Atendimento.
+// Aditivo. WhatsApp: envia JA pelo mesmo caminho do agente (enviarTexto, respeita
+// a instancia/numero da conversa). IG/FB: a entrega no Direct e feita pelo
+// navegador do PC (o motor nao envia social direto), entao so registra + sinaliza.
+// Em ambos os casos grava a mensagem 'saida' (aparece no thread) e marca a conversa
+// como 'meu' (humano assumiu), pausando a IA pra nao responder por cima.
+// ============================================================================
+app.post('/atendimento/responder', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const contatoId = String(b.contatoId || b.contato_id || '');
+    const texto = String(b.texto || '').trim();
+    if (!contatoId || !texto) return res.json({ ok: false, erro: 'contatoId_e_texto_obrigatorios' });
+    const ct = db.prepare(`SELECT id, nome, telefone, projeto, COALESCE(canal,'wa') canal FROM contatos WHERE id=?`).get(contatoId) as any;
+    if (!ct) return res.json({ ok: false, erro: 'contato_inexistente' });
+    const at = db.prepare(`SELECT instancia FROM atendimentos WHERE contato_id=?`).get(contatoId) as any;
+    const _li = db.prepare(`SELECT instancia FROM mensagens WHERE contato_id=? AND instancia IS NOT NULL AND instancia<>'' ORDER BY criado_em DESC LIMIT 1`).get(contatoId) as any;
+    const instancia = (at && at.instancia) || (_li && _li.instancia) || undefined;
+    const projeto = String(ct.projeto || 'teclado');
+    const canal = String(ct.canal || 'wa');
+    let enviado = false; let motivo = '';
+    if (canal === 'ig' || canal === 'fb') {
+      motivo = 'canal_social_entrega_pelo_navegador';
+    } else {
+      try { await enviarTexto(projeto as any, String(ct.telefone), texto, instancia ? String(instancia) : undefined); enviado = true; }
+      catch (e: any) { motivo = 'falha_envio_wa: ' + String((e && e.message) || e); }
+    }
+    try { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,instancia,canal,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(randomUUID(), projeto, contatoId, 'saida', texto, instancia || null, canal, agora()); } catch { /* registro best-effort */ }
+    try { setAtendimentoCA(contatoId, { status: 'meu', responsavel: String(b.responsavel || 'humano'), instancia: instancia || null }); db.prepare(`UPDATE agente_conversas SET status='humano', atualizado_em=? WHERE contato_id=?`).run(agora(), contatoId); } catch { /* best-effort */ }
+    res.json({ ok: true, enviado, canal, motivo: motivo || undefined });
+  } catch (e: any) { res.json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+
+
 
 
 // ============================================================================
