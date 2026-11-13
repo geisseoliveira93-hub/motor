@@ -1104,6 +1104,32 @@ export async function aplicarVideoRelacionadoViaEdit(opts: { projeto: string; vi
     for (const criar of alvos) {
       try { const el = criar(); await el.waitFor({ state: 'visible', timeout: 4000 }); await el.scrollIntoViewIfNeeded().catch(() => { /* ok */ }); await el.click({ timeout: 4000 }); escolheu = true; break; } catch { /* tenta próximo */ }
     }
+    // [+vr-busca-robusta 13/11] fallback: a âncora da Comunidade tem EMOJI (🔴) + ESPAÇOS DUPLOS no título,
+    // então a busca original (título cru) não filtra e o card não aparece. Aqui limpamos o título (sem emoji,
+    // espaços colapsados) e tentamos termos progressivamente mais curtos + o próprio ID, re-clicando pelo ID.
+    if (!escolheu) {
+      const _limpa = (s: string) => String(s || '').replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}️‍]/gu, ' ').replace(/\s+/g, ' ').trim();
+      const _tl = _limpa(ancoraTitulo);
+      const _pal = _tl.split(' ').filter(Boolean);
+      const _termos = [_tl.slice(0, 40), _pal.slice(0, 5).join(' '), _pal.slice(0, 3).join(' '), ancoraId].filter((t, i, a) => !!t && a.indexOf(t) === i);
+      for (const termo of _termos) {
+        if (escolheu) break;
+        try {
+          const campo = escopo.locator('input[placeholder*="Pesquise nos seus" i], input[placeholder*="search your videos" i]').first();
+          await campo.click({ timeout: 4000 }).catch(() => { /* ok */ });
+          await campo.fill('').catch(() => { /* ok */ });
+          await delayHumano(300, 600);
+          await campo.fill(termo).catch(async () => { await page.keyboard.type(termo, { delay: 40 }).catch(() => { /* ok */ }); });
+          await delayHumano(600, 1000);
+          await page.keyboard.press('Enter').catch(() => { /* ok */ });
+          await delayHumano(2500, 3800);
+        } catch { /* ok */ }
+        for (const criar of alvos) {
+          try { const el = criar(); await el.waitFor({ state: 'visible', timeout: 3500 }); await el.scrollIntoViewIfNeeded().catch(() => { /* ok */ }); await el.click({ timeout: 3500 }); escolheu = true; break; } catch { /* próximo */ }
+        }
+      }
+      if (escolheu) await snap('vr-03b-busca-limpa-ok');
+    }
     if (!escolheu) { await snap('vr-04-ancora-nao-achada'); return { ok: false, erro: 'não achei o vídeo-âncora ' + ancoraId + ' no seletor (âncora é de OUTRO canal? busca: "' + ancoraTitulo + '")', proxyUsado, screenshots }; }
     await delayHumano(1200, 2000);
     // confirma o seletor se tiver botão (nem sempre tem)
