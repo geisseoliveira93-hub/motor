@@ -9737,7 +9737,10 @@ function pbYtIdDaUrl(url?: string): string {
   const m = String(url).match(/(?:youtu\.be\/|shorts\/|[?&]v=)([\w-]{6,})/);
   return m ? m[1] : '';
 }
+const _pbEmAndamento = new Set<string>(); // [+horizontal-timeout 13/11] ids postando AGORA neste processo
 async function pbPostarItem(item: any): Promise<void> {
+  _pbEmAndamento.add(String(item.id));
+  try {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
   const plataformas: string[] = (() => { try { return JSON.parse(item.plataformas_json || '[]'); } catch { return []; } })();
@@ -9775,10 +9778,12 @@ async function pbPostarItem(item: any): Promise<void> {
 
   const resultados: Record<string, string> = {};
   const videoIds: Record<string, string> = {};
+  try { const _prev = JSON.parse(item.resultado_por_plataforma_json || '{}'); for (const _k in _prev) { if (String(_prev[_k] || '').startsWith('OK')) resultados[_k] = _prev[_k]; } const _pv = JSON.parse(item.video_ids_externos_json || '{}'); for (const _k in _pv) videoIds[_k] = _pv[_k]; } catch { /* */ } // [+horizontal-timeout 13/11] retoma redes já OK
   let sucessos = 0; let tentados = 0;
   let ytAdiado = false; // [guardrail-yt-limite] YouTube deste item foi adiado por bater o teto diário
 
   for (const p of plataformas) {
+    if (String(resultados[p] || '').startsWith('OK')) { continue; } // [+horizontal-timeout 13/11] já postou nessa rede
     // [cutover-nuvem] se houver allowlist, a nuvem só posta as plataformas habilitadas (resto fica no PC)
     if (!pbPlataformaNuvemHabilitada(p)) { resultados[p] = 'PULADO: ' + p + ' nao habilitado na nuvem (fica no PC)'; continue; }
     try {
@@ -9841,10 +9846,14 @@ async function pbPostarItem(item: any): Promise<void> {
       if (msg === 'PULAR' || msg.startsWith('PULAR')) { resultados[p] = 'PULADO: ' + msg.replace(/^PULAR:?\s*/, ''); }
       else { resultados[p] = 'ERRO: ' + msg; tentados++; }
     }
+    try { db.prepare(`UPDATE fila_publicacao SET resultado_por_plataforma_json=?, video_ids_externos_json=?, atualizado_em=? WHERE id=?`).run(JSON.stringify(resultados), JSON.stringify(videoIds), agora(), item.id); } catch { /* */ } // [+horizontal-timeout 13/11] grava progresso após cada rede
   }
 
   db.prepare(`UPDATE fila_publicacao SET resultado_por_plataforma_json=?, video_ids_externos_json=?, atualizado_em=? WHERE id=?`)
     .run(JSON.stringify(resultados), JSON.stringify(videoIds), agora(), item.id);
+
+  sucessos = 0; tentados = 0; // [+horizontal-timeout 13/11] recomputa do mapa final (conta OKs retomados)
+  for (const _k in resultados) { const _v = String(resultados[_k] || ''); if (_v.startsWith('OK')) { sucessos++; tentados++; } else if (_v.startsWith('ERRO')) { tentados++; } }
 
   if (sucessos > 0) {
     // sucesso (total ou parcial): marca publicado, nunca re-posta
@@ -9872,6 +9881,7 @@ async function pbPostarItem(item: any): Promise<void> {
       db.prepare(`UPDATE fila_publicacao SET status='agendado', tentativas_consecutivas=?, data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(n, prox, JSON.stringify(resultados).slice(0, 500), agora(), item.id);
     }
   }
+  } finally { try { _pbEmAndamento.delete(String(item.id)); } catch { /* */ } }
 }
 
 // ============================ WORKER (inerte até publicador_ativo=1) ============================
@@ -9886,7 +9896,9 @@ async function tickPublicador() {
     const nowIso = new Date().toISOString();
     const itens = db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' AND data_agendada<=? AND COALESCE(aguardando_instrumento,0)=0 ORDER BY COALESCE(prioridade,0) DESC, data_agendada ASC LIMIT 5`).all(nowIso) as any[];
     for (const item of itens) {
-      try { await pbComTimeout(pbPostarItem(item), 12 * 60 * 1000); }
+      if (_pbEmAndamento.has(String(item.id))) continue; // [+horizontal-timeout 13/11] já postando (tick que estourou timeout) — não roda 2x
+      const _tmoMs = (String(item.formato) === 'horizontal' ? 45 : 12) * 60 * 1000; // [+horizontal-timeout 13/11] horizontal = 4 redes + cópia IG + navegador
+      try { await pbComTimeout(pbPostarItem(item), _tmoMs); }
       catch (e) { try { db.prepare(`UPDATE fila_publicacao SET status='agendado', data_agendada=?, erro=?, atualizado_em=? WHERE id=?`).run(new Date(Date.now() + 30 * 60000).toISOString(), 'timeout/erro worker: ' + String((e as any)?.message || e), agora(), item.id); } catch { /* */ } }
     }
   } finally { _pubBusy = false; }
@@ -9903,6 +9915,7 @@ function pbDestravarPresos(dry?: boolean): any {
   const presos = db.prepare(`SELECT * FROM fila_publicacao WHERE status='publicando' AND COALESCE(atualizado_em,'') < ? ORDER BY atualizado_em ASC LIMIT 200`).all(limite) as any[];
   const acoes: any[] = [];
   for (const it of presos) {
+    if (_pbEmAndamento.has(String(it.id))) continue; // [+horizontal-timeout 13/11] postando AGORA (horizontal demora) — não destrava
     const outro = db.prepare(`SELECT id,status FROM fila_publicacao WHERE id<>? AND canal_id=? AND onedrive_ref=? AND status IN ('agendado','publicando','publicado') LIMIT 1`).get(it.id, it.canal_id, it.onedrive_ref) as any;
     if (outro) {
       if (!dry) db.prepare(`UPDATE fila_publicacao SET status='cancelado', erro=?, atualizado_em=? WHERE id=?`).run('duplicado de ' + outro.id + ', destravado', agora(), it.id);
@@ -10004,7 +10017,7 @@ app.post('/pub/publicador/testar', async (req, res) => {
     const item = id ? db.prepare(`SELECT * FROM fila_publicacao WHERE id=?`).get(String(id)) as any
       : db.prepare(`SELECT * FROM fila_publicacao WHERE status='agendado' ORDER BY data_agendada ASC LIMIT 1`).get() as any;
     if (!item) return res.status(404).json({ ok: false, erro: 'nenhum item pra testar' });
-    await pbComTimeout(pbPostarItem(item), 12 * 60 * 1000);
+    await pbComTimeout(pbPostarItem(item), (String(item.formato) === 'horizontal' ? 45 : 12) * 60 * 1000); // [+horizontal-timeout 13/11]
     const depois = db.prepare(`SELECT status, resultado_por_plataforma_json, erro FROM fila_publicacao WHERE id=?`).get(item.id);
     res.json({ ok: true, item: item.id, resultado: depois });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e?.message || e) }); }
@@ -10126,6 +10139,7 @@ app.post('/pub/fila/importar', (req, res) => {
     const tx = db.transaction((rows: any[]) => {
       for (const it of rows) {
         const id = String(it.id || randomUUID());
+        try { const _cur = db.prepare(`SELECT status FROM fila_publicacao WHERE id=?`).get(id) as any; if (_pbEmAndamento.has(id) || (_cur && _cur.status === 'publicando')) { continue; } } catch { /* */ } // [+horizontal-timeout 13/11] não re-agenda item postando
         stmt.run(id, String(it.canalId ?? it.canal_id ?? ''), it.projeto || null, it.onedriveRef || it.onedrive_ref || '', it.thumbRef || it.thumb_ref || null,
           it.formato || 'vertical', JSON.stringify(it.plataformas || it.plataformas_json || []), it.titulo || '', it.descricao || null, it.descricaoSocial || it.descricao_social || null,
           it.dataAgendada || it.data_agendada || new Date().toISOString(), ((it.trialReels ?? it.trial_reels) ? 1 : 0), agora(), agora());
