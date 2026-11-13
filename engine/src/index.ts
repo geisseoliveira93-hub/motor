@@ -14347,6 +14347,11 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 /* [layout-home 31/10] setas SEMPRE visiveis em tela menor / toque (sem hover). ADITIVO. */
 @media(hover:none),(max-width:980px){.railwrap .arw{opacity:.92}}
 .ic.acspk{background:none;font-size:16px}
+/* [+banner-fit 13/11] banner do curso: DESKTOP (.bgd) imagem INTEIRA (contain) + fundo desfocado. CELULAR (.bgm) continua no original (cover, como na migracao). */
+.coverhero .bgd{background-size:0 0;filter:none}
+.coverhero .bgd::before{content:'';position:absolute;inset:0;background-image:inherit;background-position:center;background-repeat:no-repeat;background-size:cover;filter:blur(26px) brightness(.42);transform:scale(1.12)}
+.coverhero .bgd::after{content:'';position:absolute;inset:0;background-image:inherit;background-position:center;background-repeat:no-repeat;background-size:contain;filter:brightness(.82)}
+.coverhero .in h1,.coverhero .in .meta{text-shadow:0 2px 10px rgba(0,0,0,.85)}
 /* [+lupa-curso 13/11] busca de aulas dentro do curso */
 .acbusca{display:flex;align-items:center;gap:10px;background:#0e0e12;border:1px solid #26262f;border-radius:999px;padding:11px 16px;margin:4px 0 14px}
 .acbusca svg{flex:none}
