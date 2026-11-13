@@ -9368,6 +9368,73 @@ async function pbIgRuploadBytes(containerId: string, igToken: string, filePath: 
 async function pbIgPermalink(postId: string, igToken: string): Promise<string> {
   try { const r = await fetch(`https://graph.facebook.com/${PB_META_VER}/${postId}?fields=permalink&access_token=${encodeURIComponent(igToken)}`); const d = await r.json() as any; return d.permalink || ''; } catch { return ''; }
 }
+// [+ig-horizontal-reels 13/11] === HORIZONTAL NAS 4 REDES ===
+// Instagram nao aceita mais media_type VIDEO (so REELS/STORIES/CAROUSEL). Video HORIZONTAL (16:9) vai como
+// REELS (share_to_feed=true) — o IG aceita proporcao 0,01:1 a 10:1. Guarda: >15min PULA; >~290MB gera copia
+// reduzida (~280MB) so pro IG (ffmpeg ASYNC pra NAO travar o motor), posta ela e apaga. Original nao muda.
+function _pbFfprobeDuracao(file: string): Promise<number> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = ''; p.stdout.on('data', (d: any) => { out += String(d); });
+      p.on('close', () => { const n = parseFloat(out.trim()); resolve(isFinite(n) && n > 0 ? n : 0); });
+      p.on('error', () => resolve(0));
+    } catch { resolve(0); }
+  });
+}
+function _pbFfmpegReduzir(input: string, output: string, videoKbps: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    try {
+      const args = ['-y', '-i', input, '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', videoKbps + 'k', '-maxrate', Math.floor(videoKbps * 1.25) + 'k', '-bufsize', (videoKbps * 2) + 'k', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output];
+      const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'ignore'] });
+      p.on('close', (code: any) => { if (code === 0) resolve(); else reject(new Error('ffmpeg code ' + code)); });
+      p.on('error', (e: any) => reject(e));
+    } catch (e) { reject(e); }
+  });
+}
+// ordem de postagem: redes de API primeiro (rapidas), navegador (YouTube/TikTok, lentos) por ultimo
+function pbOrdemRede(p: string): number { return p === 'youtube' ? 90 : p === 'tiktok' ? 95 : p === 'kwai' ? 96 : 10; }
+async function pbIgPublicarHorizontal(canalId: string, a: { filePath: string; publicUrl: string; formato: string; caption: string }): Promise<{ id: string; url: string }> {
+  const canal = pbCanal(canalId); const igId = canal?.ig_business_id;
+  const tok = pbTokLer(canalId, 'instagram');
+  if (!igId || !tok?.accessToken) throw new Error('Instagram nao conectado neste canal.');
+  const igToken = tok.accessToken;
+  const LIMITE_IG = 290 * 1024 * 1024;
+  let tamBytes = 0; try { tamBytes = fs.statSync(a.filePath).size; } catch { /* segue */ }
+  const dur = await _pbFfprobeDuracao(a.filePath);
+  if (dur > 15 * 60 + 5) throw new Error('PULAR: Instagram aceita ate 15 min (horizontal tem ~' + Math.round(dur / 60) + ' min)');
+  let fileIg = a.filePath; let urlIg = a.publicUrl; let copiaTmp = '';
+  if (tamBytes > LIMITE_IG) {
+    try {
+      const base = String(a.publicUrl || '').split('/media/')[0] || 'https://motor.melodiaseriffs.com.br';
+      const durSeg = dur > 0 ? dur : 600;
+      const vKbps = Math.max(800, Math.floor((280 * 1024 * 8) / durSeg) - 128);
+      const nome = 'ig-' + Date.now() + '-' + Math.floor(Math.random() * 1e6) + '.mp4';
+      copiaTmp = MEDIA_DIR + '/' + nome;
+      pbLog('ig horizontal >290MB: gerando copia reduzida', { canalId, tamMB: Math.round(tamBytes / 1048576), vKbps });
+      await _pbFfmpegReduzir(a.filePath, copiaTmp, vKbps);
+      if (fs.existsSync(copiaTmp) && fs.statSync(copiaTmp).size > 0) {
+        fileIg = copiaTmp; urlIg = base + '/media/' + nome;
+        pbLog('ig horizontal: usando copia reduzida', { novoMB: Math.round(fs.statSync(copiaTmp).size / 1048576) });
+      }
+    } catch (e) { pbLog('ig horizontal: falha ao reduzir, tentando original', (e as any)?.message); }
+  }
+  const params: Record<string, string> = { media_type: 'REELS', upload_type: 'resumable', caption: a.caption, share_to_feed: 'true' };
+  let c = '';
+  try {
+    c = await pbIgCriarContainer(igId, igToken, params);
+    await pbIgRuploadBytes(c, igToken, fileIg);
+    await pbIgPoll(igToken, c);
+  } catch (e) {
+    pbLog('ig horizontal rupload falhou, tentando por URL', (e as any)?.message);
+    c = await pbIgCriarContainer(igId, igToken, { media_type: 'REELS', video_url: urlIg, caption: a.caption, share_to_feed: 'true' });
+    await pbIgPoll(igToken, c);
+  }
+  const id = await pbIgPublicarContainer(igId, igToken, c);
+  try { if (copiaTmp && fs.existsSync(copiaTmp)) fs.unlinkSync(copiaTmp); } catch { /* ok */ }
+  return { id, url: (await pbIgPermalink(id, igToken)) || 'https://instagram.com/' };
+}
+
 async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: string; formato: string; caption: string; trial?: boolean }): Promise<{ id: string; url: string }> {
   const canal = pbCanal(canalId); const igId = canal?.ig_business_id;
   const tok = pbTokLer(canalId, 'instagram');
@@ -9389,6 +9456,7 @@ async function pbIgPublicar(canalId: string, a: { filePath: string; publicUrl: s
     await pbIgRuploadBytes(c, igToken, a.filePath); await pbIgPoll(igToken, c);
     const id = await pbIgPublicarContainer(igId, igToken, c); return { id, url: '' };
   }
+  if (f === 'horizontal') return await pbIgPublicarHorizontal(canalId, { filePath: a.filePath, publicUrl: a.publicUrl, formato: a.formato, caption: a.caption });
   const tipo = (f === 'horizontal') ? 'VIDEO' : 'REELS'; // vertical/reels => REELS; horizontal => VIDEO feed
   const params: Record<string, string> = { media_type: tipo, upload_type: 'resumable', caption: a.caption };
   // [+trial-reels 28/10] REEL DE TESTE: manda trial_params + share_to_feed=false (espelha o instagram-upload.ts do PC);
@@ -9576,6 +9644,10 @@ async function pbPostarItem(item: any): Promise<void> {
   const canalId = String(item.canal_id);
   db.prepare(`UPDATE fila_publicacao SET status='publicando', erro=NULL, atualizado_em=? WHERE id=?`).run(agora(), item.id);
   const plataformas: string[] = (() => { try { return JSON.parse(item.plataformas_json || '[]'); } catch { return []; } })();
+  // [+mesmo-horario 13/11] redes de API (FB/IG/Threads/Pinterest) saem ANTES do YouTube/TikTok (navegador, lentos),
+  // pra o horizontal sair o mais perto do horario agendado. NAO paraleliza YT/TikTok (dividem proxy/perfil do navegador).
+  try { plataformas.sort((x: string, y: string) => pbOrdemRede(x) - pbOrdemRede(y)); } catch { /* ok */ }
+
   const formato = String(item.formato || 'vertical');
   const titulo = item.titulo || (item.arquivo_nome ? item.arquivo_nome.replace(/\.[^.]+$/, '') : 'Sem título');
   const descYt = item.descricao || '';
