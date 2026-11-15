@@ -15300,6 +15300,9 @@ async function _hotmartRecupES(telefone: string, nome: string): Promise<void> {
     try { await enviarTexto('baixo' as any, tel, msg, 'Baixo'); } catch { /* best-effort */ }
   } catch { /* best-effort */ }
 }
+function _hotmartRegistraVenda(pedido: string, projeto: string, produto: string, valorCentavos: number | null): void {
+  try { db.prepare(`INSERT OR IGNORE INTO transacoes(id,projeto,contato_id,produto,valor,status,provider,criado_em) VALUES(?,?,?,?,?,?,?,?)`).run(pedido, projeto || '', null, produto || '', (Number(valorCentavos || 0) / 100) || 0, 'liquidada', 'hotmart', agora()); } catch { /* [+hotmart-painel 15/11] registra a venda da Hotmart em transacoes p/ o painel contar; best-effort */ }
+}
 app.post('/webhook/hotmart', async (req: any, res: any) => {
   try {
     const b: any = req.body || {};
@@ -15337,12 +15340,14 @@ app.post('/webhook/hotmart', async (req: any, res: any) => {
       // Mapa de la Palabra: ebook, NAO e curso -> confirmacao WhatsApp ES via 1030 (dedup por pedido). CAPI Purchase no pixel do Mapa.
       const dM: any = db.prepare(`INSERT OR IGNORE INTO hotmart_entregue(pedido,email,criado_em) VALUES(?,?,?)`).run(pedido, email, agora());
       if (!dM.changes) return res.json({ ok: true, duplicado: true });
+      _hotmartRegistraVenda(pedido, projRastreio, produtoNome, _valorC);
       await _capiPurchase();
       if (telefone) { const pnM = (nome.split(' ')[0] || '').trim(); const olaM = pnM ? ('Hola ' + pnM + '!') : 'Hola!'; const msgM = olaM + ' Gracias por tu compra del *Mapa de la Palabra* 🙌 Tu material ya esta en camino a tu correo (' + email + '). Si no lo ves, revisa spam/promociones. Cualquier duda, escribeme por aqui. Que Dios te bendiga! 📖'; try { await enviarTexto('teclado' as any, telefone, msgM, 'Teclado-suporte'); } catch { /* */ } }
       return res.json({ ok: true, entregue_mapa: true, email });
     }
     const dd: any = db.prepare(`INSERT OR IGNORE INTO hotmart_entregue(pedido,email,criado_em) VALUES(?,?,?)`).run(pedido, email, agora());
     if (!dd.changes) return res.json({ ok: true, duplicado: true });
+    _hotmartRegistraVenda(pedido, projRastreio, produtoNome, _valorC);
     try { _acMatricularPorVenda({ produtoNome, email, nome }); } catch { /* best-effort */ }
     await _capiPurchase(); // [+hotmart-capi 15/11] espelha a compra no pixel isolado do Bajista
     let tok = '';
