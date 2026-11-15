@@ -1347,7 +1347,7 @@ app.use((req: any, res: any, next: any) => {
   try {
     const p: any = db.prepare(`SELECT * FROM paginas WHERE slug='bajista-pro' AND publicada=1`).get();
     if (!p) { res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>'); return; }
-    const html = String(p.html || '').replace(/("projeto":")[^"]*(")/g, '$1bajista$2'); // forca o pixel isolado no integrador embutido
+    const html = String(p.html || '').replace(/("projeto":")[^"]*(")/g, '$1bajista$2').replace(/(snippet\.js\?projeto=)[a-z0-9_-]+/gi, '$1bajista'); // forca o pixel isolado no integrador embutido
     res.setHeader('Cache-Control', 'no-store');
     res.removeHeader('X-Frame-Options');
     res.type('html').send(_injetarBannerLgpd(_injetarTrackPagina(_wrapPagina(html, p), 'bajista')));
