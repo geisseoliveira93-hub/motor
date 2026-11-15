@@ -1337,6 +1337,24 @@ app.use((req: any, res: any, next: any) => {
   } catch (e) { res.status(500).send('erro'); }
 });
 
+// [+bajista-sub 15/11] subdominio bajista.melodiaseriffs.com.br serve a MESMA pagina /p/bajista-pro,
+// mas com o pixel/projeto de rastreio ISOLADO "bajista" (nao mistura com o baixo). ADD-ONLY.
+// Troca o projeto embutido no integrador (mr-integra) E passa 'bajista' pro _injetarTrackPagina.
+const BAJISTA_HOST = 'bajista.melodiaseriffs.com.br';
+app.use((req: any, res: any, next: any) => {
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase().split(':')[0];
+  if (host !== BAJISTA_HOST) return next();
+  try {
+    const p: any = db.prepare(`SELECT * FROM paginas WHERE slug='bajista-pro' AND publicada=1`).get();
+    if (!p) { res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>'); return; }
+    const html = String(p.html || '').replace(/("projeto":")[^"]*(")/g, '$1bajista$2'); // forca o pixel isolado no integrador embutido
+    res.setHeader('Cache-Control', 'no-store');
+    res.removeHeader('X-Frame-Options');
+    res.type('html').send(_injetarBannerLgpd(_injetarTrackPagina(_wrapPagina(html, p), 'bajista')));
+    return;
+  } catch (e) { res.status(500).send('erro'); }
+});
+
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
   if (req.path === '/health') return next();
@@ -3239,6 +3257,7 @@ function _recProdutoBucket(nome: string): string {
   if (/baix/.test(t)) return 'Baixo';
   if (/viol/.test(t)) return 'Violao';
   if (/harpa|comunidade/.test(t)) return 'Harpa';
+  if (/palabra|vive la palabra|mapa de la|biblia/.test(t)) return 'Mapa de la Palabra'; // [+mapa-painel] produto espanhol
   return 'Outros';
 }
 // Grava a venda recuperada SE o telefone estava num fluxo de recuperação. best-effort: nunca quebra a entrega.
@@ -4154,6 +4173,8 @@ let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone
 // Meta CAPI + GA4, reusa track_config do projeto). Preenchido no bloco CAPI (etapa29) no boot.
 // Inerte até pubFlag('vsl_capi_ativo')='1'.
 let vslTrackHook: ((projeto: string, eventName: string, dados: { email?: string | null; telefone?: string | null; pagina?: string | null; clientIp?: string | null; userAgent?: string | null; fbp?: string | null; fbc?: string | null }) => Promise<void>) | null = null;
+// [+hotmart-capi 15/11] Purchase direto num projeto/pixel (Bajista/Mapa via track_config), fora do roteador por instrumento. Preenchido no bloco CAPI no boot.
+let capiPurchaseIsolado: ((projeto: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; eventId?: string | null; externalId?: string | null }) => Promise<void>) | null = null;
 
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
@@ -10497,6 +10518,16 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     } catch { /* best-effort: nunca quebra o ingest do player */ }
   };
 
+  // [+hotmart-capi 15/11] Purchase isolado num projeto/pixel especifico (Bajista/Mapa via track_config). trackLer/trackEnviarTudo em escopo aqui.
+  capiPurchaseIsolado = async (projeto, dados) => {
+    try {
+      const cfgT = trackLer(String(projeto || ''));
+      if (cfgT && cfgT.ativo !== 0 && cfgT.meta_pixel_id) {
+        await trackEnviarTudo(cfgT, 'Purchase', { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: dados.valorCentavos ?? null, produto: dados.produto || null, pagina: null, eventId: dados.eventId || undefined, externalId: dados.externalId || dados.email || dados.telefone || null } as any, 'hotmart');
+      }
+    } catch { /* best-effort: nunca quebra o webhook */ }
+  };
+
   // ---------- ROTAS ----------
   // Config do pixel (pixel_id + token cifrado). id = produto/canal (ex: 'teclado').
   app.post('/capi/pixel', (req: any, res: any) => {
@@ -15237,6 +15268,38 @@ app.post('/academy/aluno/nome', (req: any, res: any) => {
 });
 // [+webhook-hotmart 13/11] ADD-ONLY. Checkout da Hotmart (produto espanhol "Metodo Bajista Pro", MX) -> libera acesso na Academia + mensagem de acesso EM ESPANHOL (WhatsApp Baixo + e-mail). A entrega e so pela nossa plataforma; Hotmart e so o checkout. Sempre responde 200. Dedup por transacao (hotmart_entregue). NAO toca a entrega BR.
 try { db.exec(`CREATE TABLE IF NOT EXISTS hotmart_entregue (pedido TEXT PRIMARY KEY, email TEXT, criado_em TEXT)`); } catch { /* existe */ }
+// [+hotmart-eventos 15/11] ADD-ONLY. Tabelas e helpers p/ tratar reembolso/estorno (revoga acesso Bajista),
+// abandono/boleto (recuperacao ES dedup 24h) e log de eventos. NAO mexe na entrega BR nem no fluxo aprovado existente.
+try { db.exec(`CREATE TABLE IF NOT EXISTS hotmart_recup (telefone TEXT, criado_em TEXT)`); } catch { /* existe */ }
+try { db.exec(`CREATE TABLE IF NOT EXISTS hotmart_eventos (id TEXT PRIMARY KEY, evento TEXT, email TEXT, telefone TEXT, produto TEXT, status TEXT, criado_em TEXT)`); } catch { /* existe */ }
+const BAJISTA_CURSO = '42825fe8-0b6a-464a-b7c7-1b98048571ff';
+function _hotmartLog(ev: string, email: string, telefone: string, produto: string, status: string): void {
+  try { db.prepare(`INSERT OR IGNORE INTO hotmart_eventos(id,evento,email,telefone,produto,status,criado_em) VALUES(?,?,?,?,?,?,?)`).run(randomUUID(), ev, email || '', telefone || '', produto || '', status || '', agora()); } catch { /* */ }
+}
+// REVOGA acesso ao curso do Bajista (reembolso/chargeback/cancelado). Conservador: EXPIRA (validade=ontem), NAO apaga -> reversivel.
+function _hotmartRevogarBajista(email: string): void {
+  try {
+    const al: any = db.prepare(`SELECT id FROM academy_matriculas WHERE lower(email)=?`).get(String(email || '').toLowerCase());
+    if (!al || !al.id) return;
+    const ontem = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    db.prepare(`UPDATE academy_acesso SET validade=? WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).run(ontem, al.id, BAJISTA_CURSO);
+    try { _acLog(al.id, 'acesso_revogado_hotmart', BAJISTA_CURSO); } catch { /* */ }
+  } catch { /* best-effort */ }
+}
+// RECUPERACAO ES (abandono/boleto nao pago): 1 WhatsApp em espanhol, dedup 24h por telefone (num Baixo).
+async function _hotmartRecupES(telefone: string, nome: string): Promise<void> {
+  try {
+    const tel = String(telefone || '').replace(/\D/g, ''); if (!tel) return;
+    const ja: any = db.prepare(`SELECT 1 FROM hotmart_recup WHERE telefone=? AND criado_em > ?`).get(tel, new Date(Date.now() - 86400000).toISOString());
+    if (ja) return; // dedup 24h
+    db.prepare(`INSERT INTO hotmart_recup(telefone,criado_em) VALUES(?,?)`).run(tel, agora());
+    const pn = (String(nome || '').split(' ')[0] || '').trim();
+    const ola = pn ? ('Hola ' + pn + '!') : 'Hola!';
+    const link = 'https://baixo.melodiaseriffs.com.br/p/bajista-pro';
+    const msg = ola + ' Vi que empezaste tu compra del *Metodo Bajista Pro* pero no se completo 😊 Si tuviste algun problema, estoy aqui para ayudarte. Puedes terminar tu compra por aqui:\n' + link + '\n\nCualquier duda, escribeme por aqui. A tocar el bajo! 🎸';
+    try { await enviarTexto('baixo' as any, tel, msg, 'Baixo'); } catch { /* best-effort */ }
+  } catch { /* best-effort */ }
+}
 app.post('/webhook/hotmart', async (req: any, res: any) => {
   try {
     const b: any = req.body || {};
@@ -15244,7 +15307,6 @@ app.post('/webhook/hotmart', async (req: any, res: any) => {
     try { db.prepare(`INSERT OR REPLACE INTO webhook_pagamento_log(id,provider,pedido,raw_json,criado_em) VALUES(?,?,?,?,?)`).run('hotmart:' + String((d.purchase && d.purchase.transaction) || b.id || randomUUID()), 'hotmart', String((d.purchase && d.purchase.transaction) || ''), JSON.stringify(b).slice(0, 20000), agora()); } catch { /* log best-effort */ }
     const statusRaw = String((d.purchase && d.purchase.status) || b.status || '').toUpperCase();
     const aprovado = statusRaw === 'APPROVED' || statusRaw === 'COMPLETE' || statusRaw === 'APPROVED_PAYMENT';
-    if (!aprovado) return res.json({ ok: true, ignorado: true, status: statusRaw });
     const buyer: any = d.buyer || d.contact || {};
     const prod: any = d.product || {};
     const email = String(buyer.email || '').trim().toLowerCase();
@@ -15252,10 +15314,37 @@ app.post('/webhook/hotmart', async (req: any, res: any) => {
     const telefone = String((buyer.phone && (buyer.phone.number || buyer.phone)) || buyer.checkout_phone || buyer.phone_number || '').replace(/\D/g, '');
     const produtoNome = String(prod.name || prod.nome || 'Metodo Bajista Pro').trim();
     const pedido = String((d.purchase && d.purchase.transaction) || b.id || ('hotmart-' + Date.now()));
+    // [+hotmart-eventos 15/11] Mapa (ebook espanhol, NAO e curso) vs Bajista (curso). CAPI Purchase por pixel isolado + tratamento por evento.
+    const _pid = String((prod && (prod.id || prod.ucode)) || '').trim();
+    const eMapa = /mapa de la|vive la palabra|palabra|biblia/i.test(produtoNome) || _pid === '8887542';
+    const projRastreio = eMapa ? 'mapa' : 'bajista';
+    const _valorC = Math.round(Number((d.purchase && d.purchase.price && ((d.purchase.price as any).value ?? d.purchase.price)) || (d.purchase && d.purchase.full_price && d.purchase.full_price.value) || 0) * 100) || null;
+    const _capiPurchase = async (): Promise<void> => { try { if (capiPurchaseIsolado) await capiPurchaseIsolado(projRastreio, { email, telefone, valorCentavos: _valorC, produto: produtoNome, eventId: pedido, externalId: email || telefone || null }); } catch { /* CAPI best-effort */ } };
+    const _evCat = classificaPagamento('guru', statusRaw); // Hotmart: approved / refunded / chargeback / canceled / expired / abandoned
+    try { _hotmartLog(aprovado ? 'aprovado' : _evCat, email, telefone, produtoNome, statusRaw); } catch { /* */ }
+    if (!aprovado) {
+      const _sLow = statusRaw.toLowerCase();
+      const _eRevogar = /refund|chargeback|reembols|estorn|cancel/.test(_sLow); // reembolso/estorno/cancelado -> revoga Bajista (no-op se nao tinha acesso)
+      const _eRecuperar = /abandon|billet|boleto|waiting|pix|expir/.test(_sLow); // abandono/boleto-pix nao pago -> recuperacao ES
+      try {
+        if (_eRevogar && email && !eMapa) _hotmartRevogarBajista(email);
+        else if (_eRecuperar && telefone && !eMapa) await _hotmartRecupES(telefone, nome);
+      } catch { /* best-effort */ }
+      return res.json({ ok: true, evento: _eRevogar ? 'revogado' : (_eRecuperar ? 'recuperacao' : _evCat), status: statusRaw, email: email || null });
+    }
     if (!email) return res.json({ ok: true, ignorado: true, motivo: 'sem_email' });
+    if (eMapa) {
+      // Mapa de la Palabra: ebook, NAO e curso -> confirmacao WhatsApp ES via 1030 (dedup por pedido). CAPI Purchase no pixel do Mapa.
+      const dM: any = db.prepare(`INSERT OR IGNORE INTO hotmart_entregue(pedido,email,criado_em) VALUES(?,?,?)`).run(pedido, email, agora());
+      if (!dM.changes) return res.json({ ok: true, duplicado: true });
+      await _capiPurchase();
+      if (telefone) { const pnM = (nome.split(' ')[0] || '').trim(); const olaM = pnM ? ('Hola ' + pnM + '!') : 'Hola!'; const msgM = olaM + ' Gracias por tu compra del *Mapa de la Palabra* 🙌 Tu material ya esta en camino a tu correo (' + email + '). Si no lo ves, revisa spam/promociones. Cualquier duda, escribeme por aqui. Que Dios te bendiga! 📖'; try { await enviarTexto('teclado' as any, telefone, msgM, 'Teclado-suporte'); } catch { /* */ } }
+      return res.json({ ok: true, entregue_mapa: true, email });
+    }
     const dd: any = db.prepare(`INSERT OR IGNORE INTO hotmart_entregue(pedido,email,criado_em) VALUES(?,?,?)`).run(pedido, email, agora());
     if (!dd.changes) return res.json({ ok: true, duplicado: true });
     try { _acMatricularPorVenda({ produtoNome, email, nome }); } catch { /* best-effort */ }
+    await _capiPurchase(); // [+hotmart-capi 15/11] espelha a compra no pixel isolado do Bajista
     let tok = '';
     try { const al: any = db.prepare(`SELECT token_login FROM academy_matriculas WHERE lower(email)=?`).get(email); tok = (al && al.token_login) || ''; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE lower(email)=?`).run(tok, email); } } catch { /* */ }
     const link = _AREA_URL + '/area/entrar/' + tok;
@@ -17323,8 +17412,10 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       if (/baix/.test(t)) return 'Baixo';
       if (/viol/.test(t)) return 'Violao';
       if (/harpa|comunidade/.test(t)) return 'Harpa';
+      if (/palabra|vive la palabra|mapa de la|biblia/.test(t)) return 'Mapa de la Palabra'; // [+mapa-painel] produto espanhol
       return 'Outros';
     };
+    const _pnlProdDeAd = (a: any): string => { if (String((a && a.ad_account_id) || '').includes('1994733334543735')) return 'Mapa de la Palabra'; return _pnlProduto((a && (a.campaign_nome || a.ad_nome)) || ''); }; // [+mapa-painel] forca por conta Vive la Palabra (nome de campanha e fragil)
     let _pnlContasCache: Record<string,string> | null = null; let _pnlContasTs = 0;
     const _pnlContasMap = async (): Promise<Record<string,string>> => {
       try {
@@ -17365,7 +17456,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
 
       const porProd: Record<string, any> = {};
       for (const a of anuncios) {
-        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
+        const prod = _pnlProdDeAd(a);
         const p = porProd[prod] || (porProd[prod] = { produto: prod, gasto: 0, vendas: 0, fat: 0, leads: 0, cliques: 0, impressoes: 0, ic: 0 });
         p.gasto += (a.gasto_centavos || 0) / 100;
         p.vendas += (a.vendas_meta || a.vendas || 0);
@@ -17458,7 +17549,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const mapaContas = await _pnlContasMap();
       const _contasSet: Record<string, string> = {};
       const ads = (anuncios || []).map((a: any) => {
-        const prod = _pnlProduto(a.campaign_nome || a.ad_nome || '');
+        const prod = _pnlProdDeAd(a);
         const gasto = (a.gasto_centavos || 0) / 100; const fat = ((a.fat_meta_centavos || a.fat_centavos) || 0) / 100;
         const taxaV = fat * tx / 100; const impV = gasto * im / 100;
         const conta = String(a.ad_account_id || '');
