@@ -16149,7 +16149,7 @@ app.post('/academy/pwa-config', (req: any, res: any) => {
   } catch (e) { _ndErr(res, e); }
 });
 app.get('/area/sw.js', (_req: any, res: any) => {
-  res.type('application/javascript').send("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',function(){});");
+  res.type('application/javascript').send("self.addEventListener('install',function(e){self.skipWaiting();});self.addEventListener('activate',function(e){e.waitUntil((async function(){try{var ks=await caches.keys();await Promise.all(ks.map(function(k){return caches.delete(k);}));}catch(_){}try{await self.clients.claim();}catch(_){}try{await self.registration.unregister();}catch(_){}try{var cs=await self.clients.matchAll({type:'window'});cs.forEach(function(c){try{c.navigate(c.url);}catch(_){}});}catch(_){}})());});self.addEventListener('fetch',function(){});");
 });
 
 // ---------- [B.4] ANÚNCIOS NA AULA (pré-roll / pós-roll) — p/ lançamentos (Black Friday) ----------
