@@ -4289,7 +4289,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         aplicarTag(projeto, cid, 'comprou');
         // [tags-auto] tags da trilha do produto principal (low-ticket / qualificar-24h / comprou-low-*).
         try { for (const tg of _produtoTags(p.produtoId, p.produtoNome)) aplicarTag(projeto, cid, tg); } catch { /* best-effort */ }
-        await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {});
+        if (provider !== 'pagarme') await dispararEntrega(projeto, p.telefone, p.nome, p.produtoId, p.produtoNome).catch(() => {}); // [+ck-no-entrega-legada 16/11] checkout proprio entrega sozinho (msg nova + link magico); nao dispara a entrega antiga (Cademi)
         try { _entregarVol2DoPedido(projeto, p, provider, b); } catch { /* vol2 best-effort */ }
         // [+vendas-recuperacao 29/10] se essa venda veio de quem estava em recuperação, registra com a origem (whatsapp/checkout).
         try { _registrarVendaRecuperacao(provider, p, projeto); } catch { /* best-effort: nunca quebra a entrega */ }
