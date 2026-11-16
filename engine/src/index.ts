@@ -3460,7 +3460,9 @@ function _emailDomDoItem(m: any): any {
   if (m && m.dominio_id) { const d = db.prepare(`SELECT * FROM email_dominios WHERE id=? AND ${okSmtp}`).get(String(m.dominio_id)) as any; if (d) return d; }
   const pad = db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND padrao=1 AND ${okSmtp} ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
   if (pad) return pad;
-  return db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND ${okSmtp} ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+  const _prjDom = db.prepare(`SELECT * FROM email_dominios WHERE projeto=? AND ${okSmtp} ORDER BY criado_em DESC LIMIT 1`).get(String(m.projeto || '')) as any;
+  if (_prjDom) return _prjDom;
+  return db.prepare(`SELECT * FROM email_dominios WHERE ${okSmtp} ORDER BY padrao DESC, criado_em DESC LIMIT 1`).get() as any; // [+email-fallback-smtp 16/11] projeto sem SMTP proprio usa qualquer remetente valido (destrava a fila + entrega orfaos de projeto vazio)
 }
 async function _tickEmail(): Promise<void> {
   try {
