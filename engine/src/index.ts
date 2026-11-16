@@ -19272,7 +19272,7 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     const pedidoId = randomUUID();
     const payload: any = { code: pedidoId, items: _itensPay, customer, payments: [pagamento] };
     db.prepare(`INSERT INTO ck_pedidos (id,produto_id,slug,nome,email,telefone,cpf,metodo,parcelas,valor_centavos,status,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, _valorFinal, 'pending', agora()); // [+juros-parcelado 13/11] valor cobrado (com juros se cartão parcelado)
+      .run(pedidoId, prod.id, prod.slug, nome, email, telDig, cpf, metodo, parcelas, _valorFinal, 'pending', agora()); // [+juros-parcelado 13/11] valor cobrado (com juros se cartão parcelado) // [+fix-email-pedido 16/11] email faltava: 12 colunas x 11 valores -> "Too few parameter values"
     // [+ck-extras] registra cupom/desconto/bump usados nesse pedido (pra concessão e relatório)
     try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=?, bumps_json=? WHERE id=?`).run(_cupomCod, _descont, (_bumpSlugsPagos[0] || ''), JSON.stringify(_bumpSlugsPagos), pedidoId); } catch { /* */ }
     try { db.prepare(`UPDATE ck_pedidos SET endereco_json=? WHERE id=?`).run(JSON.stringify((b && b.endereco) || {}), pedidoId); } catch { /* */ } // [+checkout-black 16/11]
