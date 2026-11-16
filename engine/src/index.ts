@@ -1355,6 +1355,20 @@ app.use((req: any, res: any, next: any) => {
   } catch (e) { res.status(500).send('erro'); }
 });
 
+// [+checkout-black 16/11] domínio curto pay.melodiaseriffs.com.br: /<slug> serve a página /pay/<slug> (cobrança/status/cupom já usam /pay/*). ADD-ONLY.
+const PAY_HOST = 'pay.melodiaseriffs.com.br';
+app.use((req: any, _res: any, next: any) => {
+  try {
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase().split(':')[0];
+    if (host === PAY_HOST) {
+      const p = String(req.path || '/');
+      if (p !== '/' && !/^\/(pay|media|track|area|go|yt|p|f)(\/|$)/.test(p) && /^\/[a-z0-9][a-z0-9-]*\/?$/.test(p)) {
+        req.url = '/pay' + req.url;
+      }
+    }
+  } catch { /* */ }
+  next();
+});
 app.use((req, res, next) => {
   if (req.path.startsWith('/webhook/')) return next();
   if (req.path === '/health') return next();
@@ -18927,6 +18941,10 @@ try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bump_slug TEXT`); } catch { /* 
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN mostrar_cupom TEXT DEFAULT ''`); } catch { /* já existe */ } // ''=automático(se tiver cupom), '1'=sempre, '0'=nunca
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bumps_json TEXT`); } catch { /* já existe */ } // lista [{slug,titulo}] — vários order bumps
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bumps_json TEXT`); } catch { /* já existe */ }
+// [+checkout-black 16/11] pacote (bundle) + mensagem de entrega custom + endereço p/ envio físico. ADD-ONLY.
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bundle_json TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN msg_entrega TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN endereco_json TEXT`); } catch { /* já existe */ }
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ck_cupons (
     id TEXT PRIMARY KEY, codigo TEXT UNIQUE, tipo TEXT DEFAULT 'percent', valor INTEGER DEFAULT 0,
@@ -18986,14 +19004,27 @@ function _ckConceder(pedidoId: string): void {
       const ja = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, curso);
       if (!ja) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', curso, _ckValidade(prod.validade), agora()); // [+validade-relativa 13/11]
     }
+    // [+checkout-black 16/11] BUNDLE: concede vários cursos (lista {curso,validade}) além do principal. Reusa _ckValidade. ADD-ONLY.
+    try {
+      let _bundle: any[] = []; try { _bundle = JSON.parse(prod.bundle_json || '[]'); } catch { _bundle = []; }
+      for (const _bi of (Array.isArray(_bundle) ? _bundle : [])) {
+        const _cb = String((_bi && _bi.curso) || '').trim(); if (!_cb) continue;
+        const _jb = db.prepare(`SELECT 1 FROM academy_acesso WHERE aluno_id=? AND alvo_tipo='curso' AND alvo_id=?`).get(id, _cb);
+        if (!_jb) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', _cb, _ckValidade((_bi && _bi.validade) || 'vitalicio'), agora());
+      }
+    } catch { /* */ }
     const dedupKey = curso || ('ck:' + prod.id);
     const jaEnv = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, dedupKey);
     if (jaEnv) return; // já mandou acesso desse produto pra esse e-mail (recompra): não remanda
     const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
     const nome = _primeiroNomeBonito(String(pd.nome || (al && al.nome) || ''));
     const m: any = { emoji: String(prod.emoji || '🎵'), produto_nome: String(prod.nome || 'seu curso'), projeto: String(prod.projeto || 'teclado'), instancia: String(prod.instancia || '') };
-    if (pd.telefone) { try { enviarTexto(m.projeto as any, String(pd.telefone), _acAcessoMsgTexto(m, nome, email, link), m.instancia || undefined).catch(() => {}); } catch { /* */ } }
-    try { _emailFilaEnfileirar(m.projeto, email, 'Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs', _acAcessoMsgEmailHtml(m, nome, email, link)); } catch { /* */ }
+    // [+checkout-black 16/11] mensagem de entrega custom (se o produto tiver msg_entrega); senão a padrão. {nome}{email}{link}
+    const _msgC = String(prod.msg_entrega || '').trim();
+    const _txtWpp = _msgC ? _msgC.replace(/\{nome\}/g, nome).replace(/\{email\}/g, email).replace(/\{link[^}]*\}/g, link) : _acAcessoMsgTexto(m, nome, email, link);
+    const _htmlE = _msgC ? ('<div style="font-family:system-ui,Arial,sans-serif;font-size:15px;line-height:1.7;color:#222;white-space:pre-wrap">' + _txtWpp.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</div>') : _acAcessoMsgEmailHtml(m, nome, email, link);
+    if (pd.telefone) { try { enviarTexto(m.projeto as any, String(pd.telefone), _txtWpp, m.instancia || undefined).catch(() => {}); } catch { /* */ } }
+    try { _emailFilaEnfileirar(m.projeto, email, _msgC ? ('Seu acesso — Melodias e Riffs') : ('Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs'), _htmlE); } catch { /* */ }
     try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), email, dedupKey, (pd.telefone ? 'wa+email' : 'email'), agora()); } catch { /* */ }
     try { _acLog(id, 'acesso_checkout', dedupKey); } catch { /* */ }
   } catch { /* best-effort: nunca quebra */ }
@@ -19100,6 +19131,9 @@ app.post('/checkout/produto', (req: any, res: any) => {
       db.prepare(`INSERT INTO ck_produtos (id,slug,nome,descricao,imagem,preco_centavos,de_centavos,academy_curso_id,validade,metodos,max_parcelas,juros_am,projeto,instancia,instrumento,emoji,itens_json,ativo,criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, slug, String(b.nome), String(b.descricao || ''), String(b.imagem || ''), Number(b.preco_centavos || 0), Number(b.de_centavos || 0), String(b.academy_curso_id || ''), String(b.validade || 'vitalicio'), metodos, Number(b.max_parcelas || 12), Number(b.juros_am || 0), String(b.projeto || 'teclado'), String(b.instancia || ''), String(b.instrumento || ''), String(b.emoji || '🎵'), itens, 1, agora());
     }
+    // [+checkout-black 16/11] bundle + mensagem custom (colunas extras, sem mexer no upsert principal)
+    try { if (b.bundle !== undefined || b.bundle_json !== undefined) db.prepare(`UPDATE ck_produtos SET bundle_json=? WHERE id=?`).run(Array.isArray(b.bundle) ? JSON.stringify(b.bundle) : String(b.bundle_json || '[]'), id); } catch { /* */ }
+    try { if (b.msg_entrega !== undefined) db.prepare(`UPDATE ck_produtos SET msg_entrega=? WHERE id=?`).run(String(b.msg_entrega || ''), id); } catch { /* */ }
     res.json({ ok: true, id, slug, url: '/pay/' + slug });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
@@ -19203,11 +19237,11 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     // [+juros-parcelado 13/11] cartão parcelado: embute os juros no valor cobrado (vêm pra nós) usando a MESMA fórmula da página (juros_am do produto). PIX/boleto e à vista não têm juros. IMPORTANTE: Pagar.me deve estar em parcelado SEM juros (lojista), senão dobra. ADD-ONLY.
     let _valorFinal = valor;
     try {
+      // [+checkout-black 16/11] JUROS SIMPLES global (pub_kv checkout_juros_simples_am, padrão 1,6667%/mês). SUBSTITUI o composto. juros_am>0 do produto = liga/desliga.
+      const _jsimp = Number(pubFlag('checkout_juros_simples_am', '0.016667')) || 0.016667;
       const _jam = Number(prod.juros_am || 0);
       if (metodo === 'card' && parcelas > 1 && _jam > 0 && valor > 0) {
-        const _coef = (_jam * Math.pow(1 + _jam, parcelas)) / (Math.pow(1 + _jam, parcelas) - 1);
-        const _parcCent = Math.round(valor * _coef);
-        const _totalJuros = _parcCent * parcelas;
+        const _totalJuros = Math.round(valor * (1 + _jsimp * parcelas)); // simples: total = valor*(1 + j*n)
         const _jurosCent = _totalJuros - valor;
         if (_jurosCent > 0) { _itensPay.push({ amount: _jurosCent, description: 'Juros do parcelamento (' + parcelas + 'x)', quantity: 1, code: 'juros' }); _valorFinal = _totalJuros; }
       }
@@ -19215,6 +19249,15 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     const customer: any = { name: nome, email, type: 'individual' };
     if (cpf) customer.document = cpf;
     const ph = _ckPhone(telDig); if (ph) customer.phones = ph;
+    // [+checkout-black 16/11] endereço completo (envio dos livros físicos da Black)
+    try {
+      const _ad = (b && b.endereco) || {};
+      const _zip = String(_ad.cep || b.cep || '').replace(/\D/g, '');
+      const _l1 = [String(_ad.rua || '').trim(), String(_ad.numero || '').trim()].filter(Boolean).join(', ');
+      if (_zip || _l1) {
+        customer.address = { country: 'BR', state: String(_ad.uf || '').trim().toUpperCase().slice(0, 2), city: String(_ad.cidade || '').trim(), zip_code: _zip, line_1: _l1 || String(_ad.rua || '').trim(), line_2: [String(_ad.complemento || '').trim(), String(_ad.bairro || '').trim()].filter(Boolean).join(' - ') };
+      }
+    } catch { /* */ }
     let pagamento: any;
     if (metodo === 'card') {
       const token = String(b.card_token || '');
@@ -19232,6 +19275,7 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
       .run(pedidoId, prod.id, prod.slug, nome, telDig, cpf, metodo, parcelas, _valorFinal, 'pending', agora()); // [+juros-parcelado 13/11] valor cobrado (com juros se cartão parcelado)
     // [+ck-extras] registra cupom/desconto/bump usados nesse pedido (pra concessão e relatório)
     try { db.prepare(`UPDATE ck_pedidos SET cupom=?, desconto_centavos=?, bump_slug=?, bumps_json=? WHERE id=?`).run(_cupomCod, _descont, (_bumpSlugsPagos[0] || ''), JSON.stringify(_bumpSlugsPagos), pedidoId); } catch { /* */ }
+    try { db.prepare(`UPDATE ck_pedidos SET endereco_json=? WHERE id=?`).run(JSON.stringify((b && b.endereco) || {}), pedidoId); } catch { /* */ } // [+checkout-black 16/11]
     let j: any;
     try { j = await _ckPagarme('/orders', 'POST', payload); }
     catch (e: any) {
@@ -19290,12 +19334,25 @@ function _ckPaginaHtml(prod: any): string {
   const bumpsP: any[] = [];
   for (const bc of _bcfg) { try { const bp = db.prepare(`SELECT slug,nome,descricao,preco_centavos,de_centavos,emoji FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(bc.slug)) as any; if (bp && !bumpsP.find((x) => x.slug === bp.slug)) bumpsP.push({ ...bp, _titulo: String((bc && bc.titulo) || '') }); } catch { /* */ } }
   const pixelId = String(prod.pixel_id || '').trim();
+  const _isBlack = /-black$/.test(String(prod.slug || ''));
   const cfg = {
     slug: String(prod.slug), pk, preco: Number(prod.preco_centavos || 0), maxp: Number(prod.max_parcelas || 12),
-    juros: Number(prod.juros_am || 0), metodos,
+    juros: Number(prod.juros_am || 0), jsimp: Number(pubFlag('checkout_juros_simples_am', '0.016667')) || 0.016667, metodos,
     bumps: bumpsP.map((bp: any) => ({ slug: String(bp.slug), preco: Number(bp.preco_centavos || 0) })),
+    black: _isBlack ? { ab: pubFlag('checkout_black_abertura', ''), dl: pubFlag('checkout_black_deadline', '') } : null,
   };
   const precoBR = (c: number) => 'R$ ' + (c / 100).toFixed(2).replace('.', ',');
+  // [+checkout-black 16/11] parcela do maior nº de vezes (juros simples global) p/ o resumo
+  const _jsimpPg = Number(pubFlag('checkout_juros_simples_am', '0.016667')) || 0.016667;
+  const _maxpPg = Number(prod.max_parcelas || 12) || 12;
+  const _temJuros = Number(prod.juros_am || 0) > 0;
+  const _parcResumo = _temJuros ? Math.round(Number(prod.preco_centavos || 0) * (1 + _jsimpPg * _maxpPg) / _maxpPg) : Math.round(Number(prod.preco_centavos || 0) / _maxpPg);
+  // endereço de entrega: SÓ nos produtos Black (físicos). Digital não pede (não quebra o checkout vivo).
+  const enderecoHtml = _isBlack ? ('<div class="sec-h" style="margin-top:8px"><span class="n" style="background:var(--gold-d)">\u{1F4E6}</span><h2 style="font-size:14px">Endereço de entrega dos livros</h2></div>'
+    + '<div class="row2"><label class="f"><span>CEP</span><input id="e_cep" class="in" inputmode="numeric" placeholder="00000-000"></label><label class="f"><span>Cidade</span><input id="e_cidade" class="in" placeholder="Cidade"></label></div>'
+    + '<label class="f"><span>Rua / Logradouro</span><input id="e_rua" class="in" placeholder="Nome da rua"></label>'
+    + '<div class="row2"><label class="f"><span>Número</span><input id="e_num" class="in" placeholder="Nº"></label><label class="f"><span>Complemento (opcional)</span><input id="e_comp" class="in" placeholder="Apto / bloco"></label></div>'
+    + '<div class="row2"><label class="f" style="margin-bottom:0"><span>Bairro</span><input id="e_bairro" class="in" placeholder="Bairro"></label><label class="f" style="margin-bottom:0"><span>UF</span><input id="e_uf" class="in" placeholder="SP" maxlength="2" style="max-width:90px;text-transform:uppercase"></label></div>') : '';
   const logoHtml = logo
     ? '<img src="' + esc(logo) + '" alt="Melodias e Riffs" style="width:44px;height:44px;border-radius:11px;display:block;box-shadow:0 6px 16px rgba(75,46,131,.3)">'
     : '<span style="width:40px;height:40px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#4b2e83,#6d4bb8);color:#fff;font-size:18px">' + esc(String(prod.emoji || '🎵')) + '</span>';
@@ -19361,7 +19418,7 @@ function _ckPaginaHtml(prod: any): string {
     'var $=function(s,r){return (r||document).querySelector(s)};',
     'function brl(c){return "R$ "+(c/100).toFixed(2).replace(".",",")}',
     'function soDig(s){return String(s||"").replace(/\\D/g,"")}',
-    'function parcelasOpts(){var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=CFG.preco/n}else{var j=CFG.juros;var coef=(j*Math.pow(1+j,n))/(Math.pow(1+j,n)-1);v=CFG.preco*coef}out.push({n:n,v:Math.round(v)})}return out}',
+    'function parcelasOpts(){var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=CFG.preco/n}else{v=CFG.preco*(1+CFG.jsimp*n)/n}out.push({n:n,v:Math.round(v)})}return out}',
     'function montaParcelas(){var sel=$("#parcelas");if(!sel)return;var o=parcelasOpts();sel.innerHTML=o.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
     'var metodoAtual="",parcelasAtual=1;',
     'document.querySelectorAll(".pay").forEach(function(b){b.addEventListener("click",function(){document.querySelectorAll(".pay").forEach(function(x){x.classList.remove("active")});b.classList.add("active");var p=b.getAttribute("data-p");metodoAtual=p==="bol"?"boleto":p;document.querySelectorAll(".panel").forEach(function(pn){pn.classList.toggle("show",pn.getAttribute("data-panel")===p)})})});',
@@ -19369,7 +19426,8 @@ function _ckPaginaHtml(prod: any): string {
     'function showMsg(t,ok){var m=$("#msg");m.className="msg "+(ok?"ok":"err");m.textContent=t}',
     'async function tokenizaCartao(){var card={number:soDig($("#c_num").value),holder_name:$("#c_nome").value.trim(),exp_month:soDig($("#c_val").value).slice(0,2),exp_year:soDig($("#c_val").value).slice(2),cvv:soDig($("#c_cvv").value)};var r=await fetch("https://api.pagar.me/core/v5/tokens?appId="+encodeURIComponent(CFG.pk),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({type:"card",card:card})});var j=await r.json();if(!r.ok||!j.id){throw new Error((j&&(j.message||(j.errors&&JSON.stringify(j.errors))))||"Cartão inválido")}return j.id}',
     'async function pagar(){var btn=$("#btn");btn.disabled=true;var old=btn.innerHTML;btn.innerHTML="Processando...";try{',
-    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual,cupom:(window.MR_CUPOM||""),bumps:(function(){var a=[];document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)a.push(c.getAttribute("data-slug"))});return a})()};',
+    'var body={nome:$("#nome").value.trim(),email:$("#email").value.trim(),telefone:$("#tel").value,cpf:($("#cpf")?$("#cpf").value:""),metodo:metodoAtual,cupom:(window.MR_CUPOM||""),endereco:{cep:(($("#e_cep")||{}).value||""),rua:(($("#e_rua")||{}).value||""),numero:(($("#e_num")||{}).value||""),complemento:(($("#e_comp")||{}).value||""),bairro:(($("#e_bairro")||{}).value||""),cidade:(($("#e_cidade")||{}).value||""),uf:(($("#e_uf")||{}).value||"")},bumps:(function(){var a=[];document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)a.push(c.getAttribute("data-slug"))});return a})()};',
+    'if(CFG.black){var _e=body.endereco;if(!_e.cep||!_e.rua||!_e.numero||!_e.cidade||!_e.uf){showMsg("Preencha o endereço completo (CEP, rua, número, cidade e UF) para o envio dos livros.",false);btn.disabled=false;btn.innerHTML=old;return}}',
     'if(metodoAtual==="card"){body.cpf=$("#c_cpf")?$("#c_cpf").value:body.cpf;body.parcelas=Number($("#parcelas").value||1);body.card_token=await tokenizaCartao()}',
     'if(metodoAtual==="boleto"){body.cpf=$("#b_cpf")?$("#b_cpf").value:body.cpf}',
     'var r=await fetch("/pay/"+CFG.slug+"/cobrar",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});var j=await r.json();',
@@ -19382,14 +19440,15 @@ function _ckPaginaHtml(prod: any): string {
     'function mostraPix(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><span class=\\"pill\\">⚡ Aprovação na hora</span><h2 style=\\"margin:12px 0 4px\\">Escaneie o PIX pra pagar</h2>";if(j.pix&&j.pix.qr_url)html+="<img class=\\"qr\\" src=\\""+j.pix.qr_url+"\\" alt=\\"QR PIX\\">";html+="<div class=\\"copia\\"><input id=\\"pxc\\" value=\\""+(j.pix&&j.pix.copia||"")+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText($(\'#pxc\').value)\\">Copiar</button></div><p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">Assim que o pagamento cair, seu acesso é liberado automaticamente.</p></div>";$("#area").innerHTML=html;poll(j.pedido)}',
     'function mostraBoleto(j){var html="<div class=\\"card pad\\" style=\\"text-align:center\\"><h2 style=\\"margin:0 0 8px\\">Boleto gerado</h2>";if(j.boleto&&j.boleto.url)html+="<p><a class=\\"cta\\" style=\\"text-decoration:none\\" href=\\""+j.boleto.url+"\\" target=\\"_blank\\">Abrir boleto</a></p>";if(j.boleto&&j.boleto.linha)html+="<div class=\\"copia\\"><input value=\\""+j.boleto.linha+"\\" readonly><button type=\\"button\\" onclick=\\"navigator.clipboard&&navigator.clipboard.writeText(this.previousSibling.value)\\">Copiar</button></div>";html+="<p style=\\"color:#6a6577;font-size:12px;margin-top:12px\\">O acesso é liberado quando o pagamento for compensado.</p></div>";$("#area").innerHTML=html}',
     'function poll(id){var n=0;var t=setInterval(function(){n++;fetch("/pay/status/"+id).then(function(r){return r.json()}).then(function(s){if(s&&s.status==="paid"){clearInterval(t);sucesso()}});if(n>120)clearInterval(t)},5000)}',
-    'montaParcelas();var bt=$("#btn");if(bt)bt.addEventListener("click",pagar);',
+    'montaParcelas();function _def12(){try{var s=$("#parcelas");if(s&&s.options.length)s.value=String(CFG.maxp)}catch(e){}}_def12();var bt=$("#btn");if(bt)bt.addEventListener("click",pagar);',
     // [+ck-extras] cupom + order bump: recalcula total e parcelas
     'window.MR_CUPOM="";window.MR_DESC=0;',
-    'function montaParcelasBase(val){var sel=$("#parcelas");if(!sel)return;var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=val/n}else{var j=CFG.juros;var coef=(j*Math.pow(1+j,n))/(Math.pow(1+j,n)-1);v=val*coef}out.push({n:n,v:Math.round(v)})}sel.innerHTML=out.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
-    'function recalcTotal(){var base=CFG.preco;var dc=(window.MR_DESC||0);var bp=0;document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)bp+=Number(c.getAttribute("data-preco")||0)});var tot=Math.max(100,base-dc)+bp;var el=$("#totbig");if(el)el.innerHTML=brl(tot)+"<small> à vista</small>";montaParcelasBase(tot)}',
+    'function montaParcelasBase(val){var sel=$("#parcelas");if(!sel)return;var out=[];for(var n=1;n<=CFG.maxp;n++){var v;if(n===1||CFG.juros<=0){v=val/n}else{v=val*(1+CFG.jsimp*n)/n}out.push({n:n,v:Math.round(v)})}sel.innerHTML=out.map(function(p){var t=p.n+"x de "+brl(p.v);if(p.n===1||CFG.juros<=0)t+=" — sem juros";return "<option value=\\""+p.n+"\\">"+t+"</option>"}).join("")}',
+    'function recalcTotal(){var base=CFG.preco;var dc=(window.MR_DESC||0);var bp=0;document.querySelectorAll(".bumpck").forEach(function(c){if(c.checked)bp+=Number(c.getAttribute("data-preco")||0)});var tot=Math.max(100,base-dc)+bp;var el=$("#totbig");if(el)el.innerHTML=brl(tot);montaParcelasBase(tot);try{_def12&&_def12()}catch(e){}}',
     'document.querySelectorAll(".bumpck").forEach(function(c){c.addEventListener("change",recalcTotal)});',
     'async function aplicarCupom(){var i=document.getElementById("cupom_in");if(!i)return;var cod=i.value.trim();var fb=document.getElementById("cupom_fb");if(!cod){window.MR_CUPOM="";window.MR_DESC=0;if(fb)fb.textContent="";recalcTotal();return}try{var r=await fetch("/pay/"+CFG.slug+"/cupom",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cupom:cod})});var j=await r.json();if(j&&j.valido){window.MR_CUPOM=j.codigo;window.MR_DESC=j.desconto_centavos||0;if(fb){fb.textContent="✔ Cupom aplicado: −"+brl(j.desconto_centavos||0);fb.style.color="#1f9d57"}}else{window.MR_CUPOM="";window.MR_DESC=0;if(fb){fb.textContent="Cupom inválido ou expirado.";fb.style.color="#b03232"}}recalcTotal()}catch(e){}}',
     'var _cb=document.getElementById("cupom_btn");if(_cb)_cb.addEventListener("click",aplicarCupom);',
+    '(function(){if(!CFG.black)return;var bar=document.getElementById("blackbar");if(!bar)return;function pz(n){return (n<10?"0":"")+n}function parseD(s){s=String(s||"").trim();var m=s.match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})/);if(!m)return null;return new Date(+m[1],+m[2]-1,+m[3],+m[4],+m[5],0)}var ab=parseD(CFG.black.ab),dl=parseD(CFG.black.dl);function tick(){var now=new Date();var B=document.getElementById("btn");if(ab&&now<ab){bar.style.cssText="display:block;margin-bottom:16px;background:#1d1a26;color:#fff;border-radius:14px;padding:16px;text-align:center;font-weight:700";bar.textContent="🔒 A oferta Black abre hoje às 20h";if(B){B.disabled=true;B.setAttribute("data-blk","1")}return}if(dl&&now<dl){var ms=dl-now,h=Math.floor(ms/3600000),mi=Math.floor(ms/60000%60),se=Math.floor(ms/1000%60);bar.style.cssText="display:block;margin-bottom:16px;background:linear-gradient(135deg,#1d1a26,#3a2b57);color:#fff;border-radius:14px;padding:14px 16px;text-align:center";bar.innerHTML="";var l1=document.createElement("div");l1.style.cssText="font-weight:800;font-size:15px";l1.textContent="🔥 Oferta por tempo limitado — Termina em "+pz(h)+":"+pz(mi)+":"+pz(se);var l2=document.createElement("div");l2.style.cssText="margin-top:6px;font-size:13px;color:#ffd98a";l2.textContent="🎁 Comprando HOJE até 23:59 você ganha 3 livros físicos de brinde, enviados pra sua casa! 📚";bar.appendChild(l1);bar.appendChild(l2);if(B&&B.getAttribute("data-blk")==="1"){B.disabled=false;B.removeAttribute("data-blk")}return}bar.style.display="none";bar.textContent="";if(B&&B.getAttribute("data-blk")==="1"){B.disabled=false;B.removeAttribute("data-blk")}}tick();setInterval(tick,1000);})();',
     'try{if(window.fbq)fbq("track","InitiateCheckout")}catch(e){}',
   ].join('');
 
@@ -19411,13 +19470,17 @@ function _ckPaginaHtml(prod: any): string {
     + '<style>' + css + '</style>' + pixelHead + '</head><body>'
     + '<div class="topbar"><div class="logo">' + logoHtml + '<span>Melodias e Riffs<small>A Escola do Músico Cristão</small></span></div>'
     + '<div class="secure"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Ambiente 100% seguro</div></div>'
-    + '<div class="wrap" id="area"><div class="grid">'
+    + '<div class="wrap" id="area">'
+    + (cfg.black ? '<div id="blackbar" style="display:none"></div>' : '')
+    + '<div class="grid">'
     + '<div style="display:grid;gap:18px">'
     + '<div class="card pad"><div class="sec-h"><span class="n">1</span><h2>Seus dados</h2></div>'
     + '<label class="f"><span>Nome completo</span><input id="nome" class="in" placeholder="Como está no seu documento"></label>'
     + '<div class="row2"><label class="f"><span>E-mail</span><input id="email" type="email" class="in" placeholder="voce@email.com"></label>'
     + '<label class="f"><span>WhatsApp</span><input id="tel" class="in" placeholder="(16) 90000-0000"></label></div>'
-    + '<label class="f" style="margin-bottom:0"><span>CPF</span><input id="cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label></div>'
+    + '<label class="f"' + (_isBlack ? '' : ' style="margin-bottom:0"') + '><span>CPF</span><input id="cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label>'
+    + enderecoHtml
+    + '</div>'
     + '<div class="card pad"><div class="sec-h"><span class="n">2</span><h2>Forma de pagamento</h2></div>'
     + '<div class="pays">' + tabCard + tabPix + tabBol + '</div>'
     + (metodos.indexOf('card') >= 0 ? ('<div class="panel show" data-panel="card">'
@@ -19428,14 +19491,17 @@ function _ckPaginaHtml(prod: any): string {
       + '<div class="flags"><div class="flag">VISA</div><div class="flag">MASTER</div><div class="flag">ELO</div><div class="flag">AMEX</div><div class="flag">HIPER</div></div></div>') : '')
     + (metodos.indexOf('pix') >= 0 ? ('<div class="panel' + (metodos.indexOf('card') < 0 ? ' show' : '') + '" data-panel="pix"><span class="pill">⚡ Aprovação na hora</span><p style="font-size:13px;color:#3c3947;margin:10px 0 0">Ao clicar em pagar, geramos o QR Code do PIX. O acesso é liberado automaticamente assim que o pagamento cair.</p></div>') : '')
     + (metodos.indexOf('boleto') >= 0 ? ('<div class="panel" data-panel="bol"><p style="font-size:13px;color:#3c3947;margin:4px 0 12px">O boleto é gerado após confirmar e pode levar até 1 dia útil pra compensar.</p><label class="f" style="margin-bottom:0"><span>CPF do pagador</span><input id="b_cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label></div>') : '')
-    + '<button class="cta" id="btn" type="button">Pagar agora<small>· ' + precoBR(Number(prod.preco_centavos || 0)) + '</small></button>'
+    + '<button class="cta" id="btn" type="button">Pagar e Receber aulas Agora</button>'
     + '<div id="msg" class="msg"></div>'
     + '<div class="undercta"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Pagamento processado pela Pagar.me · dados criptografados</div></div></div>'
     + '<div class="summary"><div class="card pad"><div class="prod">' + thumb
     + '<div><h3>' + esc(String(prod.nome || '')) + '</h3><p>' + esc(String(prod.descricao || 'Acesso imediato')) + '</p></div></div>'
     + (incHtml ? ('<ul class="inc">' + incHtml + '</ul>') : '')
     + bumpHtml
-    + '<div class="totals">' + deHtml + '<div class="big"><span>Total</span><b id="totbig">' + precoBR(Number(prod.preco_centavos || 0)) + '<small> à vista</small></b></div></div>'
+    + '<div class="totals">' + deHtml + '<div class="big" style="font-size:12.5px"><span>Total à vista</span><b id="totbig" style="font-size:20px">' + precoBR(Number(prod.preco_centavos || 0)) + '</b></div>'
+    + '<div class="l" style="margin-top:3px"><span>ou ' + _maxpPg + 'x de</span><span style="font-weight:700;color:var(--brand)">' + precoBR(_parcResumo) + '</span></div>'
+    + (_temJuros ? '<div style="font-size:10.5px;color:#9a95a8;font-style:italic;margin-top:4px">*Juros de 1,6667% ao mês</div>' : '')
+    + '</div>'
     + cupomHtml
     + '<div class="guar"><div class="seal">🛡️</div><div><b>7 dias de garantia</b><p>Não curtiu? Devolvemos 100% do valor.</p></div></div></div>'
     + '<div class="trust"><span>🔒 Compra segura</span>·<span>Processado por <b>Pagar.me</b></span>·<span>SSL</span></div></div>'
