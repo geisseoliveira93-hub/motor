@@ -19025,7 +19025,8 @@ function _ckConceder(pedidoId: string): void {
     const _msgC = String(prod.msg_entrega || '').trim();
     const _txtWpp = _msgC ? _msgC.replace(/\{nome\}/g, nome).replace(/\{email\}/g, email).replace(/\{link[^}]*\}/g, link) : _acAcessoMsgTexto(m, nome, email, link);
     const _htmlE = _msgC ? ('<div style="font-family:system-ui,Arial,sans-serif;font-size:15px;line-height:1.7;color:#222;white-space:pre-wrap">' + _txtWpp.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</div>') : _acAcessoMsgEmailHtml(m, nome, email, link);
-    if (pd.telefone) { try { enviarTexto(m.projeto as any, String(pd.telefone), _txtWpp, m.instancia || undefined).catch(() => {}); } catch { /* */ } }
+    const _waTel = (() => { let d = String(pd.telefone || '').replace(/\D/g, ''); if (d.length === 10 || d.length === 11) d = '55' + d; return d; })(); // [+ck-wa-tel55 16/11] garante DDI 55 (numero do checkout vem sem 55 -> Evolution nao acha)
+    if (_waTel) { try { enviarTexto(m.projeto as any, _waTel, _txtWpp, m.instancia || undefined).catch(() => {}); } catch { /* */ } }
     try { _emailFilaEnfileirar(m.projeto, email, _msgC ? ('Seu acesso — Melodias e Riffs') : ('Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs'), _htmlE); } catch { /* */ }
     try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), email, dedupKey, (pd.telefone ? 'wa+email' : 'email'), agora()); } catch { /* */ }
     try { _acLog(id, 'acesso_checkout', dedupKey); } catch { /* */ }
