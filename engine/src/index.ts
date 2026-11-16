@@ -19015,7 +19015,7 @@ function _ckConceder(pedidoId: string): void {
         if (!_jb) db.prepare(`INSERT INTO academy_acesso (id,aluno_id,alvo_tipo,alvo_id,validade,criado_em) VALUES (?,?,?,?,?,?)`).run(randomUUID(), id, 'curso', _cb, _ckValidade((_bi && _bi.validade) || 'vitalicio'), agora());
       }
     } catch { /* */ }
-    const dedupKey = curso || ('ck:' + prod.id);
+    const dedupKey = 'ckped:' + pedidoId; // [+ck-dedup-pedido 16/11] dedup por PEDIDO: cada compra confirma 1x (recompra de aluno antigo tambem recebe)
     const jaEnv = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, dedupKey);
     if (jaEnv) return; // já mandou acesso desse produto pra esse e-mail (recompra): não remanda
     const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
