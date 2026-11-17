@@ -15182,6 +15182,22 @@ app.get('/campanha-wa/handoffs', (req: any, res: any) => {
   try { const rows = db.prepare(`SELECT projeto,telefone,nome,primeira_msg_em FROM campanha_wa_leads WHERE status='handoff_manual' ORDER BY primeira_msg_em DESC LIMIT 1000`).all(); res.json({ ok: true, total: rows.length, handoffs: rows }); }
   catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
 });
+// Teste controlado: manda 1 mensagem pelo mesmo caminho (checa WhatsApp -> envia pela instancia do numero de ENVIO)
+// SEM tocar na fila, no ativo, nem no gate/atribuicao. So pra validar o canal antes do go-live.
+app.post('/campanha-wa/teste-envio', async (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const projeto = String(req.query.projeto || (req.body && req.body.projeto) || 'teclado');
+    const telefone = String(req.query.telefone || (req.body && req.body.telefone) || '').replace(/\D/g, '');
+    if (!telefone) return res.status(400).json({ ok: false, erro: 'telefone obrigatorio' });
+    const inst = _campwaInstancia(projeto); if (!inst) return res.status(400).json({ ok: false, erro: 'instancia nao conectada p/ ' + projeto });
+    const tem = await _campwaTemWhatsapp(inst, telefone);
+    const cfg = _campwaCfg(); const msg = String((cfg['msg_' + projeto]) || '');
+    let enviado = false; let erroEnvio: string | null = null;
+    if (tem !== false) { try { await enviarTexto(projeto as any, telefone, msg, inst); enviado = true; } catch (e: any) { erroEnvio = String((e && e.message) || e); } }
+    res.json({ ok: true, projeto, instancia: inst, telefone, tem_whatsapp: tem, enviado, msg, erroEnvio });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 // ============================================================================
 // [+campanha-wa 17/11] fim automação de disparo
 // ============================================================================
