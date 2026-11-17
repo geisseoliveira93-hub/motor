@@ -15113,6 +15113,48 @@ app.post('/campanha-wa/importar', (req: any, res: any) => {
     res.json({ ok: true, projeto, inseridos: n, total_fila: tot });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
 });
+function _campwaNorm(t: any): string | null {
+  let d = String(t || '').replace(/\D/g, '');
+  if (d.startsWith('55')) d = d.slice(2);
+  if (d.length === 11 && d[2] === '9') return '55' + d;
+  return null; // só celular BR (DDD + 9 + 8 dígitos)
+}
+// Popula a fila da campanha a partir da tabela `contatos` do motor: só celular válido,
+// exclui aluno (tag OU telefone na Academy), dedup por telefone, prioridade Teclado > Violão > Baixo.
+// ?reset=1 (padrão) zera a fila antes. Mesma regra da planilha aprovada.
+app.post('/campanha-wa/popular-fila', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const reset = String(req.query.reset ?? '1') !== '0';
+    if (reset) { try { db.prepare(`DELETE FROM campanha_wa_leads`).run(); } catch { /* */ } }
+    // telefones de aluno (Academy) normalizados
+    const alunoTel = new Set<string>();
+    try { for (const r of (db.prepare(`SELECT telefone FROM academy_matriculas WHERE telefone IS NOT NULL AND telefone<>''`).all() as any[])) { const n = _campwaNorm(r.telefone); if (n) alunoTel.add(n); } } catch { /* coluna pode não existir: segue só com tag */ }
+    const ins = db.prepare(`INSERT OR IGNORE INTO campanha_wa_leads(projeto,telefone,nome,status,atualizado_em) VALUES(?,?,?,'pendente',?)`);
+    const visto = new Set<string>();
+    const resumo: any = {};
+    for (const projeto of ['teclado', 'violao', 'baixo']) {
+      const rows = db.prepare(`SELECT id, telefone, nome FROM contatos WHERE projeto=?`).all(projeto) as any[];
+      let add = 0, exAluno = 0, exTel = 0, exDup = 0;
+      const tx = db.transaction((arr: any[]) => {
+        for (const r of arr) {
+          const n = _campwaNorm(r.telefone);
+          if (!n) { exTel++; continue; }
+          if (alunoTel.has(n)) { exAluno++; continue; }
+          let ehAluno = false; try { ehAluno = _contatoEhAluno(projeto, String(r.id)); } catch { /* */ }
+          if (ehAluno) { exAluno++; continue; }
+          if (visto.has(n)) { exDup++; continue; }
+          visto.add(n);
+          const rr = ins.run(projeto, n, String(r.nome || ''), agora());
+          if (rr.changes) add++;
+        }
+      });
+      tx(rows);
+      resumo[projeto] = { bruto: rows.length, add, excluido_aluno: exAluno, sem_celular: exTel, dup_outro_instrumento: exDup };
+    }
+    res.json({ ok: true, reset, resumo, total_fila: Number((db.prepare(`SELECT COUNT(*) n FROM campanha_wa_leads`).get() as any)?.n || 0) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 app.post('/campanha-wa/config', (req: any, res: any) => {
   if (!_campwaAuth(req, res)) return;
   try {
