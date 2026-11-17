@@ -14682,7 +14682,7 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
       const meusV = doV.filter((c) => meus.has(c.id));
       if (!_adm && !meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela (admin vê todas)
       if (!doV.length) continue;
-      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(_acCardsVitrine(v, doV, cardHtml, meus))}</div>`; // mostra TODOS (cadeado faz o resto); modo_modulos=1 + 1 curso => cards de módulos
+      shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(_acCardsVitrine(v, doV, cardHtml, meus, _adm))}</div>`; // mostra TODOS (cadeado faz o resto); modo_modulos=1 + 1 curso => cards de módulos // [+admin-tudo 17/11] modo admin: tudo liberado
     }
     const semVit = cursos.filter((c) => !c.vitrine_id && (_adm || meus.has(c.id)));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
@@ -14790,8 +14790,8 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     const mod = db.prepare(`SELECT * FROM academy_modulos WHERE id=?`).get(aula.modulo_id) as any;
     const cursoId = aula.curso_id || (mod && mod.curso_id);
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(cursoId) as any;
-    if (!curso || !_acCursosDoAluno(al.id).has(curso.id)) return res.status(403).type('html').send('Sem acesso.');
-    const _lib = _acAulaLiberada(al, aula, curso);
+    if (!curso || (!_acEhAdmin(req) && !_acCursosDoAluno(al.id).has(curso.id))) return res.status(403).type('html').send('Sem acesso.'); // [+admin-tudo 17/11] modo admin: tudo liberado
+    const _lib = _acEhAdmin(req) ? ({ ok: true } as { ok: boolean; quando?: Date }) : _acAulaLiberada(al, aula, curso); // [+admin-tudo 17/11] modo admin: tudo liberado
     if (!_lib.ok) return res.type('html').send(_acPage(al, aula.nome || 'Aula', `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">🔒 Esta aula ainda não foi liberada.<br>Libera em <b>${_lib.quando ? new Date(_lib.quando).toLocaleDateString('pt-BR') : ''}</b>.<br><br><a class="btn btn-ghost" href="/area/curso/${curso.id}">Voltar ao curso</a></div></div>`));
 
     const mods = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(curso.id) as any[];
@@ -14834,7 +14834,7 @@ app.get('/area/aula/:id', (req: any, res: any) => {
       const lis = aus.map((a) => {
         const p = vmap[a.id];
         const cls = p && p.visto ? 'done' : (p && p.pos_seg ? 'half' : '');
-        const _l = _acAulaLiberada(al, a, curso);
+        const _l = _acEhAdmin(req) ? ({ ok: true } as { ok: boolean; quando?: Date }) : _acAulaLiberada(al, a, curso); // [+admin-tudo 17/11] modo admin: tudo liberado
         if (!_l.ok) return `<div class="au" style="opacity:.55"><span class="dot"></span><span>🔒 ${esc(a.nome || '')}</span></div>`;
         return `<a class="au ${a.id === aula.id ? 'on' : ''}" href="/area/aula/${a.id}"><span class="dot ${cls}"></span><span>${esc(a.nome || '')}</span></a>`;
       }).join('');
@@ -15991,8 +15991,8 @@ app.get('/area/certificado/:cursoId', (req: any, res: any) => {
     if (!curso) return res.status(404).type('html').send('Curso não encontrado.');
     const tot = (db.prepare(`SELECT COUNT(*) n FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?)`).get(curso.id, curso.id) as any).n;
     const feitas = (db.prepare(`SELECT COUNT(*) n FROM academy_progresso WHERE aluno_id=? AND curso_id=? AND visto=1`).get(al.id, curso.id) as any).n;
-    if (!tot || feitas < tot) return res.type('html').send(_acPage(al, 'Certificado', `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">Conclua todas as aulas de <b>${esc(curso.nome || '')}</b> para emitir o certificado.<br><br><a class="btn btn-g" href="/area/curso/${curso.id}">Voltar ao curso</a></div></div>`));
-    _acPontuar(al.id, 'certificado', curso.id); _acLog(al.id, 'certificado', curso.id);
+    if (!_acEhAdmin(req) && (!tot || feitas < tot)) return res.type('html').send(_acPage(al, 'Certificado', `<div class="wrap"><div class="card2" style="margin-top:30px;text-align:center">Conclua todas as aulas de <b>${esc(curso.nome || '')}</b> para emitir o certificado.<br><br><a class="btn btn-g" href="/area/curso/${curso.id}">Voltar ao curso</a></div></div>`)); // [+admin-tudo 17/11] modo admin: tudo liberado
+    if (!_acEhAdmin(req)) { _acPontuar(al.id, 'certificado', curso.id); _acLog(al.id, 'certificado', curso.id); } // [+admin-tudo 17/11] modo admin: tudo liberado
     const hoje = new Date().toLocaleDateString('pt-BR');
     const corpo = `<div class="wrap"><div style="max-width:820px;margin:30px auto;background:linear-gradient(135deg,#14140f,#1c1a12);border:2px solid #e7c86a;border-radius:16px;padding:48px;text-align:center">
       <div style="color:#e7c86a;font-weight:800;letter-spacing:.2em;font-size:14px">MELODIAS E RIFFS</div>
@@ -16528,7 +16528,7 @@ app.get('/area/prova/:id', (req: any, res: any) => {
     const prova = db.prepare(`SELECT * FROM academy_provas WHERE id=?`).get(req.params.id) as any;
     if (!prova) return res.status(404).type('html').send('Prova não encontrada.');
     const curso = db.prepare(`SELECT * FROM academy_cursos WHERE id=?`).get(prova.curso_id) as any;
-    if (!curso || !_acCursosDoAluno(al.id).has(curso.id)) return res.status(403).type('html').send('Sem acesso.');
+    if (!curso || (!_acEhAdmin(req) && !_acCursosDoAluno(al.id).has(curso.id))) return res.status(403).type('html').send('Sem acesso.'); // [+admin-tudo 17/11] modo admin: tudo liberado
     const questoes = (db.prepare(`SELECT * FROM academy_prova_questoes WHERE prova_id=? ORDER BY ordem`).all(prova.id) as any[]).map((q) => ({ ...q, opcoes: _ndJson(q.opcoes, []) }));
     const ult = db.prepare(`SELECT * FROM academy_prova_resultados WHERE aluno_id=? AND prova_id=? ORDER BY ts DESC LIMIT 1`).get(al.id, prova.id) as any;
     const qsHtml = questoes.map((q, i) => `<div class="card2" style="margin:10px 0"><div style="font-weight:600;margin-bottom:8px">${i + 1}. ${esc(q.pergunta || '')}</div>${(q.opcoes as any[]).map((op: string, j: number) => `<label style="display:block;padding:6px 0;cursor:pointer"><input type="radio" name="q_${q.id}" value="${j}"> ${esc(op)}</label>`).join('')}</div>`).join('');
@@ -16596,11 +16596,11 @@ const _acCardModulo = (md: any, cursoId: string, temAcesso: boolean): string => 
 };
 // Decide os cards de uma vitrine: se ela esta em modo_modulos=1 E tem exatamente 1 curso, mostra os
 // MÓDULOS desse curso como cards (igual Cademi). Senao, cai no render normal de cursos (identico ao antigo).
-const _acCardsVitrine = (v: any, doV: any[], cardHtml: (c: any) => string, meus: Set<string>): string => {
+const _acCardsVitrine = (v: any, doV: any[], cardHtml: (c: any) => string, meus: Set<string>, adm?: boolean): string => { // [+admin-tudo 17/11] modo admin: tudo liberado
   try {
     if (v && Number(v.modo_modulos) === 1 && doV.length === 1) {
       const curso = doV[0];
-      const tem = meus.has(curso.id);
+      const tem = meus.has(curso.id) || !!adm; // [+admin-tudo 17/11] modo admin: tudo liberado
       const mods = db.prepare(`SELECT * FROM academy_modulos WHERE curso_id=? ORDER BY ordem`).all(curso.id) as any[];
       if (mods.length) return mods.map((md) => _acCardModulo(md, curso.id, tem)).join('');
     }
@@ -16650,7 +16650,7 @@ app.get('/area/categoria/:cat', (req: any, res: any) => {
     const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
     const _admC = _acEhAdmin(req); // [07/11 Ezequias] admin abre qualquer curso aqui também
     let shelves = '';
-    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${_acCardsVitrine(v, doV, (c: any) => _acCardCurso(c, meus, pmap, _admC), meus)}</div></div>`; }
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${_acCardsVitrine(v, doV, (c: any) => _acCardCurso(c, meus, pmap, _admC), meus, _admC)}</div></div>`; } // [+admin-tudo 17/11] modo admin: tudo liberado
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
     const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
     res.type('html').send(_acPage(al, cat, corpo));
