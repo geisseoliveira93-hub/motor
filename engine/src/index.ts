@@ -4359,7 +4359,7 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         } else if (/baixista pr/.test(_pnST)) {
           const _nmST = String(p.nome || '').trim().split(' ')[0];
           const _txtST = (_nmST ? _nmST + ', p' : 'P') + 'arabéns pela compra do *Método Baixista Pró*! 🎸\n\nE eu tenho um presente a mais pra você: você acaba de *ganhar uma vaga* no *Desafio Baixo na Igreja — Saia das Tônicas em 3 dias* — 3 aulas ao vivo comigo (Melodias, Ritmos e Grooves e Frases), pra você sair das tônicas e tocar os louvores com firmeza.\n\nÉ um bônus gratuito, mas as vagas são limitadas. Pra garantir a sua, é só se inscrever aqui 👇\nhttps://baixo.melodiaseriffs.com.br/p/desafio-saia-das-tonicas\n\nTe espero no desafio! 🙌\nProfessor Ezequias';
-          await enviarTexto(projeto, p.telefone, _txtST, 'Baixo').catch(() => {});
+          enfileirarFluxo(projeto, p.telefone, [{ tipo: 'texto', texto: _txtST, delaySegundos: 14400 }], p.nome || '', undefined, 'Baixo', 'desafio-baixista-pro-bonus'); // [+desafio-4h 17/11] bonus do desafio sai 4h depois, nao na hora da compra
         }
       } catch (e) { /* desafio-saia-tonicas best-effort: nunca quebra a entrega */ }
       } else if (categoria === 'perdido') {
@@ -16788,8 +16788,11 @@ const _acAcessoNaVenda = (p: any, b: any, provider: string): void => {
       const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
       const nome = _primeiroNomeBonito(String((p && p.nome) || al.nome || ''));
       if (p && p.telefone) {
-        try { enviarTexto(m.projeto as any, String(p.telefone), _acAcessoMsgTexto(m, nome, email, link), m.instancia).catch(() => {}); } catch { /* */ }
-        if (m.video) { try { enviarMidia(m.projeto as any, String(p.telefone), 'video', m.video, 'Tutorial de acesso', m.instancia).catch(() => {}); } catch { /* */ } }
+        try { // [+ordem-acesso-video 17/11] texto (link magico) PRIMEIRO; video so depois que o texto resolve, pra nunca chegar antes
+          const _pTxt = enviarTexto(m.projeto as any, String(p.telefone), _acAcessoMsgTexto(m, nome, email, link), m.instancia);
+          if (m.video) { _pTxt.then(() => enviarMidia(m.projeto as any, String(p.telefone), 'video', m.video, 'Tutorial de acesso', m.instancia)).catch(() => {}); }
+          else { _pTxt.catch(() => {}); }
+        } catch { /* */ }
       }
       try { _emailFilaEnfileirar(m.projeto, email, 'Seu acesso ao ' + m.produto_nome + ' — Melodias e Riffs', _acAcessoMsgEmailHtml(m, nome, email, link)); } catch { /* */ }
       try { db.prepare(`INSERT INTO academy_envio_acesso (id,email,curso_id,canal,criado_em) VALUES (?,?,?,?,?)`).run(randomUUID(), email, m.curso, ((p && p.telefone) ? 'wa+email' : 'email'), agora()); } catch { /* */ }
