@@ -14989,6 +14989,161 @@ app.get('/campanha-wa/leads-export', (req: any, res: any) => {
 // [+campanha-wa 17/11] fim export de leads
 // ============================================================================
 
+// ============================================================================
+// [+campanha-wa 17/11] AUTOMAÇÃO DE DISPARO SDR — 10/dia/instrumento + gate + handoff 7 dias
+// Tudo DESLIGADO por padrão (campanha_wa_config.ativo=0). Nada dispara até POST /campanha-wa/ligar.
+// ============================================================================
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS campanha_wa_leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    projeto TEXT, telefone TEXT, nome TEXT, contato_id TEXT,
+    status TEXT DEFAULT 'pendente',
+    dia_envio TEXT, primeira_msg_em TEXT, enviado_em TEXT, atualizado_em TEXT, obs TEXT
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ix_campwa_proj_tel ON campanha_wa_leads(projeto, telefone)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS campanha_wa_config (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    ativo INTEGER DEFAULT 0, por_dia INTEGER DEFAULT 10,
+    hora_inicio INTEGER DEFAULT 9, hora_fim INTEGER DEFAULT 20, dias_handoff INTEGER DEFAULT 7,
+    msg_teclado TEXT, msg_baixo TEXT, msg_violao TEXT, atualizado_em TEXT
+  )`);
+  const _cwc = db.prepare(`SELECT id FROM campanha_wa_config WHERE id=1`).get();
+  if (!_cwc) {
+    db.prepare(`INSERT INTO campanha_wa_config(id,ativo,por_dia,hora_inicio,hora_fim,dias_handoff,msg_teclado,msg_baixo,msg_violao,atualizado_em) VALUES(1,0,10,9,20,7,?,?,?,?)`).run(
+      'Oi! Aqui é da equipe do Prof. Ezequias, do Melodias e Riffs 🎹 Vi que você está num dos nossos grupos de teclado gospel aqui no WhatsApp. Posso te fazer uma pergunta rápida? Hoje você já consegue tocar algum louvor na igreja ou tá começando do zero?',
+      'Oi! Aqui é da equipe do Prof. Ezequias, do Melodias e Riffs 🎸 Vi que você está num dos nossos grupos de baixo gospel aqui no WhatsApp. Rapidinho: você já toca baixo na igreja ou tá começando agora?',
+      'Oi! Aqui é da equipe do Prof. Ezequias, do Melodias e Riffs 🎸 Vi que você está num dos nossos grupos de violão gospel aqui no WhatsApp. Posso perguntar? Você já consegue acompanhar um louvor no violão ou tá começando do zero?',
+      agora());
+  }
+} catch (e) { console.log('[campanha-wa] setup tabelas falhou:', e); }
+
+const _CAMPWA_ENVIO: Record<string, string> = { teclado: '5516981708151', baixo: '5516981059200', violao: '5516981708144' };
+function _campwaCfg(): any { try { return db.prepare(`SELECT * FROM campanha_wa_config WHERE id=1`).get() || {}; } catch { return {}; } }
+function _campwaAgoraBRT(): Date { return new Date(Date.now() - 3 * 3600 * 1000); }
+function _campwaHojeBRT(): string { return _campwaAgoraBRT().toISOString().slice(0, 10); }
+function _campwaInstancia(projeto: string): string | null {
+  const tel = _CAMPWA_ENVIO[projeto]; if (!tel) return null;
+  try { const r = db.prepare(`SELECT instancia FROM numeros WHERE telefone=? AND status='conectado' ORDER BY criado_em LIMIT 1`).get(tel) as any; if (r && r.instancia) return r.instancia; } catch { /* */ }
+  try { const n = numeroConectado(projeto as any); return n ? n.instancia : null; } catch { return null; }
+}
+async function _campwaTemWhatsapp(instancia: string, telefone: string): Promise<boolean | null> {
+  try {
+    const r: any = await evo(`/chat/whatsappNumbers/${encodeURIComponent(instancia)}`, 'POST', { numbers: [telefone] });
+    const arr: any[] = Array.isArray(r) ? r : (r && Array.isArray(r.data) ? r.data : []);
+    if (arr.length) { const it = arr[0]; return !!(it && (it.exists === true || it.exists === 'true' || it.jid)); }
+    return false;
+  } catch { return null; } // transiente/endpoint -> indefinido (não marca inválido, tenta depois)
+}
+function _campwaAgenteId(projeto: string): string | null {
+  try { const a = agenteDoProjeto(projeto); if (a && a.id) return a.id; } catch { /* */ }
+  try { const a = db.prepare(`SELECT id FROM agentes_ia WHERE projeto=? ORDER BY atualizado_em DESC LIMIT 1`).get(projeto) as any; return a ? a.id : null; } catch { return null; }
+}
+let _campwaRodando = false;
+async function _campwaTick(): Promise<void> {
+  if (_campwaRodando) return; _campwaRodando = true;
+  try {
+    const cfg = _campwaCfg(); if (!cfg || !cfg.ativo) return;
+    const dBRT = _campwaAgoraBRT();
+    const horaFloat = dBRT.getUTCHours() + dBRT.getUTCMinutes() / 60;
+    const hIni = Number(cfg.hora_inicio || 9), hFim = Number(cfg.hora_fim || 20);
+    if (horaFloat < hIni || horaFloat >= hFim) return;
+    const hoje = _campwaHojeBRT(); const porDia = Number(cfg.por_dia || 10);
+    const frac = Math.max(0, Math.min(1, (horaFloat - hIni) / Math.max(0.5, (hFim - hIni))));
+    const permitidoAgora = Math.max(1, Math.ceil(porDia * frac)); // espalha ao longo da janela
+    const msgs: Record<string, string> = { teclado: cfg.msg_teclado, baixo: cfg.msg_baixo, violao: cfg.msg_violao };
+    for (const projeto of ['teclado', 'violao', 'baixo']) {
+      const jaHoje = Number((db.prepare(`SELECT COUNT(*) n FROM campanha_wa_leads WHERE projeto=? AND dia_envio=?`).get(projeto, hoje) as any)?.n || 0);
+      if (jaHoje >= porDia || jaHoje >= permitidoAgora) continue;
+      const inst = _campwaInstancia(projeto); if (!inst) continue;
+      const lead = db.prepare(`SELECT * FROM campanha_wa_leads WHERE projeto=? AND status='pendente' ORDER BY id LIMIT 1`).get(projeto) as any;
+      if (!lead) continue;
+      const tel = String(lead.telefone || '').replace(/\D/g, ''); if (!tel) { db.prepare(`UPDATE campanha_wa_leads SET status='invalido', atualizado_em=? WHERE id=?`).run(agora(), lead.id); continue; }
+      const tem = await _campwaTemWhatsapp(inst, tel);
+      if (tem === false) { db.prepare(`UPDATE campanha_wa_leads SET status='sem_whatsapp', atualizado_em=? WHERE id=?`).run(agora(), lead.id); continue; }
+      if (tem === null) continue; // tenta no próximo tick
+      const cid = upsertContato(projeto, tel, lead.nome || undefined, undefined, 'campanha-wa');
+      if (_contatoEhAluno(projeto, cid)) { db.prepare(`UPDATE campanha_wa_leads SET status='aluno', contato_id=?, atualizado_em=? WHERE id=?`).run(cid, agora(), lead.id); continue; }
+      const texto = String(msgs[projeto] || '');
+      try { await enviarTexto(projeto as any, tel, texto, inst); }
+      catch (e: any) { db.prepare(`UPDATE campanha_wa_leads SET obs=?, atualizado_em=? WHERE id=?`).run('erro envio: ' + String((e && e.message) || e).slice(0, 140), agora(), lead.id); continue; }
+      try { aplicarTag(projeto, cid, 'sdr-wa-' + projeto); } catch { /* */ }
+      try { const aid = _campwaAgenteId(projeto); if (aid) db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(cid, aid, 'campanha-wa', agora()); } catch { /* */ }
+      db.prepare(`UPDATE campanha_wa_leads SET status='enviado', contato_id=?, dia_envio=?, primeira_msg_em=?, enviado_em=?, atualizado_em=? WHERE id=?`).run(cid, hoje, agora(), agora(), agora(), lead.id);
+      break; // 1 envio por tick (ritmo humano)
+    }
+  } catch (e) { /* nunca quebra */ } finally { _campwaRodando = false; }
+}
+function _campwaSweepHandoff(): void {
+  try {
+    const cfg = _campwaCfg(); const dias = Number(cfg.dias_handoff || 7);
+    const limite = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
+    const vencidos = db.prepare(`SELECT * FROM campanha_wa_leads WHERE status IN ('enviado','respondeu') AND primeira_msg_em IS NOT NULL AND primeira_msg_em < ?`).all(limite) as any[];
+    for (const l of vencidos) {
+      try { if (l.contato_id) db.prepare(`DELETE FROM contato_agente WHERE contato_id=? AND origem='campanha-wa'`).run(l.contato_id); } catch { /* */ }
+      db.prepare(`UPDATE campanha_wa_leads SET status='handoff_manual', atualizado_em=? WHERE id=?`).run(agora(), l.id);
+    }
+  } catch { /* */ }
+}
+setInterval(() => { _campwaTick().catch(() => { }); }, 4 * 60 * 1000);
+setInterval(() => { try { _campwaSweepHandoff(); } catch { /* */ } }, 60 * 60 * 1000);
+
+function _campwaAuth(req: any, res: any): boolean { const k = req.headers['x-api-key']; if (ENGINE_API_KEY && k !== ENGINE_API_KEY) { res.status(401).json({ ok: false, erro: 'nao autorizado' }); return false; } return true; }
+app.get('/campanha-wa/status', (req: any, res: any) => {
+  try {
+    const por: any = {};
+    for (const p of ['teclado', 'baixo', 'violao']) {
+      const rows = db.prepare(`SELECT status, COUNT(*) n FROM campanha_wa_leads WHERE projeto=? GROUP BY status`).all(p) as any[];
+      const m: any = {}; for (const r of rows) m[r.status] = r.n; por[p] = m;
+    }
+    const hoje = _campwaHojeBRT();
+    const env = db.prepare(`SELECT projeto, COUNT(*) n FROM campanha_wa_leads WHERE dia_envio=? GROUP BY projeto`).all(hoje) as any[];
+    res.json({ ok: true, config: _campwaCfg(), por_status: por, enviados_hoje: env });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/campanha-wa/importar', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const projeto = String(req.query.projeto || (req.body && req.body.projeto) || '');
+    const leads = (req.body && req.body.leads) || [];
+    if (!projeto || !Array.isArray(leads)) return res.status(400).json({ ok: false, erro: 'projeto+leads obrigatorios' });
+    const ins = db.prepare(`INSERT OR IGNORE INTO campanha_wa_leads(projeto,telefone,nome,status,atualizado_em) VALUES(?,?,?,'pendente',?)`);
+    let n = 0; const tx = db.transaction((arr: any[]) => { for (const x of arr) { const tel = String((x.telefone || x.tel || '')).replace(/\D/g, ''); if (!tel) continue; const r = ins.run(projeto, tel, String(x.nome || ''), agora()); if (r.changes) n++; } });
+    tx(leads);
+    const tot = Number((db.prepare(`SELECT COUNT(*) n FROM campanha_wa_leads WHERE projeto=?`).get(projeto) as any)?.n || 0);
+    res.json({ ok: true, projeto, inseridos: n, total_fila: tot });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/campanha-wa/config', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const b = req.body || {}; const cur = _campwaCfg();
+    const g = (k: string, d: any) => (b[k] !== undefined ? b[k] : (cur[k] !== undefined ? cur[k] : d));
+    db.prepare(`UPDATE campanha_wa_config SET por_dia=?,hora_inicio=?,hora_fim=?,dias_handoff=?,msg_teclado=?,msg_baixo=?,msg_violao=?,atualizado_em=? WHERE id=1`)
+      .run(Number(g('por_dia', 10)), Number(g('hora_inicio', 9)), Number(g('hora_fim', 20)), Number(g('dias_handoff', 7)), String(g('msg_teclado', '')), String(g('msg_baixo', '')), String(g('msg_violao', '')), agora());
+    res.json({ ok: true, config: _campwaCfg() });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/campanha-wa/ligar', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    db.prepare(`UPDATE campanha_wa_config SET ativo=1, atualizado_em=? WHERE id=1`).run(agora());
+    try { if (!(CONFIG as any).agentesHabilitados) (CONFIG as any).agentesHabilitados = {}; for (const p of ['teclado', 'baixo', 'violao']) (CONFIG as any).agentesHabilitados[p] = true; salvarConfigPermanente(); } catch { /* */ }
+    res.json({ ok: true, ativo: 1 });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.post('/campanha-wa/desligar', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try { db.prepare(`UPDATE campanha_wa_config SET ativo=0, atualizado_em=? WHERE id=1`).run(agora()); res.json({ ok: true, ativo: 0 }); }
+  catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.get('/campanha-wa/handoffs', (req: any, res: any) => {
+  try { const rows = db.prepare(`SELECT projeto,telefone,nome,primeira_msg_em FROM campanha_wa_leads WHERE status='handoff_manual' ORDER BY primeira_msg_em DESC LIMIT 1000`).all(); res.json({ ok: true, total: rows.length, handoffs: rows }); }
+  catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+// ============================================================================
+// [+campanha-wa 17/11] fim automação de disparo
+// ============================================================================
+
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
 // ============================================================================
