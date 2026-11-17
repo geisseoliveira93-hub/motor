@@ -14957,6 +14957,38 @@ app.get('/disparo/grupos/membros-preview', (req, res) => {
 // [+campanha-wa 17/11] fim extração de membros
 // ============================================================================
 
+// ============================================================================
+// [+campanha-wa 17/11] EXPORT de leads p/ campanha SDR — contatos por instrumento, marcando ALUNO
+// aluno = contato matriculado na Academy (qualquer curso) OU com tag de aluno no projeto.
+// ============================================================================
+app.get('/campanha-wa/alunos-telefones', (req: any, res: any) => {
+  try {
+    const rows = db.prepare(`SELECT DISTINCT c.telefone tel FROM academy_matriculas m JOIN contatos c ON c.id=m.contato_id WHERE c.telefone IS NOT NULL AND c.telefone<>''`).all() as any[];
+    const tels = rows.map((r: any) => String((r && r.tel) || ''));
+    res.json({ ok: true, total: tels.length, telefones: tels });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+app.get('/campanha-wa/leads-export', (req: any, res: any) => {
+  try {
+    const projeto = String(req.query.projeto || '');
+    if (!projeto) return res.status(400).json({ ok: false, erro: 'projeto obrigatorio' });
+    // 1) ids de contato que sao aluno pela MATRICULA (qualquer curso)
+    const alunoIds = new Set<string>();
+    try { for (const r of (db.prepare(`SELECT DISTINCT contato_id cid FROM academy_matriculas WHERE contato_id IS NOT NULL AND contato_id<>''`).all() as any[])) alunoIds.add(String(r.cid)); } catch { /* best-effort */ }
+    // 2) ids de contato com TAG de aluno nesse projeto (mesma regra do _contatoEhAluno)
+    try {
+      const at = db.prepare(`SELECT DISTINCT ct.contato_id cid, t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE t.projeto=?`).all(projeto) as any[];
+      for (const r of at) { const n = String((r && r.nome) || '').toLowerCase().trim(); if (!n) continue; if (n === 'alunos' || n === 'aluno' || n.startsWith('aluno-') || /^t\d+-aluno/.test(n) || _ALUNO_TAG_PADROES.some((p) => n.includes(p))) alunoIds.add(String(r.cid)); }
+    } catch { /* best-effort */ }
+    const rows = db.prepare(`SELECT id, telefone, nome, origem, criado_em FROM contatos WHERE projeto=?`).all(projeto) as any[];
+    const leads = rows.map((r: any) => ({ telefone: r.telefone, nome: r.nome, origem: r.origem, criado_em: r.criado_em, eh_aluno: alunoIds.has(String(r.id)) }));
+    res.json({ ok: true, projeto, total: leads.length, alunos_no_projeto: leads.filter((x: any) => x.eh_aluno).length, leads });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+// ============================================================================
+// [+campanha-wa 17/11] fim export de leads
+// ============================================================================
+
 app.listen(PORT, () => console.log(`[engine] ouvindo na porta ${PORT} — base ${PUBLIC_BASE_URL}`));
 
 // ============================================================================
