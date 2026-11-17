@@ -15187,14 +15187,14 @@ app.get('/campanha-wa/handoffs', (req: any, res: any) => {
 app.post('/campanha-wa/fix-linguagem', (req: any, res: any) => {
   if (!_campwaAuth(req, res)) return;
   try {
-    const rx = /\b([cC])[eê]\b/g; // casa ce, cê, Ce, Cê — NÃO casa CE (acrônimo) nem "cê" dentro de "você"
+    const rx = /(^|[^0-9A-Za-zÀ-ÿ])([cC])[eê](?![0-9A-Za-zÀ-ÿ])/g; // ce, cê, Ce, Cê isolado (JS \b não trata "ê" como letra); não pega "você" nem "aparece"
     const regra = '\n\n[LINGUAGEM] Fale sempre "você" por extenso. NUNCA use "cê" nem "ce" pra se referir ao lead (pode manter "tá", "pra", "né").';
     const ags = db.prepare(`SELECT id, projeto, nome, prompt FROM agentes_ia`).all() as any[];
     const out: any[] = [];
     for (const a of ags) {
       let p = String(a.prompt || '');
       const antes = (p.match(rx) || []).length;
-      p = p.replace(rx, (m: string) => (m[0] === 'C' ? 'Você' : 'você'));
+      p = p.replace(rx, (_m: string, p1: string, pc: string) => p1 + (pc === 'C' ? 'Você' : 'você'));
       if (!p.includes('[LINGUAGEM] Fale sempre')) p += regra;
       db.prepare(`UPDATE agentes_ia SET prompt=?, atualizado_em=? WHERE id=?`).run(p, agora(), a.id);
       out.push({ id: a.id, projeto: a.projeto, nome: a.nome, trocados: antes });
