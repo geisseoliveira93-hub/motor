@@ -5844,10 +5844,10 @@ app.get('/disparo/fila-detalhe', (req: any, res: any) => {
     const args: any[] = [];
     if (req.query.is_grupo != null && String(req.query.is_grupo) !== '') { cond += ' AND f.is_grupo=?'; args.push(Number(req.query.is_grupo) ? 1 : 0); }
     if (req.query.instancia) { cond += ' AND f.instancia=?'; args.push(String(req.query.instancia)); }
-    const rows = db.prepare(`SELECT f.id,f.para,f.is_grupo,f.instancia,f.status,f.tipo,f.texto,f.legenda,f.agendado_para,f.tentativas,f.pausado,f.lote_id,f.lote_nome,f.criado_em, g.nome gnome
+    const rows = db.prepare(`SELECT f.id,f.para,f.is_grupo,f.instancia,f.status,f.tipo,f.texto,f.legenda,f.agendado_para,f.tentativas,f.pausado,f.lote_id,f.lote_nome,f.ultimo_erro,f.criado_em, g.nome gnome
       FROM fila_envio f LEFT JOIN grupos_wpp g ON g.id=f.para
       WHERE ${cond} ORDER BY (f.agendado_para IS NULL), f.agendado_para, f.criado_em LIMIT ${limite}`).all(...args) as any[];
-    const itens = rows.map((r) => ({ id: r.id, para: r.para, is_grupo: r.is_grupo ? 1 : 0, nome: r.gnome || r.para, instancia: r.instancia || '', status: r.status, pausado: r.pausado ? 1 : 0, tipo: r.tipo || 'texto', preview: String(r.texto || r.legenda || '').slice(0, 180), agendado_para: r.agendado_para || null, tentativas: r.tentativas || 0, lote_id: r.lote_id || '', lote_nome: r.lote_nome || '' }));
+    const itens = rows.map((r) => ({ id: r.id, para: r.para, is_grupo: r.is_grupo ? 1 : 0, nome: r.gnome || r.para, instancia: r.instancia || '', status: r.status, pausado: r.pausado ? 1 : 0, tipo: r.tipo || 'texto', preview: String(r.texto || r.legenda || '').slice(0, 180), agendado_para: r.agendado_para || null, tentativas: r.tentativas || 0, lote_id: r.lote_id || '', lote_nome: r.lote_nome || '', erro: r.ultimo_erro || null }));
     const cont = db.prepare(`SELECT CASE WHEN status='falhou' THEN 'falhou' WHEN status IN ('camp_pend','cmp_multi','cmp_mmk') THEN 'aguardando' WHEN status='enviado' THEN 'enviado' ELSE 'outro' END k, COUNT(*) n FROM fila_envio GROUP BY k`).all() as any[];
     const contagem: any = { aguardando: 0, enviado: 0, falhou: 0 };
     for (const c of cont) contagem[c.k] = c.n;
@@ -8277,6 +8277,7 @@ console.log('[+envios-salvos] /envios (list/get/salvar/nome/duplicar/excluir) + 
 // ============================================================================
 const MEDIA_PUBLIC_BASE = String(process.env.MEDIA_PUBLIC_BASE || PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 try { db.exec(`ALTER TABLE fila_envio ADD COLUMN instancia TEXT`); } catch { /* ja existe */ }
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN ultimo_erro TEXT`); } catch { /* ja existe */ } // [+erro-midia 18/11] motivo da última falha do item (pra diagnosticar mídia que não sai)
 
 // baixa do OneDrive e devolve URL PÚBLICA (com domínio) p/ a Evolution conseguir buscar.
 function _odBaixarPub(rel: string): string {
@@ -8363,8 +8364,9 @@ async function tickCampanhaMulti() {
         _arRegistrar(item);
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
         }
-      } catch {
+      } catch (e) {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_multi' END WHERE id=?`).run(item.id);
+        try { db.prepare(`UPDATE fila_envio SET ultimo_erro=? WHERE id=?`).run(String((e && e.message) || e).slice(0, 500), item.id); } catch { /* best-effort */ } // [+erro-midia 18/11] registra o motivo da falha
       }
     }));
   } finally { _multiBusy = false; }
@@ -8606,8 +8608,9 @@ async function tickCampanhaMultiMk() {
         _arRegistrar(item);
         db.prepare(`UPDATE fila_envio SET status='enviado' WHERE id=?`).run(item.id);
         }
-      } catch {
+      } catch (e) {
         db.prepare(`UPDATE fila_envio SET tentativas=tentativas+1, status=CASE WHEN tentativas>=3 THEN 'falhou' ELSE 'cmp_mmk' END WHERE id=?`).run(item.id);
+        try { db.prepare(`UPDATE fila_envio SET ultimo_erro=? WHERE id=?`).run(String((e && e.message) || e).slice(0, 500), item.id); } catch { /* best-effort */ } // [+erro-midia 18/11] registra o motivo da falha
       }
     }));
   } finally { _mkBusy = false; }
