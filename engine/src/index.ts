@@ -1178,6 +1178,19 @@ async function dispararEntrega(projeto: Projeto, telefone: string, nome?: string
     } catch { /* best-effort: nunca bloqueia a entrega por erro da trava */ }
     enfileirarFluxo(projeto, telefone, fluxo, nome, optsNome, fpProduto?.instancia || undefined, fpProduto?.chave); return 'fluxo';
   }
+  // [+no-cademi-default 18/11 Ezequias] NAO manda a mensagem-padrao antiga (Cademi) quando o comprador
+  // JA recebe o acesso pela Academia nova (_acAcessoNaVenda). Corrige a 2a mensagem duplicada do Baixista
+  // Pro: o fluxo vazio ([]) caia no fallback generico, que apontava pra academia antiga (cademi.com.br).
+  // ADITIVO: so pula o fallback; nenhum fluxo configurado e alterado. Gated pelo MESMO flag do acesso novo
+  // (acesso_academy_msg_ativo), entao so suprime quando a 1a mensagem (Academia nova) realmente sai.
+  try {
+    if (pubFlag('acesso_academy_msg_ativo', '0') === '1'
+        && Array.isArray(_ACESSO_ACADEMY_MSG)
+        && _ACESSO_ACADEMY_MSG.some((m: any) => m && m.match && m.match.test(String(produtoNome || '')))) {
+      console.log('[entrega] fallback Cademi pulado (produto entregue pela Academia nova):', String(produtoNome || ''));
+      return 'mensagem';
+    }
+  } catch { /* best-effort: se a trava falhar, mantem o comportamento antigo */ }
   await enviarTexto(projeto, telefone, preenche(CONFIG.entrega[projeto], nome)).catch(() => {});
   return 'mensagem';
 }
