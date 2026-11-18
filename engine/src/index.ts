@@ -14513,7 +14513,8 @@ app.post('/area/login', (req: any, res: any) => {
     const b = req.body || {};
     const email = String(b.email || '').trim().toLowerCase();
     const al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
-    if (!al || !al.senha_hash || al.senha_hash !== _acHash(String(b.senha || ''))) {
+    const _senhaIn = String(b.senha || '').replace(/^\s+|\s+$/g, ''); // [+login-trim 18/11] senha colada do WhatsApp/e-mail costuma vir com espaco/quebra no inicio/fim -> limpa antes de comparar (nao afeta quem digita certo)
+    if (!al || !al.senha_hash || al.senha_hash !== _acHash(_senhaIn)) {
       return res.type('html').send(_acLoginHtml('E-mail ou senha incorretos.'));
     }
     _acSetSession(res, al.id, req, String((b && b.lembrar) || '') === '1'); // [+login-lembrar] sem marcar = sessão só até fechar o navegador
@@ -19075,6 +19076,11 @@ try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bumps_json TEXT`); } catch { /*
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bundle_json TEXT`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN msg_entrega TEXT`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN endereco_json TEXT`); } catch { /* já existe */ }
+// [+ck-dedup-atomico 18/11 Ezequias] trava ATOMICA por pedido (tabela propria com PK). A dedup antiga usava
+// academy_envio_acesso, que tem schema divergente (criada antes com colunas aluno_id/wa_ok/...), entao o INSERT
+// de registro (id,canal,criado_em) estourava no try/catch silencioso -> a trava nunca gravava -> no cartao
+// aprovado na hora o checkout mandava (gatilho 1) e o webhook mandava de novo (gatilho 2) = mensagem duplicada.
+try { db.exec(`CREATE TABLE IF NOT EXISTS ck_entregue_msg ( chave TEXT PRIMARY KEY, criado_em TEXT )`); } catch { /* ja existe */ }
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS ck_cupons (
     id TEXT PRIMARY KEY, codigo TEXT UNIQUE, tipo TEXT DEFAULT 'percent', valor INTEGER DEFAULT 0,
@@ -19144,6 +19150,9 @@ function _ckConceder(pedidoId: string): void {
       }
     } catch { /* */ }
     const dedupKey = 'ckped:' + pedidoId; // [+ck-dedup-pedido 16/11] dedup por PEDIDO: cada compra confirma 1x (recompra de aluno antigo tambem recebe)
+    // [+ck-dedup-atomico 18/11] reserva ATOMICA por pedido ANTES de mandar: o 1o INSERT vence (changes=1) e segue;
+    // o 2o gatilho (webhook depois do checkout) pega changes=0 e sai sem remandar. Nao depende da academy_envio_acesso quebrada.
+    try { const _g: any = db.prepare(`INSERT OR IGNORE INTO ck_entregue_msg (chave, criado_em) VALUES (?,?)`).run(dedupKey, agora()); if (!_g || _g.changes === 0) return; } catch { /* se a trava falhar, cai no dedup antigo abaixo */ }
     const jaEnv = db.prepare(`SELECT 1 FROM academy_envio_acesso WHERE email=? AND curso_id=?`).get(email, dedupKey);
     if (jaEnv) return; // já mandou acesso desse produto pra esse e-mail (recompra): não remanda
     const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
