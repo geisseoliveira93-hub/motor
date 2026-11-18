@@ -18500,6 +18500,9 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
     const v: any = { nome: wPrimeiroNome(ins.nome), quando, plataforma: cfg.plataforma || '', suporte: cfg.suporte || '', link_oferta: b + '/r/' + funil + '/oferta/' + t };
     for (const a of wAulas(cfg)) v['link_' + a.k] = b + '/r/' + funil + '/' + a.k + '/' + t;
     v.link_aula = v['link_' + wPrimeiraAula(cfg).k];
+    // [+link-aula-num 17/11] alias p/ copy que usa {link_aula1/aula2/aula3}: a chave da aula e a1/a2/a3,
+    // entao mapeia por ORDEM (1a aula -> link_aula1, etc) apontando pro mesmo link_<k> ja montado. Add-only.
+    { let _an = 0; for (const _a of wAulas(cfg)) { _an++; const _lk = v['link_' + _a.k]; if (_lk !== undefined) v['link_aula' + _an] = _lk; } }
     v.fim_oferta = wDataBRT(wFimOferta(cfg, ins)).split('-').reverse().slice(0, 2).join('/');
     return v;
   }
