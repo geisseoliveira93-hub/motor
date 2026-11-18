@@ -8371,6 +8371,23 @@ async function tickCampanhaMulti() {
 }
 setInterval(() => { tickCampanhaMulti().catch(() => {}); }, 1000);
 
+// [+auto-retry-midia 18/11 Ezequias] "SEMPRE enviar tudo": se a IMAGEM/VÍDEO/DOC de um
+// disparo de GRUPO falhar (texto saiu, mídia não = "parcial"), o motor reenfileira a mídia
+// UMA vez automático ~3min depois (quando o congestionamento do disparo já passou). NÃO mexe
+// em texto, NÃO reenvia envio antigo (só falhas das últimas 2h), NÃO entra em loop (flag auto_retry).
+try { db.exec(`ALTER TABLE fila_envio ADD COLUMN auto_retry INTEGER DEFAULT 0`); } catch { /* ja existe */ }
+setInterval(() => {
+  try {
+    const lim2h = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+    const n = db.prepare(`UPDATE fila_envio SET status='cmp_multi', tentativas=0, pausado=0, agendado_para=NULL, auto_retry=1
+      WHERE status='falhou' AND (auto_retry IS NULL OR auto_retry=0) AND is_grupo=1
+        AND tipo IS NOT NULL AND tipo<>'texto'
+        AND instancia IS NOT NULL AND instancia<>'' AND criado_em >= ?`).run(lim2h).changes;
+    if (n > 0) console.log('[auto-retry-midia] reenfileiradas ' + n + ' mídia(s) que falharam no disparo (1x automático)');
+  } catch (e) { /* best-effort, nunca derruba o motor */ }
+}, 180000);
+console.log('[auto-retry-midia] reenvio automático de mídia falha em disparo de grupo (1x, últimas 2h) ativo');
+
 // lista, p/ cada grupo, quais dos NOSSOS números são admin (p/ a tela montar as opções).
 app.post('/disparo/grupos-admins', async (req, res) => {
   try {
