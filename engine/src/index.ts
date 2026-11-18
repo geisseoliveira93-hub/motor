@@ -3072,6 +3072,14 @@ function _injetarBannerLgpd(html: string): string {
 app.get('/p/:slug', (req, res) => {
   const p = db.prepare(`SELECT * FROM paginas WHERE slug=? AND publicada=1`).get(req.params.slug) as any;
   if (!p) return res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><h1>Pagina nao encontrada</h1>');
+  // [+bajista-pixel-es 18/11] a pagina bajista-pro é do produto ESPANHOL/México (Hotmart 8954222):
+  // forca o projeto de rastreio ISOLADO "bajista" (pixel ES 1102418075962206 + CAPI, ja configurado em
+  // track_config), igual ao subdominio bajista.melodiaseriffs.com.br, pra NÃO sujar o pixel BR do baixo
+  // (1913449705981574). So troca o pixel DESTA pagina; botoes/VSL/UTM/LGPD ficam iguais. ADD-ONLY/idempotente.
+  if (String(req.params.slug) === 'bajista-pro') {
+    const _htmlEs = String(p.html || '').replace(/("projeto":")[^"]*(")/g, '$1bajista$2').replace(/(snippet\.js\?projeto=)[a-z0-9_-]+/gi, '$1bajista');
+    return res.type('html').send(_injetarBannerLgpd(_injetarTrackPagina(_wrapPagina(_htmlEs, p), 'bajista')));
+  }
   res.type('html').send(_injetarBannerLgpd(_injetarTrackPagina(_wrapPagina(String(p.html || ''), p), p.projeto)));
 });
 
@@ -14706,6 +14714,57 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
 });
 
 // ---------- [B.5] PÁGINA DO CURSO ----------
+// [+popup-idioma 18/11 Ezequias] Popup que ensina o aluno a trocar a FAIXA DE ÁUDIO (PT/ES) no player,
+// mostrado ao ABRIR um curso com áudio bilíngue. ADD-ONLY. HTML/CSS/JS escopados com prefixo mrpopidi-
+// pra não colidir com a área do aluno. Só aparece nos cursos listados em _ACADEMY_POPUP_IDIOMA_CURSOS.
+const _ACADEMY_POPUP_IDIOMA_CURSOS = ['42825fe8-0b6a-464a-b7c7-1b98048571ff']; // Método Baixista Pró (áudio PT + ES)
+const _acPopupIdioma = (curso: any): string => {
+  try { if (!curso || !_ACADEMY_POPUP_IDIOMA_CURSOS.includes(String(curso.id))) return ''; } catch { return ''; }
+  return `<div class="mrpopidi-ov" id="mrpopidi" role="dialog" aria-modal="true">
+<style>
+.mrpopidi-ov{position:fixed;inset:0;background:rgba(5,6,10,.74);display:grid;place-items:center;padding:16px;z-index:99999;font:15px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif}
+.mrpopidi{width:100%;max-width:520px;max-height:92vh;overflow:auto;background:#15161c;border:1px solid #2a2b36;border-radius:18px;box-shadow:0 24px 70px rgba(0,0,0,.6);color:#edeef2}
+.mrpopidi .hd{padding:20px 22px 0;text-align:center}
+.mrpopidi .mr{display:inline-flex;align-items:center;justify-content:center;width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,#e7c86a,#caa94a);color:#1a1400;font-weight:900;font-size:17px;margin-bottom:12px}
+.mrpopidi h3{font-size:19px;margin:0;line-height:1.3;color:#edeef2}
+.mrpopidi h3 .es{display:block;color:#e7c86a;font-size:15px;font-weight:600;margin-top:2px}
+.mrpopidi .sub{color:#9094a3;font-size:13.5px;margin:10px 22px 0;text-align:center}
+.mrpopidi .sub b{color:#edeef2}
+.mrpopidi .ps{display:flex;flex-direction:column;gap:9px;padding:16px 22px 4px}
+.mrpopidi .p{display:flex;gap:12px;align-items:center;background:#1c1d25;border:1px solid #2a2b36;border-radius:12px;padding:11px 13px}
+.mrpopidi .n{flex:0 0 auto;width:28px;height:28px;border-radius:50%;background:#e7c86a;color:#1a1400;font-weight:800;display:grid;place-items:center;font-size:14px}
+.mrpopidi .t{font-weight:600;font-size:14px}
+.mrpopidi .t .es{display:block;color:#9094a3;font-weight:500;font-size:12.5px;margin-top:1px}
+.mrpopidi .ic{margin-left:auto;font-size:18px}
+.mrpopidi .yt{margin:12px 22px 0;background:#0f0f0f;border:1px solid #2a2b36;border-radius:12px;padding:10px}
+.mrpopidi .yt .cap{color:#9094a3;font-size:11px;text-align:center;margin-bottom:8px}
+.mrpopidi .yt .mn{background:#212121;border-radius:10px;overflow:hidden;max-width:300px;margin:0 auto}
+.mrpopidi .yt .r{display:flex;align-items:center;gap:10px;padding:9px 13px;font-size:13px;color:#fff;border-bottom:1px solid #2f2f2f}
+.mrpopidi .yt .r:last-child{border-bottom:none}
+.mrpopidi .yt .r .v{margin-left:auto;color:#aaa;font-size:12px}
+.mrpopidi .yt .r.hl{background:#3a3217}
+.mrpopidi .yt .r.hl .v{color:#e7c86a}
+.mrpopidi .wr{display:flex;gap:9px;align-items:flex-start;margin:12px 22px 0;background:rgba(231,200,106,.08);border:1px solid rgba(231,200,106,.3);border-radius:10px;padding:11px 13px;font-size:12.5px;color:#f0e4bf}
+.mrpopidi .wr .es{color:#c9bd93;display:block;margin-top:2px}
+.mrpopidi .ft{padding:16px 22px 20px}
+.mrpopidi .bt{width:100%;border:none;border-radius:12px;padding:14px;font-size:15px;font-weight:800;cursor:pointer;background:linear-gradient(135deg,#e7c86a,#caa94a);color:#1a1400}
+.mrpopidi .once{text-align:center;color:#9094a3;font-size:11.5px;margin-top:10px}
+</style>
+<div class="mrpopidi">
+<div class="hd"><div class="mr">M|R</div><h3>🎧 Escolha o idioma do áudio<span class="es">🎧 Elige el idioma del audio</span></h3></div>
+<p class="sub">Este curso tem áudio em <b>Português</b> e <b>Español</b>. Escolha o seu antes de começar pra entender tudo.<br><span style="color:#9094a3">Este curso tiene audio en Portugués y Español. Elige el tuyo antes de empezar para entenderlo todo.</span></p>
+<div class="ps">
+<div class="p"><span class="n">1</span><span class="t">Dê play no vídeo<span class="es">Dale play al video</span></span><span class="ic">▶️</span></div>
+<div class="p"><span class="n">2</span><span class="t">Toque na engrenagem<span class="es">Toca el engranaje</span></span><span class="ic">⚙️</span></div>
+<div class="p"><span class="n">3</span><span class="t">Abra “Faixa de áudio” e escolha<span class="es">Abre “Pista de audio” y elige</span></span><span class="ic">🌐</span></div>
+</div>
+<div class="yt"><div class="cap">É isto que você vai ver no player · Esto es lo que verás</div>
+<div class="mn"><div class="r"><span>⚙️</span><span>Qualidade</span><span class="v">360p ›</span></div><div class="r hl"><span>🎧</span><span>Faixa de áudio</span><span class="v">Español ›</span></div></div></div>
+<div class="wr"><span>⚠️</span><span><b>A engrenagem só aparece depois de dar play no vídeo.</b><span class="es">El engranaje solo aparece después de darle play al video.</span></span></div>
+<div class="ft"><button class="bt" onclick="var e=document.getElementById('mrpopidi');if(e)e.parentNode&&e.remove?e.remove():e.style.display='none'">Entendi! · ¡Entendido!</button>
+<div class="once">Esta mensagem aparece ao abrir o curso · Este mensaje aparece al abrir el curso</div></div>
+</div></div>`;
+};
 app.get('/area/curso/:id', (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
@@ -14760,7 +14819,7 @@ app.get('/area/curso/:id', (req: any, res: any) => {
       </div>
       <script>var _ACBIDX=${_acbJson};function _acbEsc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}function _acbHl(s,t){s=String(s);if(!t)return _acbEsc(s);var i=s.toLowerCase().indexOf(t);if(i<0)return _acbEsc(s);return _acbEsc(s.slice(0,i))+'<mark>'+_acbEsc(s.slice(i,i+t.length))+'</mark>'+_acbEsc(s.slice(i+t.length));}function acBuscar(){var q=document.getElementById('acbq'),res=document.getElementById('acbres'),norm=document.getElementById('acbnormal'),x=document.getElementById('acbx');var t=(q.value||'').trim().toLowerCase();if(x)x.hidden=!t;if(!t){res.hidden=true;norm.hidden=false;res.innerHTML='';return;}var f=_ACBIDX.filter(function(a){return (a.t+' '+a.m).toLowerCase().indexOf(t)>=0;});norm.hidden=true;res.hidden=false;if(!f.length){res.innerHTML='<div class="acbempty">Nenhuma aula encontrada</div>';return;}var h='<div class="acbcount">'+f.length+' aula'+(f.length===1?'':'s')+' encontrada'+(f.length===1?'':'s')+'</div>',lm='';f.forEach(function(a){if(a.m!==lm){h+='<div class="acbmod">'+_acbEsc(a.m)+'</div>';lm=a.m;}h+='<a class="acbaula" href="'+a.u+'"><span class="acbplay">▶</span><span class="acbt">'+_acbHl(a.t,t)+'</span></a>';});res.innerHTML=h;}function acBuscaLimpar(){var q=document.getElementById('acbq');q.value='';acBuscar();q.focus();}document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});</script>`;
     _acLog(al.id, 'abriu_curso', curso.id);
-    res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo + (_acEhAdmin(req) ? _AC_ADM_JS : '')));
+    res.type('html').send(_acPage(al, curso.nome || 'Curso', corpo + _acPopupIdioma(curso) + (_acEhAdmin(req) ? _AC_ADM_JS : '')));
   } catch (e: any) { res.status(500).type('html').send('<pre>' + esc(String(e && e.message || e)) + '</pre>'); }
 });
 
