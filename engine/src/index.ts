@@ -4042,6 +4042,36 @@ function _ehNumeroNosso(telefone: string): boolean {
   } catch { return false; }
 }
 
+// [+exclui-cliente 18/11 Ezequias] "nunca abordar/qualificar quem é CLIENTE/ALUNO": além das tags de aluno,
+// trata como EXCLUÍDO quem tem tag de COMPRA (comprou/compra-realizada/compra-aprovada/venda-realizada)
+// OU cujo telefone bate na base da Academia (academy_matriculas), casando pelos ÚLTIMOS 8 dígitos (mesmo
+// padrão já usado no login mágico). Usado na campanha SDR (envio + fila) e no gate do agente.
+const _COMPRA_TAG_PADROES = ['comprou', 'compra-realizada', 'compra-aprovada', 'venda-realizada'];
+function _contatoEhComprador(contatoId: string): boolean {
+  try {
+    const tags = db.prepare(`SELECT t.nome FROM contato_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.contato_id=?`).all(contatoId) as any[];
+    for (const row of tags) { const n = String(row?.nome || '').toLowerCase().trim(); if (!n) continue; if (_COMPRA_TAG_PADROES.some((p) => n.includes(p))) return true; }
+  } catch { /* best-effort */ }
+  return false;
+}
+function _telefoneEhAlunoAcademy(telefone: string): boolean {
+  try {
+    const dig = String(telefone || '').replace(/\D/g, '');
+    if (dig.length < 8) return false;
+    const al = db.prepare(`SELECT 1 FROM academy_matriculas WHERE telefone IS NOT NULL AND telefone<>'' AND replace(replace(replace(replace(replace(replace(telefone,'+',''),'-',''),' ',''),'(',''),')',''),'.','') LIKE ? LIMIT 1`).get('%' + dig.slice(-8));
+    return !!al;
+  } catch { return false; }
+}
+function _ehClienteOuAluno(projeto: string, contatoId: string): boolean {
+  try {
+    if (_contatoEhAluno(projeto, contatoId)) return true;
+    if (_contatoEhComprador(contatoId)) return true;
+    const tel = String((db.prepare(`SELECT telefone FROM contatos WHERE id=?`).get(contatoId) as any)?.telefone || '');
+    if (tel && _telefoneEhAlunoAcademy(tel)) return true;
+  } catch { /* best-effort */ }
+  return false;
+}
+
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----
 app.post('/webhook/evolution', (req, res) => {
   try {
@@ -4073,7 +4103,7 @@ app.post('/webhook/evolution', (req, res) => {
         catch { db.prepare(`INSERT INTO mensagens(id,projeto,contato_id,direcao,texto,criado_em) VALUES(?,?,?,?,?,?)`).run(randomUUID(), projeto, cid, 'entrada', texto, agora()); }
         // Automacoes: gatilho "mensagem_recebida" (palavra-chave opcional na condicao).
         if (!ehGrupo) rodarAutomacoes(projeto, 'mensagem_recebida', { contatoId: cid, telefone, nome: data.pushName, texto }).catch(() => {});
-        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && (_agenteDevResponder(projeto, cid) || _temAgenteAtribuido(cid)) && !_contatoEhAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila (ou agente atribuído manual/handoff); [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
+        try { if (!ehGrupo && ((CONFIG as any).agentesHabilitados || {})[projeto] && (_agenteDevResponder(projeto, cid) || _temAgenteAtribuido(cid)) && !_ehClienteOuAluno(projeto, cid) && !_ehNumeroNosso(telefone)) processarMensagemAgente(projeto, telefone, texto, data.pushName, cid, { instancia: String(ev.instance || '') }).catch(() => {}); } catch { /* agente IA best-effort, etapa14 — e etapa19c: nunca em grupo — [motor2] + gate por tag (8151): sem tag-gatilho fica na fila (ou agente atribuído manual/handoff); [#2-guard] nunca atende aluno nem número nosso; responde pela MESMA instância que recebeu */ }
         // [+recup-dedilhados] gatilho por FRASE do botão WhatsApp + PARADA automática (só teclado, 1-a-1, nunca grupo)
         if (!ehGrupo && projeto === 'teclado') {
           try {
@@ -19927,7 +19957,7 @@ async function _campwaTick(): Promise<void> {
       if (tem === false) { db.prepare(`UPDATE campanha_wa_leads SET status='sem_whatsapp', atualizado_em=? WHERE id=?`).run(agora(), lead.id); continue; }
       if (tem === null) continue; // tenta no próximo tick
       const cid = upsertContato(projeto, tel, lead.nome || undefined, undefined, 'campanha-wa');
-      if (_contatoEhAluno(projeto, cid)) { db.prepare(`UPDATE campanha_wa_leads SET status='aluno', contato_id=?, atualizado_em=? WHERE id=?`).run(cid, agora(), lead.id); continue; }
+      if (_ehClienteOuAluno(projeto, cid)) { db.prepare(`UPDATE campanha_wa_leads SET status='aluno', contato_id=?, atualizado_em=? WHERE id=?`).run(cid, agora(), lead.id); continue; }
       const texto = String(msgs[projeto] || '');
       try { await enviarTexto(projeto as any, tel, texto, inst); }
       catch (e: any) { db.prepare(`UPDATE campanha_wa_leads SET obs=?, atualizado_em=? WHERE id=?`).run('erro envio: ' + String((e && e.message) || e).slice(0, 140), agora(), lead.id); continue; }
@@ -20006,7 +20036,7 @@ app.post('/campanha-wa/popular-fila', (req: any, res: any) => {
           const n = _campwaNorm(r.telefone);
           if (!n) { exTel++; continue; }
           if (alunoTel.has(n)) { exAluno++; continue; }
-          let ehAluno = false; try { ehAluno = _contatoEhAluno(projeto, String(r.id)); } catch { /* */ }
+          let ehAluno = false; try { ehAluno = _ehClienteOuAluno(projeto, String(r.id)); } catch { /* */ }
           if (ehAluno) { exAluno++; continue; }
           if (visto.has(n)) { exDup++; continue; }
           visto.add(n);
@@ -20069,6 +20099,68 @@ app.post('/campanha-wa/fix-linguagem', (req: any, res: any) => {
 });
 // Teste controlado: manda 1 mensagem pelo mesmo caminho (checa WhatsApp -> envia pela instancia do numero de ENVIO)
 // SEM tocar na fila, no ativo, nem no gate/atribuicao. So pra validar o canal antes do go-live.
+// [+exclui-cliente 18/11] limpa a FILA atual: marca como 'aluno' (excluído) todo lead PENDENTE cujo telefone
+// seja de COMPRADOR (tag de compra) ou ALUNO (Academy). Não reenvia nada; só tira da fila de envio.
+app.post('/campanha-wa/reexcluir-clientes', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const excl = new Set<string>();
+    try { for (const r of (db.prepare(`SELECT telefone FROM academy_matriculas WHERE telefone IS NOT NULL AND telefone<>''`).all() as any[])) { const n = _campwaNorm(r.telefone); if (n) excl.add(n); } } catch { /* */ }
+    try {
+      const likes = _COMPRA_TAG_PADROES.map(() => `t.nome LIKE ?`).join(' OR ');
+      const args = _COMPRA_TAG_PADROES.map((p) => '%' + p + '%');
+      for (const r of (db.prepare(`SELECT DISTINCT c.telefone FROM contatos c JOIN contato_tags ct ON ct.contato_id=c.id JOIN tags t ON t.id=ct.tag_id WHERE (${likes}) AND c.telefone IS NOT NULL AND c.telefone<>''`).all(...args) as any[])) { const n = _campwaNorm(r.telefone); if (n) excl.add(n); }
+    } catch { /* */ }
+    let marcados = 0;
+    const pend = db.prepare(`SELECT id, telefone FROM campanha_wa_leads WHERE status='pendente'`).all() as any[];
+    const upd = db.prepare(`UPDATE campanha_wa_leads SET status='aluno', atualizado_em=? WHERE id=?`);
+    const tx = db.transaction(() => { for (const l of pend) { const n = _campwaNorm(l.telefone); if (n && excl.has(n)) { upd.run(agora(), l.id); marcados++; } } });
+    tx();
+    res.json({ ok: true, excluidos_marcados: marcados, chaves_excluidas: excl.size, pendentes_restantes: Number((db.prepare(`SELECT COUNT(*) n FROM campanha_wa_leads WHERE status='pendente'`).get() as any)?.n || 0) });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+// [+fix-webhook 18/11] DIAGNÓSTICO (só leitura): mostra o webhook configurado em cada instância, pra achar
+// os números da campanha que pararam de entregar RESPOSTA pro motor.
+app.get('/campanha-wa/diag-webhooks', async (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const nums = db.prepare(`SELECT instancia, telefone, projeto, status FROM numeros`).all() as any[];
+    const out: any[] = [];
+    for (const n of nums) {
+      let wh: any = null, erro: string | null = null;
+      try { wh = await evo(`/webhook/find/${encodeURIComponent(n.instancia)}`, 'GET'); } catch (e: any) { erro = String((e && e.message) || e); }
+      out.push({ instancia: n.instancia, telefone: n.telefone, projeto: n.projeto, status: n.status, webhook: wh, erro });
+    }
+    res.json({ ok: true, instancias: out });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
+// [+fix-webhook 18/11] REPARO: copia o webhook de uma instância que JÁ funciona pras instâncias de ENVIO da
+// campanha (e, com body.todas=true, pra todas as conectadas), pra as RESPOSTAS voltarem a entrar no motor.
+app.post('/campanha-wa/fix-webhooks', async (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const b = req.body || {};
+    const nums = db.prepare(`SELECT instancia, telefone, projeto, status FROM numeros WHERE status='conectado'`).all() as any[];
+    let modelo: any = null;
+    for (const n of nums) {
+      try { const wh: any = await evo(`/webhook/find/${encodeURIComponent(n.instancia)}`, 'GET'); const w = (wh && wh.webhook) ? wh.webhook : wh; if (w && w.url) { modelo = { ...w, instancia: n.instancia }; break; } } catch { /* */ }
+    }
+    const urlForcada = String(b.url || (modelo && modelo.url) || '').trim();
+    if (!urlForcada) return res.json({ ok: false, erro: 'nao achei webhook-modelo (passe body.url se precisar)' });
+    const eventos = (modelo && Array.isArray(modelo.events) && modelo.events.length) ? modelo.events : ['MESSAGES_UPSERT'];
+    const alvoTels = Object.values(_CAMPWA_ENVIO).map((t) => String(t));
+    const alvo = b.todas ? nums : nums.filter((n: any) => alvoTels.includes(String(n.telefone)));
+    const resultados: any[] = [];
+    for (const n of alvo) {
+      let ok = false, erro: string | null = null;
+      const corpo = { webhook: { enabled: true, url: urlForcada, webhookByEvents: !!(modelo && modelo.webhookByEvents), webhookBase64: !!(modelo && modelo.webhookBase64), events: eventos } };
+      try { await evo(`/webhook/set/${encodeURIComponent(n.instancia)}`, 'POST', corpo); ok = true; }
+      catch { try { await evo(`/webhook/set/${encodeURIComponent(n.instancia)}`, 'POST', { enabled: true, url: urlForcada, events: eventos }); ok = true; } catch (e2: any) { erro = String((e2 && e2.message) || e2); } }
+      resultados.push({ instancia: n.instancia, telefone: n.telefone, aplicado: ok, erro });
+    }
+    res.json({ ok: true, modelo_de: modelo ? modelo.instancia : null, url: urlForcada, eventos, resultados });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 app.post('/campanha-wa/teste-envio', async (req: any, res: any) => {
   if (!_campwaAuth(req, res)) return;
   try {
