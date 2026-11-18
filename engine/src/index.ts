@@ -15443,10 +15443,11 @@ app.post('/webhook/hotmart', async (req: any, res: any) => {
     const link = _AREA_URL + '/area/entrar/' + tok;
     const primeiro = (nome.split(' ')[0] || '').trim();
     const ola = primeiro ? ('Hola ' + primeiro + '!') : 'Hola!';
-    const msgWa = ola + ' Bienvenido al Metodo Bajista Pro! Ya tienes acceso. Entra con este enlace (un clic, sin contrasena):\n' + link + '\n\nCualquier duda, escribeme por aqui. A tocar!';
+    try { const _sa: any = db.prepare(`SELECT id, senha_hash FROM academy_matriculas WHERE lower(email)=?`).get(email); if (_sa && _sa.id && !_sa.senha_hash) { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash('melodias123'), 'melodias123', _sa.id); } } catch { /* [+bajista-acesso-es-senha] senha padrao melodias123 p/ login por e-mail */ }
+    const msgWa = ola + ' Bienvenido al Metodo Bajista Pro! Ya tienes acceso. Entra con este enlace (un clic, sin contrasena):\n' + link + '\n\nSi prefieres entrar por el sitio:\nSitio: areadoaluno.melodiaseriffs.com.br\nE-mail: ' + email + '\nContrasena: melodias123\n\nCualquier duda, escribeme por aqui. A tocar!';
     if (telefone) { try { await enviarTexto('baixo' as any, telefone, msgWa, 'Baixo'); } catch { /* best-effort */ } }
     try {
-      const html = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.6"><p>' + ola + '</p><p>Bienvenido al <b>Metodo Bajista Pro</b>! Ya tienes acceso a la plataforma.</p><p><a href="' + link + '" style="display:inline-block;background:#1f8a52;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">Acceder a mis clases</a></p><p>O copia este enlace: ' + link + '</p><p>Cualquier duda, responde a este correo. A tocar!</p></div>';
+      const html = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.6"><p>' + ola + '</p><p>Bienvenido al <b>Metodo Bajista Pro</b>! Ya tienes acceso a la plataforma.</p><p><a href="' + link + '" style="display:inline-block;background:#1f8a52;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">Acceder a mis clases</a></p><p>O copia este enlace: ' + link + '</p><p>Si prefieres entrar por el sitio:<br>Sitio: areadoaluno.melodiaseriffs.com.br<br>E-mail: ' + email + '<br>Contrasena: melodias123</p><p>Cualquier duda, responde a este correo. A tocar!</p></div>';
       _emailFilaEnfileirar('baixo', email, 'Tu acceso al Metodo Bajista Pro', html);
     } catch { /* email best-effort */ }
     return res.json({ ok: true, entregue: true, email });
