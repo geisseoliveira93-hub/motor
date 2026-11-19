@@ -14488,17 +14488,17 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 const _acTop = (al: any, aba = ''): string => {
   const ini = esc(String(al && al.nome || 'A').trim().charAt(0).toUpperCase() || 'A');
   const impers = ''; // (admin "entrar como aluno" poderia injetar "voltar"); mantido simples
-  return `<div class="top"><a class="logo" href="/area">M|R</a>
+  return `<style>.top nav a.ia-neon,.menu a.ia-neon{color:#fff27a;text-shadow:0 0 2px rgba(255,235,120,.95),0 0 9px rgba(255,225,90,.65)}.top nav a.ia-neon:hover,.menu a.ia-neon:hover{color:#fffcc2;text-shadow:0 0 4px #ffe96a,0 0 13px rgba(255,225,90,.9)}</style><div class="top"><a class="logo" href="/area">M|R</a>
     <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
     <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-    <a href="/area/ia" class="${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
+    <a href="/area/ia" class="ia-neon ${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
     <div class="av" title="Menu" onclick="var m=document.getElementById('mn');m.classList.toggle('open')"><span class="avd">⚙️</span><span class="avm">☰</span>
       <div class="menu" id="mn">${impers}
         <a class="mnav" href="/area">Início</a>
         <a class="mnav" href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-        <a class="mnav" href="/area/ia">Fale com a IA</a>
+        <a class="mnav ia-neon" href="/area/ia">Fale com a IA</a>
         <div class="mdiv"></div>
         <a href="/area/perfil">Perfil</a>
         <a href="/area/ranking">Ranking</a>
@@ -14651,7 +14651,7 @@ function _acRail(inner: string): string {
 function _acHomeJS(): string {
   return `<script>(function(){
     document.querySelectorAll('.arw').forEach(function(b){b.addEventListener('click',function(){var r=b.parentElement.querySelector('.rail');if(r)r.scrollBy({left:(Number(b.getAttribute('data-d'))||1)*330,behavior:'smooth'});});});
-    document.querySelectorAll('.rail.auto').forEach(function(r){setInterval(function(){if(r.matches(':hover'))return;if(r.scrollLeft+r.clientWidth>=r.scrollWidth-4){r.scrollTo({left:0,behavior:'smooth'});}else{r.scrollBy({left:168,behavior:'smooth'});}},4000);});
+    document.querySelectorAll('.rail.auto').forEach(function(r){setInterval(function(){if(r.matches(':hover'))return;if(r.scrollLeft+r.clientWidth>=r.scrollWidth-4){r.scrollTo({left:0,behavior:'smooth'});}else{r.scrollBy({left:168,behavior:'smooth'});}},10000);});
     var h=document.getElementById('heroC');if(h){var sl=h.querySelectorAll('.hslide'),dt=h.querySelectorAll('.hdot'),c=0,itv=(Number(h.getAttribute('data-itv'))||6)*1000;function go(i){sl[c].classList.remove('on');if(dt[c])dt[c].classList.remove('on');c=i;sl[c].classList.add('on');if(dt[c])dt[c].classList.add('on');}dt.forEach(function(d,i){d.addEventListener('click',function(){go(i);});});if(sl.length>1)setInterval(function(){go((c+1)%sl.length);},itv);}
   })();</script>`;
 }
@@ -14676,6 +14676,7 @@ app.post('/area/api/aceitar-termo', (req: any, res: any) => {
   try { db.prepare(`UPDATE academy_matriculas SET termo_aceite=? WHERE id=?`).run(agora(), al.id); _acLog(al.id, 'aceitou_termo', ''); } catch { /* */ }
   res.redirect('/area');
 });
+const _AC_CURSOS_OCULTOS = ['853f8473-2434-4255-835f-5db395197499']; // [+ocultar-curso 19/11 Ezequias] cursos escondidos da home/categorias (admin ainda ve; acesso a IA segue pelo "Fale com a IA")
 app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
   const al = _acAluno(req);
   if (!al) return res.redirect('/area/login');
@@ -14750,13 +14751,13 @@ app.get(['/area', '/area/vitrine/home'], (req: any, res: any) => {
     });
     for (const v of _ordVit) {
       // [regra antiga 23/10 — preservada como comentário]: const ehEbooks = /e-?books?/i.test(nome+categoria); if (!ehEbooks) { doV = só os do aluno }
-      const doV = cursos.filter((c) => c.vitrine_id === v.id && (_adm || c.publicado || meus.has(c.id)));
+      const doV = cursos.filter((c) => c.vitrine_id === v.id && (_adm || c.publicado || meus.has(c.id)) && (_adm || !_AC_CURSOS_OCULTOS.includes(c.id)));
       const meusV = doV.filter((c) => meus.has(c.id));
       if (!_adm && !meusV.length) continue;   // [28/10] vitrine só aparece se o aluno tem >=1 curso nela (admin vê todas)
       if (!doV.length) continue;
       shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2>${_acRail(_acCardsVitrine(v, doV, cardHtml, meus, _adm))}</div>`; // mostra TODOS (cadeado faz o resto); modo_modulos=1 + 1 curso => cards de módulos // [+admin-tudo 17/11] modo admin: tudo liberado
     }
-    const semVit = cursos.filter((c) => !c.vitrine_id && (_adm || meus.has(c.id)));
+    const semVit = cursos.filter((c) => !c.vitrine_id && (_adm || meus.has(c.id)) && (_adm || !_AC_CURSOS_OCULTOS.includes(c.id)));
     if (semVit.length) shelves += `<div class="shelf"><h2>Meus cursos</h2>${_acRail(semVit.map(cardHtml).join(''))}</div>`;
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Seus cursos aparecerão aqui.</div>`;
     const corpo = hero + `<div class="wrap home">` + shelves + `</div>` + _acPopupHtml(al) + _acHomeJS() + (_acEhAdmin(req) ? _AC_ADM_JS : '');
@@ -16774,7 +16775,7 @@ app.get('/area/categoria/:cat', (req: any, res: any) => {
     const pmap: any = {}; for (const r of prog) pmap[r.curso_id] = Math.round(r.p || 0);
     const _admC = _acEhAdmin(req); // [07/11 Ezequias] admin abre qualquer curso aqui também
     let shelves = '';
-    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${_acCardsVitrine(v, doV, (c: any) => _acCardCurso(c, meus, pmap, _admC), meus, _admC)}</div></div>`; } // [+admin-tudo 17/11] modo admin: tudo liberado
+    for (const v of vitrines) { const doV = cursos.filter((c) => c.vitrine_id === v.id && (_admC || c.publicado || meus.has(c.id)) && (_admC || !_AC_CURSOS_OCULTOS.includes(c.id))); if (!doV.length) continue; shelves += `<div class="shelf"><h2>${esc(v.nome || '')}</h2><div class="rail">${_acCardsVitrine(v, doV, (c: any) => _acCardCurso(c, meus, pmap, _admC), meus, _admC)}</div></div>`; } // [+admin-tudo 17/11] modo admin: tudo liberado
     if (!shelves) shelves = `<div class="card2" style="margin-top:24px;text-align:center;color:#8a8a96">Nenhum curso nesta categoria.</div>`;
     const corpo = `<div class="wrap"><div style="margin:18px 0"><a href="/area" style="color:#8a8a96">‹ Início</a></div><h1 style="font-size:24px;margin:0 0 10px">${esc(cat)}</h1>${shelves}</div>` + _acPopupHtml(al);
     res.type('html').send(_acPage(al, cat, corpo));
