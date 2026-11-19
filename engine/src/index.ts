@@ -15745,7 +15745,11 @@ if (pubFlag('prosp_hora_manha', '') === '') setPubFlag('prosp_hora_manha', '9');
 if (pubFlag('prosp_hora_tarde', '') === '') setPubFlag('prosp_hora_tarde', '15');
 function _agProspNorm(tel: string): string { let t = String(tel || '').replace(/\D/g, ''); if (t && !t.startsWith('55') && t.length <= 11) t = '55' + t; return t; }
 function _agProspDiaBRT(): string { return new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10); }
-function _agProspEnviadosHoje(): number { try { const r = db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='enviado' AND substr(IFNULL(enviado_em,''),1,10)=?`).get(_agProspDiaBRT()) as any; return r ? r.n : 0; } catch { return 0; } }
+// [+contador 19/11] conta pela TABELA (datas UTC do enviado_em batem com a data BRT no horário ativo). usado como semente/fallback.
+function _agProspContaTabelaHoje(): number { try { const r = db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='enviado' AND substr(IFNULL(enviado_em,''),1,10)=?`).get(_agProspDiaBRT()) as any; return r ? r.n : 0; } catch { return 0; } }
+// [+contador 19/11] contador diário ESTÁVEL em pub_kv (sobrevive a deploy). Formato "YYYY-MM-DD:N". Reseta sozinho quando o dia BRT vira.
+function _agProspIncEnviado(): void { try { const dia = _agProspDiaBRT(); const cur = pubFlag('prosp_enviados_dia', ''); const p = cur.split(':'); const base = (p[0] === dia) ? (Number(p[1]) || 0) : _agProspContaTabelaHoje(); setPubFlag('prosp_enviados_dia', dia + ':' + (base + 1)); } catch { /* best-effort */ } }
+function _agProspEnviadosHoje(): number { try { const dia = _agProspDiaBRT(); const cur = pubFlag('prosp_enviados_dia', ''); const p = cur.split(':'); if (p[0] === dia) return Number(p[1]) || 0; return _agProspContaTabelaHoje(); } catch { return 0; } }
 function _agProspAlerta(msg: string): void { try { setPubFlag('prosp_ultimo_alerta', _agProspDiaBRT() + ' ' + msg); } catch { /* */ } console.error('[prosp][ALERTA]', msg); }
 // gancho do webhook: contato da fila respondeu -> marca respondido/opt_out e abre atendimento na Central. Hoisted (function), chamável do webhook acima.
 function _agProspReplyHook(telefone: string, cid?: string, texto?: string): void {
@@ -15779,10 +15783,14 @@ async function _agProspBloco(tag: string, confirmar: boolean): Promise<any> {
     try {
       await enviarTexto(AG_PROSP_PROJETO, _agProspNorm(c.telefone), msg, AG_PROSP_INSTANCIA);
       db.prepare(`UPDATE agencia_prospeccao SET status='enviado', variacao_usada=?, enviado_em=?, erro=NULL WHERE id=?`).run(vi + 1, agora(), c.id);
+      _agProspIncEnviado(); // [+contador] +1 por envio BEM-SUCEDIDO (reseta no dia)
       enviados++;
     } catch (e: any) {
       const em = String(e?.message || e);
-      db.prepare(`UPDATE agencia_prospeccao SET erro=? WHERE id=?`).run(em.slice(0, 300), c.id);
+      // [+auto-invalido 19/11] número inexistente (Evolution 400 exists:false) -> status 'invalido' (sai da fila de pendentes), motivo no campo erro
+      const _inexistente = /exists["'\s]*[:=]["'\s]*false/i.test(em) || (/\b400\b/.test(em) && /exist/i.test(em));
+      if (_inexistente) { db.prepare(`UPDATE agencia_prospeccao SET status='invalido', erro=? WHERE id=?`).run(('inexistente: ' + em).slice(0, 300), c.id); }
+      else { db.prepare(`UPDATE agencia_prospeccao SET erro=? WHERE id=?`).run(em.slice(0, 300), c.id); }
       erros++;
       if (/not.?connected|desconect|close|logged.?out|forbidden|blocked|\bban\b|429|rate.?limit/i.test(em)) { pararBan = true; break; }
     }
@@ -15801,8 +15809,14 @@ setInterval(() => {
     let bloco = ''; if (horaBRT === hm) bloco = 'manha'; else if (horaBRT === ht) bloco = 'tarde'; else return;
     const chave = diaBRT + '-' + bloco;
     if (pubFlag('prosp_ultimo_bloco', '') === chave) return;
+    // [+disparo-async 19/11] respeita o flag anti-concorrência (destrava sozinho após 20min se ficar preso)
+    const _rodMs = Number(pubFlag('prosp_rodando', '')) || 0;
+    if (_rodMs && (Date.now() - _rodMs) < 20 * 60000) return;
     setPubFlag('prosp_ultimo_bloco', chave);
-    _agProspBloco(chave, true).catch((e: any) => console.error('[prosp] erro bloco', String(e?.message || e)));
+    setPubFlag('prosp_rodando', String(Date.now()));
+    _agProspBloco(chave, true)
+      .catch((e: any) => console.error('[prosp] erro bloco', String(e?.message || e)))
+      .finally(() => { try { setPubFlag('prosp_rodando', ''); } catch { /* */ } });
   } catch (e: any) { console.error('[prosp] erro relogio', String(e?.message || e)); }
 }, 10 * 60000);
 // POST /prospeccao/adicionar {contatos:[{empresa,telefone,nicho,cidade}]} -> dedup por telefone, insere pendentes. (É isto que o Claude chama pra alimentar a fila.)
@@ -15845,11 +15859,62 @@ app.post('/prospeccao/config', (req: any, res: any) => {
 });
 // POST /prospeccao/rodar {confirmar:true} -> DISPARAR AGORA um bloco (sem confirmar = prévia). Respeita o teto do dia.
 app.post('/prospeccao/rodar', (req: any, res: any) => {
-  try { const b = req.body || {}; _agProspBloco(b.confirmar === true ? 'manual' : 'previa', b.confirmar === true).then((r: any) => _ndOk(res, r)).catch((e: any) => _ndErr(res, e)); } catch (e) { _ndErr(res, e); }
+  try {
+    const b = req.body || {};
+    // prévia (sem confirmar): instantânea, responde o cálculo
+    if (b.confirmar !== true) { _agProspBloco('previa', false).then((r: any) => _ndOk(res, r)).catch((e: any) => _ndErr(res, e)); return; }
+    // [+disparo-async 19/11] já tem bloco rodando? (flag com carimbo de tempo; destrava sozinho após 20min)
+    const _rodMs = Number(pubFlag('prosp_rodando', '')) || 0;
+    if (_rodMs && (Date.now() - _rodMs) < 20 * 60000) { return _ndOk(res, { ja_rodando: true, desde: new Date(_rodMs).toISOString() }); }
+    // quantos entrariam no bloco agora (responde já, sem esperar os envios)
+    const _teto = Number(pubFlag('prosp_teto_dia', '60')) || 60;
+    const _porBloco = Number(pubFlag('prosp_por_bloco', '30')) || 30;
+    const _jaHoje = _agProspEnviadosHoje();
+    const _pend = (db.prepare(`SELECT COUNT(*) n FROM agencia_prospeccao WHERE status='pendente'`).get() as any).n;
+    const _total = Math.min(_porBloco, Math.max(0, _teto - _jaHoje), _pend);
+    setPubFlag('prosp_rodando', String(Date.now()));
+    // dispara em SEGUNDO PLANO (NÃO await): o bloco roda ~20s/msg sem segurar a resposta. limpa o flag no fim E em erro.
+    _agProspBloco('manual', true)
+      .catch((e: any) => console.error('[prosp] erro bloco manual', String(e?.message || e)))
+      .finally(() => { try { setPubFlag('prosp_rodando', ''); } catch { /* */ } });
+    _ndOk(res, { iniciado: true, total_no_bloco: _total, enviados_hoje: _jaHoje, teto: _teto, pendentes: _pend });
+  } catch (e) { _ndErr(res, e); }
 });
 // GET /prospeccao/lista?status= -> ver a fila
 app.get('/prospeccao/lista', (req: any, res: any) => {
   try { const st = String((req.query || {}).status || ''); const rows = st ? db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao WHERE status=? ORDER BY criado_em DESC LIMIT 500`).all(st) : db.prepare(`SELECT id,empresa,telefone,nicho,cidade,status,variacao_usada,enviado_em,erro FROM agencia_prospeccao ORDER BY criado_em DESC LIMIT 500`).all(); _ndOk(res, { total: rows.length, rows }); } catch (e) { _ndErr(res, e); }
+});
+// [+gestao-fila 19/11] POST /prospeccao/remover {ids:[...] | telefones:[...], confirmar:true} -> APAGA da tabela (casa telefone pelos últimos 10 dígitos)
+app.post('/prospeccao/remover', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.confirmar !== true) return _ndErr(res, 'mande {confirmar:true} para apagar de vez');
+    const ids = Array.isArray(b.ids) ? b.ids.map((x: any) => String(x)).filter((x: string) => x) : [];
+    const tels = Array.isArray(b.telefones) ? b.telefones.map((x: any) => _agProspNorm(x)).filter((x: string) => x && x.length >= 8) : [];
+    if (!ids.length && !tels.length) return _ndErr(res, 'mande ids:[...] ou telefones:[...]');
+    let removidos = 0;
+    const delId = db.prepare(`DELETE FROM agencia_prospeccao WHERE id=?`);
+    const delTel = db.prepare(`DELETE FROM agencia_prospeccao WHERE replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ?`);
+    const tx = db.transaction(() => { for (const id of ids) removidos += delId.run(id).changes; for (const t of tels) removidos += delTel.run('%' + t.slice(-10)).changes; });
+    tx();
+    _ndOk(res, { removidos });
+  } catch (e) { _ndErr(res, e); }
+});
+// [+gestao-fila 19/11] POST /prospeccao/reservar {ids:[...] | telefones:[...], confirmar:true} -> status='reservado_anuncia' (NÃO apaga; sai da fila de pendentes)
+app.post('/prospeccao/reservar', (req: any, res: any) => {
+  try {
+    const b = req.body || {};
+    if (b.confirmar !== true) return _ndErr(res, 'mande {confirmar:true} para reservar');
+    const ids = Array.isArray(b.ids) ? b.ids.map((x: any) => String(x)).filter((x: string) => x) : [];
+    const tels = Array.isArray(b.telefones) ? b.telefones.map((x: any) => _agProspNorm(x)).filter((x: string) => x && x.length >= 8) : [];
+    if (!ids.length && !tels.length) return _ndErr(res, 'mande ids:[...] ou telefones:[...]');
+    let reservados = 0;
+    const upId = db.prepare(`UPDATE agencia_prospeccao SET status='reservado_anuncia' WHERE id=?`);
+    const upTel = db.prepare(`UPDATE agencia_prospeccao SET status='reservado_anuncia' WHERE replace(replace(replace(IFNULL(telefone,''),'+',''),' ',''),'-','') LIKE ?`);
+    const tx = db.transaction(() => { for (const id of ids) reservados += upId.run(id).changes; for (const t of tels) reservados += upTel.run('%' + t.slice(-10)).changes; });
+    tx();
+    _ndOk(res, { reservados });
+  } catch (e) { _ndErr(res, e); }
 });
 
 // ============================================================================
