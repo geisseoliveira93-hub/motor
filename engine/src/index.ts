@@ -4072,6 +4072,9 @@ function _ehClienteOuAluno(projeto: string, contatoId: string): boolean {
   return false;
 }
 
+// [+dedup-webhook 19/11] tabela de dedup de eventos do Evolution (mesmo messages.upsert chegando 2x -> agente respondia 2x). Limpa sozinha (>2 dias). So adiciona.
+try { db.exec(`CREATE TABLE IF NOT EXISTS webhook_dedup (msg_id TEXT PRIMARY KEY, criado_em TEXT)`); } catch { /* */ }
+setInterval(() => { try { db.prepare(`DELETE FROM webhook_dedup WHERE criado_em < ?`).run(new Date(Date.now() - 2 * 86400000).toISOString()); } catch { /* */ } }, 6 * 3600 * 1000);
 // ---- Webhook da Evolution: mensagem recebida -> salva + auto-tag ----
 app.post('/webhook/evolution', (req, res) => {
   try {
@@ -4083,6 +4086,10 @@ app.post('/webhook/evolution', (req, res) => {
       const ehGrupo = String(data.key?.remoteJid || '').includes('@g.us'); // etapa19c: NUNCA responder em GRUPOS (evita flood) — agente/automações só 1-a-1
       let texto = data.message?.conversation || data.message?.extendedTextMessage?.text || '';
       if (telefone && !data.key?.fromMe) {
+        // [+dedup-webhook 19/11] Evolution às vezes reenvia o MESMO messages.upsert -> o agente respondia 2x.
+        // Dedup pelo id da mensagem: id já visto = ignora TUDO (não grava, não roda agente). So adiciona.
+        const _msgId = String(data.key?.id || '');
+        if (_msgId) { try { const _dd = db.prepare(`INSERT OR IGNORE INTO webhook_dedup(msg_id, criado_em) VALUES(?,?)`).run(_msgId, agora()); if (_dd.changes === 0) { res.json({ ok: true, dedup: true }); return; } } catch { /* se a tabela falhar, segue normal */ } }
         const cid = upsertContato(projeto, telefone, data.pushName);
         // [+fbclid-wa 03/11] captura o token de atribuicao mr~ que veio do clique no botao de WhatsApp (snippet /track/snippet.js): grava fbclid/utm no contato (sem sobrescrever, COALESCE) e TIRA o token do texto ANTES de armazenar/automacao/agente. So adiciona.
         try {
