@@ -4564,11 +4564,13 @@ async function tickFila() {
   enviando = true; enviandoDesde = Date.now();
   try {
     // Pega o próximo pendente JÁ liberado (respeita o delay do passo via agendado_para).
+    const _limVal = new Date(Date.now() - 72 * 3600 * 1000).toISOString(); // [+trava-validade-entrega 23/11] nao manda item 'pendente' preso ha mais de 72h (igual a trava de 6h do tickCampanha, com folga p/ entrega/recuperacao agendada dias a frente)
     const item = db.prepare(
       `SELECT * FROM fila_envio
          WHERE status='pendente' AND (agendado_para IS NULL OR agendado_para <= ?)
+           AND (COALESCE(agendado_para, criado_em) >= ?)
          ORDER BY agendado_para IS NULL DESC, agendado_para, criado_em LIMIT 1`
-    ).get(agora()) as any;
+    ).get(agora(), _limVal) as any;
     if (item) {
       // [campanhas-ativas] se o fluxo deste item está PAUSADO, segura o passo (reagenda +15min, não envia).
       const _fpPausa = item.fluxo_chave ? (CONFIG.entregaFluxoProduto || []).find((f) => String(f.chave || '').toLowerCase() === String(item.fluxo_chave).toLowerCase()) : null;
@@ -14929,9 +14931,11 @@ app.get('/area/aula/:id', (req: any, res: any) => {
     const aulas = db.prepare(`SELECT * FROM academy_aulas WHERE curso_id=? OR modulo_id IN (SELECT id FROM academy_modulos WHERE curso_id=?) ORDER BY ordem`).all(curso.id, curso.id) as any[];
     const prog = db.prepare(`SELECT aula_id,visto,pos_seg FROM academy_progresso WHERE aluno_id=? AND curso_id=?`).all(al.id, curso.id) as any[];
     const vmap: any = {}; for (const p of prog) vmap[p.aula_id] = p;
-    const idx = aulas.findIndex((a) => a.id === aula.id);
-    const ant = idx > 0 ? aulas[idx - 1] : null;
-    const prox = idx >= 0 && idx < aulas.length - 1 ? aulas[idx + 1] : null;
+    // [+fix-ordem-prox-aula 23/11] a lista 'aulas' vem ORDER BY ordem GLOBAL e mistura os modulos; monta a sequencia REAL da arvore (modulo por modulo, cada aula na ordem que aparece) p/ o Anterior/Proximo seguir a ordem certa e atravessar a fronteira de modulo (ultima do modulo -> 1a do proximo)
+    const _aulasSeq: any[] = []; for (const _m of mods) { for (const _a of aulas) { if (_a.modulo_id === _m.id) _aulasSeq.push(_a); } } for (const _a of aulas) { if (_aulasSeq.indexOf(_a) === -1) _aulasSeq.push(_a); }
+    const idx = _aulasSeq.findIndex((a) => a.id === aula.id);
+    const ant = idx > 0 ? _aulasSeq[idx - 1] : null;
+    const prox = idx >= 0 && idx < _aulasSeq.length - 1 ? _aulasSeq[idx + 1] : null;
     const visto = !!(vmap[aula.id] && vmap[aula.id].visto);
     const isFav = !!db.prepare(`SELECT 1 FROM academy_favoritos WHERE aluno_id=? AND aula_id=?`).get(al.id, aula.id);
     const pos = (vmap[aula.id] && vmap[aula.id].pos_seg) || 0;
