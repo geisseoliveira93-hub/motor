@@ -19199,6 +19199,7 @@ try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN bumps_json TEXT`); } catch { /*
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN bundle_json TEXT`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN msg_entrega TEXT`); } catch { /* já existe */ }
 try { db.exec(`ALTER TABLE ck_pedidos ADD COLUMN endereco_json TEXT`); } catch { /* já existe */ }
+try { db.exec(`ALTER TABLE ck_produtos ADD COLUMN sem_endereco INTEGER DEFAULT 0`); } catch { /* ja existe */ } // [+checkout-endereco-padrao 23/11] 1 = produto digital (nao pede endereco)
 // [+ck-dedup-atomico 18/11 Ezequias] trava ATOMICA por pedido (tabela propria com PK). A dedup antiga usava
 // academy_envio_acesso, que tem schema divergente (criada antes com colunas aluno_id/wa_ok/...), entao o INSERT
 // de registro (id,canal,criado_em) estourava no try/catch silencioso -> a trava nunca gravava -> no cartao
@@ -19397,6 +19398,7 @@ app.post('/checkout/produto', (req: any, res: any) => {
     // [+checkout-black 16/11] bundle + mensagem custom (colunas extras, sem mexer no upsert principal)
     try { if (b.bundle !== undefined || b.bundle_json !== undefined) db.prepare(`UPDATE ck_produtos SET bundle_json=? WHERE id=?`).run(Array.isArray(b.bundle) ? JSON.stringify(b.bundle) : String(b.bundle_json || '[]'), id); } catch { /* */ }
     try { if (b.msg_entrega !== undefined) db.prepare(`UPDATE ck_produtos SET msg_entrega=? WHERE id=?`).run(String(b.msg_entrega || ''), id); } catch { /* */ }
+    try { if (b.sem_endereco !== undefined) db.prepare(`UPDATE ck_produtos SET sem_endereco=? WHERE id=?`).run((b.sem_endereco === 1 || b.sem_endereco === true || b.sem_endereco === '1') ? 1 : 0, id); } catch { /* */ } // [+checkout-endereco-padrao 23/11]
     res.json({ ok: true, id, slug, url: '/pay/' + slug });
   } catch (e: any) { res.status(500).json({ ok: false, erro: String(e && e.message || e) }); }
 });
@@ -19478,6 +19480,12 @@ app.post('/pay/:slug/cobrar', async (req: any, res: any) => {
     const cpf = String(b.cpf || '').replace(/\D/g, '');
     if (!nome || !email || email.indexOf('@') < 0) return res.status(400).json({ ok: false, erro: 'dados_incompletos' });
     if ((metodo === 'boleto' || metodo === 'card') && cpf.length < 11) return res.status(400).json({ ok: false, erro: 'cpf_obrigatorio' });
+    // [+checkout-endereco-padrao 23/11] endereco obrigatorio por padrao (so pula se produto.sem_endereco=1)
+    if (Number(prod.sem_endereco || 0) !== 1) {
+      const _adR = (b && b.endereco) || {};
+      const _cepR = String(_adR.cep || b.cep || '').replace(/\D/g, '');
+      if (!_cepR || !String(_adR.rua || '').trim() || !String(_adR.numero || '').trim() || !String(_adR.cidade || '').trim() || !String(_adR.uf || '').trim()) return res.status(400).json({ ok: false, erro: 'endereco_obrigatorio' });
+    }
     const parcelas = Math.max(1, Math.min(Number(prod.max_parcelas || 12), Number(b.parcelas || 1)));
     // [+ck-extras] preço base + cupom + order bump (sem cupom e sem bump: idêntico ao anterior)
     const _preco = Number(prod.preco_centavos || 0);
@@ -19598,11 +19606,12 @@ function _ckPaginaHtml(prod: any): string {
   for (const bc of _bcfg) { try { const bp = db.prepare(`SELECT slug,nome,descricao,preco_centavos,de_centavos,emoji FROM ck_produtos WHERE slug=? AND ativo=1`).get(String(bc.slug)) as any; if (bp && !bumpsP.find((x) => x.slug === bp.slug)) bumpsP.push({ ...bp, _titulo: String((bc && bc.titulo) || '') }); } catch { /* */ } }
   const pixelId = String(prod.pixel_id || '').trim();
   const _isBlack = /-black$/.test(String(prod.slug || ''));
+  const _pedeEndereco = Number(prod.sem_endereco || 0) !== 1; // [+checkout-endereco-padrao 23/11] endereco padrao em TODOS; esconde so se sem_endereco=1
   const cfg = {
     slug: String(prod.slug), pk, preco: Number(prod.preco_centavos || 0), maxp: Number(prod.max_parcelas || 12),
     juros: Number(prod.juros_am || 0), jsimp: Number(pubFlag('checkout_juros_simples_am', '0.016667')) || 0.016667, metodos,
     bumps: bumpsP.map((bp: any) => ({ slug: String(bp.slug), preco: Number(bp.preco_centavos || 0) })),
-    addr: _isBlack,
+    addr: _pedeEndereco,
   };
   const precoBR = (c: number) => 'R$ ' + (c / 100).toFixed(2).replace('.', ',');
   // [+checkout-black 16/11] parcela do maior nº de vezes (juros simples global) p/ o resumo
@@ -19611,7 +19620,7 @@ function _ckPaginaHtml(prod: any): string {
   const _temJuros = Number(prod.juros_am || 0) > 0;
   const _parcResumo = _temJuros ? Math.round(Number(prod.preco_centavos || 0) * (1 + _jsimpPg * _maxpPg) / _maxpPg) : Math.round(Number(prod.preco_centavos || 0) / _maxpPg);
   // endereço de entrega: SÓ nos produtos Black (físicos). Digital não pede (não quebra o checkout vivo).
-  const enderecoHtml = _isBlack ? ('<div class="sec-h" style="margin-top:8px"><span class="n" style="background:var(--gold-d)">\u{1F4CD}</span><h2 style="font-size:14px">Endereço completo</h2></div>'
+  const enderecoHtml = _pedeEndereco ? ('<div class="sec-h" style="margin-top:8px"><span class="n" style="background:var(--gold-d)">\u{1F4CD}</span><h2 style="font-size:14px">Endereço completo</h2></div>'
     + '<div class="row2"><label class="f"><span>CEP</span><input id="e_cep" class="in" inputmode="numeric" placeholder="00000-000"></label><label class="f"><span>Cidade</span><input id="e_cidade" class="in" placeholder="Cidade"></label></div>'
     + '<label class="f"><span>Rua / Logradouro</span><input id="e_rua" class="in" placeholder="Nome da rua"></label>'
     + '<div class="row2"><label class="f"><span>Número</span><input id="e_num" class="in" placeholder="Nº"></label><label class="f"><span>Complemento (opcional)</span><input id="e_comp" class="in" placeholder="Apto / bloco"></label></div>'
@@ -19740,7 +19749,7 @@ function _ckPaginaHtml(prod: any): string {
     + '<label class="f"><span>Nome completo</span><input id="nome" class="in" placeholder="Como está no seu documento"></label>'
     + '<div class="row2"><label class="f"><span>E-mail</span><input id="email" type="email" class="in" placeholder="voce@email.com"></label>'
     + '<label class="f"><span>WhatsApp</span><input id="tel" class="in" placeholder="(16) 90000-0000"></label></div>'
-    + '<label class="f"' + (_isBlack ? '' : ' style="margin-bottom:0"') + '><span>CPF</span><input id="cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label>'
+    + '<label class="f"' + (_pedeEndereco ? '' : ' style="margin-bottom:0"') + '><span>CPF</span><input id="cpf" class="in" placeholder="000.000.000-00" style="max-width:220px"></label>'
     + enderecoHtml
     + '</div>'
     + '<div class="card pad"><div class="sec-h"><span class="n">2</span><h2>Forma de pagamento</h2></div>'
