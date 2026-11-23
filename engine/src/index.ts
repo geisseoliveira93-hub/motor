@@ -14499,10 +14499,10 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 const _acTop = (al: any, aba = ''): string => {
   const ini = esc(String(al && al.nome || 'A').trim().charAt(0).toUpperCase() || 'A');
   const impers = ''; // (admin "entrar como aluno" poderia injetar "voltar"); mantido simples
-  return `<style>.top nav a.ia-neon,.menu a.ia-neon{color:#fff27a;text-shadow:0 0 2px rgba(255,235,120,.95),0 0 9px rgba(255,225,90,.65)}.top nav a.ia-neon:hover,.menu a.ia-neon:hover{color:#fffcc2;text-shadow:0 0 4px #ffe96a,0 0 13px rgba(255,225,90,.9)}</style><div class="top"><a class="logo" href="/area">M|R</a>
+  return `<style>.top nav a.ia-neon,.menu a.ia-neon{color:#fff27a;text-shadow:0 0 2px rgba(255,235,120,.95),0 0 9px rgba(255,225,90,.65)}.top nav a.ia-neon:hover,.menu a.ia-neon:hover{color:#fffcc2;text-shadow:0 0 4px #ffe96a,0 0 13px rgba(255,225,90,.9)}.top nav a.loja-blog,.menu a.loja-blog{color:#ffb43a;display:inline-flex;align-items:center;gap:6px}.top nav a.loja-blog:hover,.menu a.loja-blog:hover{text-shadow:0 0 8px rgba(255,180,58,.6)}</style><div class="top"><a class="logo" href="/area">M|R</a>
     <nav><a href="/area" class="${aba === 'home' ? 'on' : ''}">Início</a>
     <a href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
-    <a href="/area/ia" class="ia-neon ${aba === 'ia' ? 'on' : ''}">Fale com a IA</a></nav>
+    <a href="/area/ia" class="ia-neon ${aba === 'ia' ? 'on' : ''}">Fale com a IA</a><a href="https://blog.melodiaseriffs.com.br/#loja" target="_blank" rel="noopener" class="loja-blog">🛒 Loja</a></nav>
     <div class="sp"></div>
     <button class="ic acspk" id="acspk" title="Ligar/desligar o som ao passar o mouse" onclick="acSom()">🔊</button>
     <div class="av" title="Menu" onclick="var m=document.getElementById('mn');m.classList.toggle('open')"><span class="avd">⚙️</span><span class="avm">☰</span>
@@ -14510,6 +14510,7 @@ const _acTop = (al: any, aba = ''): string => {
         <a class="mnav" href="/area">Início</a>
         <a class="mnav" href="https://api.whatsapp.com/send?phone=5516996401030" target="_blank">Suporte</a>
         <a class="mnav ia-neon" href="/area/ia">Fale com a IA</a>
+        <a class="mnav loja-blog" href="https://blog.melodiaseriffs.com.br/#loja" target="_blank" rel="noopener">🛒 Loja</a>
         <div class="mdiv"></div>
         <a href="/area/perfil">Perfil</a>
         <a href="/area/ranking">Ranking</a>
