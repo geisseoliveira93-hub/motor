@@ -20056,6 +20056,63 @@ async function _campwaTick(): Promise<void> {
     }
   } catch (e) { /* nunca quebra */ } finally { _campwaRodando = false; }
 }
+// [+campwa-fix 23/11] WORKER DESTRAVADO (substitui _campwaTick no setInterval; o _campwaTick antigo fica preservado p/ rollback). ADD-ONLY.
+// Correcoes: (1) pre-check NAO-bloqueante: _campwaTemWhatsapp null (erro/transiente) NAO pula -> envia mesmo assim (a lista ja foi validada na origem); so pula no 'false' explicito.
+// (2) anti-starvation: rodizio do projeto inicial a cada tick (gira teclado/violao/baixo) em vez de ordem fixa + break -> nenhum instrumento fica pra tras.
+// (3) diag em memoria (_campwaDiag) exposto em GET /campanha-wa/diag. (4) heartbeat no console a cada tick.
+const _campwaDiag: any = { ultimo_tick: null, vivo: false, motivo: null, projetos: {} };
+let _campwaPtr = 0;
+async function _campwaTick2(): Promise<void> {
+  if (_campwaRodando) return; _campwaRodando = true;
+  _campwaDiag.ultimo_tick = agora(); _campwaDiag.vivo = true;
+  try {
+    const cfg = _campwaCfg(); if (!cfg || !cfg.ativo) { _campwaDiag.motivo = 'inativo'; return; }
+    const dBRT = _campwaAgoraBRT();
+    const horaFloat = dBRT.getUTCHours() + dBRT.getUTCMinutes() / 60;
+    const hIni = Number(cfg.hora_inicio || 9), hFim = Number(cfg.hora_fim || 20);
+    if (horaFloat < hIni || horaFloat >= hFim) { _campwaDiag.motivo = 'fora_da_janela'; return; }
+    _campwaDiag.motivo = 'na_janela';
+    const hoje = _campwaHojeBRT(); const porDia = Number(cfg.por_dia || 10);
+    const frac = Math.max(0, Math.min(1, (horaFloat - hIni) / Math.max(0.5, (hFim - hIni))));
+    const permitidoAgora = Math.max(1, Math.ceil(porDia * frac));
+    const msgs: Record<string, string> = { teclado: cfg.msg_teclado, baixo: cfg.msg_baixo, violao: cfg.msg_violao };
+    const PROJ = ['teclado', 'violao', 'baixo'];
+    const start = _campwaPtr % PROJ.length;
+    _campwaPtr = (_campwaPtr + 1) % PROJ.length; // gira o inicio a cada tick (anti-starvation)
+    let enviouNesteTick = false;
+    for (let k = 0; k < PROJ.length; k++) {
+      const projeto = PROJ[(start + k) % PROJ.length];
+      const pd: any = (_campwaDiag.projetos[projeto] = _campwaDiag.projetos[projeto] || {});
+      const jaHoje = Number((db.prepare(`SELECT COUNT(*) n FROM campanha_wa_leads WHERE projeto=? AND dia_envio=?`).get(projeto, hoje) as any)?.n || 0);
+      pd.enviado_hoje = jaHoje; pd.permitido_agora = permitidoAgora;
+      if (jaHoje >= porDia || jaHoje >= permitidoAgora) { pd.ultimo_resultado = 'cota_atingida'; continue; }
+      const inst = _campwaInstancia(projeto); pd.instancia = inst || null;
+      if (!inst) { pd.ultimo_resultado = 'sem_instancia'; continue; }
+      const lead = db.prepare(`SELECT * FROM campanha_wa_leads WHERE projeto=? AND status='pendente' ORDER BY id LIMIT 1`).get(projeto) as any;
+      if (!lead) { pd.ultimo_resultado = 'fila_vazia'; continue; }
+      const tel = String(lead.telefone || '').replace(/\D/g, ''); pd.ultimo_lead = tel;
+      if (!tel) { db.prepare(`UPDATE campanha_wa_leads SET status='invalido', atualizado_em=? WHERE id=?`).run(agora(), lead.id); pd.ultimo_resultado = 'telefone_invalido'; continue; }
+      let tem: boolean | null = null;
+      try { tem = await _campwaTemWhatsapp(inst, tel); } catch { tem = null; }
+      pd.precheck = tem;
+      if (tem === false) { db.prepare(`UPDATE campanha_wa_leads SET status='sem_whatsapp', atualizado_em=? WHERE id=?`).run(agora(), lead.id); pd.ultimo_resultado = 'sem_whatsapp'; continue; }
+      // tem===true OU tem===null (transiente) -> segue pro envio (NAO bloqueia por instabilidade da Evolution)
+      const cid = upsertContato(projeto, tel, lead.nome || undefined, undefined, 'campanha-wa');
+      if (_ehClienteOuAluno(projeto, cid)) { db.prepare(`UPDATE campanha_wa_leads SET status='aluno', contato_id=?, atualizado_em=? WHERE id=?`).run(cid, agora(), lead.id); pd.ultimo_resultado = 'cliente_ou_aluno'; continue; }
+      const texto = String(msgs[projeto] || '');
+      try { await enviarTexto(projeto as any, tel, texto, inst); }
+      catch (e: any) { const em = String((e && e.message) || e).slice(0, 140); db.prepare(`UPDATE campanha_wa_leads SET obs=?, atualizado_em=? WHERE id=?`).run('erro envio: ' + em, agora(), lead.id); pd.ultimo_resultado = 'erro_envio:' + em.slice(0, 80); continue; }
+      try { aplicarTag(projeto, cid, 'sdr-wa-' + projeto); } catch { /* */ }
+      try { const aid = _campwaAgenteId(projeto); if (aid) db.prepare(`INSERT INTO contato_agente(contato_id,agente_id,origem,atualizado_em) VALUES(?,?,?,?) ON CONFLICT(contato_id) DO UPDATE SET agente_id=excluded.agente_id, origem=excluded.origem, atualizado_em=excluded.atualizado_em`).run(cid, aid, 'campanha-wa', agora()); } catch { /* */ }
+      db.prepare(`UPDATE campanha_wa_leads SET status='enviado', contato_id=?, dia_envio=?, primeira_msg_em=?, enviado_em=?, atualizado_em=? WHERE id=?`).run(cid, hoje, agora(), agora(), agora(), lead.id);
+      pd.ultimo_resultado = (tem === null ? 'enviado_sem_precheck' : 'enviado'); pd.ultimo_envio_em = agora();
+      enviouNesteTick = true;
+      try { console.log('[campwa] tick ' + projeto + ' -> ENVIADO tel=' + tel.slice(0, 6) + '** precheck=' + tem); } catch { /* */ }
+      break; // 1 envio por tick (ritmo humano)
+    }
+    if (!enviouNesteTick) { try { console.log('[campwa] tick sem envio; projetos=' + JSON.stringify(_campwaDiag.projetos).slice(0, 320)); } catch { /* */ } }
+  } catch (e) { _campwaDiag.motivo = 'erro:' + String((e as any)?.message || e).slice(0, 120); } finally { _campwaRodando = false; }
+}
 function _campwaSweepHandoff(): void {
   try {
     const cfg = _campwaCfg(); const dias = Number(cfg.dias_handoff || 7);
@@ -20067,10 +20124,24 @@ function _campwaSweepHandoff(): void {
     }
   } catch { /* */ }
 }
-setInterval(() => { _campwaTick().catch(() => { }); }, 4 * 60 * 1000);
+setInterval(() => { _campwaTick2().catch(() => { }); }, 4 * 60 * 1000); // [+campwa-fix 23/11] worker destravado (antigo _campwaTick preservado acima)
 setInterval(() => { try { _campwaSweepHandoff(); } catch { /* */ } }, 60 * 60 * 1000);
 
 function _campwaAuth(req: any, res: any): boolean { const k = req.headers['x-api-key']; if (ENGINE_API_KEY && k !== ENGINE_API_KEY) { res.status(401).json({ ok: false, erro: 'nao autorizado' }); return false; } return true; }
+// [+campwa-fix 23/11] DIAGNOSTICO do worker (tira a caixa-preta): ultimo tick, janela, e por projeto a instancia/ultimo lead/precheck/resultado/cotas.
+app.get('/campanha-wa/diag', (req: any, res: any) => {
+  if (!_campwaAuth(req, res)) return;
+  try {
+    const cfg = _campwaCfg();
+    const dBRT = _campwaAgoraBRT(); const horaFloat = dBRT.getUTCHours() + dBRT.getUTCMinutes() / 60;
+    const hIni = Number(cfg.hora_inicio || 9), hFim = Number(cfg.hora_fim || 20);
+    res.json({
+      ok: true, ativo: cfg.ativo, agora_brt: dBRT.toISOString(), hora_float: Math.round(horaFloat * 100) / 100,
+      janela: { ini: hIni, fim: hFim, dentro: (horaFloat >= hIni && horaFloat < hFim) }, por_dia: cfg.por_dia,
+      worker: _campwaDiag
+    });
+  } catch (e: any) { res.status(500).json({ ok: false, erro: String((e && e.message) || e) }); }
+});
 app.get('/campanha-wa/status', (req: any, res: any) => {
   try {
     const por: any = {};
