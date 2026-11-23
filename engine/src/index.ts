@@ -14466,6 +14466,8 @@ html.ac-big body{font-size:17px}html.ac-big .top nav{font-size:16px}html.ac-big 
 .hslide .hbtn:hover{background:var(--bfh,var(--bf,#fff));color:var(--bth,var(--bt,#111))}
 .hgrad{position:absolute;left:0;right:0;bottom:0;height:42%;z-index:2;pointer-events:none}
 @media(max-width:820px){.hslide .bgd{display:none}.hslide .bgm{display:block}.hslide .ov{align-items:center;text-align:center;justify-content:flex-end;padding-bottom:30px;max-width:none}.hslide .htxt{max-width:92%}.hslide .hbtn{width:100%;max-width:340px}}
+/* [+banner-texto-maior 23/11] no DESKTOP (>820px) aumenta o texto e o botao do hero. Celular intocado. ADD-ONLY. */
+@media(min-width:821px){.hslide .htxt{font-size:clamp(17px,1.5vw,23px)}.hslide .hbtn{font-size:clamp(16px,1.3vw,19px);padding:16px 34px}}
 .railwrap{position:relative}
 .arw{position:absolute;top:10px;bottom:18px;width:46px;border:0;color:#fff;font-size:26px;cursor:pointer;z-index:4;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
 .arw.l{left:0;background:linear-gradient(90deg,#0d0d10,transparent)}
