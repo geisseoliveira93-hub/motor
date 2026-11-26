@@ -1341,6 +1341,8 @@ app.use((req: any, res: any, next: any) => {
     let p = decodeURIComponent((req.path || '/').split('?')[0]);
     if (p === '/' || p === '') p = '/index.html';
     if (p.indexOf('..') >= 0) { res.status(400).send('bad'); return; }
+    // [+biblia-subdir 26/11] resolve diretorio -> index.html (ex.: /mapa-da-palavra -> /mapa-da-palavra/index.html). ADD-ONLY.
+    try { if (p !== '/index.html' && !/\.[a-z0-9]{1,5}$/i.test(p)) { const _candIdx = (p.replace(/\/+$/, '')) + '/index.html'; if (fs.existsSync(BIBLIA_DIR + _candIdx) && fs.statSync(BIBLIA_DIR + _candIdx).isFile()) p = _candIdx; } } catch { /* biblia-subdir best-effort */ }
     const file = BIBLIA_DIR + p;
     if (!fs.existsSync(file) || !fs.statSync(file).isFile()) { res.status(404).type('html').send('<h1>404</h1>'); return; }
     res.setHeader('Content-Type', _bibliaCT(file));
