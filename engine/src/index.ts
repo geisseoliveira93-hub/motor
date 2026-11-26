@@ -4334,6 +4334,29 @@ app.post('/webhook/payment/:provider', async (req, res) => {
 
     const projeto = projetoDoProduto(p.produtoId, p.produtoNome);
     const categoria = classificaPagamento(provider, p.status);
+    // [+mapa-br 26/11] Mapa da Palavra (ebook BR via LastLink): entrega e da PROPRIA LastLink (6 PDFs por e-mail).
+    // O motor NAO cria aluno/curso/magic link/fluxo: so manda 1 confirmacao no 8151 + Purchase CAPI no pixel BR (projeto 'mapabr').
+    if (categoria === 'aprovado' && provider === 'lastlink' && /mapa da palavra/i.test(String(p.produtoNome || ''))) {
+      let _mDup = false;
+      try {
+        const _mTel = p.telefone ? String(p.telefone).replace(/\D/g, '') : '';
+        const _mEmail = p.email ? String(p.email).toLowerCase() : '';
+        const _mChave = (_mTel || _mEmail || String(p.pedido || '')) + '|mapabr';
+        try { db.exec(`CREATE TABLE IF NOT EXISTS mapa_br_confirmado (chave TEXT, criado_em TEXT)`); } catch { /* existe */ }
+        try { const _mq: any = db.prepare(`SELECT 1 FROM mapa_br_confirmado WHERE chave=? AND criado_em > ? LIMIT 1`).get(_mChave, new Date(Date.now() - 12 * 3600 * 1000).toISOString()); if (_mq) _mDup = true; } catch { /* dedup best-effort */ }
+        if (!_mDup) {
+          try { db.prepare(`INSERT INTO mapa_br_confirmado (chave, criado_em) VALUES (?,?)`).run(_mChave, agora()); } catch { /* */ }
+          try { if (capiPurchaseIsolado) await capiPurchaseIsolado('mapabr', { email: p.email || null, telefone: p.telefone || null, valorCentavos: Math.round(Number(p.valor || 0) * 100) || null, produto: p.produtoNome || 'Mapa da Palavra', eventId: (p as any).pedido || null, externalId: p.email || p.telefone || null, fbclid: _fbclVenda }); } catch { /* CAPI best-effort */ }
+          if (_mTel) {
+            const _mNome = (String(p.nome || '').split(' ')[0] || '').trim();
+            const _mOla = _mNome ? ('Ola, ' + _mNome + '!') : 'Ola!';
+            const _mMsg = _mOla + ' 🙏\nSua compra do *Mapa da Palavra* foi confirmada com sucesso! ✅\nO material completo — as 66 fichas + os 5 bônus — foi enviado para o seu e-mail: *' + (p.email || '') + '*.\nConfira sua caixa de entrada (e dá uma olhada no spam/promoções, por garantia). Se tiver qualquer dificuldade pra acessar, é só responder aqui que a gente te ajuda.\nQue Deus abençoe seu estudo da Palavra! 📖';
+            try { await enviarTexto('teclado' as any, p.telefone, _mMsg, _RECUP_DED_INST); } catch { /* envio best-effort */ }
+          }
+        }
+      } catch { /* mapa-br best-effort: nunca quebra o webhook */ }
+      return res.json({ ok: true, mapa_br: true, dup: _mDup });
+    }
     // [etapa31] ADD: espelha a venda no CAPI (pixel Meta) reusando ESTE webhook de entrega.
     // Best-effort e envolto em try/catch: NUNCA pode quebrar a entrega. Só Purchase (aprovado)
     // e InitiateCheckout (perdido). Enquanto capi_ativo=0 no motor, isto só grava log 'inerte'.
