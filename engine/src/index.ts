@@ -3026,12 +3026,32 @@ const _TRACK_PAGINA_JS = `(function(){
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',run); else run();
 })();`;
+// [+hotmart-fbc 26/11] Encaminha o fbclid do clique do anuncio pro checkout da Hotmart via o
+// parametro sck (sck=mrfbc_<fbclid>), que a Hotmart ecoa no webhook (purchase.sckPaymentLink).
+// Assim o motor manda o fbc no Purchase -> atribuicao de criativo no Meta. So appenda o sck nos
+// links pay.hotmart.com; NAO altera visual nem outros links. Idempotente (window.__mrHsf).
+const _HOTMART_SCK_FBC_JS = `(function(){
+  if(window.__mrHsf) return; window.__mrHsf=1;
+  function fbclid(){
+    try{ var m=(location.search||'').match(/[?&]fbclid=([^&#]+)/i); if(m&&m[1]) return decodeURIComponent(m[1]); }catch(e){}
+    try{ var c=document.cookie.match(/_mr_fbc=fb\.1\.\d+\.([^;]+)/)||document.cookie.match(/_fbc=fb\.1\.\d+\.([^;]+)/); if(c&&c[1]) return decodeURIComponent(c[1]); }catch(e){}
+    return '';
+  }
+  function aplica(){
+    try{ var fb=fbclid(); if(!fb) return; var sck='mrfbc_'+fb;
+      var as=document.querySelectorAll('a[href*="pay.hotmart.com"]');
+      for(var i=0;i<as.length;i++){ (function(a){ try{ var u=new URL(a.href, location.href); u.searchParams.set('sck', sck); a.href=u.toString(); }catch(e){} })(as[i]);
+    } }catch(e){}
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',aplica); else aplica();
+  try{ document.addEventListener('click', aplica, true); }catch(e){}
+})();`;
 function _injetarTrackPagina(html: string, projeto: any): string {
   const h = String(html || '');
   if (/window\.__mrPg/.test(h)) return h;
   const base = PUBLIC_BASE_URL || 'https://motor.melodiaseriffs.com.br';
   const js = _TRACK_PAGINA_JS.replace('__BASE__', JSON.stringify(base)).replace('__PROJ__', JSON.stringify(String(projeto || 'teclado')));
-  const sc = '<scr' + 'ipt>' + js + '</scr' + 'ipt>';
+  const sc = '<scr' + 'ipt>' + js + '</scr' + 'ipt>' + '<scr' + 'ipt>' + _HOTMART_SCK_FBC_JS + '</scr' + 'ipt>';
   if (/<\/body>/i.test(h)) return h.replace(/<\/body>/i, sc + '</body>');
   return h + sc;
 }
@@ -4248,7 +4268,7 @@ let capiHookPagamento: ((fonte: string, dados: { email?: string | null; telefone
 // Inerte até pubFlag('vsl_capi_ativo')='1'.
 let vslTrackHook: ((projeto: string, eventName: string, dados: { email?: string | null; telefone?: string | null; pagina?: string | null; clientIp?: string | null; userAgent?: string | null; fbp?: string | null; fbc?: string | null }) => Promise<void>) | null = null;
 // [+hotmart-capi 15/11] Purchase direto num projeto/pixel (Bajista/Mapa via track_config), fora do roteador por instrumento. Preenchido no bloco CAPI no boot.
-let capiPurchaseIsolado: ((projeto: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; eventId?: string | null; externalId?: string | null }) => Promise<void>) | null = null;
+let capiPurchaseIsolado: ((projeto: string, dados: { email?: string | null; telefone?: string | null; valorCentavos?: number | null; produto?: string | null; eventId?: string | null; externalId?: string | null; fbclid?: string | null }) => Promise<void>) | null = null;
 
 app.post('/webhook/payment/:provider', async (req, res) => {
   try {
@@ -10619,7 +10639,17 @@ console.log('[etapa28] publicador na nuvem carregado (INERTE ate publicador_ativ
     try {
       const cfgT = trackLer(String(projeto || ''));
       if (cfgT && cfgT.ativo !== 0 && cfgT.meta_pixel_id) {
-        await trackEnviarTudo(cfgT, 'Purchase', { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: dados.valorCentavos ?? null, produto: dados.produto || null, pagina: null, eventId: dados.eventId || undefined, externalId: dados.externalId || dados.email || dados.telefone || null } as any, 'hotmart');
+        let _fbcI: string | null = null; let _ipI: string | null = null; let _uaI: string | null = null; // [+hotmart-fbc 26/11] atribuicao de criativo
+        try {
+          const _telI = dados.telefone ? String(dados.telefone).replace(/\D/g, '') : '';
+          let _ccI: any = null;
+          if (_telI) _ccI = db.prepare(`SELECT utm_fbclid FROM contatos WHERE projeto=? AND telefone=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(projeto || ''), _telI) as any;
+          if ((!_ccI || !_ccI.utm_fbclid) && dados.email) _ccI = db.prepare(`SELECT utm_fbclid FROM contatos WHERE lower(email)=? AND utm_fbclid IS NOT NULL AND utm_fbclid<>'' ORDER BY criado_em DESC LIMIT 1`).get(String(dados.email).toLowerCase()) as any;
+          if (_ccI && _ccI.utm_fbclid) _fbcI = 'fb.1.' + Date.now() + '.' + String(_ccI.utm_fbclid);
+          if (!_fbcI && (dados as any).fbclid) _fbcI = 'fb.1.' + Date.now() + '.' + String((dados as any).fbclid);
+          try { const _rawI = _fbcI ? String(_fbcI).split('.').slice(3).join('.') : ((dados as any).fbclid ? String((dados as any).fbclid) : ''); if (_rawI) { const _tqI = db.prepare(`SELECT ip, ua FROM rastreio_toque WHERE fbclid=?`).get(_rawI) as any; if (_tqI) { _ipI = _tqI.ip || null; _uaI = _tqI.ua || null; } } } catch { /* ip-ua best-effort */ }
+        } catch { /* fbc best-effort */ }
+        await trackEnviarTudo(cfgT, 'Purchase', { email: dados.email || null, telefone: dados.telefone || null, valorCentavos: dados.valorCentavos ?? null, produto: dados.produto || null, pagina: null, eventId: dados.eventId || undefined, externalId: dados.externalId || dados.email || dados.telefone || null, fbc: _fbcI, clientIp: _ipI, userAgent: _uaI } as any, 'hotmart');
       }
     } catch { /* best-effort: nunca quebra o webhook */ }
   };
@@ -15442,6 +15472,7 @@ function _hotmartRevogarBajista(email: string): void {
 }
 // RECUPERACAO ES (abandono/boleto nao pago): 1 WhatsApp em espanhol, dedup 24h por telefone (num Baixo).
 async function _hotmartRecupES(telefone: string, nome: string): Promise<void> {
+  try { if (pubFlag('hotmart_recup_es_ativo', '0') !== '1') return; } catch { return; } // [+hotmart-recup-off 26/11] desligado: disparava em venda paga via metodo pendente (pix/oxxo/boleto). Religar = pub_kv hotmart_recup_es_ativo=1.
   try {
     const tel = String(telefone || '').replace(/\D/g, ''); if (!tel) return;
     const ja: any = db.prepare(`SELECT 1 FROM hotmart_recup WHERE telefone=? AND criado_em > ?`).get(tel, new Date(Date.now() - 86400000).toISOString());
@@ -15476,7 +15507,8 @@ app.post('/webhook/hotmart', async (req: any, res: any) => {
     const eMapa = /mapa de la|vive la palabra|palabra|biblia/i.test(produtoNome) || _pid === '8887542';
     const projRastreio = eMapa ? 'mapa' : 'bajista';
     const _valorC = Math.round(Number((d.purchase && d.purchase.price && ((d.purchase.price as any).value ?? d.purchase.price)) || (d.purchase && d.purchase.full_price && d.purchase.full_price.value) || 0) * 100) || null;
-    const _capiPurchase = async (): Promise<void> => { try { if (capiPurchaseIsolado) await capiPurchaseIsolado(projRastreio, { email, telefone, valorCentavos: _valorC, produto: produtoNome, eventId: pedido, externalId: email || telefone || null }); } catch { /* CAPI best-effort */ } };
+    const _fbclidHot: string | null = (() => { try { let _f = _fbclidDoPayload(b) || ''; if (!_f) { const _sckH = String((d.purchase && (d.purchase.sckPaymentLink || (d.purchase as any).sck)) || '').trim(); if (/^mrfbc_/.test(_sckH)) _f = _sckH.replace(/^mrfbc_/, ''); } return _f || null; } catch { return null; } })(); // [+hotmart-fbc 26/11] fbclid do clique (sck=mrfbc_<fbclid> encaminhado pela pagina, ou payload)
+    const _capiPurchase = async (): Promise<void> => { try { if (capiPurchaseIsolado) await capiPurchaseIsolado(projRastreio, { email, telefone, valorCentavos: _valorC, produto: produtoNome, eventId: pedido, externalId: email || telefone || null, fbclid: _fbclidHot }); } catch { /* CAPI best-effort */ } };
     const _evCat = classificaPagamento('guru', statusRaw); // Hotmart: approved / refunded / chargeback / canceled / expired / abandoned
     try { _hotmartLog(aprovado ? 'aprovado' : _evCat, email, telefone, produtoNome, statusRaw); } catch { /* */ }
     if (!aprovado) {
@@ -16952,6 +16984,7 @@ app.post('/academy/mapa/remover', (req: any, res: any) => { try { db.prepare(`DE
 // curso; ESTE bloco so manda a mensagem de acesso. INERTE ate pub_kv 'acesso_academy_msg_ativo'='1'.
 // Dedup por (email,curso) em academy_envio_acesso: nunca remanda em recompra.
 try { db.exec(`CREATE TABLE IF NOT EXISTS academy_envio_acesso ( id TEXT PRIMARY KEY, email TEXT, curso_id TEXT, canal TEXT, criado_em TEXT )`); } catch { /* existe */ }
+try { db.exec(`CREATE TABLE IF NOT EXISTS academy_acesso_lock ( chave TEXT PRIMARY KEY, criado_em TEXT )`); } catch { /* existe */ }
 const _ACESSO_ACADEMY_MSG: any[] = [
   { match: /baixista\s*pr/i, curso: '42825fe8-0b6a-464a-b7c7-1b98048571ff', produto_nome: 'Método Baixista Pró',
     projeto: 'baixo', instancia: 'Baixo', emoji: '🎸',
@@ -16987,6 +17020,7 @@ const _acAcessoNaVenda = (p: any, b: any, provider: string): void => {
       if (ja) continue;   // ja mandou acesso desse curso pra esse email (recompra): nao remanda
       const al = db.prepare(`SELECT * FROM academy_matriculas WHERE lower(email)=?`).get(email) as any;
       if (!al) continue;  // _acMatricularPorVenda deveria ter criado; se nao casou o mapa, sai
+      try { const _lkAc: any = db.prepare(`INSERT OR IGNORE INTO academy_acesso_lock (chave, criado_em) VALUES (?,?)`).run(email + '|' + m.curso, agora()); if (!_lkAc || _lkAc.changes === 0) continue; } catch { /* [+acesso-dedup-atomico 26/11] 1x por (email,curso) */ }
       if (!al.senha_hash) { try { db.prepare(`UPDATE academy_matriculas SET senha_hash=?, senha_plana=? WHERE id=?`).run(_acHash('melodias123'), 'melodias123', al.id); } catch { /* */ } }
       let tok = al.token_login; if (!tok) { tok = _acToken(); db.prepare(`UPDATE academy_matriculas SET token_login=? WHERE id=?`).run(tok, al.id); }
       const link = (_AREA_URL || 'https://areadoaluno.melodiaseriffs.com.br') + '/area/entrar/' + tok;
