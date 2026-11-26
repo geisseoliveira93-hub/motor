@@ -17691,6 +17691,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
     };
     const taxaPct = (): number => { const v = Number((CONFIG as any).painelTaxaPct); return isFinite(v) && v > 0 ? v : 15; };
     const impPct = (): number => { const v = Number((CONFIG as any).painelImpostoPct); return isFinite(v) && v >= 0 ? v : 12; };
+    const _pnlTaxaProd = (produto: string): number => { try { if (String(produto || '') === 'Baixista Pró Espanhol') return 21.5; } catch { /* */ } return taxaPct(); }; // [+taxa-por-produto 26/11] Hotmart Bajista ES = 21,5% (IVA+comissao; liquido real) — resto segue taxaPct()
 
     const _pnlProduto = (nome: string): string => {
       const t = String(nome || '').toLowerCase();
@@ -17705,7 +17706,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
     // [+subprodutos 17/11] rotulo curto do PRODUTO (sub do instrumento) a partir do nome da venda OU da campanha — add-only
     const _pnlLabelProduto = (nome: string): string => {
       const t = String(nome || '').toLowerCase();
-      if (/bajista/.test(t)) return 'Baixista Pró Espanhol'; // [+bajista-es-painel 26/11]
+      if (/bajista|palabra|mapa de la|vive la palabra/.test(t)) return 'Baixista Pró Espanhol'; // [+bajista-es-painel 26/11] sub-rotulo ES (inclui nome cru 'Mapa de la Palabra')
       if (/baixista/.test(t)) return 'Baixista Pró';
       if (/tecladista/.test(t)) return 'Tecladista Pró';
       if (/violonista/.test(t)) return 'Violonista Pró';
@@ -17830,7 +17831,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
         const tx2 = (p.produto === 'Todos') ? _txTotal : (_txByProd[p.produto] || { total: 0, fat: 0 }); // [+todas-vendas 31/10]
         const vendasT = (tx2.total || 0); // TODAS as vendas aprovadas (transacoes: LastLink+Guru+Pagarme, já inclui recuperação)
         const fatT = (tx2.fat || 0);
-        const taxaV = fatT * tx / 100;
+        const taxaV = fatT * _pnlTaxaProd(p.produto) / 100; // [+taxa-por-produto 26/11]
         const impV = p.gasto * im / 100;
         const lucro = fatT - taxaV - impV - p.gasto;
         return {
@@ -17855,7 +17856,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const ads = (anuncios || []).map((a: any) => {
         const prod = _pnlProdDeAd(a);
         const gasto = (a.gasto_centavos || 0) / 100; const fat = ((a.fat_meta_centavos || a.fat_centavos) || 0) / 100;
-        const taxaV = fat * tx / 100; const impV = gasto * im / 100;
+        const taxaV = fat * _pnlTaxaProd(prod) / 100; const impV = gasto * im / 100; // [+taxa-por-produto 26/11]
         const conta = String(a.ad_account_id || '');
         const contaNome = mapaContas[conta] || (conta ? ('Conta ' + conta.replace('act_', '')) : '(sem conta)');
         if (conta) _contasSet[conta] = contaNome;
@@ -17881,7 +17882,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
         o.gasto += (a.gasto_centavos || 0) / 100; o.cliques += (a.cliques || 0); o.impressoes += (a.impressoes || 0); o.leads += (a.leads || 0); o.ic += (a.ic || 0);
       }
       const subprodutos = Object.keys(_subMap).map((k) => {
-        const s = _subMap[k]; const taxaV = s.fat * tx / 100; const impV = s.gasto * im / 100; const lucro = s.fat - taxaV - impV - s.gasto;
+        const s = _subMap[k]; const taxaV = s.fat * _pnlTaxaProd(s.instrumento) / 100; const impV = s.gasto * im / 100; const lucro = s.fat - taxaV - impV - s.gasto; // [+taxa-por-produto 26/11]
         return { ...s, roas: s.gasto > 0 ? s.fat / s.gasto : 0, cpa: s.vendas > 0 ? s.gasto / s.vendas : 0, ticket: s.vendas > 0 ? s.fat / s.vendas : 0, taxaPlataforma: taxaV, impostoMeta: impV, lucro, margem: s.fat > 0 ? lucro / s.fat * 100 : 0 };
       }).sort((a: any, b: any) => b.fat - a.fat);
       return { ok: true, dias, de: deFinal, ate: ateFinal, taxaPct: tx, impostoPct: im, total, produtos: lista, subprodutos, ads, contas };
