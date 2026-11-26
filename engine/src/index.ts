@@ -1341,8 +1341,8 @@ app.use((req: any, res: any, next: any) => {
     let p = decodeURIComponent((req.path || '/').split('?')[0]);
     if (p === '/' || p === '') p = '/index.html';
     if (p.indexOf('..') >= 0) { res.status(400).send('bad'); return; }
-    // [+biblia-subdir 26/11] resolve diretorio -> index.html (ex.: /mapa-da-palavra -> /mapa-da-palavra/index.html). ADD-ONLY.
-    try { if (p !== '/index.html' && !/\.[a-z0-9]{1,5}$/i.test(p)) { const _candIdx = (p.replace(/\/+$/, '')) + '/index.html'; if (fs.existsSync(BIBLIA_DIR + _candIdx) && fs.statSync(BIBLIA_DIR + _candIdx).isFile()) p = _candIdx; } } catch { /* biblia-subdir best-effort */ }
+    // [+biblia-subdir 26/11] diretorio -> index.html; sem barra final redireciona 301 p/ barra (relativo img/ funcionar). ADD-ONLY.
+    try { if (p !== '/index.html' && !/\.[a-z0-9]{1,5}$/i.test(p)) { const _dirP = p.replace(/\/+$/, ''); if (fs.existsSync(BIBLIA_DIR + _dirP + '/index.html') && fs.statSync(BIBLIA_DIR + _dirP + '/index.html').isFile()) { if (!/\/$/.test(p)) { res.statusCode = 301; res.setHeader('Location', _dirP + '/'); res.end(); return; } p = _dirP + '/index.html'; } } } catch { /* biblia-subdir best-effort */ }
     const file = BIBLIA_DIR + p;
     if (!fs.existsSync(file) || !fs.statSync(file).isFile()) { res.status(404).type('html').send('<h1>404</h1>'); return; }
     res.setHeader('Content-Type', _bibliaCT(file));
