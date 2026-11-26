@@ -17699,12 +17699,13 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       if (/baix/.test(t)) return 'Baixo';
       if (/viol/.test(t)) return 'Violao';
       if (/harpa|comunidade/.test(t)) return 'Harpa';
-      if (/palabra|vive la palabra|mapa de la|biblia/.test(t)) return 'Mapa de la Palabra'; // [+mapa-painel] produto espanhol
+      if (/bajista|palabra|vive la palabra|mapa de la|biblia/.test(t)) return 'Baixista Pró Espanhol'; // [+bajista-es-painel 26/11] conta/produto ES (antes 'Mapa de la Palabra')
       return 'Outros';
     };
     // [+subprodutos 17/11] rotulo curto do PRODUTO (sub do instrumento) a partir do nome da venda OU da campanha — add-only
     const _pnlLabelProduto = (nome: string): string => {
       const t = String(nome || '').toLowerCase();
+      if (/bajista/.test(t)) return 'Baixista Pró Espanhol'; // [+bajista-es-painel 26/11]
       if (/baixista/.test(t)) return 'Baixista Pró';
       if (/tecladista/.test(t)) return 'Tecladista Pró';
       if (/violonista/.test(t)) return 'Violonista Pró';
@@ -17718,7 +17719,7 @@ console.log('[+obs-audiencia] rota /obs/audiencia carregada (audiencia ao vivo Y
       const raw = String(nome || '').trim();
       return raw ? (raw.length > 26 ? raw.slice(0, 26) + '…' : raw) : 'Outros';
     };
-    const _pnlProdDeAd = (a: any): string => { if (String((a && a.ad_account_id) || '').includes('1994733334543735')) return 'Mapa de la Palabra'; return _pnlProduto((a && (a.campaign_nome || a.ad_nome)) || ''); }; // [+mapa-painel] forca por conta Vive la Palabra (nome de campanha e fragil)
+    const _pnlProdDeAd = (a: any): string => { if (String((a && a.ad_account_id) || '').includes('1994733334543735')) return 'Baixista Pró Espanhol'; return _pnlProduto((a && (a.campaign_nome || a.ad_nome)) || ''); }; // [+bajista-es-painel 26/11] conta Vive la Palabra = Baixista Pró Espanhol (antes Mapa de la Palabra)
     let _pnlContasCache: Record<string,string> | null = null; let _pnlContasTs = 0;
     const _pnlContasMap = async (): Promise<Record<string,string>> => {
       try {
