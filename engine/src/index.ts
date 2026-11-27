@@ -5027,7 +5027,8 @@ function _slotsLivres(projeto: string, periodo: string, limite = 10): any[] {
   const agoraMs = Date.now();
   const minMs = agoraMs + (grade.antecedenciaH || 2) * 3600 * 1000;
   const ocupados = new Set(
-    (db.prepare(`SELECT inicio FROM eventos WHERE projeto=?`).all(projeto) as any[]).map((e) => String(e.inicio))
+    // [fuso-agenda 27/11] dedup por INSTANTE (getTime), nao por string — eventos antigos em "Z" e slots novos em -03:00 continuam casando
+    (db.prepare(`SELECT inicio FROM eventos WHERE projeto=?`).all(projeto) as any[]).map((e) => new Date(String(e.inicio)).getTime())
   );
   const out: any[] = [];
   for (let d = 0; d < 21 && out.length < limite; d++) {
@@ -5041,8 +5042,9 @@ function _slotsLivres(projeto: string, periodo: string, limite = 10): any[] {
       const mm = Number(parts[1] || 0);
       const inicioUtcMs = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), hh + 3, mm);
       if (inicioUtcMs < minMs) continue;
-      const iso = new Date(inicioUtcMs).toISOString();
-      if (ocupados.has(iso)) continue;
+      // [fuso-agenda 27/11] iso no fuso -03:00: a DATA do iso passa a bater com a DATA do label (horario da noite NAO pula pro dia seguinte). Mesmo instante de antes.
+      const iso = brt.getUTCFullYear() + '-' + String(brt.getUTCMonth() + 1).padStart(2, '0') + '-' + String(brt.getUTCDate()).padStart(2, '0') + 'T' + String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + ':00-03:00';
+      if (ocupados.has(inicioUtcMs)) continue;
       out.push({ iso, label: _DIAS_PT[dow] + ' ' + String(brt.getUTCDate()).padStart(2, '0') + '/' + String(brt.getUTCMonth() + 1).padStart(2, '0') + ' as ' + h });
       if (out.length >= limite) break;
     }
@@ -5071,7 +5073,8 @@ function _slotsLivresV2(projeto: string, periodo: string, limite = 10): any[] {
   const agoraMs = Date.now();
   const minMs = agoraMs + antecedenciaH * 3600 * 1000;
   const ocup: any = {};
-  try { (db.prepare(`SELECT inicio, COUNT(*) c FROM eventos WHERE projeto=? GROUP BY inicio`).all(projeto) as any[]).forEach((e) => { ocup[String(e.inicio)] = Number(e.c || 0); }); } catch { /* best-effort */ }
+  // [fuso-agenda 27/11] chaveia ocupacao por INSTANTE (getTime) pra casar com o slot novo em -03:00 e com eventos antigos em "Z"
+  try { (db.prepare(`SELECT inicio, COUNT(*) c FROM eventos WHERE projeto=? GROUP BY inicio`).all(projeto) as any[]).forEach((e) => { ocup[new Date(String(e.inicio)).getTime()] = Number(e.c || 0); }); } catch { /* best-effort */ }
   const porDia: any = {};
   for (const j of janelas) { const d = Number(j.dia_semana); if (!porDia[d]) porDia[d] = []; porDia[d].push(j); }
   const out: any[] = [];
@@ -5086,9 +5089,10 @@ function _slotsLivresV2(projeto: string, periodo: string, limite = 10): any[] {
       const parts = h.split(':'); const hh = Number(parts[0]); const mm = Number(parts[1] || 0);
       const inicioUtcMs = Date.UTC(brt.getUTCFullYear(), brt.getUTCMonth(), brt.getUTCDate(), hh + 3, mm);
       if (inicioUtcMs < minMs) continue;
-      const iso = new Date(inicioUtcMs).toISOString();
+      // [fuso-agenda 27/11] iso no fuso -03:00: DATA do iso = DATA do label (noite nao pula o dia). Mesmo instante de antes.
+      const iso = brt.getUTCFullYear() + '-' + String(brt.getUTCMonth() + 1).padStart(2, '0') + '-' + String(brt.getUTCDate()).padStart(2, '0') + 'T' + String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + ':00-03:00';
       const vagas = Math.max(1, Number(j.vagas || 1));
-      if (Number(ocup[iso] || 0) >= vagas) continue;
+      if (Number(ocup[inicioUtcMs] || 0) >= vagas) continue;
       out.push({ iso, label: _DIAS_PT[dow] + ' ' + String(brt.getUTCDate()).padStart(2, '0') + '/' + String(brt.getUTCMonth() + 1).padStart(2, '0') + ' as ' + h, tipo: j.tipo || '', vagas });
       if (out.length >= limite) break;
     }
@@ -5126,7 +5130,19 @@ async function _execTool(projeto: string, conversa: any, nomeFerr: string, args:
       return { ok: true, telefone: tel };
     }
     if (nomeFerr === 'marcar_agendamento') {
-      const inicio = String(args.inicio_iso || '');
+      // [fuso-agenda 27/11] normaliza pro instante canonico em UTC ("Z"): aceita iso em -03:00 ou em "Z"; eventos.inicio segue SEMPRE em "Z" (sem ripple em gcal/lembretes/dedup antigos).
+      const _inicioRaw = String(args.inicio_iso || '');
+      const _inicioMs = _inicioRaw ? new Date(_inicioRaw).getTime() : NaN;
+      if (_inicioRaw && !Number.isFinite(_inicioMs)) return { ok: false, erro: 'inicio_invalido', instrucao: 'O horario (inicio_iso) veio invalido. Chame listar_horarios_livres e use exatamente o iso que a ferramenta devolver.' };
+      const inicio = Number.isFinite(_inicioMs) ? new Date(_inicioMs).toISOString() : '';
+      // [fuso-agenda 27/11] VALIDA: so aceita um instante que seja um horario REALMENTE livre oferecido agora (evita marcar no dia/hora errado por iso mal copiado pelo LLM). Falha-aberto se der erro interno; falha-fechado so em nao-correspondencia confirmada.
+      if (inicio) {
+        try {
+          const _livres = _slotsLivresV2(projeto, '', 60);
+          const _ok = _livres.some((s: any) => new Date(s.iso).getTime() === _inicioMs);
+          if (!_ok) return { ok: false, erro: 'horario_indisponivel', instrucao: 'Esse horario nao esta na lista de horarios livres (ou ja foi ocupado). Chame listar_horarios_livres de novo e use exatamente o iso que a ferramenta devolver.' };
+        } catch { /* best-effort: nao bloqueia a marcacao se a validacao der erro interno */ }
+      }
       const durMin = (seed.grade && seed.grade.duracaoMin) || 40;
       const fim = inicio ? new Date(new Date(inicio).getTime() + durMin * 60000).toISOString() : '';
       const id = randomUUID();
