@@ -4374,6 +4374,45 @@ app.post('/webhook/payment/:provider', async (req, res) => {
         }).catch(() => {});
       }
     } catch { /* CAPI best-effort: nunca quebra a entrega */ }
+    // [painel-trafego 27/11 - Claude, pedido do Ezequias] ADD: espelha a venda no painel de trafego
+    // (LogPose em trafego.melodiaseriffs.com.br) reusando ESTE webhook. Best-effort, try/catch:
+    // NUNCA pode quebrar a entrega. So aprovado (valor>0), reembolso e chargeback, e so com e-mail.
+    // Liga/desliga por pub_kv 'painel_trafego_ativo' (default '1'); URL em 'painel_trafego_webhook_url'.
+    try {
+      if (pubFlag('painel_trafego_ativo', '1') === '1' && p.email) {
+        const _ptUrl = pubFlag('painel_trafego_webhook_url', 'https://trafego.melodiaseriffs.com.br/api/webhook/api/0f850ae2');
+        const _ptRaw = String(p.status || '');
+        const _ptStatus =
+          categoria === 'aprovado' ? 'approved'
+          : /estorn|reembol|refund|devolv/i.test(_ptRaw) ? 'refunded'
+          : /chargeback|charge_back|contesta|disput/i.test(_ptRaw) ? 'chargeback'
+          : null;
+        const _ptValor = Number(p.valor || 0);
+        if (_ptUrl && _ptStatus && (_ptStatus !== 'approved' || _ptValor > 0)) {
+          const _ptBody = {
+            external_id: String(p.pedido || ''),
+            status: _ptStatus,
+            amount: _ptValor,
+            product_external_id: String(p.produtoId || ''),
+            product_name: String(p.produtoNome || ''),
+            product_price: _ptValor,
+            customer_email: String(p.email || ''),
+            customer_name: (p as any).nome || null,
+            customer_phone: p.telefone || null,
+            utm_source: _utmVenda?.utm_source || null,
+            utm_medium: _utmVenda?.utm_medium || null,
+            utm_campaign: _utmVenda?.utm_campaign || null,
+            utm_content: _utmVenda?.utm_content || null,
+            utm_term: _utmVenda?.utm_term || null,
+          };
+          const _ptCtrl = new AbortController();
+          const _ptTo = setTimeout(() => { try { _ptCtrl.abort(); } catch { /* */ } }, 8000);
+          fetch(_ptUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(_ptBody), signal: _ptCtrl.signal })
+            .catch(() => { /* painel-trafego best-effort */ })
+            .finally(() => { try { clearTimeout(_ptTo); } catch { /* */ } });
+        }
+      }
+    } catch { /* painel-trafego best-effort: nunca quebra a entrega */ }
     if (categoria === 'aprovado') { try { _acMatricularPorVenda(p); } catch { /* academy best-effort */ } }
     if (categoria === 'aprovado') { try { _acAcessoNaVenda(p, b, provider); } catch { /* acesso-academy best-effort: nunca quebra a entrega */ } }
     if (categoria === 'aprovado') { try { _ckWebhookPaid(p); } catch { /* checkout-proprio best-effort: nunca quebra a entrega */ } }
